@@ -397,30 +397,34 @@ public sealed class BlockModel
 
     private static void GetFaceUvs(CubeNetAtlas atlas, byte id, FaceDirection face, BlockModelUv? uv, out Vector2 uv00, out Vector2 uv10, out Vector2 uv11, out Vector2 uv01)
     {
-        atlas.GetFaceUvRect(id, face, out var f00, out var f10, out var f11, out var f01);
         if (uv == null)
         {
-            uv00 = f00;
-            uv10 = f10;
-            uv11 = f11;
-            uv01 = f01;
+            atlas.GetFaceUvRect(id, face, out uv00, out uv10, out uv11, out uv01);
             return;
         }
 
-        var minU = MathF.Min(MathF.Min(f00.X, f10.X), MathF.Min(f11.X, f01.X));
-        var maxU = MathF.Max(MathF.Max(f00.X, f10.X), MathF.Max(f11.X, f01.X));
-        var minV = MathF.Min(MathF.Min(f00.Y, f10.Y), MathF.Min(f11.Y, f01.Y));
-        var maxV = MathF.Max(MathF.Max(f00.Y, f10.Y), MathF.Max(f11.Y, f01.Y));
+        // The model's UVs are already normalized to 0..1 within the block's local 48x32 texture.
+        // We need to map these to the global atlas.
+        // The CubeNetAtlas uses a grid of 48x32 regions.
+        
+        var def = BlockRegistry.Get(id);
+        var atlasWidth = atlas.Texture.Width;
+        var atlasHeight = atlas.Texture.Height;
+        
+        // Find the top-left pixel of this block's 48x32 region in the atlas.
+        // regionsPerRow is 4.
+        var regionX = (def.AtlasIndex % 4) * 48; 
+        var regionY = (def.AtlasIndex / 4) * 32;
 
-        var u0 = MathHelper.Lerp(minU, maxU, uv.Value.U0);
-        var u1 = MathHelper.Lerp(minU, maxU, uv.Value.U1);
-        var v0 = MathHelper.Lerp(minV, maxV, uv.Value.V0);
-        var v1 = MathHelper.Lerp(minV, maxV, uv.Value.V1);
+        // Map the 0..1 UVs from the JSON model to pixels within the 48x32 region, 
+        // then normalize to the full atlas size.
+        float MapU(float u) => (regionX + u * 48f) / atlasWidth;
+        float MapV(float v) => (regionY + v * 32f) / atlasHeight;
 
-        uv00 = new Vector2(u0, v1);
-        uv10 = new Vector2(u1, v1);
-        uv11 = new Vector2(u1, v0);
-        uv01 = new Vector2(u0, v0);
+        uv00 = new Vector2(MapU(uv.Value.U0), MapV(uv.Value.V1));
+        uv10 = new Vector2(MapU(uv.Value.U1), MapV(uv.Value.V1));
+        uv11 = new Vector2(MapU(uv.Value.U1), MapV(uv.Value.V0));
+        uv01 = new Vector2(MapU(uv.Value.U0), MapV(uv.Value.V0));
     }
 
     private static Vector3 ReadVec3(JsonElement element, Vector3 fallback)

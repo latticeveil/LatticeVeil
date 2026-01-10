@@ -38,12 +38,12 @@ class BlockModelGenerator
                         to = new[] { 16, 16, 16 },
                         faces = new Dictionary<string, object>
                         {
-                            { "north", new { uv = new[] { 10.66667, 8, 16, 16 }, texture = "#0" } }, // (2,1)
-                            { "east",  new { uv = new[] { 0, 0, 5.33333, 8 }, texture = "#0" } },   // (0,0)
-                            { "south", new { uv = new[] { 5.33333, 8, 10.66667, 16 }, texture = "#0" } }, // (1,1)
-                            { "west",  new { uv = new[] { 5.33333, 0, 10.66667, 8 }, texture = "#0" } }, // (1,0)
-                            { "up",    new { uv = new[] { 10.66667, 0, 16, 8 }, texture = "#0" } },  // (2,0)
-                            { "down",  new { uv = new[] { 0, 8, 5.33333, 16 }, texture = "#0" } }   // (0,1)
+                            { "north", new { uv = new[] { 0.66667, 0.5, 1.0, 1.0 }, texture = "#0" } }, // (2,1)
+                            { "east",  new { uv = new[] { 0.0, 0.0, 0.33333, 0.5 }, texture = "#0" } }, // (0,0)
+                            { "south", new { uv = new[] { 0.33333, 0.5, 0.66667, 1.0 }, texture = "#0" } }, // (1,1)
+                            { "west",  new { uv = new[] { 0.33333, 0.0, 0.66667, 0.5 }, texture = "#0" } }, // (1,0)
+                            { "up",    new { uv = new[] { 0.66667, 0.0, 1.0, 0.5 }, texture = "#0" } }, // (2,0)
+                            { "down",  new { uv = new[] { 0.0, 0.5, 0.33333, 1.0 }, texture = "#0" } } // (0,1)
                         }
                     }
                 },

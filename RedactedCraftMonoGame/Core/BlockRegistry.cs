@@ -64,8 +64,16 @@ public static class BlockRegistry
     private static void Register(BlockDef def)
     {
         var idx = (byte)def.Id;
+        
+        // Replace in array
         Defs[idx] = def;
-        AllDefs.Add(def);
+        
+        // Replace or add in list
+        var existingIdx = AllDefs.FindIndex(d => d.Id == def.Id);
+        if (existingIdx >= 0)
+            AllDefs[existingIdx] = def;
+        else
+            AllDefs.Add(def);
     }
 
     public static BlockDef Get(BlockId id) => Defs[(byte)id] ?? Defs[(byte)BlockId.Air];

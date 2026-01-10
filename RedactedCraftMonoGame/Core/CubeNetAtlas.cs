@@ -77,6 +77,8 @@ public sealed class CubeNetAtlas
     public void GetFaceUvRect(byte blockId, FaceDirection face, out Vector2 uv00, out Vector2 uv10, out Vector2 uv11, out Vector2 uv01)
     {
         var uv = GetFaceUv(blockId, face);
+        
+        // Standard winding for the greedy mesher (axis aligned quads)
         uv00 = new Vector2(uv.U0, uv.V0);
         uv10 = new Vector2(uv.U1, uv.V0);
         uv11 = new Vector2(uv.U1, uv.V1);
