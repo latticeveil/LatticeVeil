@@ -53,6 +53,9 @@ public static class Paths
     public static string MultiplayerWorldsDir =>
         Path.Combine(RootDir, "Worlds_Multiplayer");
 
+    public static string BackupsDir =>
+        Path.Combine(RootDir, "Backups");
+
     public static string ActiveLogPath =>
         Path.Combine(LogsDir, "current.log");
 

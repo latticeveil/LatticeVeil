@@ -53,7 +53,7 @@ public sealed class ProfileScreen : IScreen
         _profile = profile;
         _graphics = graphics;
 
-        _eos = eosClient ?? EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+        _eos = eosClient;
 
         _nameValue = _profile.OfflineUsername ?? string.Empty;
 

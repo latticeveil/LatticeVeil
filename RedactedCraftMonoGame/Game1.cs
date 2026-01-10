@@ -88,9 +88,17 @@ public sealed class Game1 : Game
 
 
         // EOS Device-ID only (no login UI).
-        _eosClient = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
-        if (_eosClient == null)
-            _log.Warn("EOS client unavailable; online play disabled.");
+        if (_startOptions?.Offline == true)
+        {
+            _log.Info("Starting in OFFLINE mode; EOS initialization skipped.");
+            _eosClient = null;
+        }
+        else
+        {
+            _eosClient = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+            if (_eosClient == null)
+                _log.Warn("EOS client unavailable; online play disabled.");
+        }
 
         if (_startOptions?.HasJoinToken == true)
         {
@@ -110,7 +118,7 @@ public sealed class Game1 : Game
         else
         {
             _menus.Push(
-                new MainMenuScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient),
+                new MainMenuScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient, _startOptions?.Offline ?? false),
                 UiLayout.Viewport);
         }
 

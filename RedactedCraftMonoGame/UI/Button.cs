@@ -17,6 +17,10 @@ public sealed class Button
 	/// </summary>
 	public bool Enabled { get; set; } = true;
     /// <summary>
+    /// When true, the button is drawn in a disabled style even if it is enabled.
+    /// </summary>
+    public bool ForceDisabledStyle { get; set; } = false;
+    /// <summary>
     /// When true, draws the label slightly thicker for readability.
     /// </summary>
     public bool BoldText { get; set; } = false;
@@ -45,13 +49,14 @@ public sealed class Button
 
         if (Texture is not null)
         {
-            sb.Draw(Texture, Bounds, Color.White);
+            sb.Draw(Texture, Bounds, ForceDisabledStyle ? new Color(128, 128, 128) : Color.White);
             // If a texture is provided, we do not draw label text over it (prevents overlap).
             return;
         }
 
-		var bg = Enabled ? new Color(30, 30, 30) : new Color(20, 20, 20);
-		var fg = Enabled ? Color.White : new Color(160, 160, 160);
+		var effectivelyEnabled = Enabled && !ForceDisabledStyle;
+		var bg = effectivelyEnabled ? new Color(30, 30, 30) : new Color(20, 20, 20);
+		var fg = effectivelyEnabled ? Color.White : new Color(160, 160, 160);
 		sb.Draw(pixel, Bounds, bg);
 		DrawBorder(sb, pixel, Bounds, fg);
 

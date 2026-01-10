@@ -16,6 +16,7 @@ using DImage = System.Drawing.Image;
 using DPoint = System.Drawing.Point;
 using DSize = System.Drawing.Size;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -72,6 +73,8 @@ public sealed class LauncherForm : Form
     private readonly Button _hubResetBtn = new();
     private readonly Label _hubStatusLabel = new();
     private readonly Button _launchBtn = new();
+    private readonly Button _launchOfflineBtn = new();
+    private readonly Button _backupBtn = new();
     private readonly Button _openLogsBtn = new();
     private readonly Button _openGameFolderBtn = new();
     private readonly Button _saveLogsBtn = new();
@@ -338,6 +341,25 @@ public sealed class LauncherForm : Form
                 ConfirmAndKillGame();
         };
 
+        _launchOfflineBtn.Text = "PLAY OFFLINE";
+        _launchOfflineBtn.Width = 140;
+        _launchOfflineBtn.Height = 34;
+        _launchOfflineBtn.UseVisualStyleBackColor = false;
+        _launchOfflineBtn.Click += (_, _) =>
+        {
+            SaveProfile();
+            var state = GetGameState();
+            if (state == GameState.NotRunning)
+                StartAssetCheckAndLaunch("--game --offline");
+            else
+                ConfirmAndKillGame();
+        };
+
+        _backupBtn.Text = "BACKUP WORLDS";
+        _backupBtn.Width = 140;
+        _backupBtn.Height = 34;
+        _backupBtn.Click += (_, _) => PerformBackup();
+
         _openLogsBtn.Text = "Open Logs";
         _openLogsBtn.Width = 140;
         _openLogsBtn.Height = 34;
@@ -354,6 +376,8 @@ public sealed class LauncherForm : Form
         _saveLogsBtn.Click += (_, _) => SaveLogsSnapshot();
 
         _buttons.Controls.Add(_launchBtn);
+        _buttons.Controls.Add(_launchOfflineBtn);
+        _buttons.Controls.Add(_backupBtn);
         _buttons.Controls.Add(_saveLogsBtn);
         _buttons.Controls.Add(_openLogsBtn);
         _buttons.Controls.Add(_openGameFolderBtn);
@@ -1276,6 +1300,57 @@ public sealed class LauncherForm : Form
             "Save Logs",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
+    }
+
+    private void PerformBackup()
+    {
+        try
+        {
+            var backupsDir = Paths.BackupsDir;
+            Directory.CreateDirectory(backupsDir);
+
+            var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmm");
+            var zipPath = Path.Combine(backupsDir, $"backup-{timestamp}.zip");
+
+            // Simple backup: just the Worlds folders if they exist.
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+
+            using (var archive = System.IO.Compression.ZipFile.Open(zipPath, System.IO.Compression.ZipArchiveMode.Create))
+            {
+                void AddDir(string dirPath, string entryPath)
+                {
+                    if (!Directory.Exists(dirPath)) return;
+                    foreach (var file in Directory.GetFiles(dirPath, "*", SearchOption.AllDirectories))
+                    {
+                        var relative = Path.GetRelativePath(dirPath, file);
+                        archive.CreateEntryFromFile(file, Path.Combine(entryPath, relative));
+                    }
+                }
+
+                AddDir(Paths.WorldsDir, "Worlds");
+                AddDir(Paths.MultiplayerWorldsDir, "Worlds_Multiplayer");
+                
+                if (File.Exists(Paths.SettingsJsonPath))
+                    archive.CreateEntryFromFile(Paths.SettingsJsonPath, "settings.json");
+                if (File.Exists(Paths.PlayerProfileJsonPath))
+                    archive.CreateEntryFromFile(Paths.PlayerProfileJsonPath, "player_profile.json");
+            }
+
+            // Retention: keep last 10
+            var files = Directory.GetFiles(backupsDir, "backup-*.zip")
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(f => f.CreationTime)
+                .Skip(10);
+            foreach (var old in files) old.Delete();
+
+            MessageBox.Show($"Backup created successfully:\n{Path.GetFileName(zipPath)}", "Backup", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _log.Info($"World backup created: {zipPath}");
+        }
+        catch (Exception ex)
+        {
+            _log.Error(ex, "Backup failed");
+            MessageBox.Show($"Backup failed: {ex.Message}", "Backup Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void UpdateLogBox()

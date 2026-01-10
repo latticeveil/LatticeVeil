@@ -17,6 +17,7 @@ public sealed class MainMenuScreen : IScreen
     private readonly Logger _log;
     private readonly PlayerProfile _profile;
     private readonly EosClient? _eosClient;
+    private readonly bool _isOffline;
     private readonly GameSettings _settings;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
 
@@ -31,6 +32,7 @@ public sealed class MainMenuScreen : IScreen
     private Rectangle _viewport;
     private bool _assetsMissing;
     private double _lastAssetCheck = double.NegativeInfinity;
+    private double _offlineMessageUntil = 0;
     private const double AssetCheckIntervalSeconds = 1.0;
     private static readonly string[] CriticalAssets =
     {
@@ -42,7 +44,7 @@ public sealed class MainMenuScreen : IScreen
         "textures/menu/buttons/Profile.png"
     };
 
-    public MainMenuScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient)
+    public MainMenuScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient, bool isOffline = false)
     {
         _menus = menus;
         _assets = assets;
@@ -51,11 +53,22 @@ public sealed class MainMenuScreen : IScreen
         _log = log;
         _profile = profile;
         _eosClient = eosClient;
+        _isOffline = isOffline;
         _settings = GameSettings.LoadOrCreate(_log);
         _graphics = graphics;
 
         _singleBtn = new Button("SINGLEPLAYER", () => _menus.Push(new SingleplayerScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics), _viewport));
-        _multiBtn = new Button("MULTIPLAYER", () => _menus.Push(new MultiplayerScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient), _viewport));
+        
+        if (_isOffline)
+        {
+            _multiBtn = new Button("MULTIPLAYER", () => _offlineMessageUntil = 3.0);
+            _multiBtn.ForceDisabledStyle = true;
+        }
+        else
+        {
+            _multiBtn = new Button("MULTIPLAYER", () => _menus.Push(new MultiplayerScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient), _viewport));
+        }
+
         _optionsBtn = new Button("OPTIONS", () => _menus.Push(new OptionsScreen(_menus, _assets, _font, _pixel, _log, _graphics), _viewport));
         _quitBtn = new Button("QUIT", () => _menus.Pop());
         _profileBtn = new Button("PROFILE", () => _menus.Push(new ProfileScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient), _viewport));
@@ -106,6 +119,11 @@ public sealed class MainMenuScreen : IScreen
     {
         UpdateAssetStatus(gameTime.TotalGameTime.TotalSeconds);
 
+        if (_offlineMessageUntil > 0)
+        {
+            _offlineMessageUntil -= gameTime.ElapsedGameTime.TotalSeconds;
+        }
+
         if (input.IsNewKeyPress(Keys.Escape))
         {
             // go back to launcher if keep-open is enabled, else exit
@@ -146,8 +164,26 @@ public sealed class MainMenuScreen : IScreen
 
         if (_assetsMissing)
             DrawAssetsMissingBanner(sb);
+        
+        if (_offlineMessageUntil > 0)
+            DrawOfflineMessage(sb);
 
         sb.End();
+    }
+
+    private void DrawOfflineMessage(SpriteBatch sb)
+    {
+        var message = "Offline mode: Multiplayer disabled";
+        var size = _font.MeasureString(message);
+        var padding = 10;
+        var rect = new Rectangle(
+            _viewport.X + (_viewport.Width - (int)size.X) / 2 - padding,
+            _viewport.Y + 20,
+            (int)size.X + padding * 2,
+            (int)size.Y + padding * 2);
+        
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 200));
+        _font.DrawString(sb, message, new Vector2(rect.X + padding, rect.Y + padding), Color.Yellow);
     }
 
     private void UpdateAssetStatus(double now)

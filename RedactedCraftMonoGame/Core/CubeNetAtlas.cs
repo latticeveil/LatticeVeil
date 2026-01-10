@@ -36,11 +36,11 @@ public sealed class CubeNetAtlas
 
     private static readonly (int x, int y)[] FaceTiles =
     {
-        (0, 0), // PosX (East)
+        (1, 0), // PosX (East)
         (1, 1), // NegX (West)
-        (2, 0), // PosY (Up)
-        (0, 1), // NegY (Down)
-        (1, 0), // PosZ (South)
+        (0, 0), // PosY (Up)
+        (2, 0), // NegY (Down)
+        (0, 1), // PosZ (South)
         (2, 1)  // NegZ (North)
     };
 
@@ -77,28 +77,10 @@ public sealed class CubeNetAtlas
     public void GetFaceUvRect(byte blockId, FaceDirection face, out Vector2 uv00, out Vector2 uv10, out Vector2 uv11, out Vector2 uv01)
     {
         var uv = GetFaceUv(blockId, face);
-
-        if (face is FaceDirection.PosX or FaceDirection.NegX)
-        {
-            uv00 = new Vector2(uv.U0, uv.V1);
-            uv10 = new Vector2(uv.U0, uv.V0);
-            uv11 = new Vector2(uv.U1, uv.V0);
-            uv01 = new Vector2(uv.U1, uv.V1);
-        }
-        else if (face is FaceDirection.PosZ or FaceDirection.NegZ)
-        {
-            uv00 = new Vector2(uv.U0, uv.V1);
-            uv10 = new Vector2(uv.U1, uv.V1);
-            uv11 = new Vector2(uv.U1, uv.V0);
-            uv01 = new Vector2(uv.U0, uv.V0);
-        }
-        else
-        {
-            uv00 = new Vector2(uv.U0, uv.V0);
-            uv10 = new Vector2(uv.U1, uv.V0);
-            uv11 = new Vector2(uv.U1, uv.V1);
-            uv01 = new Vector2(uv.U0, uv.V1);
-        }
+        uv00 = new Vector2(uv.U0, uv.V0);
+        uv10 = new Vector2(uv.U1, uv.V0);
+        uv11 = new Vector2(uv.U1, uv.V1);
+        uv01 = new Vector2(uv.U0, uv.V1);
     }
 
     public Rectangle GetFaceSourceRect(byte blockId, FaceDirection face)

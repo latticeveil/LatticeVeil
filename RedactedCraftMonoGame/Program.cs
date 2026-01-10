@@ -34,7 +34,8 @@ public static class Program
 
         var startOptions = new GameStartOptions
         {
-            JoinToken = GetArgValue(args, "--join-token")
+            JoinToken = GetArgValue(args, "--join-token"),
+            Offline = HasArg(args, "--offline")
         };
 
         var forceLauncher = HasArg(args, "--launcher");
