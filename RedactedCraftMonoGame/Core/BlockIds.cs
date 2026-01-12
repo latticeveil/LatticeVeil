@@ -10,14 +10,12 @@ public static class BlockIds
     public const byte Sand = 5;
     public const byte Wood = 6;
     public const byte Leaves = 7;
-    public const byte Door = 8;
-    public const byte DoorOpen = 9;
     public const byte Chest = 10;
     public const byte Coal = 11;
     public const byte Iron = 12;
-    public const byte CraftingTable = 13;
+    public const byte ArtificerBench = 13;
     public const byte Glass = 14;
-    public const byte Corestone = 15;
+    public const byte Nullrock = 15;
     public const byte Gravel = 16;
     public const byte Plank = 17;
     public const byte Gold = 18;

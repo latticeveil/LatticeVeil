@@ -74,10 +74,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Dictionary<int, PlayerModel> _remotePlayers = new();
     private readonly Dictionary<int, string> _playerNames = new();
 
-    private readonly Dictionary<Point3, float> _doorAnimations = new(); // Position -> OpenProgress (0.0 to 1.0)
-
-    private record struct Point3(int X, int Y, int Z);
-
     public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen;
 
     private bool _pauseMenuOpen;
@@ -286,7 +282,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         UpdatePlayer(gameTime, dt, input);
         UpdateActiveChunks(force: false);
-        UpdateDoorAnimations(dt);
         HandleHotbarInput(input);
         UpdateSelectionTimer(dt);
         HandleBlockInteraction(gameTime, input);
@@ -434,7 +429,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 #endif
         device.SamplerStates[0] = SamplerState.PointClamp;
         DrawRemotePlayers(device, view, proj);
-        DrawDynamicBlocks(device, view, proj);
         device.SamplerStates[0] = sampler;
 
         device.BlendState = BlendState.AlphaBlend;
@@ -805,22 +799,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
         else if (input.IsNewRightClick())
         {
-            var hitId = _world.GetBlock(hit.X, hit.Y, hit.Z);
-            if (hitId == (byte)BlockId.Door || hitId == (byte)BlockId.DoorOpen)
-            {
-                var next = hitId == (byte)BlockId.Door ? (byte)BlockId.DoorOpen : (byte)BlockId.Door;
-                _world.SetBlock(hit.X, hit.Y, hit.Z, next);
-                _lanSession?.SendBlockSet(hit.X, hit.Y, hit.Z, next);
-                
-                // Initialize animation if not present
-                var p3 = new Point3(hit.X, hit.Y, hit.Z);
-                if (!_doorAnimations.ContainsKey(p3))
-                    _doorAnimations[p3] = hitId == (byte)BlockId.DoorOpen ? 1.0f : 0.0f;
-
-                _interactCooldown = InteractCooldownSeconds;
-                return;
-            }
-
             var id = _world.GetBlock(hit.PrevX, hit.PrevY, hit.PrevZ);
             var selected = _inventory.SelectedId;
             var sandbox = _gameMode == GameMode.Sandbox;
@@ -1967,105 +1945,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         // Shadow/Glow effect
         _font.DrawString(sb, text, pos + new Vector2(2, 2), Color.Black * 0.6f * alpha);
         _font.DrawString(sb, text, pos, Color.White * alpha);
-    }
-
-    private void UpdateDoorAnimations(float dt)
-    {
-        if (_world == null) return;
-
-        var toRemove = new List<Point3>();
-        var keys = new List<Point3>(_doorAnimations.Keys);
-
-        foreach (var p in keys)
-        {
-            var id = _world.GetBlock(p.X, p.Y, p.Z);
-            bool targetOpen = id == (byte)BlockId.DoorOpen;
-            float target = targetOpen ? 1.0f : 0.0f;
-            float current = _doorAnimations[p];
-
-            if (Math.Abs(current - target) < 0.001f)
-            {
-                _doorAnimations[p] = target;
-                // If it's closed and we are done, we can remove it from tracking if we want, 
-                // but let's keep it until chunk unload for simplicity.
-                continue;
-            }
-
-            float speed = 5.0f; // Animation speed
-            if (current < target) current = Math.Min(target, current + dt * speed);
-            else current = Math.Max(target, current - dt * speed);
-
-            _doorAnimations[p] = current;
-        }
-    }
-
-    private void DrawDynamicBlocks(GraphicsDevice device, Matrix view, Matrix proj)
-    {
-        if (_world == null || _atlas == null || _effect == null) return;
-
-        var model = BlockModel.GetModel(BlockId.Door, _log);
-
-        foreach (var coord in _chunkOrder)
-        {
-            if (!_world.TryGetChunk(coord, out var chunk) || chunk == null) continue;
-
-            for (int ly = 0; ly < VoxelChunkData.ChunkSizeY; ly++)
-            {
-                for (int lz = 0; lz < VoxelChunkData.ChunkSizeZ; lz++)
-                {
-                    for (int lx = 0; lx < VoxelChunkData.ChunkSizeX; lx++)
-                    {
-                        var id = chunk.GetLocal(lx, ly, lz);
-                        if (id == (byte)BlockId.Door || id == (byte)BlockId.DoorOpen)
-                        {
-                            var wx = coord.X * VoxelChunkData.ChunkSizeX + lx;
-                            var wy = coord.Y * VoxelChunkData.ChunkSizeY + ly;
-                            var wz = coord.Z * VoxelChunkData.ChunkSizeZ + lz;
-
-                            var p3 = new Point3(wx, wy, wz);
-                            if (!_doorAnimations.TryGetValue(p3, out float openProgress))
-                            {
-                                openProgress = id == (byte)BlockId.DoorOpen ? 1.0f : 0.0f;
-                                _doorAnimations[p3] = openProgress;
-                            }
-
-                            DrawDoor(device, wx, wy, wz, openProgress, _atlas);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private void DrawDoor(GraphicsDevice device, int wx, int wy, int wz, float openProgress, CubeNetAtlas atlas)
-    {
-        var bs = Scale.BlockSize;
-        var worldPos = new Vector3(wx * bs, wy * bs, wz * bs);
-        
-        var model = BlockModel.GetModel(BlockId.Door, _log);
-        var verts = model.BuildMesh(atlas, BlockId.Door);
-
-        // Hinge is at the NegX, NegZ corner of the block.
-        // The mesh from BuildMesh is centered at (0,0,0) in local space [-0.5, 0.5].
-        // So the hinge corner is at (-0.5, -0.5, -0.5) relative to the mesh center.
-        
-        var pivotOffset = new Vector3(0.5f, 0f, 0.5f);
-        var rotation = Matrix.CreateRotationY(openProgress * -MathHelper.PiOver2);
-        
-        // Transform: Move to pivot -> Rotate -> Move back -> Move to block center -> Move to world
-        _effect!.World = Matrix.CreateTranslation(pivotOffset) 
-                         * rotation 
-                         * Matrix.CreateTranslation(-pivotOffset)
-                         * Matrix.CreateTranslation(new Vector3(0.5f, 0.5f, 0.5f) * bs)
-                         * Matrix.CreateTranslation(worldPos);
-
-        foreach (var pass in _effect.CurrentTechnique.Passes)
-        {
-            pass.Apply();
-            device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
-        }
-        
-        _effect.World = Matrix.Identity;
     }
 
     private VertexPositionTexture[] BuildBoxVertices(Vector3 min, Vector3 max, CubeNetAtlas atlas, byte id)

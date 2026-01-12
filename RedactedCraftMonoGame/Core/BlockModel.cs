@@ -52,11 +52,7 @@ public sealed class BlockModel
 
         if (model == null)
         {
-            model = id switch
-            {
-                BlockId.Door or BlockId.DoorOpen => CreateDoorModel(id == BlockId.DoorOpen),
-                _ => CreateDefaultCube()
-            };
+            model = CreateDefaultCube();
         }
 
         Cache[id] = model;
@@ -218,64 +214,6 @@ public sealed class BlockModel
             new Vector3(max.X, max.Y, min.Z));
 
         return verts.ToArray();
-    }
-
-    private static BlockModel CreateDoorModel(bool open)
-    {
-        var elements = new List<BlockModelElement>();
-
-        // Main Door Slab
-        var doorSlab = new BlockModelElement
-        {
-            From = new Vector3(0, 0, 0),
-            To = open ? new Vector3(2, 32, 16) : new Vector3(16, 32, 2)
-        };
-
-        // UVs for the door slab (16x32 area mapped to 16x16 tiles in the net)
-        // We'll use the standard tiles but they will be stretched or tiled. 
-        // Actually, the BuildMesh logic will handle it by stretching if we don't specify custom UVs.
-        // But we want to ensure they look right.
-        
-        // Front/Back faces (the large ones)
-        doorSlab.Faces[FaceDirection.NegZ] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 1, V1 = 1 } };
-        doorSlab.Faces[FaceDirection.PosZ] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 1, V1 = 1 } };
-        // Sides (thin edges)
-        doorSlab.Faces[FaceDirection.PosX] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 0.125f, V1 = 1 } };
-        doorSlab.Faces[FaceDirection.NegX] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 0.125f, V1 = 1 } };
-        // Top/Bottom
-        doorSlab.Faces[FaceDirection.PosY] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 1, V1 = 0.125f } };
-        doorSlab.Faces[FaceDirection.NegY] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0, V0 = 0, U1 = 1, V1 = 0.125f } };
-
-        elements.Add(doorSlab);
-
-        // 3D Doorknob
-        var knob = new BlockModelElement
-        {
-            // Positioned near the edge opposite the hinge (X=0)
-            From = open ? new Vector3(2, 12, 12) : new Vector3(12, 12, 2),
-            To = open ? new Vector3(4, 14, 14) : new Vector3(14, 14, 4)
-        };
-        // Use a small gold/brass colored area from the texture or just a solid part of the door texture.
-        // For now, let's just use the PosY tile (top edge) which we can make look like metal.
-        foreach (FaceDirection dir in Enum.GetValues(typeof(FaceDirection)))
-        {
-            knob.Faces[dir] = new BlockModelFace { Uv = new BlockModelUv { U0 = 0.8f, V0 = 0.8f, U1 = 1.0f, V1 = 1.0f } };
-        }
-        elements.Add(knob);
-
-        var display = new Dictionary<BlockModelContext, BlockModelTransform>
-        {
-            [BlockModelContext.Gui] = new() { Rotation = new Vector3(-17f, -31.5f, 0f), Translation = new Vector3(-1f, -2f, 0f), ScaleFactor = new Vector3(0.41406f, 0.41406f, 0.41406f) },
-            [BlockModelContext.FirstPersonRightHand] = new() { Rotation = new Vector3(-7.76f, 17.08f, 5.37f), Translation = new Vector3(9.75f, -4.5f, 0f), ScaleFactor = new Vector3(0.55273f, 0.55273f, 0.55273f) },
-            [BlockModelContext.FirstPersonLeftHand] = new() { Rotation = new Vector3(-7.76f, 17.08f, 5.37f), Translation = new Vector3(9.75f, -4.5f, 0f), ScaleFactor = new Vector3(0.55273f, 0.55273f, 0.55273f) },
-            [BlockModelContext.ThirdPersonRightHand] = new() { Rotation = new Vector3(-0.27f, -3.42f, 1.67f), Translation = new Vector3(0f, 0f, 2.5f), ScaleFactor = new Vector3(0.36719f, 0.36719f, 0.36719f) },
-            [BlockModelContext.ThirdPersonLeftHand] = new() { Rotation = new Vector3(-0.27f, -3.42f, 1.67f), Translation = new Vector3(0f, 0f, 2.5f), ScaleFactor = new Vector3(0.36719f, 0.36719f, 0.36719f) },
-            [BlockModelContext.Ground] = new() { Translation = new Vector3(0f, 0.75f, 0f), ScaleFactor = new Vector3(0.32422f, 0.32422f, 0.32422f) },
-            [BlockModelContext.Fixed] = new() { Translation = new Vector3(0f, -2f, 3.75f), ScaleFactor = new Vector3(0.51953f, 0.51953f, 0.51953f) },
-            [BlockModelContext.Head] = new() { ScaleFactor = new Vector3(0.80859f, 0.80859f, 0.80859f) }
-        };
-
-        return new BlockModel(elements, display, new Vector2(48f, 32f));
     }
 
     private static BlockModel CreateDefaultCube()
