@@ -7,7 +7,6 @@ Builds/
 *.userosscache
 *.sln.docstates
 *.pdb
-ThirdParty/EOS/
 **/eos.local.json
 .Plans
 RedactedCraft.exe
