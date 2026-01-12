@@ -30,66 +30,26 @@ public sealed class EosConfig
 
     public static EosConfig? Load(Logger log)
     {
-        EosConfig? envConfig = null;
-        if (TryLoadFromEnvironment(out var tempEnv))
-        {
-            envConfig = tempEnv;
-            if (envConfig.IsValid(out var envError))
-                return envConfig;
+        // FORCE REMOTE: Ignore environment and local files.
+        var cached = TryGetRemoteCached();
+        if (cached != null)
+            return cached;
 
-            log.Warn($"EOS env config invalid: {envError}");
+        log.Info($"Fetching EOS config from {DefaultRemoteConfigUrl}...");
+        var remote = TryLoadRemoteConfig(log);
+        if (remote != null)
+        {
+            lock (RemoteSync)
+                _remoteCached = remote;
+            return remote;
         }
 
-        var path = ResolveConfigPath(log);
-        if (path == null)
+        if (!_missingLogged)
         {
-            var cached = TryGetRemoteCached();
-            if (cached != null)
-                return cached;
-
-            log.Info($"Local EOS config not found. Fetching from {DefaultRemoteConfigUrl}...");
-            var remote = TryLoadRemoteConfig(log);
-            if (remote != null)
-            {
-                lock (RemoteSync)
-                    _remoteCached = remote;
-                return remote;
-            }
-
-            if (!_missingLogged)
-            {
-                log.Warn("EOS config not found locally and remote fetch failed.");
-                _missingLogged = true;
-            }
-            return null;
+            log.Warn("EOS remote config fetch failed.");
+            _missingLogged = true;
         }
-
-        try
-        {
-            var json = File.ReadAllText(path);
-            var cfg = JsonSerializer.Deserialize<EosConfig>(json, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            });
-            if (cfg == null)
-            {
-                log.Warn("EOS config parse failed.");
-                return null;
-            }
-
-            if (!cfg.IsValid(out var error))
-            {
-                log.Warn($"EOS config invalid: {error}");
-                return null;
-            }
-
-            return cfg;
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"EOS config load failed: {ex.Message}");
-            return null;
-        }
+        return null;
     }
 
     public bool IsValid(out string? error)
