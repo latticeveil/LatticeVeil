@@ -135,15 +135,47 @@ function Prepare-Ship {
 }
 
 function Clean-Project {
-    Log "Cleaning Solution..."
-    if (Test-Path "$SolutionRoot\CLEAN.cmd") {
-        Set-Location $SolutionRoot
-        & .\CLEAN.cmd | Out-Null
-        Log "Cleaned via script."
-    } else {
-        Run-Process "dotnet" "clean `"$ProjectFile`""
+    Log "Cleaning Project Artifacts..."
+    $btnClean.Enabled = $false
+
+    # Files/Folders to remove from Root
+    $itemsToRemove = @(
+        "Builds",
+        "artifacts",
+        "publish",
+        "out",
+        "RedactedcraftCsharp.zip",
+        "RedactedCraft.exe"
+    )
+
+    foreach ($item in $itemsToRemove) {
+        $path = "$SolutionRoot\$item"
+        if (Test-Path $path) {
+            try {
+                Remove-Item -Recurse -Force $path -ErrorAction Stop
+                Log "Deleted: $item"
+            } catch {
+                Log "Error deleting $item : $_"
+            }
+        }
     }
-    Log "Done."
+
+    Log "Removing bin/obj folders..."
+    try {
+        Get-ChildItem -Path $SolutionRoot -Include bin,obj -Recurse -Force | Where-Object { $_.PSIsContainer } | ForEach-Object {
+            try {
+                Remove-Item -Recurse -Force $_.FullName -ErrorAction Stop
+            } catch {
+                Log "Error deleting $($_.Name): $_"
+            }
+        }
+        Log "Bin/Obj folders cleared."
+    } catch {
+        Log "Error scanning for folders: $_"
+    }
+
+    Log "Cleanup Complete."
+    $btnClean.Enabled = $true
 }
 
 function Open-BuildFolder {
