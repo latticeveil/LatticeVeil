@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: eos-config-service
-    runtime: docker
-    rootDir: EosConfigService
-    plan: free
-    autoDeploy: true

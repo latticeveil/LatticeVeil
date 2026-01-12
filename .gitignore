@@ -9,3 +9,4 @@ Builds/
 *.pdb
 ThirdParty/EOS/
 **/eos.local.json
+.Plans
