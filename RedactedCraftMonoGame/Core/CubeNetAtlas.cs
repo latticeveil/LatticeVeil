@@ -6,11 +6,10 @@ using Microsoft.Xna.Framework.Graphics;
 namespace RedactedCraftMonoGame.Core;
 
 // Asset layout plan (blocks):
-// 1) Prefer atlas at Assets/textures/blocks_cubenet_atlas.png.
-// 2) Otherwise pack per-block cube-net PNGs from Assets/textures/blocks/*.png.
-// 3) If missing, return a checkerboard pattern.
-// 4) Support dynamic face sizes (16x, 32x, 64x, 128x etc).
-// 5) Enable Mipmaps for quality scaling.
+// 1) Prefer per-block cube-net PNGs from Assets/textures/blocks/*.png.
+// 2) If missing, return a checkerboard pattern.
+// 3) Support dynamic face sizes (16x, 32x, 64x, 128x etc).
+// 4) Enable Mipmaps for quality scaling.
 
 public readonly struct UvRect
 {
@@ -97,20 +96,9 @@ public sealed class CubeNetAtlas
     public static CubeNetAtlas Build(AssetLoader assets, Logger log, string? quality = null)
     {
         bool isLow = quality == "LOW";
-        var atlasPath = isLow && File.Exists(Paths.LowQualityBlocksAtlasPath) ? Paths.LowQualityBlocksAtlasPath : Paths.BlocksAtlasPath;
         var blocksDir = isLow && Directory.Exists(Paths.LowQualityBlocksTexturesDir) ? Paths.LowQualityBlocksTexturesDir : Paths.BlocksTexturesDir;
 
-        if (TryLoadAtlas(atlasPath, assets, log, out var atlasTex, out var cols, out var rows, out var invalid))
-        {
-            if (invalid)
-            {
-                var errorAtlas = CreateErrorAtlas(assets.GraphicsDevice, out var errCols, out var errRows);
-                return new CubeNetAtlas(errorAtlas, errCols, errRows, generated: true);
-            }
-            return new CubeNetAtlas(atlasTex, cols, rows, generated: false);
-        }
-
-        if (TryBuildAtlasFromBlockNets(assets, log, blocksDir, out atlasTex, out cols, out rows, out var anyGenerated))
+        if (TryBuildAtlasFromBlockNets(assets, log, blocksDir, out var atlasTex, out var cols, out var rows, out var anyGenerated))
         {
             return new CubeNetAtlas(atlasTex, cols, rows, generated: anyGenerated);
         }

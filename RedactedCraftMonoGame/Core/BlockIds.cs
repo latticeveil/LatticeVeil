@@ -17,7 +17,7 @@ public static class BlockIds
     public const byte Iron = 12;
     public const byte CraftingTable = 13;
     public const byte Glass = 14;
-    public const byte Bedrock = 15;
+    public const byte Corestone = 15;
     public const byte Gravel = 16;
     public const byte Plank = 17;
     public const byte Gold = 18;

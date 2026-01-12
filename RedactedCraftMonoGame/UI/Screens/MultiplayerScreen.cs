@@ -231,7 +231,9 @@ public sealed class MultiplayerScreen : IScreen
         if (_tab == MultiplayerTab.Online)
         {
             var eos = EnsureEosClient();
-            var label = eos == null ? "EOS: DISABLED" : (eos.IsLoggedIn ? "EOS: READY" : "EOS: CONNECTING...");
+            var label = eos == null
+                ? (EosConfig.IsRemoteFetchPending ? "EOS: LOADING..." : "EOS: DISABLED")
+                : (eos.IsLoggedIn ? "EOS: READY" : "EOS: CONNECTING...");
             var size = _font.MeasureString(label);
             var pos = new Vector2(_infoRect.Right - size.X - 4, _infoRect.Y + 2);
             _font.DrawString(sb, label, pos, new Color(220, 180, 80));
@@ -311,7 +313,10 @@ public sealed class MultiplayerScreen : IScreen
 
         if (eos == null)
         {
-            _font.DrawString(sb, "EOS is disabled in this build.", new Vector2(x, y), Color.White);
+            var msg = EosConfig.IsRemoteFetchPending
+                ? "EOS config loading... please wait."
+                : "EOS is disabled in this build.";
+            _font.DrawString(sb, msg, new Vector2(x, y), Color.White);
             return;
         }
 
@@ -366,7 +371,7 @@ public sealed class MultiplayerScreen : IScreen
         var eos = EnsureEosClient();
         if (eos == null)
         {
-            _status = "EOS disabled.";
+            _status = EosConfig.IsRemoteFetchPending ? "EOS config loading..." : "EOS disabled.";
             return;
         }
 
@@ -381,7 +386,7 @@ public sealed class MultiplayerScreen : IScreen
         var eos = EnsureEosClient();
         if (eos == null)
         {
-            _status = "EOS disabled.";
+            _status = EosConfig.IsRemoteFetchPending ? "EOS config loading..." : "EOS disabled.";
             return;
         }
 

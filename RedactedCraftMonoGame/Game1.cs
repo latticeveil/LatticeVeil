@@ -37,6 +37,10 @@ public sealed class Game1 : Game
     private string? _screenshotToast;
     private double _screenshotToastUntil;
     private bool _exitRequested;
+    private double _lastUpdateSeconds = -1;
+    private double _lastStallLogSeconds = -1;
+    private const double StallThresholdSeconds = 2.0;
+    private const double StallLogCooldownSeconds = 10.0;
 
 	public PlayerProfile Profile => _profile;
 
@@ -141,6 +145,7 @@ public sealed class Game1 : Game
             ReleaseMouseCapture();
             _input.Reset();
             _wasActive = false;
+            _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
             base.Update(gameTime);
             return;
         }
@@ -150,10 +155,12 @@ public sealed class Game1 : Game
             _input.Reset();
             _wasActive = true;
             UpdateMouseCapture(computeDelta: false);
+            _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
             base.Update(gameTime);
             return;
         }
 
+        LogFrameStall(gameTime);
         _input.Update();
         RefreshSettingsIfChanged();
         UpdateUiLayout();
@@ -421,5 +428,22 @@ public sealed class Game1 : Game
         _spriteBatch.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), Color.White);
         _font.DrawString(sb: _spriteBatch, text: _screenshotToast, pos: new Vector2(rect.X + padding, rect.Y + padding), color: Color.White);
         _spriteBatch.End();
+    }
+
+    private void LogFrameStall(GameTime gameTime)
+    {
+        var now = gameTime.TotalGameTime.TotalSeconds;
+        if (_lastUpdateSeconds >= 0)
+        {
+            var delta = now - _lastUpdateSeconds;
+            if (delta >= StallThresholdSeconds &&
+                (_lastStallLogSeconds < 0 || now - _lastStallLogSeconds >= StallLogCooldownSeconds))
+            {
+                _lastStallLogSeconds = now;
+                _log.Warn($"Frame stall detected: {delta:0.00}s (possible hang).");
+            }
+        }
+
+        _lastUpdateSeconds = now;
     }
 }

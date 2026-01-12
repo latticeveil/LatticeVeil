@@ -89,6 +89,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Button _pauseSettings;
     private readonly Button _pauseSaveExit;
     private EosClient? _eosClient;
+    private bool _debugFaceOverlay;
 
     private const int InventoryCols = Inventory.GridCols;
     private const int InventoryRows = Inventory.GridRows;
@@ -208,6 +209,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (input.IsNewKeyPress(Keys.F9))
             ExportAtlas();
+        if (input.IsNewKeyPress(Keys.F3))
+            _debugFaceOverlay = !_debugFaceOverlay;
 
 #if DEBUG
         if (input.IsNewKeyPress(Keys.F6))
@@ -475,6 +478,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 #if DEBUG
         DrawDebugOverlay(sb);
 #endif
+        DrawFaceOverlay(sb);
         sb.End();
 
         if (_pauseMenuOpen)
@@ -1346,7 +1350,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 blockText = $"BLOCK: {def.Name} ({id}) ATLAS:{def.AtlasIndex} @ {hit.X},{hit.Y},{hit.Z}";
             }
         }
-        var lines = new[]
+        var lines = new List<string>
         {
             $"FPS: {_fps:0}",
             $"POS: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
@@ -1368,10 +1372,43 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var x = _viewport.X + 20;
         var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
-        for (int i = 0; i < lines.Length; i++)
+        for (int i = 0; i < lines.Count; i++)
             _font.DrawString(sb, lines[i], new Vector2(x, y + i * (_font.LineHeight + 2)), Color.White);
     }
 #endif
+
+    private void DrawFaceOverlay(SpriteBatch sb)
+    {
+        if (!_debugFaceOverlay)
+            return;
+
+        var hitFaceText = "HIT FACE: NONE";
+        if (_world != null)
+        {
+            var origin = _player.Position + _player.HeadOffset;
+            if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
+                hitFaceText = $"HIT FACE: {FormatFaceLabel(hit.Face)} ({hit.Face})";
+        }
+
+        var x = _viewport.X + 20;
+        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
+        _font.DrawString(sb, "FACE MAP: TOP=PosY | BOTTOM=NegY | SIDE1=PosX | SIDE2=NegX | SIDE3=PosZ | SIDE4=NegZ", new Vector2(x, y), Color.White);
+        _font.DrawString(sb, hitFaceText, new Vector2(x, y + _font.LineHeight + 2), Color.White);
+    }
+
+    private static string FormatFaceLabel(FaceDirection face)
+    {
+        return face switch
+        {
+            FaceDirection.PosY => "TOP",
+            FaceDirection.NegY => "BOTTOM",
+            FaceDirection.PosX => "SIDE 1",
+            FaceDirection.NegX => "SIDE 2",
+            FaceDirection.PosZ => "SIDE 3",
+            FaceDirection.NegZ => "SIDE 4",
+            _ => face.ToString().ToUpperInvariant()
+        };
+    }
 
     private Matrix GetViewMatrix()
     {

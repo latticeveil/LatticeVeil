@@ -29,8 +29,8 @@ public sealed class AssetPackCheckResult
 public sealed class AssetPackInstaller
 {
     private const string AssetName = "Assets.zip";
-    private const string AssetsOwner = "Redacted480";
-    private const string AssetsRepo = "Redactedcraft-Assets";
+    private const string AssetsOwner = "Redactedcraft";
+    private const string AssetsRepo = "Assets";
     private readonly Logger _log;
     private readonly HttpClient _http;
     private readonly GitHubRepoClient _repoClient;
@@ -71,8 +71,6 @@ public sealed class AssetPackInstaller
             list.Add("textures/menu/");
         if (!Directory.Exists(Paths.BlocksTexturesDir))
             list.Add("textures/blocks/");
-        if (!File.Exists(Paths.BlocksAtlasPath))
-            list.Add("textures/blocks_cubenet_atlas.png");
         foreach (var asset in RequiredAssets)
         {
             if (!AssetResolver.TryResolve(asset, out _))
@@ -91,21 +89,16 @@ public sealed class AssetPackInstaller
 
     public async Task<AssetPackCheckResult> CheckForUpdateAsync(bool useFixedTag, CancellationToken ct)
     {
-        // Prefer the latest GitHub release asset when available.
-        // If callers want to avoid the API, they can pass useFixedTag=false to fall back to a branch archive.
+        // Prefer the latest GitHub release asset only.
         AssetReleaseInfo? release;
         if (useFixedTag)
         {
             release = await GetLatestReleaseAssetAsync(ct);
-            if (release == null)
-                release = await GetLatestArchiveAsync(ct);
-            if (release == null)
-                release = GetLatestFallback();
         }
         else
         {
-            // Default to the repo's main branch archive.
-            release = GetRefFallback("main");
+            // Optional: fallback to a repo archive when explicitly requested.
+            release = await GetLatestArchiveAsync(ct) ?? GetRefFallback("main");
         }
 
         var installed = ReadInstalledMarker();

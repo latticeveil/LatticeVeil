@@ -197,6 +197,12 @@ public sealed class LoginChoiceScreen : IScreen
         var client = EosClientProvider.GetOrCreate(_log, "epic", allowRetry: true);
         if (client == null)
         {
+            if (EosConfig.IsRemoteFetchPending)
+            {
+                SetStatus("EOS CONFIG LOADING");
+                return;
+            }
+
             var cfg = EosConfig.Load(_log);
             SetStatus(cfg == null ? "EOS CONFIG MISSING" : "EOS SDK UNAVAILABLE");
             return;
@@ -254,7 +260,11 @@ public sealed class LoginChoiceScreen : IScreen
 
         var client = EosClientProvider.GetOrCreate(_log, "epic", allowRetry: true, autoLogin: false);
         if (client == null)
+        {
+            if (EosConfig.IsRemoteFetchPending)
+                SetStatus("EOS CONFIG LOADING");
             return;
+        }
 
         _autoLoginClient = client;
         _autoLoginDeadline = now + AutoLoginTimeoutSeconds;

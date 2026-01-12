@@ -19,7 +19,7 @@ public enum BlockId : byte
     Iron = 12,
     CraftingTable = 13,
     Glass = 14,
-    Bedrock = 15,
+    Corestone = 15,
     Gravel = 16,
     Plank = 17,
     Gold = 18,

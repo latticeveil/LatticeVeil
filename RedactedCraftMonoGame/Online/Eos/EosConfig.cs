@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Threading.Tasks;
 using RedactedCraftMonoGame.Core;
 
 namespace RedactedCraftMonoGame.Online.Eos;
@@ -8,6 +9,12 @@ namespace RedactedCraftMonoGame.Online.Eos;
 public sealed class EosConfig
 {
     private const string DefaultRemoteConfigUrl = "https://eos-config-service.onrender.com/eos/config";
+    private static readonly object RemoteSync = new();
+    private static Task? _remoteFetchTask;
+    private static EosConfig? _remoteCached;
+    private static bool _remoteFetchLogged;
+    private static bool _missingLogged;
+    private const int RemoteFetchTimeoutSeconds = 6;
 
     public string ProductId { get; set; } = "";
     public string SandboxId { get; set; } = "";
@@ -36,11 +43,16 @@ public sealed class EosConfig
         var path = ResolveConfigPath(log);
         if (path == null)
         {
-            var remoteConfig = TryLoadRemoteConfig(log);
-            if (remoteConfig != null)
-                return remoteConfig;
+            var cached = TryGetRemoteCached();
+            if (cached != null)
+                return cached;
 
-            log.Info("EOS config not found; skipping EOS login.");
+            EnsureRemoteFetch(log);
+            if (!_missingLogged)
+            {
+                log.Info("EOS config not found; skipping EOS login.");
+                _missingLogged = true;
+            }
             return null;
         }
 
@@ -150,54 +162,11 @@ public sealed class EosConfig
 
     private static EosConfig? TryLoadRemoteConfig(Logger log)
     {
+        // Deprecated synchronous path - keep for compatibility but avoid direct use.
         var remote = LoadRemoteConfigSource(log);
         if (remote == null)
             return null;
-
-        try
-        {
-            using var client = new System.Net.Http.HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(15)
-            };
-
-            using var req = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, remote.Url);
-            if (!string.IsNullOrWhiteSpace(remote.ApiKey))
-                req.Headers.Add("X-Api-Key", remote.ApiKey);
-
-            using var resp = client.Send(req);
-            if (!resp.IsSuccessStatusCode)
-            {
-                log.Warn($"EOS remote config fetch failed: {(int)resp.StatusCode} {resp.ReasonPhrase}");
-                return null;
-            }
-
-            var json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            var cfg = JsonSerializer.Deserialize<EosConfig>(json, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            });
-
-            if (cfg == null)
-            {
-                log.Warn("EOS remote config parse failed.");
-                return null;
-            }
-
-            if (!cfg.IsValid(out var error))
-            {
-                log.Warn($"EOS remote config invalid: {error}");
-                return null;
-            }
-
-            log.Info("EOS config loaded from remote service.");
-            return cfg;
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"EOS remote config load failed: {ex.Message}");
-            return null;
-        }
+        return TryLoadRemoteConfigAsync(log, remote).GetAwaiter().GetResult();
     }
 
     private static RemoteConfigSource? LoadRemoteConfigSource(Logger log)
@@ -238,6 +207,99 @@ public sealed class EosConfig
         {
             Url = url;
             ApiKey = apiKey;
+        }
+    }
+
+    public static bool IsRemoteFetchPending
+    {
+        get
+        {
+            lock (RemoteSync)
+                return _remoteFetchTask != null && !_remoteFetchTask.IsCompleted;
+        }
+    }
+
+    private static void EnsureRemoteFetch(Logger log)
+    {
+        lock (RemoteSync)
+        {
+            if (_remoteCached != null)
+                return;
+            if (_remoteFetchTask != null && !_remoteFetchTask.IsCompleted)
+                return;
+
+            var remote = LoadRemoteConfigSource(log);
+            if (remote == null)
+                return;
+
+            _remoteFetchTask = Task.Run(async () =>
+            {
+                var cfg = await TryLoadRemoteConfigAsync(log, remote).ConfigureAwait(false);
+                if (cfg == null)
+                    return;
+                lock (RemoteSync)
+                    _remoteCached = cfg;
+            });
+        }
+
+        if (!_remoteFetchLogged)
+        {
+            log.Info("EOS remote config fetch queued.");
+            _remoteFetchLogged = true;
+        }
+    }
+
+    private static EosConfig? TryGetRemoteCached()
+    {
+        lock (RemoteSync)
+            return _remoteCached;
+    }
+
+    private static async Task<EosConfig?> TryLoadRemoteConfigAsync(Logger log, RemoteConfigSource remote)
+    {
+        try
+        {
+            using var client = new System.Net.Http.HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(RemoteFetchTimeoutSeconds)
+            };
+
+            using var req = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, remote.Url);
+            if (!string.IsNullOrWhiteSpace(remote.ApiKey))
+                req.Headers.Add("X-Api-Key", remote.ApiKey);
+
+            using var resp = await client.SendAsync(req).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                log.Warn($"EOS remote config fetch failed: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                return null;
+            }
+
+            var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var cfg = JsonSerializer.Deserialize<EosConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            if (cfg == null)
+            {
+                log.Warn("EOS remote config parse failed.");
+                return null;
+            }
+
+            if (!cfg.IsValid(out var error))
+            {
+                log.Warn($"EOS remote config invalid: {error}");
+                return null;
+            }
+
+            log.Info("EOS config loaded from remote service.");
+            return cfg;
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"EOS remote config load failed: {ex.Message}");
+            return null;
         }
     }
 

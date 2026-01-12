@@ -274,6 +274,7 @@ public sealed class MainForm : Form
         _close.Enabled = true;
         _stepLabel.Text = "Done";
         Environment.ExitCode = 0;
+        BeginInvoke(new Action(Close));
     }
 
     private void FinishFailure()

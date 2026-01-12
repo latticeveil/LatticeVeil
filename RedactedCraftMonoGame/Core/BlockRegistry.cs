@@ -52,7 +52,7 @@ public static class BlockRegistry
         Register(new BlockDef(BlockId.Iron, "Iron", solid: true, transparent: false, hardness: 3.0f, atlasIndex: 12));
         Register(new BlockDef(BlockId.CraftingTable, "Crafting Table", solid: true, transparent: false, hardness: 1.0f, atlasIndex: 13));
         Register(new BlockDef(BlockId.Glass, "Glass", solid: true, transparent: true, hardness: 0.3f, atlasIndex: 14));
-        Register(new BlockDef(BlockId.Bedrock, "Bedrock", solid: true, transparent: false, hardness: -1.0f, atlasIndex: 15));
+        Register(new BlockDef(BlockId.Corestone, "Corestone", solid: true, transparent: false, hardness: -1.0f, atlasIndex: 15));
         Register(new BlockDef(BlockId.Gravel, "Gravel", solid: true, transparent: false, hardness: 0.6f, atlasIndex: 16));
         Register(new BlockDef(BlockId.Plank, "Plank", solid: true, transparent: false, hardness: 0.8f, atlasIndex: 17));
         Register(new BlockDef(BlockId.Gold, "Gold", solid: true, transparent: false, hardness: 3.0f, atlasIndex: 18));

@@ -101,6 +101,7 @@ public static class VoxelMesherGreedy
                         else pz = j;
 
                         atlas.GetFaceUvRect(cell.BlockId, cell.Face, out var uv00, out var uv10, out var uv11, out var uv01);
+                        AdjustFaceUvs(cell.Face, ref uv00, ref uv10, ref uv11, ref uv01);
                         var list = cell.Transparent ? transparent : opaque;
                         AddTiledQuad(list, originX, originY, originZ, px, py, pz, u, v, w, h, bs, uv00, uv10, uv11, uv01, IsBackFace(cell.Face));
 
@@ -223,6 +224,61 @@ public static class VoxelMesherGreedy
             verts.Add(new VertexPositionTexture(p3, uv01));
             verts.Add(new VertexPositionTexture(p2, uv11));
         }
+    }
+
+    private static void AdjustFaceUvs(FaceDirection face, ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        switch (face)
+        {
+            case FaceDirection.PosX:
+                SwapUvAxes(ref uv00, ref uv10, ref uv11, ref uv01);
+                FlipU(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+            case FaceDirection.NegX:
+                SwapUvAxes(ref uv00, ref uv10, ref uv11, ref uv01);
+                FlipU(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+            case FaceDirection.PosY:
+                SwapUvAxes(ref uv00, ref uv10, ref uv11, ref uv01);
+                FlipV(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+            case FaceDirection.NegY:
+                SwapUvAxes(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+            case FaceDirection.PosZ:
+                FlipV(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+            case FaceDirection.NegZ:
+                FlipV(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+        }
+    }
+
+    private static void SwapUvAxes(ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        var tmp = uv10;
+        uv10 = uv01;
+        uv01 = tmp;
+    }
+
+    private static void FlipU(ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        var tmp = uv00;
+        uv00 = uv10;
+        uv10 = tmp;
+        tmp = uv01;
+        uv01 = uv11;
+        uv11 = tmp;
+    }
+
+    private static void FlipV(ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        var tmp = uv00;
+        uv00 = uv01;
+        uv01 = tmp;
+        tmp = uv10;
+        uv10 = uv11;
+        uv11 = tmp;
     }
 
     private readonly struct MaskCell

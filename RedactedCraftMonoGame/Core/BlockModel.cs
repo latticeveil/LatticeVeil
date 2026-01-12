@@ -363,6 +363,8 @@ public sealed class BlockModel
         }
 
         GetFaceUvs(atlas, (byte)id, face, uv, out var uv00, out var uv10, out var uv11, out var uv01);
+        if (uv == null)
+            AdjustCubeFaceUvs(face, ref uv00, ref uv10, ref uv11, ref uv01);
         AddFace(verts, face, p0, p1, p2, p3, uv00, uv10, uv11, uv01);
     }
 
@@ -392,7 +394,31 @@ public sealed class BlockModel
     private static void AddFace(List<VertexPositionTexture> verts, CubeNetAtlas atlas, BlockId id, FaceDirection face, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3)
     {
         atlas.GetFaceUvRect((byte)id, face, out var uv00, out var uv10, out var uv11, out var uv01);
+        AdjustCubeFaceUvs(face, ref uv00, ref uv10, ref uv11, ref uv01);
         AddFace(verts, face, p0, p1, p2, p3, uv00, uv10, uv11, uv01);
+    }
+
+    private static void AdjustCubeFaceUvs(FaceDirection face, ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        switch (face)
+        {
+            case FaceDirection.PosX:
+            case FaceDirection.NegX:
+            case FaceDirection.PosZ:
+            case FaceDirection.NegZ:
+                FlipV(ref uv00, ref uv10, ref uv11, ref uv01);
+                break;
+        }
+    }
+
+    private static void FlipV(ref Vector2 uv00, ref Vector2 uv10, ref Vector2 uv11, ref Vector2 uv01)
+    {
+        var tmp = uv00;
+        uv00 = uv01;
+        uv01 = tmp;
+        tmp = uv10;
+        uv10 = uv11;
+        uv11 = tmp;
     }
 
     private static void GetFaceUvs(CubeNetAtlas atlas, byte id, FaceDirection face, BlockModelUv? uv, out Vector2 uv00, out Vector2 uv10, out Vector2 uv11, out Vector2 uv01)

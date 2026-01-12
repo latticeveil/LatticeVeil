@@ -10,7 +10,7 @@ class BlockModelGenerator
         string[] blocks = {
             "air", "grass", "dirt", "stone", "water", "sand", "wood", "leaves", 
             "door", "dooropen", "chest", "coal", "iron", "crafting_table", 
-            "glass", "bedrock", "gravel", "plank", "gold", "diamond"
+            "glass", "corestone", "gravel", "plank", "gold", "diamond"
         };
 
         string outputDir = @"C:\Users\Redacted\Documents\RedactedCraft\Assets\models";
