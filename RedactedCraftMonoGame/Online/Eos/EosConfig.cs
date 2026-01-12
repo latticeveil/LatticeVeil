@@ -47,10 +47,18 @@ public sealed class EosConfig
             if (cached != null)
                 return cached;
 
-            EnsureRemoteFetch(log);
+            log.Info($"Local EOS config not found. Fetching from {DefaultRemoteConfigUrl}...");
+            var remote = TryLoadRemoteConfig(log);
+            if (remote != null)
+            {
+                lock (RemoteSync)
+                    _remoteCached = remote;
+                return remote;
+            }
+
             if (!_missingLogged)
             {
-                log.Info("EOS config not found; skipping EOS login.");
+                log.Warn("EOS config not found locally and remote fetch failed.");
                 _missingLogged = true;
             }
             return null;
@@ -191,7 +199,9 @@ public sealed class EosConfig
 
         var remotePath = Path.Combine(Paths.ConfigDir, "eos.remote.json");
         if (!File.Exists(remotePath))
-            return null;
+        {
+            return new RemoteConfigSource(DefaultRemoteConfigUrl, null);
+        }
 
         try
         {
