@@ -46,10 +46,10 @@
   - A68CD4F5A4DABB1EB5D357D187E83F75DF404B60476BB30C251818F7E5F3D512
 
 ## What was pushed
-- Pushed update/gravestone-model-v1 prior to custom-model render fix; new commit pending.
+- Pushed update/gravestone-model-v1 (includes custom-model render fix).
 
 ## Next steps
-- Commit and push custom-model render fix, then print pull/build/smoke/assetview commands and wait for WORKED/NOT WORKING.
+- Print pull/build/smoke/assetview commands and wait for WORKED/NOT WORKING.
 
 ## SWE-1.5 CONTINUATION PROMPT
-You are SWE-1.5 taking over in the game repo at update/gravestone-model-v1. Commit/push the custom-model render fix, then print test commands and wait for WORKED/NOT WORKING.
+You are SWE-1.5 taking over in the game repo at update/gravestone-model-v1. Branch is pushed; print test commands and wait for WORKED/NOT WORKING.
