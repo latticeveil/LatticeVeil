@@ -189,9 +189,13 @@ public sealed class PlayerWorldState
         if (string.IsNullOrWhiteSpace(itemId))
             return BlockId.Air;
 
+        var normalized = itemId.Trim();
+        if (Enum.TryParse<BlockId>(normalized, true, out var parsed))
+            return parsed;
+
         foreach (var def in BlockRegistry.All)
         {
-            if (string.Equals(def.Name, itemId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(def.Name, normalized, StringComparison.OrdinalIgnoreCase))
                 return def.Id;
         }
 

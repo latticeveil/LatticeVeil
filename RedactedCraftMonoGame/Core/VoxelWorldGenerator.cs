@@ -81,6 +81,9 @@ public sealed class VoxelWorldGenerator
                             id = BlockIds.Sand;
                     }
 
+                    if (wy == 0)
+                        id = BlockIds.Nullblock;
+
                     chunk.SetLocal(lx, ly, lz, id, markDirty: false);
                 }
             }
@@ -135,6 +138,9 @@ public sealed class VoxelWorldGenerator
                     }
                     _blocksGenerated++;
                 }
+
+                if (wy == 0)
+                    id = BlockIds.Nullblock;
 
                 _currentChunk.SetLocal(lx, ly, lz, id, markDirty: false);
             }

@@ -33,12 +33,13 @@ function Invoke-Ui([Action]$action) {
     }
 }
 
-function Set-ButtonsEnabled($build, $ship, $clean, $open) {
+function Set-ButtonsEnabled($build, $ship, $clean, $open, $lore) {
     Invoke-Ui([Action]{
         if ($build -ne $null) { $btnBuild.Enabled = $build }
         if ($ship -ne $null) { $btnShip.Enabled = $ship }
         if ($clean -ne $null) { $btnClean.Enabled = $clean }
         if ($open -ne $null) { $btnOpen.Enabled = $open }
+        if ($lore -ne $null -and $btnLore -ne $null) { $btnLore.Enabled = $lore }
     })
 }
 
@@ -54,7 +55,7 @@ function Start-BackgroundTask([ScriptBlock]$work) {
         Log "ERROR: $_"
     } finally {
         $script:busy = $false
-        Set-ButtonsEnabled $true $true $true $true
+        Set-ButtonsEnabled $true $true $true $true $true
     }
 }
 
@@ -137,7 +138,7 @@ function Set-ProgressMarquee($status) {
 
 function Build-Game {
     Log "Starting Build (Release)..."
-    Set-ButtonsEnabled $false $false $false $null
+    Set-ButtonsEnabled $false $false $false $null $false
 
     Set-ProgressMarquee "Building (Release)..."
     $code = Run-Process "dotnet" "build `"$ProjectFile`" -c Release"
@@ -150,7 +151,7 @@ function Build-Game {
         Set-Progress 0 "Build failed."
     }
 
-    Set-ButtonsEnabled $true $true $true $null
+    Set-ButtonsEnabled $true $true $true $null $true
     return $code
 }
 
@@ -163,8 +164,8 @@ function Run-Game {
     }
 }
 
-function Prepare-Ship {
-    Set-ButtonsEnabled $false $false $false $null
+function Prepare-Ship([bool]$runAfter = $false) {
+    Set-ButtonsEnabled $false $false $false $null $false
     Log "Preparing for Deployment..."
     Set-Progress 5 "Cleaning old artifacts..."
 
@@ -187,7 +188,7 @@ function Prepare-Ship {
     if ($code -ne 0 -and -not (Test-Path $exeSource)) {
         Log "Publish Failed. (exit code: $code)"
         Set-Progress 0 "Publish failed."
-        Set-ButtonsEnabled $true $true $true $null
+        Set-ButtonsEnabled $true $true $true $null $true
         return
     }
 
@@ -227,12 +228,77 @@ function Prepare-Ship {
     Log "  - Builds\RedactedCraft.exe"
     Log "  - RedactedcraftCsharp.zip"
 
-    Set-ButtonsEnabled $true $true $true $null
+    if ($runAfter -and (Test-Path $FinalExe)) {
+        Log "Launching packaged build..."
+        Start-Process $FinalExe -WorkingDirectory $BuildDir
+    }
+
+    Set-ButtonsEnabled $true $true $true $null $true
+}
+
+function Export-LorePack {
+    Log "Exporting lore pack (data + textures)..."
+    Set-ButtonsEnabled $false $false $false $false $false
+    Set-ProgressMarquee "Exporting lore pack..."
+
+    $BuildDir = "$SolutionRoot\Builds"
+    $LoreOutDir = "$BuildDir\LorePack"
+    $LoreDataSrc = "$SolutionRoot\RedactedCraftMonoGame\Defaults\Assets\data\lore"
+    $LoreBlocksSrc = "$SolutionRoot\RedactedCraftMonoGame\Defaults\Assets\textures\blocks"
+    $LoreZip = "$SolutionRoot\RedactedCraft_LorePack_FULL_v1_1d_LOREPLUS_TEXTURES.zip"
+
+    if (Test-Path $LoreOutDir) { Remove-Item $LoreOutDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $LoreOutDir | Out-Null
+
+    Set-Progress 20 "Copying lore data..."
+    if (Test-Path $LoreDataSrc) {
+        $dataDest = "$LoreOutDir\Assets\data\lore"
+        New-Item -ItemType Directory -Force -Path $dataDest | Out-Null
+        Copy-Item -Path (Join-Path $LoreDataSrc "*") -Destination $dataDest -Recurse -Force
+        Log "Lore data copied."
+    } else {
+        Log "Lore data folder not found: $LoreDataSrc"
+    }
+
+    Set-Progress 55 "Copying lore textures..."
+    $blocksDest = "$LoreOutDir\Assets\textures\blocks"
+    New-Item -ItemType Directory -Force -Path $blocksDest | Out-Null
+    $textures = @(
+        "runestone.png",
+        "veinstone.png",
+        "veilglass.png",
+        "resonance_core.png",
+        "waybound_frame.png",
+        "transit_regulator.png"
+    )
+    foreach ($tex in $textures) {
+        $src = Join-Path $LoreBlocksSrc $tex
+        if (Test-Path $src) {
+            Copy-Item $src $blocksDest -Force
+            Log "Copied texture: $tex"
+        } else {
+            Log "Missing texture: $src"
+        }
+        Pump-Ui
+    }
+
+    Set-Progress 85 "Copying lore pack zip..."
+    if (Test-Path $LoreZip) {
+        $zipDest = Join-Path $BuildDir (Split-Path $LoreZip -Leaf)
+        Copy-Item $LoreZip $zipDest -Force
+        Log "Copied lore pack zip: $zipDest"
+    } else {
+        Log "Lore pack zip not found: $LoreZip"
+    }
+
+    Set-Progress 100 "Lore pack export complete."
+    Set-ButtonsEnabled $true $true $true $true $true
 }
 
 function Clean-Project {
     Log "Cleaning Project Artifacts..."
-    Set-ButtonsEnabled $false $false $false $null
+    Set-ButtonsEnabled $false $false $false $null $false
     Set-ProgressMarquee "Cleaning project..."
 
     # Files/Folders to remove from Root
@@ -276,7 +342,7 @@ function Clean-Project {
 
     Log "Cleanup Complete."
     Set-Progress 100 "Cleanup complete."
-    Set-ButtonsEnabled $true $true $true $null
+    Set-ButtonsEnabled $true $true $true $null $true
 }
 
 function Open-BuildFolder {
@@ -326,14 +392,14 @@ $btnBuild.Add_Click({ Start-BackgroundTask { Run-Game } })
 $form.Controls.Add($btnBuild)
 
 $btnShip = New-Object System.Windows.Forms.Button
-$btnShip.Text = "PREPARE RELEASE`n(Zip + Exe)"
+$btnShip.Text = "PREPARE + RUN`n(Zip + Exe)"
 $btnShip.Location = New-Object System.Drawing.Point(240, 90)
 $btnShip.Size = New-Object System.Drawing.Size(180, 50)
 $btnShip.FlatStyle = "Flat"
 $btnShip.BackColor = $ColorButton
 $btnShip.ForeColor = $ColorAccent
 $btnShip.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$btnShip.Add_Click({ Start-BackgroundTask { Prepare-Ship } })
+$btnShip.Add_Click({ Start-BackgroundTask { Prepare-Ship $true } })
 $form.Controls.Add($btnShip)
 
 $btnOpen = New-Object System.Windows.Forms.Button
@@ -374,6 +440,17 @@ $btnClean.BackColor = $ColorButton
 $btnClean.ForeColor = $ColorError
 $btnClean.Add_Click({ Start-BackgroundTask { Clean-Project } })
 $form.Controls.Add($btnClean)
+
+$btnLore = New-Object System.Windows.Forms.Button
+$btnLore.Text = "Export Lore Pack"
+$btnLore.Location = New-Object System.Drawing.Point(160, 150)
+$btnLore.Size = New-Object System.Drawing.Size(200, 30)
+$btnLore.FlatStyle = "Flat"
+$btnLore.BackColor = $ColorButton
+$btnLore.ForeColor = $ColorAccent
+$btnLore.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$btnLore.Add_Click({ Start-BackgroundTask { Export-LorePack } })
+$form.Controls.Add($btnLore)
 
 # Progress
 $lblProgress = New-Object System.Windows.Forms.Label

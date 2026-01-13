@@ -55,6 +55,51 @@ public static class BlockRegistry
         Register(new BlockDef(BlockId.Plank, "Plank", solid: true, transparent: false, hardness: 0.8f, atlasIndex: 17));
         Register(new BlockDef(BlockId.Gold, "Gold", solid: true, transparent: false, hardness: 3.0f, atlasIndex: 18));
         Register(new BlockDef(BlockId.Diamond, "Diamond", solid: true, transparent: false, hardness: 4.0f, atlasIndex: 19));
+        Register(new BlockDef(BlockId.Runestone, "Runestone", solid: true, transparent: false, hardness: 1.2f, atlasIndex: 20, textureName: "runestone"));
+        Register(new BlockDef(BlockId.Veinstone, "Veinstone", solid: true, transparent: false, hardness: 1.6f, atlasIndex: 21, textureName: "veinstone"));
+        Register(new BlockDef(BlockId.Veilglass, "Veilglass", solid: true, transparent: true, hardness: 0.3f, atlasIndex: 22, textureName: "veilglass"));
+        Register(new BlockDef(BlockId.Gravestone, "Gravestone", solid: true, transparent: true, hardness: 1.0f, atlasIndex: 23, textureName: "gravestone"));
+        Register(new BlockDef(BlockId.InscribedTablet, "Inscribed Tablet", solid: true, transparent: true, hardness: 0.8f, atlasIndex: 24, textureName: "inscribed_tablet"));
+        Register(new BlockDef(BlockId.FragmentScrap, "Fragment Scrap", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 25, textureName: "fragment_scrap"));
+        Register(new BlockDef(BlockId.VeilSealStone, "Veil Sealstone", solid: true, transparent: false, hardness: 2.0f, atlasIndex: 26, textureName: "veil_sealstone"));
+        Register(new BlockDef(BlockId.EchoBloom, "Echo Bloom", solid: false, transparent: true, hardness: 0.2f, atlasIndex: 27, textureName: "echo_bloom"));
+        Register(new BlockDef(BlockId.GraveSilt, "Grave Silt", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 28, textureName: "grave_silt"));
+        Register(new BlockDef(BlockId.RunestoneDust, "Runestone Dust", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 29, textureName: "runestone_dust"));
+        Register(new BlockDef(BlockId.VeinstoneCrystal, "Veinstone Crystal", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 30, textureName: "veinstone_crystal"));
+        Register(new BlockDef(BlockId.AnchoringSalt, "Anchoring Salt", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 31, textureName: "anchoring_salt"));
+        Register(new BlockDef(BlockId.StabilizedAsh, "Stabilized Ash", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 32, textureName: "stabilized_ash"));
+        Register(new BlockDef(BlockId.EchoIconShard, "Echo Icon Shard", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 33, textureName: "echo_icon_shard"));
+        Register(new BlockDef(BlockId.CopperWiring, "Copper Wiring", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 34, textureName: "copper_wiring"));
+        Register(new BlockDef(BlockId.LimiterSigil, "Limiter Sigil", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 35, textureName: "limiter_sigil"));
+        Register(new BlockDef(BlockId.AlignmentMatrixFragment, "Alignment Matrix Fragment", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 36, textureName: "alignment_matrix_fragment"));
+        Register(new BlockDef(BlockId.AttunedKeystoneFragment, "Attuned Keystone Fragment", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 37, textureName: "attuned_keystone_fragment"));
+        Register(new BlockDef(BlockId.RegulatorComponent, "Regulator Component", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 38, textureName: "regulator_component"));
+        Register(new BlockDef(BlockId.TransitRegulatorPart, "Transit Regulator Part", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 39, textureName: "transit_regulator_part"));
+        Register(new BlockDef(BlockId.WayfinderPlinthPart, "Wayfinder Plinth Part", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 40, textureName: "wayfinder_plinth_part"));
+        Register(new BlockDef(BlockId.ResonanceCore, "Resonance Core", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 41, textureName: "resonance_core"));
+        Register(new BlockDef(BlockId.AxiomFulgrite, "Axiom Fulgrite", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 42, textureName: "axiom_fulgrite"));
+        Register(new BlockDef(BlockId.AnchoringAlloy, "Anchoring Alloy", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 43, textureName: "anchoring_alloy"));
+        Register(new BlockDef(BlockId.CleanPhial, "Clean Phial", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 44, textureName: "clean_phial"));
+        Register(new BlockDef(BlockId.Swiftleaf, "Swiftleaf", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 45, textureName: "swiftleaf"));
+        Register(new BlockDef(BlockId.Driftcap, "Driftcap", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 46, textureName: "driftcap"));
+        Register(new BlockDef(BlockId.Embermoss, "Embermoss", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 47, textureName: "embermoss"));
+        Register(new BlockDef(BlockId.SigilLoom, "Sigil Loom", solid: true, transparent: false, hardness: 1.0f, atlasIndex: 48, textureName: "sigil_loom"));
+        Register(new BlockDef(BlockId.QuietAlembic, "Quiet Alembic", solid: true, transparent: true, hardness: 0.8f, atlasIndex: 49, textureName: "quiet_alembic"));
+        Register(new BlockDef(BlockId.RunicAnvil, "Runic Anvil", solid: true, transparent: false, hardness: 2.0f, atlasIndex: 50, textureName: "runic_anvil"));
+        Register(new BlockDef(BlockId.CinderbranchStaff, "Cinderbranch Staff", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 51, textureName: "cinderbranch_staff"));
+        Register(new BlockDef(BlockId.StormreedStaff, "Stormreed Staff", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 52, textureName: "stormreed_staff"));
+        Register(new BlockDef(BlockId.WayboundFrame, "Waybound Frame", solid: true, transparent: false, hardness: 3.0f, atlasIndex: 53, textureName: "waybound_frame"));
+        Register(new BlockDef(BlockId.AttunedKeystone, "Attuned Keystone", solid: true, transparent: true, hardness: 3.0f, atlasIndex: 54, textureName: "attuned_keystone"));
+        Register(new BlockDef(BlockId.TimedLimiter, "Timed Limiter", solid: true, transparent: true, hardness: 2.0f, atlasIndex: 55, textureName: "timed_limiter"));
+        Register(new BlockDef(BlockId.TransitRegulator, "Transit Regulator", solid: true, transparent: true, hardness: 2.0f, atlasIndex: 56, textureName: "transit_regulator"));
+        Register(new BlockDef(BlockId.WaygatePlinth, "Waygate Plinth", solid: true, transparent: false, hardness: 2.5f, atlasIndex: 57, textureName: "waygate_plinth"));
+        Register(new BlockDef(BlockId.WaygateRune, "Waygate Rune", solid: true, transparent: true, hardness: 1.0f, atlasIndex: 58, textureName: "waygate_rune"));
+        Register(new BlockDef(BlockId.EvergateCore, "Evergate Core", solid: true, transparent: true, hardness: 3.5f, atlasIndex: 59, textureName: "evergate_core"));
+        Register(new BlockDef(BlockId.EvergateCoreUnstable, "Evergate Core (Unstable)", solid: true, transparent: true, hardness: 3.5f, atlasIndex: 60, textureName: "evergate_core_unstable"));
+        Register(new BlockDef(BlockId.FleetstepDraught, "Fleetstep Draught", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 61, textureName: "fleetstep_draught"));
+        Register(new BlockDef(BlockId.SkyboundPhilter, "Skybound Philter", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 62, textureName: "skybound_philter"));
+        Register(new BlockDef(BlockId.PyroskinTonic, "Pyroskin Tonic", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 63, textureName: "pyroskin_tonic"));
+        Register(new BlockDef(BlockId.BrineveilElixir, "Brineveil Elixir", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 64, textureName: "brineveil_elixir"));
 
         AllDefs.Sort((a, b) => a.AtlasIndex.CompareTo(b.AtlasIndex));
     }
@@ -62,6 +107,9 @@ public static class BlockRegistry
     private static void Register(BlockDef def)
     {
         var idx = (byte)def.Id;
+
+        if (Defs[idx] != null)
+            throw new InvalidOperationException($"Duplicate BlockId {idx} ({def.Id}).");
         
         // Replace in array
         Defs[idx] = def;

@@ -781,6 +781,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
             if (id != BlockIds.Air)
             {
+                if (id == BlockIds.Nullblock && _gameMode == GameMode.Survival)
+                {
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
+                }
+
                 _world.SetBlock(hit.X, hit.Y, hit.Z, BlockIds.Air);
                 _lanSession?.SendBlockSet(hit.X, hit.Y, hit.Z, BlockIds.Air);
                 _inventory.Add((BlockId)id, 1);
