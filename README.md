@@ -1,10 +1,18 @@
-# ⚒️ RedactedCraft C#
+# ⚒️ RedactedCraft C# (v6.0.0)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-win--x64-blue)
 ![Engine](https://img.shields.io/badge/engine-MonoGame-orange)
 
-**RedactedCraft** is a high-performance voxel sandbox engine built from the ground up in C# using the MonoGame framework. Dive into an infinite world of blocks, creativity, and exploration.
+**RedactedCraft** is a high-performance voxel sandbox engine built from the ground up in C# using the MonoGame framework.
+
+---
+
+## 🛠️ The Artificer Update (v6.0.0)
+This major update consolidates all assets and engine features into a single, unified version. 
+- **Consolidated Assets:** Unified V6 asset pack.
+- **Lore Integration:** Full support for The Continuist Papers and faction lore.
+- **Nullblock Bedrock:** Unbreakable bottom layer enforced at Y=0.
 
 ---
 
@@ -14,6 +22,7 @@
 | :--- | :--- |
 | **Latest Build** | [🎮 Download RedactedCraft.exe](./RedactedCraft.exe) |
 | **Source Archive** | [📦 Download RedactedcraftCsharp.zip](./RedactedcraftCsharp.zip) |
+| **Asset Pack** | [📦 Download Assets.zip](./Assets.zip) |
 
 ### Prerequisites
 - Windows 10/11 (x64)
