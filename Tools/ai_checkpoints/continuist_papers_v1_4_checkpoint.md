@@ -26,10 +26,10 @@
 - Smoke: `RedactedCraftMonoGame.exe --smoke` -> SMOKE PASS (log: C:\Users\Redacted\Documents\RedactedCraft\logs\latest.log).
 
 ## What was pushed
-- (pending)
+- Branch update/blocks-and-assets-v1_4 pushed to origin.
 
 ## Next steps
-- Update Assets repo (placeholders + checkpoint), commit both repos, push, then provide user test commands.
+- Await user validation after providing build/smoke/run commands.
 
 ## SWE-1.5 CONTINUATION PROMPT
-If taking over, finish Phase 1: ensure assets repo updates are committed, commit this repo, push branch update/blocks-and-assets-v1_4, then provide build/smoke/run commands and wait for WORKED/NOT WORKING.
+If taking over, provide build/smoke/run commands, wait for WORKED/NOT WORKING, then stop (Phase 2 deferred).
