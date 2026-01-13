@@ -10,3 +10,8 @@ Builds/
 **/eos.local.json
 .Plans
 RedactedCraft.exe
+_tmp_canon_*/
+_wt_*/
+*.log
+lorepack_generated/
+_templates/

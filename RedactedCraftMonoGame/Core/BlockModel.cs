@@ -42,12 +42,21 @@ public sealed class BlockModel
             return cached;
 
         var name = BlockRegistry.Get(id).Name.Trim().ToLowerInvariant().Replace(' ', '_');
-        var path = Path.Combine(Paths.AssetsDir, "models", $"{name}.json");
-        
+        var primaryPath = Path.Combine(Paths.AssetsDir, "Models", "Blocks", $"{name}.json");
+        var legacyPath = Path.Combine(Paths.AssetsDir, "models", $"{name}.json");
+
         BlockModel? model = null;
-        if (File.Exists(path))
+        if (File.Exists(primaryPath))
         {
-            model = LoadModel(path, log);
+            model = LoadModel(primaryPath, log);
+        }
+        else if (File.Exists(legacyPath))
+        {
+            model = LoadModel(legacyPath, log);
+        }
+        else
+        {
+            log.Warn($"Model file not found for '{name}'. Tried: {primaryPath} | {legacyPath}. Using default cube.");
         }
 
         if (model == null)

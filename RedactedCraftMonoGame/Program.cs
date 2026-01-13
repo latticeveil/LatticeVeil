@@ -32,10 +32,28 @@ public static class Program
         // Copy default assets from the app directory to Documents\RedactedCraft\Assets if missing.
         AssetInstaller.EnsureDefaultsInstalled(AppDomain.CurrentDomain.BaseDirectory, log);
 
+        var smoke = HasArg(args, "--smoke");
+        var smokeAssetsOk = true;
+        string[] smokeMissing = Array.Empty<string>();
+        if (smoke)
+        {
+            var assetInstaller = new AssetPackInstaller(log);
+            smokeAssetsOk = assetInstaller.CheckLocalAssetsInstalled(out smokeMissing);
+            if (smokeAssetsOk)
+                log.Info("SMOKE assets check: OK.");
+            else
+                log.Warn($"SMOKE assets check: missing {string.Join(", ", smokeMissing)}");
+        }
+
+        var assetView = HasArg(args, "--assetview");
         var startOptions = new GameStartOptions
         {
             JoinToken = GetArgValue(args, "--join-token"),
-            Offline = HasArg(args, "--offline")
+            Offline = HasArg(args, "--offline"),
+            Smoke = smoke,
+            SmokeAssetsOk = smokeAssetsOk,
+            SmokeMissingAssets = smokeMissing,
+            AssetView = assetView
         };
 
         var forceLauncher = HasArg(args, "--launcher");
@@ -115,7 +133,9 @@ public static class Program
 
     private static bool IsGameEntry(string[] args)
     {
-        if (HasArg(args, "--game")
+        if (HasArg(args, "--smoke")
+            || HasArg(args, "--assetview")
+            || HasArg(args, "--game")
             || HasArg(args, "--dedicated")
             || HasArg(args, "--host-lan")
             || HasArg(args, "--join-lan")

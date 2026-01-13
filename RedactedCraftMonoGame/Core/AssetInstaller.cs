@@ -15,10 +15,25 @@ public static class AssetInstaller
         {
             Directory.CreateDirectory(Paths.AssetsDir);
 
-            var defaultsAssets = Path.Combine(defaultsRoot, "Assets");
-            if (!Directory.Exists(defaultsAssets))
+            var defaultsCandidates = new[]
             {
-                log.Warn($"Defaults assets folder missing: {defaultsAssets}");
+                Path.Combine(defaultsRoot, "Defaults", "Assets"),
+                Path.Combine(defaultsRoot, "Assets")
+            };
+
+            string? defaultsAssets = null;
+            for (var i = 0; i < defaultsCandidates.Length; i++)
+            {
+                if (Directory.Exists(defaultsCandidates[i]))
+                {
+                    defaultsAssets = defaultsCandidates[i];
+                    break;
+                }
+            }
+
+            if (defaultsAssets is null)
+            {
+                log.Warn($"Defaults assets folder missing: {string.Join(" | ", defaultsCandidates)}");
                 return;
             }
 

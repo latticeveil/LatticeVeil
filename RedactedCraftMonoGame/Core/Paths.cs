@@ -57,7 +57,7 @@ public static class Paths
         Path.Combine(RootDir, "Backups");
 
     public static string ActiveLogPath =>
-        Path.Combine(LogsDir, "current.log");
+        Path.Combine(LogsDir, "latest.log");
 
     public static string GamePidPath =>
         Path.Combine(RootDir, "game.pid");
@@ -96,6 +96,7 @@ public static class Paths
             Directory.CreateDirectory(TexturesDir);
             Directory.CreateDirectory(MenuTexturesDir);
             Directory.CreateDirectory(BlocksTexturesDir);
+            Directory.CreateDirectory(Path.Combine(AssetsDir, "Models", "Blocks"));
 
             WarnIfLegacyAssetFoldersExist(log);
         }

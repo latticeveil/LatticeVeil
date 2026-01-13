@@ -37,6 +37,8 @@ public sealed class Game1 : Game
     private string? _screenshotToast;
     private double _screenshotToastUntil;
     private bool _exitRequested;
+    private double _smokeExitAtSeconds = -1;
+    private const double SmokeDurationSeconds = 8.0;
     private double _lastUpdateSeconds = -1;
     private double _lastStallLogSeconds = -1;
     private const double StallThresholdSeconds = 2.0;
@@ -109,7 +111,13 @@ public sealed class Game1 : Game
             }
         }
 
-        if (_startOptions?.HasJoinToken == true)
+        if (_startOptions?.AssetView == true)
+        {
+            _menus.Push(
+                new AssetViewerScreen(_menus, _assets, _font, _pixel, _log),
+                UiLayout.Viewport);
+        }
+        else if (_startOptions?.HasJoinToken == true)
         {
             _menus.Push(
                 new JoinByCodeScreen(
@@ -190,6 +198,7 @@ public sealed class Game1 : Game
 
         // Global quit (Alt+F4 is handled by OS; Esc handled in screens)
         _menus.Update(gameTime, _input);
+        HandleSmoke(gameTime);
         if (!_exitRequested && _menus.Count == 0)
         {
             _exitRequested = true;
@@ -446,6 +455,34 @@ public sealed class Game1 : Game
         _spriteBatch.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), Color.White);
         _font.DrawString(sb: _spriteBatch, text: _screenshotToast, pos: new Vector2(rect.X + padding, rect.Y + padding), color: Color.White);
         _spriteBatch.End();
+    }
+
+    private void HandleSmoke(GameTime gameTime)
+    {
+        if (_startOptions?.Smoke != true)
+            return;
+
+        if (_smokeExitAtSeconds < 0)
+        {
+            _smokeExitAtSeconds = gameTime.TotalGameTime.TotalSeconds + SmokeDurationSeconds;
+            _log.Info($"SMOKE mode active. Exiting in {SmokeDurationSeconds:0.0}s.");
+        }
+
+        if (gameTime.TotalGameTime.TotalSeconds < _smokeExitAtSeconds || _exitRequested)
+            return;
+
+        _exitRequested = true;
+        if (_startOptions.SmokeAssetsOk)
+        {
+            _log.Info("SMOKE PASS");
+        }
+        else
+        {
+            var missing = _startOptions.SmokeMissingAssets ?? Array.Empty<string>();
+            _log.Warn($"SMOKE FAIL: missing assets: {string.Join(", ", missing)}");
+        }
+
+        Exit();
     }
 
     private void LogFrameStall(GameTime gameTime)
