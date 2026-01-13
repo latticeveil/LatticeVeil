@@ -668,7 +668,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             // Create/generate chunks lazily here (per-frame budget) instead of in UpdateActiveChunks.
             var chunk = _world.GetOrCreateChunk(coord);
 
-            var mesh = VoxelMesherGreedy.BuildChunkMesh(_world, chunk, _atlas);
+            var mesh = VoxelMesherGreedy.BuildChunkMesh(_world, chunk, _atlas, _log);
             if (!ValidateMesh(mesh))
             {
                 if (!_loggedInvalidChunkMesh)

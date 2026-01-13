@@ -46,12 +46,12 @@
       "enumName": "Gravestone",
       "displayName": "Gravestone",
       "solid": true,
-      "transparent": true,
+      "transparent": false,
       "hardness": 1.0,
       "atlasIndex": 23,
       "textureName": "gravestone",
       "visibleInInventory": true,
-      "hasCustomModel": false,
+      "hasCustomModel": true,
       "notes": ""
     },
     {

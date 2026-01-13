@@ -6,7 +6,7 @@ namespace RedactedCraftMonoGame.Core;
 
 public static class VoxelMesherGreedy
 {
-    public static ChunkMesh BuildChunkMesh(VoxelWorld world, VoxelChunkData chunk, CubeNetAtlas atlas)
+    public static ChunkMesh BuildChunkMesh(VoxelWorld world, VoxelChunkData chunk, CubeNetAtlas atlas, Logger log)
     {
         var opaque = new List<VertexPositionTexture>();
         var transparent = new List<VertexPositionTexture>();
@@ -117,9 +117,65 @@ public static class VoxelMesherGreedy
             }
         }
 
+        AppendCustomModels(chunk, atlas, log, originX, originY, originZ, bs, opaque, transparent);
+
         var min = new Vector3(originX * bs, originY * bs, originZ * bs);
         var max = min + new Vector3(sizeX * bs, sizeY * bs, sizeZ * bs);
         return new ChunkMesh(chunk.Coord, opaque.ToArray(), transparent.ToArray(), new BoundingBox(min, max));
+    }
+
+    private static void AppendCustomModels(
+        VoxelChunkData chunk,
+        CubeNetAtlas atlas,
+        Logger log,
+        int originX,
+        int originY,
+        int originZ,
+        float blockSize,
+        List<VertexPositionTexture> opaque,
+        List<VertexPositionTexture> transparent)
+    {
+        var cache = new Dictionary<byte, VertexPositionTexture[]>();
+        var centerOffset = new Vector3(0.5f * blockSize, 0.5f * blockSize, 0.5f * blockSize);
+
+        for (var y = 0; y < VoxelChunkData.ChunkSizeY; y++)
+        {
+            for (var z = 0; z < VoxelChunkData.ChunkSizeZ; z++)
+            {
+                for (var x = 0; x < VoxelChunkData.ChunkSizeX; x++)
+                {
+                    var id = chunk.GetLocal(x, y, z);
+                    if (id == BlockIds.Air)
+                        continue;
+
+                    var def = BlockRegistry.Get(id);
+                    if (!def.HasCustomModel)
+                        continue;
+
+                    if (!cache.TryGetValue(id, out var mesh))
+                    {
+                        var model = BlockModel.GetModel((BlockId)id, log);
+                        mesh = model.BuildMesh(atlas, (BlockId)id);
+                        cache[id] = mesh;
+                    }
+
+                    if (mesh.Length == 0)
+                        continue;
+
+                    var offset = new Vector3(
+                        (originX + x) * blockSize,
+                        (originY + y) * blockSize,
+                        (originZ + z) * blockSize) + centerOffset;
+
+                    var target = def.IsTransparent ? transparent : opaque;
+                    for (var i = 0; i < mesh.Length; i++)
+                    {
+                        var v = mesh[i];
+                        target.Add(new VertexPositionTexture(v.Position + offset, v.TextureCoordinate));
+                    }
+                }
+            }
+        }
     }
 
     private static MaskCell BuildMaskCell(byte a, byte b, int axis, CubeNetAtlas atlas)

@@ -58,7 +58,7 @@ public static class BlockRegistry
         Register(new BlockDef(BlockId.Runestone, "Runestone", solid: true, transparent: false, hardness: 1.2f, atlasIndex: 20, textureName: "runestone"));
         Register(new BlockDef(BlockId.Veinstone, "Veinstone", solid: true, transparent: false, hardness: 1.6f, atlasIndex: 21, textureName: "veinstone"));
         Register(new BlockDef(BlockId.Veilglass, "Veilglass", solid: true, transparent: true, hardness: 0.3f, atlasIndex: 22, textureName: "veilglass"));
-        Register(new BlockDef(BlockId.Gravestone, "Gravestone", solid: true, transparent: true, hardness: 1.0f, atlasIndex: 23, textureName: "gravestone"));
+        Register(new BlockDef(BlockId.Gravestone, "Gravestone", solid: true, transparent: false, hardness: 1.0f, atlasIndex: 23, textureName: "gravestone", customModel: true));
         Register(new BlockDef(BlockId.InscribedTablet, "Inscribed Tablet", solid: true, transparent: true, hardness: 0.8f, atlasIndex: 24, textureName: "inscribed_tablet"));
         Register(new BlockDef(BlockId.FragmentScrap, "Fragment Scrap", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 25, textureName: "fragment_scrap"));
         Register(new BlockDef(BlockId.VeilSealStone, "Veil Sealstone", solid: true, transparent: false, hardness: 2.0f, atlasIndex: 26, textureName: "veil_sealstone"));
