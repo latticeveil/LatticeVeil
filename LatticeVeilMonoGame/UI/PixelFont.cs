@@ -1,0 +1,160 @@
+using System;
+using System.Collections.Generic;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+
+namespace LatticeVeilMonoGame.UI;
+
+/// <summary>
+/// Minimal runtime pixel font (no Content pipeline). Supports A-Z, 0-9 and common punctuation.
+/// Lowercase is mapped to uppercase for rendering.
+/// </summary>
+public sealed class PixelFont
+{
+    private readonly Texture2D _pixel;
+    private readonly Dictionary<char, byte[]> _glyphs = new();
+    private readonly int _w = 5;
+    private readonly int _h = 7;
+    private readonly int _scale;
+
+    public PixelFont(Texture2D pixel, int scale = 2)
+    {
+        _pixel = pixel;
+        _scale = Math.Clamp(scale, 1, 6);
+        BuildGlyphs();
+    }
+
+    public int LineHeight => _h * _scale + 2;
+
+    public Vector2 MeasureString(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return Vector2.Zero;
+        var lines = text.Split('\n');
+        var maxW = 0;
+        foreach (var line in lines)
+            maxW = Math.Max(maxW, line.Length * (_w * _scale + _scale));
+        var totalH = lines.Length * LineHeight;
+        return new Vector2(maxW, totalH);
+    }
+
+    public void DrawString(SpriteBatch sb, string text, Vector2 pos, Color color)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+
+        var x = (int)pos.X;
+        var y = (int)pos.Y;
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (c == '\n')
+            {
+                x = (int)pos.X;
+                y += LineHeight;
+                continue;
+            }
+
+            DrawChar(sb, NormalizeChar(c), x, y, color);
+            x += _w * _scale + _scale;
+        }
+    }
+
+    private char NormalizeChar(char c)
+    {
+        if (c >= 'a' && c <= 'z') return (char)(c - 32);
+        if (c == '\\') return '/'; // render backslash as slash to avoid missing glyphs
+        return c;
+    }
+
+    private void DrawChar(SpriteBatch sb, char c, int x, int y, Color color)
+    {
+        if (!_glyphs.TryGetValue(c, out var rows))
+            rows = _glyphs['?'];
+
+        for (int row = 0; row < _h; row++)
+        {
+            var bits = rows[row];
+            for (int col = 0; col < _w; col++)
+            {
+                if (((bits >> (_w - 1 - col)) & 1) == 1)
+                {
+                    sb.Draw(_pixel, new Rectangle(x + col * _scale, y + row * _scale, _scale, _scale), color);
+                }
+            }
+        }
+    }
+
+    private void Add(char c, params string[] rows)
+    {
+        if (rows.Length != _h) throw new ArgumentException("glyph rows must be 7");
+        var data = new byte[_h];
+        for (int r = 0; r < _h; r++)
+        {
+            byte b = 0;
+            for (int col = 0; col < _w; col++)
+            {
+                b <<= 1;
+                b |= (byte)(rows[r][col] == '1' ? 1 : 0);
+            }
+            data[r] = b;
+        }
+        _glyphs[c] = data;
+    }
+
+    private void BuildGlyphs()
+    {
+        // Basic punctuation
+        Add(' ', "00000","00000","00000","00000","00000","00000","00000");
+        Add('-', "00000","00000","00000","11111","00000","00000","00000");
+        Add('_', "00000","00000","00000","00000","00000","00000","11111");
+        Add('.', "00000","00000","00000","00000","00000","01100","01100");
+        Add(':', "00000","01100","01100","00000","01100","01100","00000");
+        Add('/', "00001","00010","00100","01000","10000","00000","00000");
+        Add('|', "00100","00100","00100","00100","00100","00100","00100");
+        Add('(', "00010","00100","01000","01000","01000","00100","00010");
+        Add(')', "01000","00100","00010","00010","00010","00100","01000");
+        Add('[', "01110","01000","01000","01000","01000","01000","01110");
+        Add(']', "01110","00010","00010","00010","00010","00010","01110");
+        Add('?', "01110","10001","00010","00100","00100","00000","00100");
+
+        // Digits 0-9
+        Add('0', "01110","10001","10011","10101","11001","10001","01110");
+        Add('1', "00100","01100","00100","00100","00100","00100","01110");
+        Add('2', "01110","10001","00001","00010","00100","01000","11111");
+        Add('3', "11110","00001","00001","01110","00001","00001","11110");
+        Add('4', "00010","00110","01010","10010","11111","00010","00010");
+        Add('5', "11111","10000","10000","11110","00001","00001","11110");
+        Add('6', "00110","01000","10000","11110","10001","10001","01110");
+        Add('7', "11111","00001","00010","00100","01000","01000","01000");
+        Add('8', "01110","10001","10001","01110","10001","10001","01110");
+        Add('9', "01110","10001","10001","01111","00001","00010","01100");
+
+        // Letters A-Z
+        Add('A', "01110","10001","10001","11111","10001","10001","10001");
+        Add('B', "11110","10001","10001","11110","10001","10001","11110");
+        Add('C', "01110","10001","10000","10000","10000","10001","01110");
+        Add('D', "11110","10001","10001","10001","10001","10001","11110");
+        Add('E', "11111","10000","10000","11110","10000","10000","11111");
+        Add('F', "11111","10000","10000","11110","10000","10000","10000");
+        Add('G', "01110","10001","10000","10111","10001","10001","01110");
+        Add('H', "10001","10001","10001","11111","10001","10001","10001");
+        Add('I', "01110","00100","00100","00100","00100","00100","01110");
+        Add('J', "00001","00001","00001","00001","10001","10001","01110");
+        Add('K', "10001","10010","10100","11000","10100","10010","10001");
+        Add('L', "10000","10000","10000","10000","10000","10000","11111");
+        Add('M', "10001","11011","10101","10001","10001","10001","10001");
+        Add('N', "10001","11001","10101","10011","10001","10001","10001");
+        Add('O', "01110","10001","10001","10001","10001","10001","01110");
+        Add('P', "11110","10001","10001","11110","10000","10000","10000");
+        Add('Q', "01110","10001","10001","10001","10101","10010","01101");
+        Add('R', "11110","10001","10001","11110","10100","10010","10001");
+        Add('S', "01111","10000","10000","01110","00001","00001","11110");
+        Add('T', "11111","00100","00100","00100","00100","00100","00100");
+        Add('U', "10001","10001","10001","10001","10001","10001","01110");
+        Add('V', "10001","10001","10001","10001","10001","01010","00100");
+        Add('W', "10001","10001","10001","10001","10101","11011","10001");
+        Add('X', "10001","10001","01010","00100","01010","10001","10001");
+        Add('Y', "10001","10001","01010","00100","00100","00100","00100");
+        Add('Z', "11111","00001","00010","00100","01000","10000","11111");
+    }
+}

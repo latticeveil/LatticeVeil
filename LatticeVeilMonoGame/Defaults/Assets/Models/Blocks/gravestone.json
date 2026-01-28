@@ -1,0 +1,40 @@
+{
+  "format_version": "baked-1",
+  "elements": [
+    {
+      "name": "base",
+      "from": [2, 0, 2],
+      "to": [14, 3, 14]
+    },
+    {
+      "name": "stem",
+      "from": [5, 3, 6],
+      "to": [11, 12, 10]
+    },
+    {
+      "name": "head",
+      "from": [3, 12, 5],
+      "to": [13, 16, 11]
+    },
+    {
+      "name": "shoulder_left",
+      "from": [2, 12, 6],
+      "to": [3, 16, 10]
+    },
+    {
+      "name": "shoulder_right",
+      "from": [13, 12, 6],
+      "to": [14, 16, 10]
+    },
+    {
+      "name": "cap",
+      "from": [4, 15, 6],
+      "to": [12, 16, 10]
+    },
+    {
+      "name": "cross_emboss",
+      "from": [6, 12.5, 10.75],
+      "to": [10, 15.5, 11]
+    }
+  ]
+}

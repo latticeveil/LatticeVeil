@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Configurations>Debug;Release</Configurations>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <RootNamespace>LatticeVeilMonoGame</RootNamespace>
+    <AssemblyName>LatticeVeilMonoGame</AssemblyName>
+    <Version>6.0.0.0</Version>
+
+    <ApplicationIcon>Icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\\ThirdParty\\EOS\\SDK\\Source\\Core\\Common.cs')">
+    <DefineConstants>$(DefineConstants);EOS_SDK;EOS_PLATFORM_WINDOWS_64</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('..\\ThirdParty\\EOS\\SDK\\Source\\Core\\Common.cs')">
+    <Compile Include="..\\ThirdParty\\EOS\\SDK\\Source\\**\\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\\ThirdParty\\EOS\\EOSSDK-Win64-Shipping.dll')">
+    <None Include="..\\ThirdParty\\EOS\\EOSSDK-Win64-Shipping.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- MonoGame DesktopGL framework - OpenGL based rendering without Vulkan dependency -->
+  <ItemGroup>
+    <PackageReference Include="LibNoise" Version="0.2.0" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
+    <PackageReference Include="SharpNoise" Version="0.12.1.1" />
+    <PackageReference Include="System.Management" Version="4.0.0" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.2" />
+    <PackageReference Include="System.Memory" Version="4.5.5" />
+    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
+    <PackageReference Include="System.Collections.Concurrent" Version="4.3.0" />
+    <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
+    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.0.0" />
+    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.4.1" />
+    <PackageReference Include="MonoGame.Library.OpenAL" Version="1.24.3.2" />
+    <PackageReference Include="NVorbis" Version="0.10.4" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="System.Threading.Tasks.Dataflow" Version="10.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Launcher/Resources/LauncherLogo.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="Defaults/**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

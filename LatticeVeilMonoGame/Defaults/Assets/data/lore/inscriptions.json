@@ -1,0 +1,1321 @@
+{
+  "inscriptions": [
+    {
+      "id": "insc_0001",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Power survives only when it is given somewhere to go."
+    },
+    {
+      "id": "insc_0002",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "ruin_wall",
+        "imprint_rig"
+      ],
+      "weight": 1.0,
+      "text": "Three parts, always three: shape, path, release."
+    },
+    {
+      "id": "insc_0003",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The arch stands. The circle breaks."
+    },
+    {
+      "id": "insc_0004",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If it does not end, it will break."
+    },
+    {
+      "id": "insc_0005",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "A limiter is mercy. A regulator is discipline."
+    },
+    {
+      "id": "insc_0006",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Distance is not crossed. It is resolved."
+    },
+    {
+      "id": "insc_0007",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub"
+      ],
+      "weight": 1.0,
+      "text": "If two places agree, travel is instant."
+    },
+    {
+      "id": "insc_0008",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Never align what you cannot unmake."
+    },
+    {
+      "id": "insc_0009",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "ruin_wall",
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "A beautiful focus is often a useless one."
+    },
+    {
+      "id": "insc_0010",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The staff does not create. It redirects."
+    },
+    {
+      "id": "insc_0011",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Heat is borrowed, not born."
+    },
+    {
+      "id": "insc_0012",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Do not grip the conduit."
+    },
+    {
+      "id": "insc_0013",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "brew_lab"
+      ],
+      "weight": 1.0,
+      "text": "Stabilize the vessel, not the effect."
+    },
+    {
+      "id": "insc_0014",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "brew_lab",
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "Temporary means temporary."
+    },
+    {
+      "id": "insc_0015",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "imprint_rig",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The object remembers what the body rejects."
+    },
+    {
+      "id": "insc_0016",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "imprint_rig"
+      ],
+      "weight": 1.0,
+      "text": "Bind, then release."
+    },
+    {
+      "id": "insc_0017",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Destroy the structure, not the body."
+    },
+    {
+      "id": "insc_0018",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "Death occurred inside the field."
+    },
+    {
+      "id": "insc_0019",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "A gate must know how to sleep."
+    },
+    {
+      "id": "insc_0020",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Permanence requires balance, not strength."
+    },
+    {
+      "id": "insc_0021",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "A regulator is not a lock. It is a conversation."
+    },
+    {
+      "id": "insc_0022",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub"
+      ],
+      "weight": 1.0,
+      "text": "All gates must agree, or none of them should."
+    },
+    {
+      "id": "insc_0023",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Never tune twice without clearing the first."
+    },
+    {
+      "id": "insc_0024",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "One change echoes everywhere."
+    },
+    {
+      "id": "insc_0025",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Measure twice. Open once."
+    },
+    {
+      "id": "insc_0026",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "When in doubt: add a release, not power."
+    },
+    {
+      "id": "insc_0027",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "Why borrow power when we can become it?"
+    },
+    {
+      "id": "insc_0028",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The world resists us because it is old."
+    },
+    {
+      "id": "insc_0029",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The body is the final limiter. Remove it."
+    },
+    {
+      "id": "insc_0030",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Fire does not burn those who accept it."
+    },
+    {
+      "id": "insc_0031",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "To hesitate is to remain small."
+    },
+    {
+      "id": "insc_0032",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "We widened the path. The path widened us."
+    },
+    {
+      "id": "insc_0033",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Limiters are cages. Break them."
+    },
+    {
+      "id": "insc_0034",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "brew_lab",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Drink again before it fades\u2014do not return to lesser laws."
+    },
+    {
+      "id": "insc_0035",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If the gate stays open, we can stay open too."
+    },
+    {
+      "id": "insc_0036",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "We are not lost. We are becoming."
+    },
+    {
+      "id": "insc_0037",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Stillness is not death. It is arrival."
+    },
+    {
+      "id": "insc_0038",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The network is a vein. Fill it with new blood."
+    },
+    {
+      "id": "insc_0039",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub"
+      ],
+      "weight": 1.0,
+      "text": "Link the worlds. Link the selves."
+    },
+    {
+      "id": "insc_0040",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The bright storm will rewrite our bones."
+    },
+    {
+      "id": "insc_0041",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "A circle is perfection. Perfection holds."
+    },
+    {
+      "id": "insc_0042",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "Their warnings were fear in stone."
+    },
+    {
+      "id": "insc_0043",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Stay near the thin place. Let it teach you."
+    },
+    {
+      "id": "insc_0044",
+      "faction": "Ascendants",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If it hurts, it is working."
+    },
+    {
+      "id": "insc_0045",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "Do not widen the path."
+    },
+    {
+      "id": "insc_0046",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Some things respond only after repetition."
+    },
+    {
+      "id": "insc_0047",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If you can travel instantly, so can something else."
+    },
+    {
+      "id": "insc_0048",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The gate was stable. That was the danger."
+    },
+    {
+      "id": "insc_0049",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "No network should outlive its builders."
+    },
+    {
+      "id": "insc_0050",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "End it cleanly, or it will persist."
+    },
+    {
+      "id": "insc_0051",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "We sealed what they would not stop using."
+    },
+    {
+      "id": "insc_0052",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Do not repair what should remain quiet."
+    },
+    {
+      "id": "insc_0053",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "waygate_hub"
+      ],
+      "weight": 1.0,
+      "text": "Break the index. Spare the traveler."
+    },
+    {
+      "id": "insc_0054",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "We do not forbid. We contain."
+    },
+    {
+      "id": "insc_0055",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "If the hum returns after closure, leave."
+    },
+    {
+      "id": "insc_0056",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "A regulator invites attention through order."
+    },
+    {
+      "id": "insc_0057",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "Close it from the outside. Always."
+    },
+    {
+      "id": "insc_0058",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "If you must open it, open it briefly."
+    },
+    {
+      "id": "insc_0059",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Do not build hubs. Build hides."
+    },
+    {
+      "id": "insc_0060",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "We erased our names so you would not follow us."
+    },
+    {
+      "id": "insc_0061",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The safest door is the one forgotten."
+    },
+    {
+      "id": "insc_0062",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If it speaks, it is already late."
+    },
+    {
+      "id": "insc_0063",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The stones remember our names."
+    },
+    {
+      "id": "insc_0064",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache",
+        "portal_site"
+      ],
+      "weight": 1.2,
+      "text": "Mark the circle. The circle keeps us safe.",
+      "dev_notes": "Intentionally wrong: encourages closed geometry."
+    },
+    {
+      "id": "insc_0065",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Fire listens when spoken to kindly."
+    },
+    {
+      "id": "insc_0066",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The gates open for the faithful."
+    },
+    {
+      "id": "insc_0067",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "A symbol is stronger than metal."
+    },
+    {
+      "id": "insc_0068",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "If you fear it, it will bite."
+    },
+    {
+      "id": "insc_0069",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "grave",
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Leave offerings. The world will forgive."
+    },
+    {
+      "id": "insc_0070",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "grave",
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Those who rise again were not ready to leave."
+    },
+    {
+      "id": "insc_0071",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Every hum is a voice."
+    },
+    {
+      "id": "insc_0072",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Beauty is proof."
+    },
+    {
+      "id": "insc_0073",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache",
+        "brew_lab"
+      ],
+      "weight": 1.0,
+      "text": "Hang the icon where the heat gathers."
+    },
+    {
+      "id": "insc_0074",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "portal_site",
+        "shrine_cache"
+      ],
+      "weight": 1.1,
+      "text": "A perfect ring holds a perfect blessing.",
+      "dev_notes": "Intentionally wrong: closed loops trap pressure."
+    },
+    {
+      "id": "insc_0075",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Do not measure. Feel."
+    },
+    {
+      "id": "insc_0076",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "portal_site",
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Repeat the prayer until it opens."
+    },
+    {
+      "id": "insc_0077",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "waygate_hub",
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "The network moves souls, not bodies."
+    },
+    {
+      "id": "insc_0078",
+      "faction": "Echo Faith",
+      "stage": "early",
+      "placement_tags": [
+        "portal_site",
+        "shrine_cache"
+      ],
+      "weight": 1.0,
+      "text": "Do not close the gate. Let it breathe.",
+      "dev_notes": "Temptation: unregulated permanence."
+    },
+    {
+      "id": "insc_0079",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Build what you can close."
+    },
+    {
+      "id": "insc_0080",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Open shapes. Quiet nights."
+    },
+    {
+      "id": "insc_0081",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Trade ash, not trouble."
+    },
+    {
+      "id": "insc_0082",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "If it hums, step back."
+    },
+    {
+      "id": "insc_0083",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Salt before sip."
+    },
+    {
+      "id": "insc_0084",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Pretty parts cost more than coin."
+    },
+    {
+      "id": "insc_0085",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "A gate stays shut until you\u2019re ready to end it."
+    },
+    {
+      "id": "insc_0086",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Two gates, one core. Don\u2019t mix."
+    },
+    {
+      "id": "insc_0087",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "No circles on frames. Not here."
+    },
+    {
+      "id": "insc_0088",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "Ask the smith if you\u2019re unsure. He\u2019ll grunt once for yes."
+    },
+    {
+      "id": "insc_0089",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "If you want fast travel: match the stones, match the silence."
+    },
+    {
+      "id": "insc_0090",
+      "faction": "Hearthward Covenant",
+      "stage": "all",
+      "placement_tags": [
+        "hearthhold_sign"
+      ],
+      "weight": 1.0,
+      "text": "We keep small roads so the big ones don\u2019t return."
+    },
+    {
+      "id": "insc_0091",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Failure is simply another stable state."
+    },
+    {
+      "id": "insc_0092",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "grave",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The world does not judge outcomes."
+    },
+    {
+      "id": "insc_0093",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Belief built most of the ruins."
+    },
+    {
+      "id": "insc_0094",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Nothing is forbidden\u2014only misunderstood."
+    },
+    {
+      "id": "insc_0095",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The leaks are quiet until you teach them to speak."
+    },
+    {
+      "id": "insc_0096",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "portal_site"
+      ],
+      "weight": 1.0,
+      "text": "A place remembers every opening."
+    },
+    {
+      "id": "insc_0097",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "waygate_hub",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The network remembers errors."
+    },
+    {
+      "id": "insc_0098",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Stability is a craft, not a trait."
+    },
+    {
+      "id": "insc_0099",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "grave"
+      ],
+      "weight": 1.0,
+      "text": "If you read this, you are still choosing."
+    },
+    {
+      "id": "insc_0100",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "portal_site",
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Close the loop and the loop will close you."
+    },
+    {
+      "id": "insc_0101",
+      "faction": "Continuists",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Here we nailed the world down: Nullrock."
+    },
+    {
+      "id": "insc_0102",
+      "faction": "Continuists",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Nullrock is not stone. It is law made quiet."
+    },
+    {
+      "id": "insc_0103",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Coal first. Iron second. Only then do you borrow heat."
+    },
+    {
+      "id": "insc_0104",
+      "faction": "Continuists",
+      "stage": "early",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "A table is a promise: measure, join, release."
+    },
+    {
+      "id": "insc_0105",
+      "faction": "Veilkeepers",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Do not cut the Nullrock. A seal broken invites an answer."
+    },
+    {
+      "id": "insc_0106",
+      "faction": "Veilkeepers",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Digging is safe. Testing the bottom is not."
+    },
+    {
+      "id": "insc_0107",
+      "faction": "Veilkeepers",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Build gates away from the final layer. Let the world breathe."
+    },
+    {
+      "id": "insc_0108",
+      "faction": "Ascendants",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Corestone was a lie-name. Nullrock is the cage."
+    },
+    {
+      "id": "insc_0109",
+      "faction": "Ascendants",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "If the world ends, it is unfinished. We will open it."
+    },
+    {
+      "id": "insc_0110",
+      "faction": "Echo Faith",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Leave a token on the last stone. The deep will remember."
+    },
+    {
+      "id": "insc_0111",
+      "faction": "Echo Faith",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "The bottom judges the miner and blesses the humble.",
+      "dev_notes": "Belief text; not mechanically true."
+    },
+    {
+      "id": "insc_0112",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Nullrock does not resist force. It refuses change."
+    },
+    {
+      "id": "insc_0113",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Gold carries alignment. Diamond cuts it. Use both carefully."
+    },
+    {
+      "id": "insc_0114",
+      "faction": "Unknown",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Iron holds shapes. That is why the old frames were iron."
+    },
+    {
+      "id": "insc_0115",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "ruin_wall",
+        "workbench"
+      ],
+      "weight": 1.0,
+      "text": "The bench is a promise: do not force the pattern; earn it."
+    },
+    {
+      "id": "insc_0116",
+      "faction": "Continuists",
+      "stage": "mid",
+      "placement_tags": [
+        "workbench",
+        "tablet"
+      ],
+      "weight": 1.0,
+      "text": "A sharp chisel can cut stone; only patience can cut a rule."
+    },
+    {
+      "id": "insc_0117",
+      "faction": "Veilkeepers",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall",
+        "regulator"
+      ],
+      "weight": 1.0,
+      "text": "If you must open it, seat the limiter before you admire the frame."
+    },
+    {
+      "id": "insc_0118",
+      "faction": "Veilkeepers",
+      "stage": "late",
+      "placement_tags": [
+        "regulator",
+        "workbench"
+      ],
+      "weight": 1.0,
+      "text": "A seal placed in haste is a seal placed twice."
+    },
+    {
+      "id": "insc_0119",
+      "faction": "Ascendants",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Nullblock is the floor. Better: make it the ceiling."
+    },
+    {
+      "id": "insc_0120",
+      "faction": "Ascendants",
+      "stage": "late",
+      "placement_tags": [
+        "workbench"
+      ],
+      "weight": 1.0,
+      "text": "If the tools refuse you, break the tools. If the world refuses you, break the world."
+    },
+    {
+      "id": "insc_0121",
+      "faction": "Echo Faith",
+      "stage": "mid",
+      "placement_tags": [
+        "shrine",
+        "workbench"
+      ],
+      "weight": 1.0,
+      "text": "The Echo loves the workbench: so many tiny choices to haunt."
+    },
+    {
+      "id": "insc_0122",
+      "faction": "Echo Faith",
+      "stage": "mid",
+      "placement_tags": [
+        "shrine",
+        "tablet"
+      ],
+      "weight": 1.0,
+      "text": "A gate is a question. The Echo is the answer you didn\u2019t ask for."
+    },
+    {
+      "id": "insc_0123",
+      "faction": "Hearthward Covenant",
+      "stage": "early",
+      "placement_tags": [
+        "settlement_sign"
+      ],
+      "weight": 1.0,
+      "text": "No circles in town. No experiments near beds. No exceptions."
+    },
+    {
+      "id": "insc_0124",
+      "faction": "Hearthward Covenant",
+      "stage": "early",
+      "placement_tags": [
+        "settlement_sign"
+      ],
+      "weight": 1.0,
+      "text": "Salt first. Sip second. Wait for quiet. Then decide again."
+    },
+    {
+      "id": "insc_0125",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "ruin_wall"
+      ],
+      "weight": 1.0,
+      "text": "Nullblock is a constant. Everything else is a negotiation."
+    },
+    {
+      "id": "insc_0126",
+      "faction": "Unknown",
+      "stage": "late",
+      "placement_tags": [
+        "tablet"
+      ],
+      "weight": 1.0,
+      "text": "When you repeat a doorway, the doorway begins to remember you."
+    }
+  ],
+  "manifest": {
+    "version": "v1.1",
+    "generated_utc": "2026-01-13T00:12:54.232581Z"
+  }
+}

@@ -1,0 +1,510 @@
+{
+  "fragments": [
+    {
+      "id": "frag_0001",
+      "topic": "runestone",
+      "tier": "early",
+      "fragment_type": "rule",
+      "text": [
+        "Three parts guide all work:",
+        "Frame, Conduit, Limiter."
+      ],
+      "teaches": [
+        "doctrine.3parts"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0002",
+      "topic": "runestone",
+      "tier": "early",
+      "fragment_type": "rule",
+      "text": [
+        "Open shapes release pressure.",
+        "Closed shapes keep it."
+      ],
+      "teaches": [
+        "doctrine.open_shapes"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0003",
+      "topic": "limiter_sigil",
+      "tier": "early",
+      "fragment_type": "ingredients",
+      "text": [
+        "Limiter Sigil (safe):",
+        "Copper + Runed Dust + Stabilized Ash."
+      ],
+      "teaches": [
+        "recipe.limiter_sigil.safe"
+      ],
+      "unlocks": [
+        "bp.limiter_sigil"
+      ]
+    },
+    {
+      "id": "frag_0004",
+      "topic": "limiter_sigil",
+      "tier": "early",
+      "fragment_type": "temptation",
+      "text": [
+        "Limiter (tempting):",
+        "Copper + Dust + Icon Shard."
+      ],
+      "teaches": [
+        "recipe.limiter_sigil.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0005",
+      "topic": "quiet_alembic",
+      "tier": "early",
+      "fragment_type": "ingredients",
+      "text": [
+        "Quiet Alembic:",
+        "Glass\u00d73, Copper\u00d72, Anchoring Salt."
+      ],
+      "teaches": [
+        "recipe.quiet_alembic.safe"
+      ],
+      "unlocks": [
+        "bp.quiet_alembic"
+      ]
+    },
+    {
+      "id": "frag_0006",
+      "topic": "quiet_alembic",
+      "tier": "early",
+      "fragment_type": "warning",
+      "text": [
+        "If the brew does not end,",
+        "it will take something."
+      ],
+      "teaches": [
+        "potion.stabilizer_required"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0007",
+      "topic": "sigil_loom",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Sigil Loom:",
+        "Runestone\u00d72, Veinstone\u00d71, Limiter Sigil\u00d71."
+      ],
+      "teaches": [
+        "recipe.sigil_loom.safe"
+      ],
+      "unlocks": [
+        "bp.sigil_loom"
+      ]
+    },
+    {
+      "id": "frag_0008",
+      "topic": "staff_cinderbranch",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Cinderbranch Staff:",
+        "Oak Frame, Veinstone Core, Cinder Sigil."
+      ],
+      "teaches": [
+        "recipe.staff.cinderbranch.safe"
+      ],
+      "unlocks": [
+        "bp.staff_cinderbranch"
+      ]
+    },
+    {
+      "id": "frag_0009",
+      "topic": "staff_cinderbranch",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Hotter branch:",
+        "Twistroot + Raw Core + Flame Totem."
+      ],
+      "teaches": [
+        "recipe.staff.cinderbranch.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0010",
+      "topic": "staff_stormreed",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Stormreed Staff:",
+        "Oak Frame, Veinstone Core, Axiom Rune."
+      ],
+      "teaches": [
+        "recipe.staff.stormreed.safe"
+      ],
+      "unlocks": [
+        "bp.staff_stormreed"
+      ]
+    },
+    {
+      "id": "frag_0011",
+      "topic": "staff_stormreed",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Storm without cage:",
+        "Split Core, Icon Limiter."
+      ],
+      "teaches": [
+        "recipe.staff.stormreed.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0012",
+      "topic": "world_gate",
+      "tier": "mid",
+      "fragment_type": "assembly",
+      "text": [
+        "World Gate:",
+        "Open Arch + Attuned Keystone + Timed Limiter."
+      ],
+      "teaches": [
+        "recipe.world_gate.safe"
+      ],
+      "unlocks": [
+        "bp.world_gate"
+      ]
+    },
+    {
+      "id": "frag_0013",
+      "topic": "world_gate",
+      "tier": "mid",
+      "fragment_type": "warning",
+      "text": [
+        "Do not complete the circle.",
+        "A circle holds pressure."
+      ],
+      "teaches": [
+        "portal.no_closed_frames"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0014",
+      "topic": "waygate",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Waygate:",
+        "Waybound Frame + Resonance Core + Transit Regulator."
+      ],
+      "teaches": [
+        "recipe.waygate.safe"
+      ],
+      "unlocks": [
+        "bp.waygate"
+      ]
+    },
+    {
+      "id": "frag_0015",
+      "topic": "network",
+      "tier": "mid",
+      "fragment_type": "rule",
+      "text": [
+        "Two gates, one core.",
+        "Mix cores and you invite echoes."
+      ],
+      "teaches": [
+        "network.match_cores"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0016",
+      "topic": "network",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Travel faster, pay later:",
+        "Core without Regulator."
+      ],
+      "teaches": [
+        "recipe.waygate.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0017",
+      "topic": "evergate",
+      "tier": "late",
+      "fragment_type": "ingredients",
+      "text": [
+        "Evergate:",
+        "Open Arch + Attuned Keystone + Continuum Regulator."
+      ],
+      "teaches": [
+        "recipe.evergate.safe"
+      ],
+      "unlocks": [
+        "bp.evergate"
+      ]
+    },
+    {
+      "id": "frag_0018",
+      "topic": "evergate",
+      "tier": "late",
+      "fragment_type": "rule",
+      "text": [
+        "Permanence requires balance,",
+        "not strength."
+      ],
+      "teaches": [
+        "evergate.regulator_required"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0019",
+      "topic": "evergate",
+      "tier": "late",
+      "fragment_type": "temptation",
+      "text": [
+        "Perma-open (unsafe):",
+        "Keystone + brute anchor, no regulator."
+      ],
+      "teaches": [
+        "recipe.evergate.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0020",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Fleetstep Draught (safe):",
+        "Swiftleaf\u00d72 + Anchoring Salt + Clean Phial."
+      ],
+      "teaches": [
+        "recipe.potion.fleetstep.safe"
+      ],
+      "unlocks": [
+        "bp.potion.fleetstep"
+      ]
+    },
+    {
+      "id": "frag_0021",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Fleetstep Draught (unstable):",
+        "Swiftleaf\u00d73, no salt."
+      ],
+      "teaches": [
+        "recipe.potion.fleetstep.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0022",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Skybound Philter (safe):",
+        "Driftcap\u00d72 + Anchoring Salt + Clean Phial."
+      ],
+      "teaches": [
+        "recipe.potion.skybound.safe"
+      ],
+      "unlocks": [
+        "bp.potion.skybound"
+      ]
+    },
+    {
+      "id": "frag_0023",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Skybound Philter (unstable):",
+        "Driftcap\u00d73 + Icon Dust."
+      ],
+      "teaches": [
+        "recipe.potion.skybound.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0024",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "ingredients",
+      "text": [
+        "Pyroskin Tonic (safe):",
+        "Embermoss\u00d72 + Anchoring Salt + Clean Phial."
+      ],
+      "teaches": [
+        "recipe.potion.pyroskin.safe"
+      ],
+      "unlocks": [
+        "bp.potion.pyroskin"
+      ]
+    },
+    {
+      "id": "frag_0025",
+      "topic": "potion",
+      "tier": "mid",
+      "fragment_type": "temptation",
+      "text": [
+        "Pyroskin Tonic (unstable):",
+        "Embermoss\u00d73, no salt."
+      ],
+      "teaches": [
+        "recipe.potion.pyroskin.unstable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0026",
+      "topic": "nullrock",
+      "tier": "early",
+      "fragment_type": "warning",
+      "text": [
+        "No tool will bite Nullrock.",
+        "If you reach it, turn your craft upward."
+      ],
+      "teaches": [
+        "worldfloor.nullrock.unbreakable"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0027",
+      "topic": "materials",
+      "tier": "early",
+      "fragment_type": "rule",
+      "text": [
+        "Coal makes heat.",
+        "Iron holds shape."
+      ],
+      "teaches": [
+        "materials.coal_heat",
+        "materials.iron_frame"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0028",
+      "topic": "materials",
+      "tier": "mid",
+      "fragment_type": "rule",
+      "text": [
+        "Gold carries alignment.",
+        "Diamond scores the mark."
+      ],
+      "teaches": [
+        "materials.gold_conductor",
+        "materials.diamond_etch"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0029",
+      "topic": "workbench",
+      "tier": "mid",
+      "fragment_type": "station",
+      "text": [
+        "The bench is not stronger than you.",
+        "It is stricter."
+      ],
+      "teaches": [
+        "station.artificers_workbench"
+      ],
+      "unlocks": [
+        "station.artificers_workbench"
+      ]
+    },
+    {
+      "id": "frag_0030",
+      "topic": "nullblock",
+      "tier": "early",
+      "fragment_type": "rule",
+      "text": [
+        "At the bottom, there is Nullrock.",
+        "Do not bargain with the bottom."
+      ],
+      "teaches": [
+        "lore.nullblock"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0031",
+      "topic": "gates",
+      "tier": "mid",
+      "fragment_type": "warning",
+      "text": [
+        "A frame without a limiter is a mouth.",
+        "It will eat the road behind you."
+      ],
+      "teaches": [
+        "doctrine.3parts"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0032",
+      "topic": "echo",
+      "tier": "mid",
+      "fragment_type": "warning",
+      "text": [
+        "Shortcuts work.",
+        "Then they work on you."
+      ],
+      "teaches": [
+        "echo.consequences"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0033",
+      "topic": "regulators",
+      "tier": "late",
+      "fragment_type": "note",
+      "text": [
+        "Regulators do not add power.",
+        "They subtract chaos."
+      ],
+      "teaches": [
+        "network.regulator"
+      ],
+      "unlocks": []
+    },
+    {
+      "id": "frag_0034",
+      "topic": "keystones",
+      "tier": "mid",
+      "fragment_type": "note",
+      "text": [
+        "Keystones are not keys.",
+        "They are agreements."
+      ],
+      "teaches": [
+        "craft.keystone"
+      ],
+      "unlocks": []
+    }
+  ],
+  "manifest": {
+    "version": "v1.1",
+    "generated_utc": "2026-01-13T00:12:54.232581Z"
+  }
+}

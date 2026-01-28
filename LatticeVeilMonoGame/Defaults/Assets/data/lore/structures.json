@@ -1,0 +1,255 @@
+{
+  "structures": [
+    {
+      "id": "grave_old",
+      "rarity": "common",
+      "biome_tags": [
+        "plains",
+        "forest",
+        "desert",
+        "mountain"
+      ],
+      "nearby_tags": [
+        "ancient_road",
+        "cliff",
+        "river"
+      ],
+      "spawn_rules": "Scatter 1–3 per 1024x1024 area. Prefer slight elevation, under lone trees, ridge lines.",
+      "loot_table": "grave",
+      "inscription_pool": [
+        "pool_grave_mixed"
+      ]
+    },
+    {
+      "id": "ruin_continuist_workshop_small",
+      "rarity": "uncommon",
+      "biome_tags": [
+        "plains",
+        "forest",
+        "mountain"
+      ],
+      "nearby_tags": [
+        "ancient_road",
+        "river"
+      ],
+      "spawn_rules": "1 per 2048x2048. Contains crafting props (broken loom/alembic), 1–2 tablets.",
+      "loot_table": "continuist_ruin_chest",
+      "inscription_pool": [
+        "pool_continuist_workshop"
+      ]
+    },
+    {
+      "id": "shrine_echo_small",
+      "rarity": "uncommon",
+      "biome_tags": [
+        "forest",
+        "swamp",
+        "desert"
+      ],
+      "nearby_tags": [
+        "cliff",
+        "river"
+      ],
+      "spawn_rules": "1 per 2048x2048. Decorative circle motifs, icon shards, temptation fragments.",
+      "loot_table": "echo_shrine_cache",
+      "inscription_pool": [
+        "pool_echo_shrine"
+      ]
+    },
+    {
+      "id": "waygate_hub_ruined",
+      "rarity": "rare",
+      "biome_tags": [
+        "plains",
+        "forest",
+        "mountain"
+      ],
+      "nearby_tags": [
+        "ancient_road"
+      ],
+      "spawn_rules": "1 per 4096x4096. Central dais + 2–6 broken gate stubs, strong network lore.",
+      "loot_table": "waygate_hub_cache",
+      "inscription_pool": [
+        "pool_waygate_hub"
+      ]
+    },
+    {
+      "id": "portal_site_continuist",
+      "rarity": "rare",
+      "biome_tags": [
+        "mountain",
+        "plains"
+      ],
+      "nearby_tags": [
+        "thin_spot",
+        "cliff"
+      ],
+      "spawn_rules": "1 per 4096x4096. Open arch foundations, missing keystone, safety notes.",
+      "loot_table": "portal_site_cache",
+      "inscription_pool": [
+        "pool_portal_site"
+      ]
+    },
+    {
+      "id": "regulator_chamber_veilkeeper",
+      "rarity": "legendary",
+      "biome_tags": [
+        "cave",
+        "mountain"
+      ],
+      "nearby_tags": [
+        "thin_spot"
+      ],
+      "spawn_rules": "Very rare. Hidden behind seals; contains Evergate lore and regulator parts.",
+      "loot_table": "veil_seal_cache",
+      "inscription_pool": [
+        "pool_veil_seal"
+      ]
+    },
+    {
+      "id": "hearthhold_small",
+      "rarity": "rare",
+      "biome_tags": [
+        "plains",
+        "forest"
+      ],
+      "nearby_tags": [
+        "river",
+        "ancient_road"
+      ],
+      "spawn_rules": "1 per 4096x4096. 6–14 NPCs, minimal quests, trading focus, subtle hint signs.",
+      "loot_table": "hearthhold_trader_stock",
+      "inscription_pool": [
+        "pool_hearthhold_signs"
+      ]
+    }
+  ],
+  "inscription_pools": {
+    "pool_grave_mixed": {
+      "filter": {
+        "placement_tags_any": [
+          "grave"
+        ],
+        "faction_any": [
+          "Continuists",
+          "Ascendants",
+          "Veilkeepers",
+          "Echo Faith",
+          "Unknown"
+        ]
+      },
+      "pick": {
+        "count": [
+          1,
+          2
+        ]
+      }
+    },
+    "pool_continuist_workshop": {
+      "filter": {
+        "placement_tags_any": [
+          "ruin_wall",
+          "brew_lab",
+          "imprint_rig"
+        ],
+        "faction_any": [
+          "Continuists"
+        ]
+      },
+      "pick": {
+        "count": [
+          2,
+          4
+        ]
+      }
+    },
+    "pool_echo_shrine": {
+      "filter": {
+        "placement_tags_any": [
+          "shrine_cache"
+        ],
+        "faction_any": [
+          "Echo Faith"
+        ]
+      },
+      "pick": {
+        "count": [
+          2,
+          4
+        ]
+      }
+    },
+    "pool_waygate_hub": {
+      "filter": {
+        "placement_tags_any": [
+          "waygate_hub"
+        ],
+        "faction_any": [
+          "Continuists",
+          "Veilkeepers",
+          "Ascendants",
+          "Unknown"
+        ]
+      },
+      "pick": {
+        "count": [
+          3,
+          6
+        ]
+      }
+    },
+    "pool_portal_site": {
+      "filter": {
+        "placement_tags_any": [
+          "portal_site"
+        ],
+        "faction_any": [
+          "Continuists",
+          "Veilkeepers",
+          "Ascendants",
+          "Unknown",
+          "Echo Faith"
+        ]
+      },
+      "pick": {
+        "count": [
+          2,
+          5
+        ]
+      }
+    },
+    "pool_veil_seal": {
+      "filter": {
+        "placement_tags_any": [
+          "ruin_wall",
+          "portal_site"
+        ],
+        "faction_any": [
+          "Veilkeepers"
+        ]
+      },
+      "pick": {
+        "count": [
+          3,
+          6
+        ]
+      }
+    },
+    "pool_hearthhold_signs": {
+      "filter": {
+        "placement_tags_any": [
+          "hearthhold_sign"
+        ],
+        "faction_any": [
+          "Hearthward Covenant"
+        ]
+      },
+      "pick": {
+        "count": [
+          2,
+          6
+        ]
+      }
+    }
+  }
+}

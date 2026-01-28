@@ -1,0 +1,410 @@
+{
+  "grave": {
+    "tiers": {
+      "early": [
+        {
+          "item": "GraveSilt",
+          "min": 1,
+          "max": 2,
+          "weight": 30
+        },
+        {
+          "item": "RunestoneDust",
+          "min": 1,
+          "max": 3,
+          "weight": 22
+        },
+        {
+          "item": "fragment.random_early",
+          "min": 1,
+          "max": 1,
+          "weight": 18
+        },
+        {
+          "item": "VeinstoneCrystal",
+          "min": 1,
+          "max": 1,
+          "weight": 8
+        },
+        {
+          "item": "AnchoringSalt",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ],
+      "mid": [
+        {
+          "item": "fragment.random_mid",
+          "min": 1,
+          "max": 1,
+          "weight": 28
+        },
+        {
+          "item": "VeinstoneCrystal",
+          "min": 1,
+          "max": 2,
+          "weight": 18
+        },
+        {
+          "item": "StabilizedAsh",
+          "min": 1,
+          "max": 1,
+          "weight": 12
+        },
+        {
+          "item": "EchoIconShard",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ],
+      "late": [
+        {
+          "item": "fragment.random_late",
+          "min": 1,
+          "max": 1,
+          "weight": 20
+        },
+        {
+          "item": "StabilizedAsh",
+          "min": 1,
+          "max": 2,
+          "weight": 16
+        },
+        {
+          "item": "AlignmentMatrixFragment",
+          "min": 1,
+          "max": 1,
+          "weight": 6
+        }
+      ]
+    }
+  },
+  "continuist_ruin_chest": {
+    "tiers": {
+      "early": [
+        {
+          "item": "StabilizedAsh",
+          "min": 1,
+          "max": 2,
+          "weight": 26
+        },
+        {
+          "item": "AnchoringSalt",
+          "min": 1,
+          "max": 2,
+          "weight": 22
+        },
+        {
+          "item": "VeinstoneCrystal",
+          "min": 1,
+          "max": 1,
+          "weight": 14
+        },
+        {
+          "item": "fragment.safe_blueprint_early",
+          "min": 1,
+          "max": 1,
+          "weight": 28
+        }
+      ],
+      "mid": [
+        {
+          "item": "fragment.safe_blueprint_mid",
+          "min": 1,
+          "max": 1,
+          "weight": 30
+        },
+        {
+          "item": "LimiterSigil",
+          "min": 1,
+          "max": 1,
+          "weight": 18
+        },
+        {
+          "item": "CopperWiring",
+          "min": 1,
+          "max": 3,
+          "weight": 20
+        },
+        {
+          "item": "ArtificersWorkbench",
+          "min": 1,
+          "max": 1,
+          "weight": 3
+        }
+      ],
+      "late": [
+        {
+          "item": "fragment.safe_blueprint_late",
+          "min": 1,
+          "max": 1,
+          "weight": 22
+        },
+        {
+          "item": "AnchoringAlloy",
+          "min": 1,
+          "max": 1,
+          "weight": 14
+        },
+        {
+          "item": "RegulatorComponent",
+          "min": 1,
+          "max": 1,
+          "weight": 8
+        }
+      ]
+    }
+  },
+  "echo_shrine_cache": {
+    "tiers": {
+      "early": [
+        {
+          "item": "EchoIconShard",
+          "min": 1,
+          "max": 2,
+          "weight": 28
+        },
+        {
+          "item": "fragment.temptation",
+          "min": 1,
+          "max": 1,
+          "weight": 22
+        },
+        {
+          "item": "GraveSilt",
+          "min": 1,
+          "max": 2,
+          "weight": 18
+        }
+      ],
+      "mid": [
+        {
+          "item": "EchoIconShard",
+          "min": 1,
+          "max": 3,
+          "weight": 26
+        },
+        {
+          "item": "fragment.temptation",
+          "min": 1,
+          "max": 1,
+          "weight": 26
+        },
+        {
+          "item": "VeinstoneCrystal",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ],
+      "late": [
+        {
+          "item": "EchoIconShard",
+          "min": 2,
+          "max": 4,
+          "weight": 20
+        },
+        {
+          "item": "fragment.temptation",
+          "min": 1,
+          "max": 1,
+          "weight": 20
+        }
+      ]
+    }
+  },
+  "waygate_hub_cache": {
+    "tiers": {
+      "mid": [
+        {
+          "item": "fragment.waygate",
+          "min": 1,
+          "max": 1,
+          "weight": 30
+        },
+        {
+          "item": "VeinstoneCrystal",
+          "min": 1,
+          "max": 2,
+          "weight": 18
+        },
+        {
+          "item": "AxiomFulgrite",
+          "min": 1,
+          "max": 2,
+          "weight": 18
+        },
+        {
+          "item": "TransitRegulatorPart",
+          "min": 1,
+          "max": 1,
+          "weight": 12
+        }
+      ],
+      "late": [
+        {
+          "item": "fragment.network",
+          "min": 1,
+          "max": 1,
+          "weight": 28
+        },
+        {
+          "item": "ResonanceCore",
+          "min": 1,
+          "max": 1,
+          "weight": 16
+        },
+        {
+          "item": "WayfinderPlinthPart",
+          "min": 1,
+          "max": 1,
+          "weight": 12
+        }
+      ]
+    }
+  },
+  "veil_seal_cache": {
+    "tiers": {
+      "late": [
+        {
+          "item": "fragment.evergate",
+          "min": 1,
+          "max": 1,
+          "weight": 26
+        },
+        {
+          "item": "AlignmentMatrixFragment",
+          "min": 1,
+          "max": 1,
+          "weight": 14
+        },
+        {
+          "item": "RegulatorComponent",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        },
+        {
+          "item": "StabilizedAsh",
+          "min": 1,
+          "max": 2,
+          "weight": 20
+        }
+      ]
+    }
+  },
+  "portal_site_cache": {
+    "tiers": {
+      "mid": [
+        {
+          "item": "fragment.world_gate",
+          "min": 1,
+          "max": 1,
+          "weight": 28
+        },
+        {
+          "item": "AttunedKeystoneFragment",
+          "min": 1,
+          "max": 1,
+          "weight": 18
+        },
+        {
+          "item": "LimiterSigil",
+          "min": 1,
+          "max": 1,
+          "weight": 14
+        }
+      ],
+      "late": [
+        {
+          "item": "fragment.evergate",
+          "min": 1,
+          "max": 1,
+          "weight": 22
+        },
+        {
+          "item": "AttunedKeystoneFragment",
+          "min": 1,
+          "max": 2,
+          "weight": 16
+        }
+      ]
+    }
+  },
+  "hearthhold_trader_stock": {
+    "tiers": {
+      "early": [
+        {
+          "item": "StabilizedAsh",
+          "min": 1,
+          "max": 6,
+          "weight": 30
+        },
+        {
+          "item": "AnchoringSalt",
+          "min": 1,
+          "max": 6,
+          "weight": 30
+        },
+        {
+          "item": "CleanPhial",
+          "min": 1,
+          "max": 4,
+          "weight": 24
+        },
+        {
+          "item": "fragment.safe_blueprint_early",
+          "min": 1,
+          "max": 1,
+          "weight": 6
+        }
+      ],
+      "mid": [
+        {
+          "item": "StabilizedAsh",
+          "min": 2,
+          "max": 8,
+          "weight": 26
+        },
+        {
+          "item": "LimiterSigil",
+          "min": 1,
+          "max": 2,
+          "weight": 14
+        },
+        {
+          "item": "fragment.safe_blueprint_mid",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ],
+      "late": [
+        {
+          "item": "AnchoringAlloy",
+          "min": 1,
+          "max": 2,
+          "weight": 10
+        },
+        {
+          "item": "RegulatorComponent",
+          "min": 1,
+          "max": 1,
+          "weight": 6
+        },
+        {
+          "item": "fragment.safe_blueprint_late",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ]
+    }
+  },
+  "manifest": {
+    "version": "v1.1",
+    "generated_utc": "2026-01-13T00:12:54.232581Z"
+  }
+}

@@ -1,0 +1,7 @@
+[01/28/2026 16:05:03] Cleaned old log files
+[01/28/2026 16:05:03] Level 2 cleanup (deep)...
+[01/28/2026 16:05:03] Cleaned bin/obj/.vs/TestResults folders
+[01/28/2026 16:05:03] Cleaning NuGet caches (folder delete)...
+[01/28/2026 16:05:03] Deleting: C:\Users\Redacted\AppData\Local\NuGet\\v3-cache
+[01/28/2026 16:05:03] NuGet cache cleanup done. (global-packages not cleared)
+[01/28/2026 16:05:03] Cleanup completed successfully

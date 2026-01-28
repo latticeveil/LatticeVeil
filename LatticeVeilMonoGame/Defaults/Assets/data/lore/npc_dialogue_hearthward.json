@@ -1,0 +1,300 @@
+{
+  "dialogue": [
+    {
+      "id": "dlg_0001",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "greeting",
+      "hint_level": "low",
+      "text": "We don’t sell trouble. Only parts that keep it asleep."
+    },
+    {
+      "id": "dlg_0002",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "buy_ash",
+      "hint_level": "med",
+      "text": "Stabilized ash. The old kind. Use it where you want the hum to stop."
+    },
+    {
+      "id": "dlg_0003",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "buy_salt",
+      "hint_level": "med",
+      "text": "Anchoring salt. One pinch per bottle. More doesn’t make it safer—just louder."
+    },
+    {
+      "id": "dlg_0004",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "buy_phial",
+      "hint_level": "low",
+      "text": "Clean phials don’t crack when the brew gets eager."
+    },
+    {
+      "id": "dlg_0005",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "sell_fragment",
+      "hint_level": "low",
+      "text": "If you can read the old hand, you can skip the old mistakes."
+    },
+    {
+      "id": "dlg_0006",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "greeting",
+      "hint_level": "med",
+      "text": "If it’s round, I won’t touch it."
+    },
+    {
+      "id": "dlg_0007",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "advice_portal_shape",
+      "hint_level": "high",
+      "text": "Build your gate like an arch. Circles belong on jewelry."
+    },
+    {
+      "id": "dlg_0008",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "advice_limiter",
+      "hint_level": "high",
+      "text": "A limiter is cheaper than a cure. Always was."
+    },
+    {
+      "id": "dlg_0009",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "trade_limiter",
+      "hint_level": "low",
+      "text": "Got sigils. Got wire. You bring copper; I’ll make it honest."
+    },
+    {
+      "id": "dlg_0010",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "greeting",
+      "hint_level": "low",
+      "text": "You smell like thin places. Sit downwind."
+    },
+    {
+      "id": "dlg_0011",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "advice_potions",
+      "hint_level": "high",
+      "text": "Salt first. Sip second. Wait for quiet. Then decide again."
+    },
+    {
+      "id": "dlg_0012",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "warning_overuse",
+      "hint_level": "med",
+      "text": "If your hands twitch, stop drinking. That’s the dose asking for more."
+    },
+    {
+      "id": "dlg_0013",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "greeting",
+      "hint_level": "med",
+      "text": "We don’t open gates inside town. Ever."
+    },
+    {
+      "id": "dlg_0014",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "waygate_rule",
+      "hint_level": "high",
+      "text": "Two gates, one core. Don’t mix cores unless you like forgetting where you stood."
+    },
+    {
+      "id": "dlg_0015",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "network_warning",
+      "hint_level": "med",
+      "text": "Networks fail politely at first. Then they remember you."
+    },
+    {
+      "id": "dlg_0016",
+      "faction": "Hearthward Covenant",
+      "role": "Child",
+      "context": "ambient",
+      "hint_level": "med",
+      "text": "Grandma says circles make the air bite."
+    },
+    {
+      "id": "dlg_0017",
+      "faction": "Hearthward Covenant",
+      "role": "Child",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "I saw a stone that hummed all night. Dad buried it farther."
+    },
+    {
+      "id": "dlg_0018",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "sell_regulator_part",
+      "hint_level": "high",
+      "text": "This part? Don’t lose it. It’s how you tell a gate to stop talking."
+    },
+    {
+      "id": "dlg_0019",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "advice_regulator",
+      "hint_level": "med",
+      "text": "Regulators aren’t stronger. They’re balanced. Treat ’em gentle."
+    },
+    {
+      "id": "dlg_0020",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "corruption_notice",
+      "hint_level": "low",
+      "text": "Your eyes look a little bright. Don’t stand too close to your own work."
+    },
+    {
+      "id": "dlg_0021",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "corruption_help",
+      "hint_level": "low",
+      "text": "Ash poultice won’t cure it, but it’ll calm it. Don’t push today."
+    },
+    {
+      "id": "dlg_0022",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "boss_hint",
+      "hint_level": "low",
+      "text": "Some doors are held open by living mistakes. If you go, go ready to end it."
+    },
+    {
+      "id": "dlg_0023",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "travel_hint",
+      "hint_level": "med",
+      "text": "If you want a gate to stay on: you need the part that says ‘enough.’"
+    },
+    {
+      "id": "dlg_0024",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "echo_warning",
+      "hint_level": "low",
+      "text": "Icon shards sell well to fools. Use ’em if you want the hard road."
+    },
+    {
+      "id": "dlg_0025",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "Old roads lead to old decisions."
+    },
+    {
+      "id": "dlg_0026",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "I’ve seen a man build power with a prayer. I’ve also seen the grave after."
+    },
+    {
+      "id": "dlg_0027",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "Plants near thin spots grow fast. That doesn’t mean they grow kind."
+    },
+    {
+      "id": "dlg_0028",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "If you can’t close it from here, don’t open it from there."
+    },
+    {
+      "id": "dlg_0029",
+      "faction": "Hearthward Covenant",
+      "role": "Child",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "Do you think the stones get bored?"
+    },
+    {
+      "id": "dlg_0030",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "We trade because building alone makes you reckless."
+    },
+    {
+      "id": "dlg_0031",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "Bring me copper, not confidence."
+    },
+    {
+      "id": "dlg_0032",
+      "faction": "Hearthward Covenant",
+      "role": "Herbalist",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "The world forgets slowly. Be patient."
+    },
+    {
+      "id": "dlg_0033",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "No circles. No exceptions."
+    },
+    {
+      "id": "dlg_0034",
+      "faction": "Hearthward Covenant",
+      "role": "Child",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "I like the quiet hum. Mom says it’s bad quiet."
+    },
+    {
+      "id": "dlg_0035",
+      "faction": "Hearthward Covenant",
+      "role": "Smith",
+      "context": "advice_nullrock",
+      "hint_level": "med",
+      "text": "Corestone in old books. Nullrock in ours. Don’t waste steel on it."
+    },
+    {
+      "id": "dlg_0036",
+      "faction": "Hearthward Covenant",
+      "role": "Gatekeeper",
+      "context": "warning_nullrock",
+      "hint_level": "med",
+      "text": "If you hit the last layer, stop digging. The world’s done ending down there."
+    },
+    {
+      "id": "dlg_0037",
+      "faction": "Hearthward Covenant",
+      "role": "Trader",
+      "context": "ambient",
+      "hint_level": "low",
+      "text": "Picks for stone, sure. Picks for Nullrock? That’s just exercise."
+    }
+  ]
+}
