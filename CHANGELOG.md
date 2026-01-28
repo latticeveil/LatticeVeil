@@ -1,6 +1,6 @@
 # LatticeVeil - Change Log
 
-## [7.0.0.0] - 2026-01-28
+## [7.0.0] - 2026-01-28
 
 ### "Quantum Genesis" - Complete World Generation Revolution
 
