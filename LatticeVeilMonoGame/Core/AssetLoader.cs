@@ -49,6 +49,30 @@ public sealed class AssetLoader : IDisposable
         return GetFallback(key);
     }
 
+    public bool TryLoadAssetBytes(string relativePath, out byte[] bytes)
+    {
+        var key = $"bytes:{relativePath.Replace('\\', '/')}";
+        if (AssetResolver.TryResolve(relativePath, out var filePath))
+        {
+            try
+            {
+                bytes = File.ReadAllBytes(filePath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogMissing(key, filePath, $"Failed to load bytes: {ex.Message}");
+                bytes = Array.Empty<byte>();
+                return false;
+            }
+        }
+
+        var resolved = AssetResolver.Resolve(relativePath);
+        LogMissing(key, resolved, "Asset file not found.");
+        bytes = Array.Empty<byte>();
+        return false;
+    }
+
     public void Dispose()
     {
         foreach (var t in _textures.Values)

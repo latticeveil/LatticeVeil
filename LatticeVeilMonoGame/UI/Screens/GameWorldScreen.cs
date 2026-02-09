@@ -11,6 +11,7 @@ using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using LatticeVeilMonoGame.Core;
 using LatticeVeilMonoGame.Online.Eos;
+using LatticeVeilMonoGame.Online.Gate;
 using LatticeVeilMonoGame.Online.Lan;
 using LatticeVeilMonoGame.UI;
 
@@ -33,7 +34,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Logger _log;
     private readonly PlayerProfile _profile;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
-    private readonly ILanSession? _lanSession;
+    private ILanSession? _lanSession;
     private readonly string _worldPath;
     private readonly string _metaPath;
     private GameSettings _settings = new();
@@ -67,6 +68,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int KeepRadiusBuffer = 3;
     private const int PrewarmRadius = 8; // Match render distance to prevent post-spawn loading
     private const int PrewarmGateRadius = 3;
+    private const int PrewarmVerticalChunkTop = 5;
     private const int PrewarmChunkBudgetPerFrame = 6;
     private const int PrewarmMeshBudgetPerFrame = 4;
     private const double PrewarmTimeoutSeconds = 12.0;
@@ -124,6 +126,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _loggedInvalidHandMesh;
 
     private BasicEffect? _effect;
+    private Effect? _waterEffect;
+    private bool _waterEffectLoadAttempted;
     private BasicEffect? _lineEffect;
     private SamplerState? _samplerLow;
     private SamplerState? _samplerMedium;
@@ -203,8 +207,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Button _homeGuiSetIconHeldBtn;
     private readonly Button _homeGuiSetIconAutoBtn;
     private readonly Button _homeGuiCloseBtn;
+    private bool _structureFinderOpen;
+    private bool _structureFinderStructureTab;
+    private int _structureFinderSelectedBiomeIndex;
+    private int _structureFinderRadiusIndex = 2;
+    private string _structureFinderStatus = "";
+    private float _structureFinderStatusTimer;
+    private Texture2D? _structureFinderPanelTexture;
+    private Rectangle _structureFinderPanelRect;
+    private Rectangle _structureFinderListRect;
+    private readonly Rectangle[] _structureFinderBiomeRects = new Rectangle[3];
+    private readonly Button _structureFinderBiomeTabBtn;
+    private readonly Button _structureFinderStructureTabBtn;
+    private readonly Button _structureFinderRadiusBtn;
+    private readonly Button _structureFinderFindBtn;
+    private readonly Button _structureFinderCloseBtn;
 
-    public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen && !_homeGuiOpen && !IsTextInputActive && !_gamemodeWheelVisible && !IsOverlayActionInteractionActive && _hasLoadedWorld && !_worldSyncInProgress && _spawnPrewarmComplete;
+    public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen && !_homeGuiOpen && !_structureFinderOpen && !IsTextInputActive && !_gamemodeWheelVisible && !IsOverlayActionInteractionActive && _hasLoadedWorld && !_worldSyncInProgress && _spawnPrewarmComplete;
     public bool WorldReady => !_worldSyncInProgress && _hasLoadedWorld && _spawnPrewarmComplete;
     private bool IsTextInputActive => _commandInputActive || _chatInputActive;
     private bool IsOverlayActionInteractionActive => !IsTextInputActive
@@ -216,6 +235,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Rectangle _pauseRect;
     private Rectangle _pauseHeaderRect;
     private readonly Button _pauseResume;
+    private readonly Button _pauseOpenLan;
+    private readonly Button _pauseHostOnline;
     private readonly Button _pauseInvite;
     private readonly Button _pauseSettings;
     private readonly Button _pauseSaveExit;
@@ -261,6 +282,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private int _frameCount;
     private float _playerSaveTimer; // Timer for periodic player state saving
     private int _autoSaveInFlight;
+    private readonly object _previewQueueLock = new();
+    private Task? _previewUpdateWorker;
+    private bool _previewUpdatePending;
+    private int _previewPendingCenterX;
+    private int _previewPendingCenterZ;
     private bool _isClosing;
     private bool _saveAndExitInProgress;
     private bool _skipOnCloseFullSave;
@@ -287,6 +313,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private string _displayName = "";
     private Keys _chatKey = Keys.T;
     private Keys _commandKey = Keys.OemQuestion;
+    private Keys _homeGuiKey = Keys.H;
+    private Keys _gamemodeModifierKey = Keys.LeftAlt;
+    private Keys _gamemodeWheelKey = Keys.G;
     private bool _chatInputActive;
     private string _chatInputText = "";
     private readonly List<ChatLine> _chatLines = new();
@@ -306,6 +335,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly List<CommandPredictionItem> _commandPredictionBuffer = new();
     private readonly Dictionary<string, CommandDescriptor> _commandLookup = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<CommandDescriptor> _commandDescriptors = new();
+    private readonly List<CommandCompletionCandidate> _commandTabCycleCandidates = new();
+    private readonly List<CommandCompletionCandidate> _commandTabBuildBuffer = new();
+    private string _commandTabContextKey = string.Empty;
+    private int _commandTabIndex = -1;
+    private bool _commandTabAppendSpace;
     private bool _commandsInitialized;
     private const int MaxChatLines = 256;
     private const float ChatLineLifetimeSeconds = 14f;
@@ -316,9 +350,20 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const float ChatOverlayWidthRatio = 0.46f;
     private const int ChatOverlayMinWidth = 420;
     private const int ChatOverlayMaxWidth = 780;
-    private const float ChatOverlayActionUnlockSeconds = 5f;
+    private const float ChatOverlayActionUnlockSeconds = ChatLineLifetimeSeconds;
     private const int CommandFindBiomeDefaultRadius = 2048;
     private const int CommandFindBiomeMaxRadius = 8192;
+    private const int BiomeSearchRefineWindow = 6;
+    private const int BiomeLocateRingStep = 8;
+    private const int BiomeLocateGlobalStride = 16;
+    private const int BiomeLocateGlobalFallbackStride = 8;
+    private const int BiomeLocateMaxRingRadius = 1536;
+    private bool _hasQueuedLocateOrigin;
+    private int _queuedLocateOriginX;
+    private int _queuedLocateOriginZ;
+    private static readonly string[] FinderBiomeTokens = { "grasslands", "desert", "ocean" };
+    private static readonly string[] FinderBiomeLabels = { "Grasslands", "Desert", "Ocean" };
+    private static readonly int[] FinderRadiusOptions = { 512, 1024, 2048, 4096, 8192 };
     private static readonly GameMode[] GameModeWheelModes =
     {
         GameMode.Artificer,
@@ -334,6 +379,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private GameMode _gamemodeWheelHoverMode = GameMode.Artificer;
     private string _gamemodeToastText = "";
     private float _gamemodeToastTimer;
+    private readonly BlockBreakParticleSystem _blockBreakParticles = new();
+    private BiomeCatalog? _biomeCatalog;
     private const string DefaultHomeName = "home";
     private const int HomeGuiRowHeight = 42;
 
@@ -376,6 +423,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
         _chatKey = GetKeybind("Chat", Keys.T);
         _commandKey = GetKeybind("Command", Keys.OemQuestion);
+        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
+        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         EnsureCommandRegistry();
 
         // Initialize stub services to fix compilation (will be replaced with new world generation)
@@ -386,6 +437,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         _pauseResume = new Button("RESUME", () => _pauseMenuOpen = false);
+        _pauseOpenLan = new Button("OPEN TO LAN", OpenToLanFromPause);
+        _pauseHostOnline = new Button("HOST ONLINE", OpenOnlineHostFromPause);
         _pauseInvite = new Button("SHARE CODE", OpenShareCode);
         _pauseSettings = new Button("SETTINGS", OpenSettings);
         _pauseSaveExit = new Button("SAVE & EXIT", SaveAndExit);
@@ -396,6 +449,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _homeGuiSetIconHeldBtn = new Button("ICON: HELD", SetSelectedHomeIconFromHeld);
         _homeGuiSetIconAutoBtn = new Button("ICON: LETTER", SetSelectedHomeIconAuto);
         _homeGuiCloseBtn = new Button("CLOSE", () => _homeGuiOpen = false);
+        _structureFinderBiomeTabBtn = new Button("BIOMES", () => _structureFinderStructureTab = false);
+        _structureFinderStructureTabBtn = new Button("STRUCTURES", () => _structureFinderStructureTab = true);
+        _structureFinderRadiusBtn = new Button("RADIUS", CycleStructureFinderRadius);
+        _structureFinderFindBtn = new Button("FIND", ExecuteStructureFinderSearchFromGui);
+        _structureFinderCloseBtn = new Button("CLOSE", () => _structureFinderOpen = false);
+        SyncStructureFinderRadiusLabel();
 
         try
         {
@@ -407,6 +466,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         LoadGamemodeWheelIcons();
+        _structureFinderPanelTexture = TryLoadOptionalTexture(
+            "textures/menu/GUIS/GUIBOX.png",
+            "textures/menu/GUIS/WorldGeneration_GUI.png");
 
         // Note: World load is deferred to the first Update() to allow "Loading..." screen to draw.
     }
@@ -417,6 +479,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         UpdatePauseMenuLayout();
         UpdateHotbarLayout();
         UpdateInventoryLayout();
+        LayoutStructureFinderGui();
     }
 
     public void Update(GameTime gameTime, InputState input)
@@ -500,7 +563,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         // PERIODIC PLAYER STATE SAVING - Save player position periodically during gameplay
         _playerSaveTimer += rawDt;
-        if (_playerSaveTimer >= 30.0f) // Save every 30 seconds
+        if (!_isClosing && _playerSaveTimer >= 30.0f) // Save every 30 seconds
         {
             QueuePlayerStateSaveAsync();
             _playerSaveTimer = 0f;
@@ -508,6 +571,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         // Always update network layer, even if world sync is in progress
         UpdateNetwork(rawDt);
+        _blockBreakParticles.Update(rawDt);
 
         if (_worldSyncInProgress)
         {
@@ -522,6 +586,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_pauseMenuOpen)
             {
                 _pauseResume.Update(input);
+                _pauseOpenLan.Update(input);
+                _pauseHostOnline.Update(input);
                 _pauseInvite.Update(input);
                 _pauseSettings.Update(input);
                 _pauseSaveExit.Update(input);
@@ -547,6 +613,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_pauseMenuOpen)
             {
                 _pauseResume.Update(input);
+                _pauseOpenLan.Update(input);
+                _pauseHostOnline.Update(input);
                 _pauseInvite.Update(input);
                 _pauseSettings.Update(input);
                 _pauseSaveExit.Update(input);
@@ -581,6 +649,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen)
         {
             _pauseResume.Update(input);
+            _pauseOpenLan.Update(input);
+            _pauseHostOnline.Update(input);
             _pauseInvite.Update(input);
             _pauseSettings.Update(input);
             _pauseSaveExit.Update(input);
@@ -592,6 +662,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             UpdateHomeGui(input, rawDt);
             WarmBlockIcons();
+            return;
+        }
+
+        if (_structureFinderOpen)
+        {
+            UpdateStructureFinderGui(input, rawDt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (!IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_homeGuiKey))
+        {
+            OpenHomeGui();
             return;
         }
 
@@ -751,6 +834,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _effect.FogEnd = fogEndRadius;
         _effect.View = view;
         _effect.Projection = proj;
+        _effect.World = Matrix.Identity;
+        _effect.DiffuseColor = Vector3.One;
+        _effect.Alpha = 1f;
 
         var frustum = new BoundingFrustum(view * proj);
 
@@ -844,7 +930,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
+        DrawWaterChunks(device, frustum, view, proj);
+
         DrawWorldItems(device, view, proj);
+        if (_blockBreakParticles.ActiveCount > 0)
+        {
+            sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            _blockBreakParticles.Draw(sb, _pixel, view, proj, device.Viewport);
+            sb.End();
+        }
 
         var drawHands = !_pauseMenuOpen;
 #if DEBUG
@@ -865,7 +959,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var mode = _gameMode;
         _font.DrawString(sb, $"WORLD: {name}", new Vector2(_viewport.X + 20, _viewport.Y + 20), Color.White);
         _font.DrawString(sb, $"MODE: {mode.ToString().ToUpperInvariant()}", new Vector2(_viewport.X + 20, _viewport.Y + 20 + _font.LineHeight + 4), Color.White);
-        _font.DrawString(sb, "WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | ALT+G MODE WHEEL | ESC PAUSE", new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
+        var modeCombo = $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)}";
+        _font.DrawString(sb, $"WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | {modeCombo} MODE WHEEL | ESC PAUSE", new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
         
         DrawHotbar(sb);
         DrawSelectedBlockName(sb);
@@ -875,6 +970,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         DrawGamemodeWheel(sb);
         if (_homeGuiOpen)
             DrawHomeGui(sb);
+        if (_structureFinderOpen)
+            DrawStructureFinderGui(sb);
         if (_debugHudVisible)
             DrawDevOverlay(sb);
         DrawFaceOverlay(sb);
@@ -914,6 +1011,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _meta = _world.Meta;
         _gameMode = _meta.CurrentWorldGameMode;
         _playerCollisionEnabled = _meta.PlayerCollision;
+        EnsureBiomeCatalog();
 
         // 1) FIX INIT ORDER: Build atlas FIRST, then create streaming service
         sw.Restart();
@@ -1007,7 +1105,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         // DISABLED: HybridWorldManager handles this now
         // EnsureSpawnChunksLoaded();
         
-        // RESEARCH-BASED: Implement force loading system like Minecraft's /forceload
+        // RESEARCH-BASED: Implement force loading system similar to server force-load commands
         // DISABLED: HybridWorldManager handles this now
         // ForceLoadCriticalChunks();
         
@@ -1035,6 +1133,32 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _blockIconCache = new BlockIconCache(_assets.GraphicsDevice, _atlas, _blockModel, _log);
     }
 
+    private int GetStreamingMaxChunkY(int playerChunkY)
+    {
+        if (_world == null)
+            return 0;
+
+        var worldMax = Math.Max(0, _world.MaxChunkY);
+        var terrainBandTop = Math.Min(worldMax, PrewarmVerticalChunkTop);
+        var playerHeadroomTop = Math.Clamp(playerChunkY + 2, 0, worldMax);
+        return Math.Max(terrainBandTop, playerHeadroomTop);
+    }
+
+    private bool IsChunkWithinWorldBounds(ChunkCoord coord)
+    {
+        if (_meta?.Size == null)
+            return true;
+
+        var minX = coord.X * VoxelChunkData.ChunkSizeX;
+        var minZ = coord.Z * VoxelChunkData.ChunkSizeZ;
+        var maxX = minX + VoxelChunkData.ChunkSizeX - 1;
+        var maxZ = minZ + VoxelChunkData.ChunkSizeZ - 1;
+        return maxX >= 0
+            && maxZ >= 0
+            && minX < _meta.Size.Width
+            && minZ < _meta.Size.Depth;
+    }
+
     private void InitializePrewarmTargets()
     {
         if (_world == null)
@@ -1046,7 +1170,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             (int)MathF.Floor(_player.Position.Z),
             out _, out _, out _);
 
-        var maxCy = Math.Max(0, _world.MaxChunkY);
+        var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
         var prewarmRadius = Math.Clamp(Math.Min(_activeRadiusChunks, PrewarmRadius), 2, PrewarmRadius);
         var gateRadius = Math.Clamp(Math.Min(prewarmRadius, PrewarmGateRadius), 1, prewarmRadius);
         var prewarmRadiusSq = prewarmRadius * prewarmRadius;
@@ -1066,6 +1190,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 for (var cy = 0; cy <= maxCy; cy++)
                 {
                     var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
                     _prewarmRequiredChunks.Add(coord);
                     if (distSq <= gateRadiusSq)
                         _tier0Chunks.Add(coord);
@@ -1097,7 +1223,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
-        _log.Info($"Prewarm targets: gate={_prewarmTargetCount}, full={_prewarmRequiredChunks.Count}, radius={prewarmRadius}");
+        _log.Info($"Prewarm targets: gate={_prewarmTargetCount}, full={_prewarmRequiredChunks.Count}, radius={prewarmRadius}, maxCy={maxCy}");
     }
 
     private void PrimeTier0FromMeshCache()
@@ -1255,7 +1381,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _centerChunk = playerChunk;
         _playerChunkCoord = playerChunk;
 
-        var maxCy = Math.Max(0, _world.MaxChunkY);
+        var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
         var radius = Math.Clamp(_activeRadiusChunks, 2, MaxRuntimeActiveRadius);
         var radiusSq = radius * radius;
         var chunkBudgetPerFrame = _spawnPrewarmComplete
@@ -1281,6 +1407,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     for (var cy = 0; cy <= maxCy; cy++)
                     {
                         var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                        if (!IsChunkWithinWorldBounds(coord))
+                            continue;
                         _activeKeepBuffer.Add(coord);
                         _drawOrderBuffer.Add(coord);
                         var nearCritical = ring <= 2 && Math.Abs(cy - playerChunk.Y) <= 1;
@@ -1412,6 +1540,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
         _chatKey = GetKeybind("Chat", Keys.T);
         _commandKey = GetKeybind("Command", Keys.OemQuestion);
+        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
+        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         UpdateReticleSettings();
 
         if (newQuality != oldQuality)
@@ -2075,10 +2207,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private static bool ValidateMesh(ChunkMesh mesh)
     {
-        if (mesh.OpaqueVertices.Length % 3 != 0 || mesh.TransparentVertices.Length % 3 != 0)
+        if (mesh.OpaqueVertices.Length % 3 != 0 || mesh.TransparentVertices.Length % 3 != 0 || mesh.WaterVertices.Length % 3 != 0)
             return false;
 
-        return VerticesFinite(mesh.OpaqueVertices) && VerticesFinite(mesh.TransparentVertices);
+        return VerticesFinite(mesh.OpaqueVertices)
+            && VerticesFinite(mesh.TransparentVertices)
+            && VerticesFinite(mesh.WaterVertices);
     }
 
     private static bool VerticesFinite(VertexPositionTexture[] verts)
@@ -2148,6 +2282,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         _player.Update(dt, gameTime.TotalGameTime.TotalSeconds, input, _world.GetBlock);
+        ClampPlayerToWorldBounds();
+    }
+
+    private void ClampPlayerToWorldBounds()
+    {
+        if (_meta == null)
+            return;
+
+        var maxX = Math.Max(0.5f, _meta.Size.Width - 0.5f);
+        var maxZ = Math.Max(0.5f, _meta.Size.Depth - 0.5f);
+        var pos = _player.Position;
+        var clampedX = Math.Clamp(pos.X, 0.5f, maxX);
+        var clampedZ = Math.Clamp(pos.Z, 0.5f, maxZ);
+        if (MathF.Abs(clampedX - pos.X) < 0.0001f && MathF.Abs(clampedZ - pos.Z) < 0.0001f)
+            return;
+
+        _player.Position = new Vector3(clampedX, pos.Y, clampedZ);
     }
 
     private void ApplyPlayerSeparation(float dt)
@@ -2238,6 +2389,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _world.SetBlock(hit.X, hit.Y, hit.Z, BlockIds.Air);
                 _lanSession?.SendBlockSet(hit.X, hit.Y, hit.Z, BlockIds.Air);
                 QueuePriorityRemeshForBlockEdit(hit.X, hit.Y, hit.Z);
+                _blockBreakParticles.SpawnBlockBreak(hit.X, hit.Y, hit.Z, id);
                 
                 if (_gameMode == GameMode.Veilwalker)
                     SpawnBlockDrop(hit.X, hit.Y, hit.Z, (BlockId)id);
@@ -2260,6 +2412,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var id = _world.GetBlock(hit.PrevX, hit.PrevY, hit.PrevZ);
             var selected = _inventory.SelectedId;
             var sandbox = _gameMode == GameMode.Artificer;
+            if (id == BlockIds.Air && selected == BlockId.WaterBucket && (sandbox || _inventory.SelectedCount > 0))
+            {
+                if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
+                {
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
+                }
+
+                _world.SetBlock(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
+                _lanSession?.SendBlockSet(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
+                QueuePriorityRemeshForBlockEdit(hit.PrevX, hit.PrevY, hit.PrevZ);
+                _interactCooldown = InteractCooldownSeconds;
+                return;
+            }
+
             if (id == BlockIds.Air && selected != BlockId.Air && (sandbox || _inventory.SelectedCount > 0))
             {
                 if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
@@ -3471,6 +3638,61 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         };
     }
 
+    private void EnsureWaterEffect(GraphicsDevice device)
+    {
+        if (_waterEffectLoadAttempted)
+            return;
+
+        _waterEffectLoadAttempted = true;
+        var candidates = new[]
+        {
+            "effects/water.ogl.mgfxo",
+            "effects/water.dx11.mgfxo",
+            "effects/water.mgfxo"
+        };
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            if (!AssetResolver.TryResolve(candidates[i], out _))
+                continue;
+            if (!_assets.TryLoadAssetBytes(candidates[i], out var bytes) || bytes.Length == 0)
+                continue;
+
+            try
+            {
+                _waterEffect = new Effect(device, bytes);
+                _log.Info($"Loaded optional water effect: {candidates[i]}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to load water effect {candidates[i]}: {ex.Message}");
+                _waterEffect?.Dispose();
+                _waterEffect = null;
+            }
+        }
+    }
+
+    private static void SetEffectMatrix(Effect effect, string name, Matrix value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectVector3(Effect effect, string name, Vector3 value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectFloat(Effect effect, string name, float value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectTexture(Effect effect, string name, Texture2D value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
     private void EnsureLineEffect(GraphicsDevice device)
     {
         if (_lineEffect != null)
@@ -3593,6 +3815,84 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         DrawWorldItemsPass(device, transparent: false);
         DrawWorldItemsPass(device, transparent: true);
+    }
+
+    private void DrawWaterChunks(GraphicsDevice device, BoundingFrustum frustum, Matrix view, Matrix proj)
+    {
+        if (_effect == null)
+            return;
+
+        EnsureWaterEffect(device);
+
+        device.BlendState = BlendState.AlphaBlend;
+        device.DepthStencilState = DepthStencilState.DepthRead;
+
+        var pulse = (MathF.Sin(_worldTimeSeconds * 1.6f) + 1f) * 0.5f;
+        var tintA = new Vector3(0.56f, 0.78f, 1f);
+        var tintB = new Vector3(0.44f, 0.67f, 0.95f);
+        var tint = Vector3.Lerp(tintA, tintB, pulse);
+        var alpha = 0.66f + pulse * 0.10f;
+
+        if (_waterEffect == null)
+        {
+            _effect.DiffuseColor = tint;
+            _effect.Alpha = alpha;
+        }
+        else
+        {
+            SetEffectVector3(_waterEffect, "TintColor", tint);
+            SetEffectFloat(_waterEffect, "WaterAlpha", alpha);
+            SetEffectFloat(_waterEffect, "Time", _worldTimeSeconds);
+            SetEffectFloat(_waterEffect, "WaveStrength", 0.015f);
+            SetEffectFloat(_waterEffect, "UvScrollSpeed", 0.015f);
+            SetEffectMatrix(_waterEffect, "View", view);
+            SetEffectMatrix(_waterEffect, "Projection", proj);
+            if (_atlas != null)
+                SetEffectTexture(_waterEffect, "Texture0", _atlas.Texture);
+        }
+
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.WaterVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+            if (verts.Length % 3 != 0)
+                continue;
+
+            var wave = MathF.Sin(_worldTimeSeconds * 1.9f + coord.X * 0.45f + coord.Z * 0.37f) * 0.015f;
+            var world = Matrix.CreateTranslation(0f, wave, 0f);
+
+            if (_waterEffect != null)
+            {
+                SetEffectMatrix(_waterEffect, "World", world);
+                foreach (var pass in _waterEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            else
+            {
+                _effect.World = world;
+                foreach (var pass in _effect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+        }
+
+        if (_waterEffect == null)
+        {
+            _effect.World = Matrix.Identity;
+            _effect.DiffuseColor = Vector3.One;
+            _effect.Alpha = 1f;
+        }
     }
 
     private void DrawWorldItemsPass(GraphicsDevice device, bool transparent)
@@ -3743,8 +4043,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void UpdatePauseMenuLayout()
     {
         var showInvite = CanShareJoinCode();
+        var showOpenLan = CanOpenLanFromPause();
+        var showHostOnline = CanOpenOnlineFromPause();
+
+        _pauseOpenLan.Visible = showOpenLan;
+        _pauseHostOnline.Visible = showHostOnline;
         _pauseInvite.Visible = showInvite;
-        var buttonCount = showInvite ? 4 : 3;
+        _pauseHostOnline.Enabled = showHostOnline;
+
+        var buttonCount = 3;
+        if (showOpenLan)
+            buttonCount++;
+        if (showHostOnline)
+            buttonCount++;
+        if (showInvite)
+            buttonCount++;
+
         var panelW = Math.Clamp((int)(_viewport.Width * 0.42f), 320, _viewport.Width - 40);
         var buttonW = Math.Clamp((int)(panelW * 0.6f), 160, 320);
         var buttonH = Math.Clamp((int)(buttonW * 0.22f), 36, 60);
@@ -3770,24 +4084,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var startY = _pauseRect.Y + padding + titleH + Math.Max(0, (available - totalButtonsH) / 2);
         var centerX = _pauseRect.X + (_pauseRect.Width - buttonW) / 2;
 
-        _pauseResume.Bounds = new Rectangle(centerX, startY, buttonW, buttonH);
+        var row = 0;
+        _pauseResume.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row++, buttonW, buttonH);
+        if (showOpenLan)
+            _pauseOpenLan.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row++, buttonW, buttonH);
+        if (showHostOnline)
+            _pauseHostOnline.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row++, buttonW, buttonH);
         if (showInvite)
-        {
-            _pauseInvite.Bounds = new Rectangle(centerX, startY + buttonH + gap, buttonW, buttonH);
-            _pauseSettings.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * 2, buttonW, buttonH);
-            _pauseSaveExit.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * 3, buttonW, buttonH);
-        }
-        else
-        {
-            _pauseSettings.Bounds = new Rectangle(centerX, startY + buttonH + gap, buttonW, buttonH);
-            _pauseSaveExit.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * 2, buttonW, buttonH);
-        }
+            _pauseInvite.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row++, buttonW, buttonH);
+        _pauseSettings.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row++, buttonW, buttonH);
+        _pauseSaveExit.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * row, buttonW, buttonH);
     }
 
     private void DrawPauseMenu(SpriteBatch sb)
     {
-        if (_viewport != UiLayout.Viewport)
-            UpdatePauseMenuLayout();
+        UpdatePauseMenuLayout();
 
         sb.Begin(samplerState: SamplerState.PointClamp);
         sb.Draw(_pixel, UiLayout.WindowViewport, new Color(0, 0, 0, 140));
@@ -3808,6 +4119,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, title, titlePos, Color.White);
 
         _pauseResume.Draw(sb, _pixel, _font);
+        _pauseOpenLan.Draw(sb, _pixel, _font);
+        _pauseHostOnline.Draw(sb, _pixel, _font);
         _pauseInvite.Draw(sb, _pixel, _font);
         _pauseSettings.Draw(sb, _pixel, _font);
         _pauseSaveExit.Draw(sb, _pixel, _font);
@@ -3855,9 +4168,92 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
 
 
-        private void OpenShareCode()
+    private void OpenToLanFromPause()
+    {
+        if (!CanOpenLanFromPause())
+        {
+            SetCommandStatus("LAN host is already active.");
+            return;
+        }
+
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var result = WorldHostBootstrap.TryStartLanHost(_log, _profile, _world);
+        if (!result.Success || result.Session == null)
+        {
+            SetCommandStatus($"LAN host failed: {result.Error}");
+            return;
+        }
+
+        _lanSession = result.Session;
+        SeedLocalPlayerName();
+        SetCommandStatus("LAN hosting enabled. Other players can now join from Multiplayer > LAN.", 7f);
+        UpdatePauseMenuLayout();
+    }
+
+    private void OpenOnlineHostFromPause()
+    {
+        if (!CanOpenOnlineFromPause())
+        {
+            SetCommandStatus("Online host is already active.");
+            return;
+        }
+
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var eos = EnsureEosClient();
+        if (eos == null)
+        {
+            SetCommandStatus("EOS CLIENT UNAVAILABLE");
+            return;
+        }
+        var onlineGate = OnlineGateClient.GetOrCreate();
+        if (!onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            SetCommandStatus(gateDenied);
+            return;
+        }
+
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason != EosRuntimeReason.Ready)
+        {
+            if (snapshot.Reason == EosRuntimeReason.Connecting)
+                eos.StartLogin();
+            SetCommandStatus(snapshot.StatusText);
+            return;
+        }
+
+        var result = WorldHostBootstrap.TryStartEosHost(_log, _profile, eos, _world);
+        if (!result.Success || result.Session == null)
+        {
+            SetCommandStatus($"Online host failed: {result.Error}");
+            return;
+        }
+
+        _lanSession = result.Session;
+        SeedLocalPlayerName();
+        SetCommandStatus("Online hosting enabled. Use SHARE CODE to invite others.", 7f);
+        UpdatePauseMenuLayout();
+    }
+
+    private void OpenShareCode()
     {
         _pauseMenuOpen = false;
+
+        var onlineGate = OnlineGateClient.GetOrCreate();
+        if (!onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            SetCommandStatus(gateDenied);
+            return;
+        }
 
         if (_lanSession is not EosP2PHostSession)
         {
@@ -3881,9 +4277,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _isClosing = true;
         if (!_skipOnCloseFullSave)
         {
-            SavePlayerState();
+            var closeState = CapturePlayerState();
+            SavePlayerState(closeState);
             var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
             var savedMeshes = SaveAllLoadedChunkMeshesToCache();
+            FlushWorldPreviewUpdate(closeState);
             _log.Info($"GameWorldScreen: OnClose saved {savedChunks} chunks and {savedMeshes} mesh caches.");
         }
         else
@@ -3902,6 +4300,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         while (_chunkGenerationQueue.TryDequeue(out _)) { }
         _chunkGenerationQueued.Clear();
         _chunkGenerationInFlight.Clear();
+        if (_lanSession is EosP2PHostSession)
+            WorldHostBootstrap.TryClearHostingPresence(_log, EnsureEosClient());
         _lanSession?.Dispose();
         _blockIconCache?.Dispose();
         _blockIconCache = null;
@@ -3913,6 +4313,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _samplerHigh = null;
         _samplerUltra?.Dispose();
         _samplerUltra = null;
+        _waterEffect?.Dispose();
+        _waterEffect = null;
     }
 
     private void SaveAndExit()
@@ -3983,6 +4385,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var ensuredGateMeshes = EnsureResumeGateMeshes(state);
             var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
             var savedMeshes = SaveAllLoadedChunkMeshesToCache();
+            FlushWorldPreviewUpdate(state);
 
             sw.Stop();
             _log.Info($"Save & Exit detail: ensured gate meshes={ensuredGateMeshes}, cached meshes={savedMeshes}");
@@ -4005,7 +4408,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             (int)MathF.Floor(playerState.PosY),
             (int)MathF.Floor(playerState.PosZ),
             out _, out _, out _);
-        var maxCy = Math.Max(0, _world.MaxChunkY);
+        var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
         var prewarmRadius = Math.Clamp(Math.Min(_activeRadiusChunks, PrewarmRadius), 2, PrewarmRadius);
         var gateRadius = Math.Clamp(Math.Min(prewarmRadius, PrewarmGateRadius), 1, prewarmRadius);
         var gateRadiusSq = gateRadius * gateRadius;
@@ -4021,6 +4424,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 for (var cy = 0; cy <= maxCy; cy++)
                 {
                     var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
                     if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
                         chunk = _world.GetOrCreateChunk(coord);
 
@@ -4078,7 +4483,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_eosClient != null)
             return _eosClient;
 
-        _eosClient = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+        _eosClient = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
         if (_eosClient == null)
             _log.Warn("GameWorldScreen: EOS client not available.");
         return _eosClient;
@@ -4087,7 +4492,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
 
 
-        private bool CanShareJoinCode()
+    private bool CanOpenLanFromPause()
+    {
+        if (_saveAndExitInProgress || _world == null || _worldSyncInProgress)
+            return false;
+        return _lanSession == null;
+    }
+
+    private bool CanOpenOnlineFromPause()
+    {
+        if (_saveAndExitInProgress || _world == null || _worldSyncInProgress)
+            return false;
+        return _lanSession == null;
+    }
+
+    private bool CanShareJoinCode()
     {
         if (_lanSession == null || !_lanSession.IsHost)
             return false;
@@ -4509,7 +4928,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     }
 
     /// <summary>
-    /// RESEARCH-BASED: Ensure spawn chunks are loaded like Minecraft's spawn chunk system
+    /// RESEARCH-BASED: Ensure spawn chunks are loaded using persistent spawn-chunk logic
     /// Spawn chunks always tick even without players nearby
     /// </summary>
     private void EnsureSpawnChunksLoaded()
@@ -4517,7 +4936,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_world == null || _streamingService == null)
             return;
 
-        _log.Info("RESEARCH-BASED: Ensuring spawn chunks are loaded like Minecraft");
+        _log.Info("RESEARCH-BASED: Ensuring persistent spawn chunks are loaded");
         
         var spawnPoint = GetWorldSpawnPoint();
         var spawnChunk = VoxelWorld.WorldToChunk((int)spawnPoint.X, 0, (int)spawnPoint.Y, out _, out _, out _);
@@ -4526,7 +4945,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var maxCy = _world.MaxChunkY;
         var spawnChunksLoaded = 0;
         
-        // Load spawn chunks in a 3x3 area (like Minecraft's spawn chunk system)
+        // Load spawn chunks in a persistent 3x3 area around spawn.
         for (var dx = -1; dx <= 1; dx++)
         {
             for (var dz = -1; dz <= 1; dz++)
@@ -4566,7 +4985,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     }
 
     /// <summary>
-    /// RESEARCH-BASED: Force load critical chunks like Minecraft's /forceload command
+    /// RESEARCH-BASED: Force load critical chunks using admin-style force-load behavior
     /// This keeps critical chunks loaded artificially to prevent missing chunks
     /// </summary>
     private void ForceLoadCriticalChunks()
@@ -4574,7 +4993,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_world == null || _streamingService == null || _player == null)
             return;
 
-        _log.Info("RESEARCH-BASED: Force loading critical chunks like Minecraft's /forceload");
+        _log.Info("RESEARCH-BASED: Force loading critical chunks with admin-style force-load behavior");
         
         var playerPos = _player.Position;
         var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
@@ -5268,7 +5687,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_world.TryGetChunk(coord, out var chunk) && chunk != null)
             {
                 if (!_chunkMeshes.TryGetValue(coord, out var mesh) || mesh == null || 
-                    (mesh.OpaqueVertices.Length == 0 && mesh.TransparentVertices.Length == 0))
+                    (mesh.OpaqueVertices.Length == 0 && mesh.TransparentVertices.Length == 0 && mesh.WaterVertices.Length == 0))
                 {
                     _log.Warn($"Building Tier-0 fallback mesh for {coord}");
                     var fallbackMesh = BuildFallbackMesh(coord, chunk);
@@ -5289,6 +5708,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         // B) FAST FALLBACK MESH - Simple cube faces, no greedy meshing, no neighbor dependency
         var opaque = new List<VertexPositionTexture>();
         var transparent = new List<VertexPositionTexture>();
+        var water = new List<VertexPositionTexture>();
 
         var bs = Scale.BlockSize;
         var originX = coord.X * VoxelChunkData.ChunkSizeX;
@@ -5312,12 +5732,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     var worldZ = originZ + z * bs;
 
                     // Add all 6 faces for simplicity
-                    AddFallbackCubeFace(opaque, worldX, worldY, worldZ, bs, blockId);
+                    if (blockId == BlockIds.Water)
+                        AddFallbackCubeFace(water, worldX, worldY, worldZ, bs, blockId);
+                    else if (BlockRegistry.IsTransparent(blockId))
+                        AddFallbackCubeFace(transparent, worldX, worldY, worldZ, bs, blockId);
+                    else
+                        AddFallbackCubeFace(opaque, worldX, worldY, worldZ, bs, blockId);
                 }
             }
         }
 
-        return new ChunkMesh(coord, opaque.ToArray(), transparent.ToArray(), 
+        return new ChunkMesh(coord, opaque.ToArray(), transparent.ToArray(), water.ToArray(), 
             new BoundingBox(new Vector3(originX, originY, originZ), 
                            new Vector3(originX + VoxelChunkData.ChunkSizeX * bs, 
                                        originY + VoxelChunkData.ChunkSizeY * bs, 
@@ -5735,6 +6160,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             try
             {
                 snapshot.Save(_worldPath, _log);
+                QueueWorldPreviewUpdate(snapshot);
             }
             catch (Exception ex)
             {
@@ -5747,16 +6173,100 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         });
     }
 
-    private void SavePlayerState()
+    private void SavePlayerState(PlayerWorldState? state = null)
     {
         try
         {
-            var state = CapturePlayerState();
+            state ??= CapturePlayerState();
             state.Save(_worldPath, _log);
+            QueueWorldPreviewUpdate(state);
         }
         catch (Exception ex)
         {
             _log.Warn($"Failed to save player state: {ex.Message}");
+        }
+    }
+
+    private void QueueWorldPreviewUpdate(PlayerWorldState state)
+    {
+        QueueWorldPreviewUpdate(
+            (int)MathF.Floor(state.PosX),
+            (int)MathF.Floor(state.PosZ));
+    }
+
+    private void QueueWorldPreviewUpdate(int centerX, int centerZ)
+    {
+        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+
+        lock (_previewQueueLock)
+        {
+            _previewPendingCenterX = centerX;
+            _previewPendingCenterZ = centerZ;
+            _previewUpdatePending = true;
+            if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
+                _previewUpdateWorker = Task.Run(ProcessPreviewUpdateQueue);
+        }
+    }
+
+    private void FlushWorldPreviewUpdate(PlayerWorldState state)
+    {
+        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+
+        Task? worker;
+        lock (_previewQueueLock)
+        {
+            _previewPendingCenterX = (int)MathF.Floor(state.PosX);
+            _previewPendingCenterZ = (int)MathF.Floor(state.PosZ);
+            _previewUpdatePending = true;
+            if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
+                _previewUpdateWorker = Task.Run(ProcessPreviewUpdateQueue);
+            worker = _previewUpdateWorker;
+        }
+
+        try
+        {
+            worker?.GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to flush world preview update: {ex.Message}");
+        }
+    }
+
+    private void ProcessPreviewUpdateQueue()
+    {
+        while (true)
+        {
+            int centerX;
+            int centerZ;
+            WorldMeta? meta;
+            lock (_previewQueueLock)
+            {
+                if (!_previewUpdatePending)
+                {
+                    _previewUpdateWorker = null;
+                    return;
+                }
+
+                centerX = _previewPendingCenterX;
+                centerZ = _previewPendingCenterZ;
+                _previewUpdatePending = false;
+                meta = _meta;
+            }
+
+            if (meta == null)
+                continue;
+
+            try
+            {
+                WorldPreviewGenerator.GenerateAndSave(meta, _worldPath, centerX, centerZ, _log);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"World preview update failed: {ex.Message}");
+            }
         }
     }
 
@@ -5907,8 +6417,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (input.IsNewKeyPress(_commandKey))
             return true;
 
-        // Keep numpad slash usable by default when command bind is '/' key.
-        return _commandKey == Keys.OemQuestion && input.IsNewKeyPress(Keys.Divide);
+        // Always keep slash as a direct command opener even when rebound.
+        return input.IsNewKeyPress(Keys.OemQuestion) || input.IsNewKeyPress(Keys.Divide);
     }
 
     private void BeginChatInput(string initialText = "")
@@ -5916,6 +6426,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _chatInputActive = true;
         _commandInputActive = false;
         _chatInputText = initialText ?? string.Empty;
+        ResetCommandTabCompletion();
         BeginTextInputHistorySession(_chatInputText);
     }
 
@@ -6036,7 +6547,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!action.HasTeleport)
             return;
 
-        if (!TryTeleportPlayer(action.TeleportX, action.TeleportZ, null, out var result))
+        if (!TryTeleportPlayer(action.TeleportX, action.TeleportZ, action.TeleportY, out var result))
         {
             SetCommandStatus(result);
             return;
@@ -6063,8 +6574,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _player.Velocity = Vector3.Zero;
         EnsurePlayerNotInsideSolid(forceLog: false);
         UpdateActiveChunks(force: true);
+        _queuedLocateOriginX = clampedX;
+        _queuedLocateOriginZ = clampedZ;
+        _hasQueuedLocateOrigin = true;
         var username = _profile.GetDisplayUsername();
-        result = $"{username} Teleported to {clampedX}, {y:0}, {clampedZ}";
+        result = $"{username} Teleported to {clampedX} {(int)MathF.Round(y)} {clampedZ}";
         return true;
     }
 
@@ -6100,12 +6614,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         if (TryNavigateTextInputHistory(input, ref _chatInputText))
+        {
+            ResetCommandTabCompletion();
             return;
+        }
 
         if (input.IsNewKeyPress(Keys.Escape))
         {
             _chatInputActive = false;
             _chatInputText = "";
+            ResetCommandTabCompletion();
             return;
         }
 
@@ -6122,13 +6640,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 else
                     SubmitLocalChatMessage(message);
             }
+
+            ResetCommandTabCompletion();
             return;
         }
 
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        if (commandLikeText && input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _chatInputText, reverseCycle: shift))
+            return;
+
         var changed = false;
         foreach (var key in input.GetNewKeys())
         {
+            if (key == Keys.Tab)
+                continue;
+
             if (key == Keys.Back)
             {
                 if (_chatInputText.Length > 0)
@@ -6155,6 +6681,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _textInputHistoryCursor = _textInputHistory.Count;
             _textInputHistoryDraft = _chatInputText;
         }
+
+        if (changed)
+            ResetCommandTabCompletion();
     }
 
     private void UpdateCommandInput(InputState input)
@@ -6165,12 +6694,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         if (TryNavigateTextInputHistory(input, ref _commandInputText))
+        {
+            ResetCommandTabCompletion();
             return;
+        }
 
         if (input.IsNewKeyPress(Keys.Escape))
         {
             _commandInputActive = false;
             _commandInputText = "";
+            ResetCommandTabCompletion();
             return;
         }
 
@@ -6185,13 +6718,20 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             _commandInputActive = false;
             _commandInputText = "";
+            ResetCommandTabCompletion();
             return;
         }
 
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        if (input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _commandInputText, reverseCycle: shift))
+            return;
+
         var changed = false;
         foreach (var key in input.GetNewKeys())
         {
+            if (key == Keys.Tab)
+                continue;
+
             if (key == Keys.Back)
             {
                 if (_commandInputText.Length > 0)
@@ -6218,6 +6758,319 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _textInputHistoryCursor = _textInputHistory.Count;
             _textInputHistoryDraft = _commandInputText;
         }
+
+        if (changed)
+            ResetCommandTabCompletion();
+    }
+
+    private void ResetCommandTabCompletion()
+    {
+        _commandTabContextKey = string.Empty;
+        _commandTabIndex = -1;
+        _commandTabAppendSpace = false;
+        _commandTabCycleCandidates.Clear();
+    }
+
+    private bool TryApplyTabCommandCompletion(ref string text, bool reverseCycle)
+    {
+        if (!TryParseCommandCompletionContext(text, out var context))
+            return false;
+
+        EnsureCommandRegistry();
+        BuildCommandCompletionCandidates(context, _commandTabBuildBuffer);
+        if (_commandTabBuildBuffer.Count == 0)
+            return false;
+
+        var contextKey = BuildCommandCompletionContextKey(context);
+        var sameContext = string.Equals(_commandTabContextKey, contextKey, StringComparison.Ordinal)
+            && HaveSameCommandCompletionSet(_commandTabCycleCandidates, _commandTabBuildBuffer);
+        if (!sameContext)
+        {
+            _commandTabCycleCandidates.Clear();
+            _commandTabCycleCandidates.AddRange(_commandTabBuildBuffer);
+            _commandTabContextKey = contextKey;
+            _commandTabIndex = reverseCycle ? _commandTabCycleCandidates.Count - 1 : 0;
+            _commandTabAppendSpace = _commandTabCycleCandidates.Count == 1;
+        }
+        else
+        {
+            if (_commandTabCycleCandidates.Count == 0)
+                return false;
+
+            _commandTabIndex = reverseCycle
+                ? (_commandTabIndex - 1 + _commandTabCycleCandidates.Count) % _commandTabCycleCandidates.Count
+                : (_commandTabIndex + 1) % _commandTabCycleCandidates.Count;
+        }
+
+        if (_commandTabIndex < 0 || _commandTabIndex >= _commandTabCycleCandidates.Count)
+            return false;
+
+        var replacement = _commandTabCycleCandidates[_commandTabIndex].Value;
+        text = $"{context.PrefixText}{replacement}{(_commandTabAppendSpace ? " " : string.Empty)}";
+        if (text.Length > CommandInputMaxLength)
+            text = text.Substring(0, CommandInputMaxLength);
+        return true;
+    }
+
+    private static bool HaveSameCommandCompletionSet(IReadOnlyList<CommandCompletionCandidate> a, IReadOnlyList<CommandCompletionCandidate> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!string.Equals(a[i].Value, b[i].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string BuildCommandCompletionContextKey(in CommandCompletionContext context)
+    {
+        return $"{context.TokenIndex}|{context.PrefixText.ToLowerInvariant()}";
+    }
+
+    private static bool TryParseCommandCompletionContext(string rawInput, out CommandCompletionContext context)
+    {
+        context = default;
+        var input = (rawInput ?? string.Empty).TrimStart();
+        if (!input.StartsWith("/", StringComparison.Ordinal))
+            return false;
+
+        var body = input.Length > 1 ? input.Substring(1) : string.Empty;
+        var tokens = body.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var endsWithSpace = input.EndsWith(" ", StringComparison.Ordinal);
+
+        var tokenIndex = 0;
+        var tokenPrefix = string.Empty;
+        if (tokens.Length > 0)
+        {
+            if (endsWithSpace)
+            {
+                tokenIndex = tokens.Length;
+            }
+            else
+            {
+                tokenIndex = tokens.Length - 1;
+                tokenPrefix = tokens[tokenIndex];
+            }
+        }
+
+        var prefixPartsCount = Math.Clamp(tokenIndex, 0, tokens.Length);
+        var prefixBody = prefixPartsCount > 0
+            ? string.Join(" ", tokens.Take(prefixPartsCount)) + " "
+            : string.Empty;
+        var prefixText = "/" + prefixBody;
+        context = new CommandCompletionContext(prefixText, tokenPrefix, tokenIndex, tokens);
+        return true;
+    }
+
+    private void BuildCommandCompletionCandidates(in CommandCompletionContext context, List<CommandCompletionCandidate> output)
+    {
+        output.Clear();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var prefix = context.TokenPrefix ?? string.Empty;
+        var prefixLower = prefix.ToLowerInvariant();
+
+        if (context.TokenIndex == 0)
+        {
+            var ordered = _commandDescriptors.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase);
+            foreach (var descriptor in ordered)
+            {
+                if (descriptor.Permission == CommandPermission.OwnerAdmin && !HasOwnerAdminPermissions())
+                    continue;
+
+                AddCandidate(descriptor.Name, descriptor.Description, descriptor.Usage);
+                for (var i = 0; i < descriptor.Aliases.Length; i++)
+                    AddCandidate(descriptor.Aliases[i], $"Alias for /{descriptor.Name}. {descriptor.Description}", descriptor.Usage);
+            }
+
+            return;
+        }
+
+        if (context.Tokens.Length == 0)
+            return;
+
+        if (!_commandLookup.TryGetValue(context.Tokens[0], out var command))
+            return;
+        if (command.Permission == CommandPermission.OwnerAdmin && !HasOwnerAdminPermissions())
+            return;
+
+        var tokenOptions = GetCommandArgumentCompletionTokens(command, context.TokenIndex, context.Tokens);
+        for (var i = 0; i < tokenOptions.Count; i++)
+            AddCandidate(tokenOptions[i], $"Argument for /{command.Name}.", command.Usage);
+
+        output.Sort((a, b) => string.Compare(a.Value, b.Value, StringComparison.OrdinalIgnoreCase));
+        return;
+
+        void AddCandidate(string value, string description, string usage)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+            if (!value.StartsWith(prefixLower, StringComparison.OrdinalIgnoreCase))
+                return;
+            if (!seen.Add(value))
+                return;
+
+            output.Add(new CommandCompletionCandidate(
+                value,
+                $"{description} Usage: {usage}"));
+        }
+    }
+
+    private List<string> GetCommandArgumentCompletionTokens(in CommandDescriptor command, int tokenIndex, string[] tokens)
+    {
+        var values = new List<string>();
+        var name = command.Name.ToLowerInvariant();
+        switch (name)
+        {
+            case "help":
+                if (tokenIndex == 1)
+                {
+                    for (var i = 0; i < _commandDescriptors.Count; i++)
+                        values.Add(_commandDescriptors[i].Name);
+                }
+                break;
+
+            case "biome":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "list", "here", "desert", "grasslands", "ocean" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && TryResolveBiome(tokens[1], out _, out _))
+                    AppendRadiusPresets(values);
+                break;
+
+            case "structure":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[] { "gui", "list", "biome" });
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && string.Equals(tokens[1], "biome", StringComparison.OrdinalIgnoreCase))
+                {
+                    values.AddRange(new[] { "desert", "grasslands", "ocean" });
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length && string.Equals(tokens[1], "biome", StringComparison.OrdinalIgnoreCase))
+                {
+                    AppendRadiusPresets(values);
+                }
+                break;
+
+            case "gamemode":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "artificer", "veilwalker", "veilseer", "gui" });
+                break;
+
+            case "difficulty":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "peaceful", "easy", "normal", "hard" });
+                break;
+
+            case "time":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "query", "day", "night", "set" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && string.Equals(tokens[1], "set", StringComparison.OrdinalIgnoreCase))
+                    values.AddRange(new[] { "0", "1000", "6000", "12000", "13000", "18000" });
+                break;
+
+            case "weather":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "query", "clear", "rain", "storm" });
+                break;
+
+            case "chatclear":
+                if (tokenIndex == 1)
+                    values.Add("confirm");
+                break;
+
+            case "setspawn":
+            case "tp":
+                AppendCurrentPositionTokens(values);
+                break;
+
+            case "sethome":
+                if (tokenIndex == 1)
+                    AppendHomeNameTokens(values);
+                break;
+
+            case "home":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[] { "list", "gui", "set", "rename", "delete", "icon" });
+                    AppendHomeNameTokens(values);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var sub = tokens[1].ToLowerInvariant();
+                    if (sub is "rename" or "delete" or "icon")
+                        AppendHomeNameTokens(values);
+                    else if (sub == "set")
+                        AppendHomeNameTokens(values);
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length && string.Equals(tokens[1], "icon", StringComparison.OrdinalIgnoreCase))
+                {
+                    values.Add("auto");
+                    AppendBlockIconTokens(values);
+                }
+                break;
+
+            case "msg":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
+        }
+
+        var ordered = values
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return ordered;
+    }
+
+    private static void AppendRadiusPresets(List<string> output)
+    {
+        for (var i = 0; i < FinderRadiusOptions.Length; i++)
+            output.Add(FinderRadiusOptions[i].ToString());
+    }
+
+    private void AppendCurrentPositionTokens(List<string> output)
+    {
+        var px = (int)MathF.Floor(_player.Position.X);
+        var py = (int)MathF.Floor(_player.Position.Y);
+        var pz = (int)MathF.Floor(_player.Position.Z);
+        output.Add(px.ToString());
+        output.Add(py.ToString());
+        output.Add(pz.ToString());
+    }
+
+    private void AppendHomeNameTokens(List<string> output)
+    {
+        for (var i = 0; i < _homes.Count; i++)
+            output.Add(_homes[i].Name);
+    }
+
+    private void AppendPlayerNameTokens(List<string> output)
+    {
+        var localName = _profile.GetDisplayUsername();
+        if (!string.IsNullOrWhiteSpace(localName))
+            output.Add(localName);
+
+        foreach (var name in _playerNames.Values)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+                output.Add(name);
+        }
+    }
+
+    private static void AppendBlockIconTokens(List<string> output)
+    {
+        var names = Enum.GetNames(typeof(BlockId));
+        for (var i = 0; i < names.Length; i++)
+        {
+            if (string.Equals(names[i], nameof(BlockId.Air), StringComparison.OrdinalIgnoreCase))
+                continue;
+            output.Add(names[i]);
+        }
     }
 
     private void SubmitLocalChatMessage(string message)
@@ -6243,7 +7096,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         AddChatLine($"{username}: {text}", isSystem: false);
     }
 
-    private void AddChatLine(string text, bool isSystem, int? teleportX = null, int? teleportZ = null)
+    private void AddChatLine(string text, bool isSystem, int? teleportX = null, int? teleportY = null, int? teleportZ = null, string? hoverText = null)
     {
         if (string.IsNullOrWhiteSpace(text))
             return;
@@ -6252,10 +7105,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             _chatLines[^1].TimeRemaining = ChatLineLifetimeSeconds;
             _chatLines[^1].IsSystem = isSystem;
-            _chatLines[^1].HasTeleportAction = teleportX.HasValue && teleportZ.HasValue;
+            _chatLines[^1].HasTeleportAction = teleportX.HasValue && teleportY.HasValue && teleportZ.HasValue;
             _chatLines[^1].TeleportX = teleportX ?? 0;
+            _chatLines[^1].TeleportY = teleportY ?? 0;
             _chatLines[^1].TeleportZ = teleportZ ?? 0;
-            if (teleportX.HasValue && teleportZ.HasValue)
+            _chatLines[^1].HoverText = hoverText ?? string.Empty;
+            if (teleportX.HasValue && teleportY.HasValue && teleportZ.HasValue)
                 _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
             return;
         }
@@ -6265,12 +7120,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             Text = text,
             IsSystem = isSystem,
             TimeRemaining = ChatLineLifetimeSeconds,
-            HasTeleportAction = teleportX.HasValue && teleportZ.HasValue,
+            HasTeleportAction = teleportX.HasValue && teleportY.HasValue && teleportZ.HasValue,
             TeleportX = teleportX ?? 0,
-            TeleportZ = teleportZ ?? 0
+            TeleportY = teleportY ?? 0,
+            TeleportZ = teleportZ ?? 0,
+            HoverText = hoverText ?? string.Empty
         });
 
-        if (teleportX.HasValue && teleportZ.HasValue)
+        if (teleportX.HasValue && teleportY.HasValue && teleportZ.HasValue)
             _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
 
         if (_chatLines.Count > MaxChatLines)
@@ -6285,6 +7142,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _commandsInitialized = true;
         RegisterCommand("help", new[] { "?" }, "/help", "Show command help.", CommandPermission.Everyone, ExecuteHelpCommand);
         RegisterCommand("biome", Array.Empty<string>(), "/biome [list|here|<desert|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
+        RegisterCommand("structure", new[] { "locate" }, "/structure [gui|list|biome <name> [radius]]", "Open structure finder GUI or run finder tools.", CommandPermission.Everyone, ExecuteStructureCommand);
         RegisterCommand("tp", new[] { "teleport" }, "/tp <x> <z> or /tp <x> <y> <z>", "Teleport to coordinates.", CommandPermission.OwnerAdmin, ExecuteTeleportCommand);
         RegisterCommand("gamemode", new[] { "gm" }, "/gamemode <artificer|veilwalker|veilseer|gui>", "Change gamemode or open selector.", CommandPermission.OwnerAdmin, ExecuteGameModeCommand);
         RegisterCommand("artificer", Array.Empty<string>(), "/artificer", "Set ARTIFICER mode.", CommandPermission.OwnerAdmin, _ => ExecuteDirectGameMode(GameMode.Artificer));
@@ -6424,18 +7282,427 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             maxRadius = Math.Clamp(maxRadius, 16, CommandFindBiomeMaxRadius);
         }
 
-        var searchWatch = Stopwatch.StartNew();
-        if (!TryFindNearestBiome(targetBiomeToken, originX, originZ, maxRadius, out var foundX, out var foundZ, out var distance))
+        if (!TryReportBiomeLocation(targetBiomeToken, targetBiomeLabel, maxRadius))
+            return;
+    }
+
+    private void ExecuteStructureCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2 || string.Equals(commandParts[1], "gui", StringComparison.OrdinalIgnoreCase))
         {
-            searchWatch.Stop();
-            SetCommandStatus($"No {targetBiomeLabel} found within {maxRadius} blocks.");
+            OpenStructureFinderGui(openStructuresTab: true);
+            SetCommandStatus("Opened structure finder.");
             return;
         }
 
-        searchWatch.Stop();
-        var resultText = $"{targetBiomeLabel} at {foundX}, {foundZ} ({distance:0} blocks, {searchWatch.ElapsedMilliseconds}ms)";
-        SetCommandStatus(resultText, 7f);
-        AddChatLine($"{resultText}  [CLICK TO TELEPORT]", isSystem: true, teleportX: foundX, teleportZ: foundZ);
+        if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
+        {
+            SetCommandStatus("Structures: (none configured yet).", 8f);
+            return;
+        }
+
+        var tokenIndex = 1;
+        if (string.Equals(commandParts[1], "biome", StringComparison.OrdinalIgnoreCase))
+        {
+            if (commandParts.Length < 3)
+            {
+                SetCommandStatus("Usage: /structure biome <desert|grasslands|ocean> [radius]");
+                return;
+            }
+
+            tokenIndex = 2;
+        }
+
+        if (!TryResolveBiome(commandParts[tokenIndex], out var targetBiomeToken, out var targetBiomeLabel))
+        {
+            SetCommandStatus("No structures are configured yet. Use /structure gui.");
+            return;
+        }
+
+        var maxRadius = CommandFindBiomeDefaultRadius;
+        if (commandParts.Length > tokenIndex + 1)
+        {
+            if (!int.TryParse(commandParts[tokenIndex + 1], out maxRadius))
+            {
+                SetCommandStatus("Radius must be a number.");
+                return;
+            }
+
+            maxRadius = Math.Clamp(maxRadius, 16, CommandFindBiomeMaxRadius);
+        }
+
+        if (!TryReportBiomeLocation(targetBiomeToken, targetBiomeLabel, maxRadius))
+            return;
+    }
+
+    private bool TryReportBiomeLocation(string targetBiomeToken, string targetBiomeLabel, int maxRadius)
+    {
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return false;
+        }
+
+        var originX = (int)MathF.Floor(_player.Position.X);
+        var originZ = (int)MathF.Floor(_player.Position.Z);
+        if (_hasQueuedLocateOrigin)
+        {
+            originX = _queuedLocateOriginX;
+            originZ = _queuedLocateOriginZ;
+            _hasQueuedLocateOrigin = false;
+        }
+        if (!TryResolveValidatedBiomeCoordinate(targetBiomeToken, originX, originZ, maxRadius, out var foundX, out var foundZ))
+        {
+            SetCommandStatus($"Unable to locate {targetBiomeLabel}.");
+            return false;
+        }
+
+        var foundY = Math.Clamp(
+            (int)MathF.Round(FindSafeSpawnHeight(foundX, foundZ) + 1f),
+            2,
+            Math.Max(3, (_meta?.Size?.Height ?? 256) - 2));
+        var resultText = $"X: {foundX} Y: {foundY} Z: {foundZ}";
+        AddChatLine(
+            resultText,
+            isSystem: true,
+            teleportX: foundX,
+            teleportY: foundY,
+            teleportZ: foundZ,
+            hoverText: $"Click to teleport to {targetBiomeLabel} at {foundX} {foundY} {foundZ}");
+        return true;
+    }
+
+    private bool TryResolveValidatedBiomeCoordinate(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+
+        if (_world == null || _meta == null)
+            return false;
+
+        originX = Math.Clamp(originX, 0, Math.Max(0, _meta.Size.Width - 1));
+        originZ = Math.Clamp(originZ, 0, Math.Max(0, _meta.Size.Depth - 1));
+
+        if (IsBiomeCoordinateValid(targetBiomeToken, originX, originZ))
+        {
+            foundX = originX;
+            foundZ = originZ;
+            return true;
+        }
+
+        EnsureBiomeCatalog();
+        if (TryFindValidatedBiomeFromCatalog(targetBiomeToken, originX, originZ, maxRadius, out var catalogX, out var catalogZ)
+            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, catalogX, catalogZ, out foundX, out foundZ))
+            return true;
+
+        var worldRadius = GetBiomeSearchWorldRadius();
+        var boundedRadius = Math.Clamp(maxRadius, 16, Math.Max(16, worldRadius));
+        var ringRadius = Math.Min(boundedRadius, BiomeLocateMaxRingRadius);
+
+        if (TryFindBiomeOnRingScan(targetBiomeToken, originX, originZ, ringRadius, BiomeLocateRingStep, out var ringX, out var ringZ)
+            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, ringX, ringZ, out foundX, out foundZ))
+            return true;
+
+        if (TryFindBiomeByGlobalStrideScan(targetBiomeToken, originX, originZ, BiomeLocateGlobalStride, out var globalX, out var globalZ)
+            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, globalX, globalZ, out foundX, out foundZ))
+            return true;
+
+        if (TryFindBiomeByGlobalStrideScan(targetBiomeToken, originX, originZ, BiomeLocateGlobalFallbackStride, out var fallbackX, out var fallbackZ)
+            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, fallbackX, fallbackZ, out foundX, out foundZ))
+            return true;
+
+        if (TryFindBestBiomeClimateCandidate(targetBiomeToken, originX, originZ, out var climateX, out var climateZ)
+            && TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, climateX, climateZ, Math.Max(12, BiomeSearchRefineWindow * 4), out var refinedX, out var refinedZ)
+            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, refinedX, refinedZ, out foundX, out foundZ))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryFindValidatedBiomeFromCatalog(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        if (_biomeCatalog == null || !BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+            return false;
+
+        var points = _biomeCatalog.GetPoints(targetBiomeId);
+        if (points.Count == 0)
+            return false;
+
+        var radiusSq = (long)Math.Max(16, maxRadius) * Math.Max(16, maxRadius);
+        var bestAnyDistSq = long.MaxValue;
+        var bestAnyX = originX;
+        var bestAnyZ = originZ;
+        var bestInRadiusDistSq = long.MaxValue;
+        var bestInRadiusX = originX;
+        var bestInRadiusZ = originZ;
+        var hasInRadius = false;
+
+        for (var i = 0; i < points.Count; i++)
+        {
+            var point = points[i];
+            if (!IsWithinBiomeSearchBounds(point.X, point.Z))
+                continue;
+
+            var dx = point.X - originX;
+            var dz = point.Z - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+
+            if (distSq < bestAnyDistSq)
+            {
+                bestAnyDistSq = distSq;
+                bestAnyX = point.X;
+                bestAnyZ = point.Z;
+            }
+
+            if (distSq <= radiusSq && distSq < bestInRadiusDistSq)
+            {
+                bestInRadiusDistSq = distSq;
+                bestInRadiusX = point.X;
+                bestInRadiusZ = point.Z;
+                hasInRadius = true;
+            }
+        }
+
+        if (hasInRadius
+            && TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestInRadiusX, bestInRadiusZ, Math.Max(8, BiomeSearchRefineWindow * 2), out foundX, out foundZ))
+        {
+            return true;
+        }
+
+        if (TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestAnyX, bestAnyZ, Math.Max(8, BiomeSearchRefineWindow * 2), out foundX, out foundZ))
+            return true;
+
+        return false;
+    }
+
+    private bool TryFindBiomeOnRingScan(string targetBiomeToken, int originX, int originZ, int maxRadius, int step, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        if (maxRadius <= 0)
+            return false;
+
+        step = Math.Max(1, step);
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        var bestX = originX;
+        var bestZ = originZ;
+
+        void EvaluateCandidate(int wx, int wz)
+        {
+            if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                return;
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (distSq >= bestDistSq)
+                return;
+
+            bestDistSq = distSq;
+            bestX = wx;
+            bestZ = wz;
+            found = true;
+        }
+
+        for (var radius = step; radius <= maxRadius; radius += step)
+        {
+            for (var dx = -radius; dx <= radius; dx += step)
+            {
+                EvaluateCandidate(originX + dx, originZ - radius);
+                EvaluateCandidate(originX + dx, originZ + radius);
+            }
+
+            for (var dz = -radius + step; dz <= radius - step; dz += step)
+            {
+                EvaluateCandidate(originX - radius, originZ + dz);
+                EvaluateCandidate(originX + radius, originZ + dz);
+            }
+
+            if (found)
+            {
+                foundX = bestX;
+                foundZ = bestZ;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindBiomeByGlobalStrideScan(string targetBiomeToken, int originX, int originZ, int stride, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        if (_meta == null || stride <= 0)
+            return false;
+
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        var bestX = originX;
+        var bestZ = originZ;
+        var maxX = Math.Max(0, _meta.Size.Width - 1);
+        var maxZ = Math.Max(0, _meta.Size.Depth - 1);
+
+        void Evaluate(int wx, int wz)
+        {
+            if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                return;
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (distSq >= bestDistSq)
+                return;
+
+            bestDistSq = distSq;
+            bestX = wx;
+            bestZ = wz;
+            found = true;
+        }
+
+        for (var wz = 0; wz <= maxZ; wz += stride)
+        {
+            for (var wx = 0; wx <= maxX; wx += stride)
+                Evaluate(wx, wz);
+            Evaluate(maxX, wz);
+        }
+
+        for (var wx = 0; wx <= maxX; wx += stride)
+            Evaluate(wx, maxZ);
+        Evaluate(maxX, maxZ);
+
+        if (!found)
+            return false;
+
+        return TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestX, bestZ, Math.Max(8, stride), out foundX, out foundZ);
+    }
+
+    private bool TryRefineBiomeCandidate(string targetBiomeToken, int originX, int originZ, int centerX, int centerZ, int radius, out int foundX, out int foundZ)
+    {
+        foundX = centerX;
+        foundZ = centerZ;
+
+        if (IsBiomeCoordinateValid(targetBiomeToken, centerX, centerZ))
+            return true;
+
+        radius = Math.Max(1, radius);
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        for (var wz = centerZ - radius; wz <= centerZ + radius; wz++)
+        {
+            for (var wx = centerX - radius; wx <= centerX + radius; wx++)
+            {
+                if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                    continue;
+
+                var dx = wx - originX;
+                var dz = wz - originZ;
+                var distSq = (long)dx * dx + (long)dz * dz;
+                if (distSq >= bestDistSq)
+                    continue;
+
+                bestDistSq = distSq;
+                foundX = wx;
+                foundZ = wz;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    private bool TryFinalizeBiomeLocateCandidate(string targetBiomeToken, int originX, int originZ, int candidateX, int candidateZ, out int foundX, out int foundZ)
+    {
+        foundX = candidateX;
+        foundZ = candidateZ;
+        if (!IsBiomeCoordinateValid(targetBiomeToken, candidateX, candidateZ))
+            return false;
+
+        var promotedX = candidateX;
+        var promotedZ = candidateZ;
+        TryPromoteBiomeInterior(targetBiomeToken, originX, originZ, ref promotedX, ref promotedZ);
+        if (IsBiomeCoordinateValid(targetBiomeToken, promotedX, promotedZ))
+        {
+            foundX = promotedX;
+            foundZ = promotedZ;
+        }
+
+        return true;
+    }
+
+    private void TryPromoteBiomeInterior(string targetBiomeToken, int originX, int originZ, ref int bestX, ref int bestZ)
+    {
+        if (_world == null || _meta == null)
+            return;
+
+        var radius = targetBiomeToken switch
+        {
+            "ocean" => 144,
+            "desert" => 128,
+            _ => 96
+        };
+        var step = targetBiomeToken == "ocean" ? 4 : 3;
+        var minX = Math.Max(0, bestX - radius);
+        var maxX = Math.Min(_meta.Size.Width - 1, bestX + radius);
+        var minZ = Math.Max(0, bestZ - radius);
+        var maxZ = Math.Min(_meta.Size.Depth - 1, bestZ + radius);
+
+        var bestStrength = GetBiomeLocateStrength(targetBiomeToken, bestX, bestZ);
+        var bestDistSq = (long)(bestX - originX) * (bestX - originX) + (long)(bestZ - originZ) * (bestZ - originZ);
+        if (bestStrength >= 0.92f)
+            return;
+
+        for (var wz = minZ; wz <= maxZ; wz += step)
+        {
+            for (var wx = minX; wx <= maxX; wx += step)
+            {
+                if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                    continue;
+
+                var strength = GetBiomeLocateStrength(targetBiomeToken, wx, wz);
+                var dx = wx - originX;
+                var dz = wz - originZ;
+                var distSq = (long)dx * dx + (long)dz * dz;
+                if (strength > bestStrength + 0.015f
+                    || (MathF.Abs(strength - bestStrength) <= 0.015f && distSq < bestDistSq))
+                {
+                    bestStrength = strength;
+                    bestDistSq = distSq;
+                    bestX = wx;
+                    bestZ = wz;
+                }
+            }
+        }
+    }
+
+    private float GetBiomeLocateStrength(string targetBiomeToken, int x, int z)
+    {
+        if (_world == null)
+            return 0f;
+
+        var oceanWeight = Math.Clamp(_world.GetOceanWeightAt(x, z), 0f, 1f);
+        var desertWeight = Math.Clamp(_world.GetDesertWeightAt(x, z), 0f, 1f);
+        var effectiveDesert = Math.Clamp(desertWeight * (1f - oceanWeight * 0.9f), 0f, 1f);
+        return targetBiomeToken switch
+        {
+            "ocean" => Math.Clamp((oceanWeight - 0.67f) / 0.33f, 0f, 1f),
+            "desert" => Math.Clamp((effectiveDesert - 0.44f) / 0.56f, 0f, 1f),
+            _ => Math.Clamp(1f - MathF.Max(oceanWeight, effectiveDesert), 0f, 1f)
+        };
+    }
+
+    private bool IsBiomeCoordinateValid(string targetBiomeToken, int x, int z)
+    {
+        if (_world == null)
+            return false;
+        if (!IsWithinBiomeSearchBounds(x, z))
+            return false;
+        return IsBiomeMatch(_world.GetBiomeNameAt(x, z), targetBiomeToken);
     }
 
     private void ReportCurrentBiome(int wx, int wz)
@@ -7147,6 +8414,183 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _homeGuiStatusTimer = 4f;
     }
 
+    private void OpenStructureFinderGui(bool openStructuresTab)
+    {
+        _homeGuiOpen = false;
+        _structureFinderOpen = true;
+        _structureFinderStructureTab = openStructuresTab;
+        _structureFinderStatus = string.Empty;
+        _structureFinderStatusTimer = 0f;
+        LayoutStructureFinderGui();
+    }
+
+    private void LayoutStructureFinderGui()
+    {
+        var panelW = Math.Clamp((int)MathF.Round(_viewport.Width * 0.56f), 520, 860);
+        var panelH = Math.Clamp((int)MathF.Round(_viewport.Height * 0.60f), 360, 620);
+        _structureFinderPanelRect = new Rectangle(
+            _viewport.Center.X - panelW / 2,
+            _viewport.Center.Y - panelH / 2,
+            panelW,
+            panelH);
+
+        var topY = _structureFinderPanelRect.Y + 44;
+        var sidePad = 16;
+        var tabGap = 10;
+        var tabWidth = (_structureFinderPanelRect.Width - sidePad * 2 - tabGap) / 2;
+        _structureFinderBiomeTabBtn.Bounds = new Rectangle(_structureFinderPanelRect.X + sidePad, topY, tabWidth, 34);
+        _structureFinderStructureTabBtn.Bounds = new Rectangle(_structureFinderBiomeTabBtn.Bounds.Right + tabGap, topY, tabWidth, 34);
+
+        _structureFinderListRect = new Rectangle(
+            _structureFinderPanelRect.X + sidePad,
+            _structureFinderBiomeTabBtn.Bounds.Bottom + 10,
+            _structureFinderPanelRect.Width - sidePad * 2,
+            _structureFinderPanelRect.Height - 178);
+
+        var rowH = Math.Max(40, (_structureFinderListRect.Height - 8) / FinderBiomeLabels.Length);
+        for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+        {
+            _structureFinderBiomeRects[i] = new Rectangle(
+                _structureFinderListRect.X + 4,
+                _structureFinderListRect.Y + 4 + i * rowH,
+                _structureFinderListRect.Width - 8,
+                rowH - 6);
+        }
+
+        var bottomY = _structureFinderPanelRect.Bottom - 44;
+        _structureFinderRadiusBtn.Bounds = new Rectangle(_structureFinderPanelRect.X + sidePad, bottomY, 180, 30);
+        _structureFinderFindBtn.Bounds = new Rectangle(_structureFinderRadiusBtn.Bounds.Right + 10, bottomY, 120, 30);
+        _structureFinderCloseBtn.Bounds = new Rectangle(_structureFinderPanelRect.Right - sidePad - 120, bottomY, 120, 30);
+    }
+
+    private void UpdateStructureFinderGui(InputState input, float dt)
+    {
+        LayoutStructureFinderGui();
+        if (_structureFinderStatusTimer > 0f)
+        {
+            _structureFinderStatusTimer = Math.Max(0f, _structureFinderStatusTimer - dt);
+            if (_structureFinderStatusTimer <= 0f)
+                _structureFinderStatus = string.Empty;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            _structureFinderOpen = false;
+            return;
+        }
+
+        if (!_structureFinderStructureTab && input.IsNewLeftClick() && _structureFinderListRect.Contains(input.MousePosition))
+        {
+            for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+            {
+                if (_structureFinderBiomeRects[i].Contains(input.MousePosition))
+                {
+                    _structureFinderSelectedBiomeIndex = i;
+                    break;
+                }
+            }
+        }
+
+        _structureFinderBiomeTabBtn.ForceDisabledStyle = !_structureFinderStructureTab;
+        _structureFinderStructureTabBtn.ForceDisabledStyle = _structureFinderStructureTab;
+        _structureFinderRadiusBtn.Enabled = !_structureFinderStructureTab;
+        _structureFinderFindBtn.Enabled = !_structureFinderStructureTab;
+        _structureFinderRadiusBtn.ForceDisabledStyle = _structureFinderStructureTab;
+        _structureFinderFindBtn.ForceDisabledStyle = _structureFinderStructureTab;
+
+        _structureFinderBiomeTabBtn.Update(input);
+        _structureFinderStructureTabBtn.Update(input);
+        _structureFinderRadiusBtn.Update(input);
+        _structureFinderFindBtn.Update(input);
+        _structureFinderCloseBtn.Update(input);
+    }
+
+    private void DrawStructureFinderGui(SpriteBatch sb)
+    {
+        sb.Draw(_pixel, _viewport, new Color(0, 0, 0, 120));
+        if (_structureFinderPanelTexture != null)
+            sb.Draw(_structureFinderPanelTexture, _structureFinderPanelRect, Color.White);
+        else
+            sb.Draw(_pixel, _structureFinderPanelRect, new Color(18, 22, 28, 235));
+        DrawBorder(sb, _structureFinderPanelRect, new Color(210, 220, 235));
+
+        _font.DrawString(sb, "FINDER", new Vector2(_structureFinderPanelRect.X + 16, _structureFinderPanelRect.Y + 12), Color.White);
+        _structureFinderBiomeTabBtn.Draw(sb, _pixel, _font);
+        _structureFinderStructureTabBtn.Draw(sb, _pixel, _font);
+
+        sb.Draw(_pixel, _structureFinderListRect, new Color(8, 8, 8, 180));
+        DrawBorder(sb, _structureFinderListRect, new Color(170, 170, 170));
+        if (_structureFinderStructureTab)
+        {
+            var empty = "No structures configured yet.";
+            var helper = "Biome finder is available in the BIOMES tab.";
+            var emptySize = _font.MeasureString(empty);
+            var helperSize = _font.MeasureString(helper);
+            _font.DrawString(sb, empty, new Vector2(_structureFinderListRect.Center.X - emptySize.X / 2f, _structureFinderListRect.Center.Y - _font.LineHeight), new Color(230, 230, 230));
+            _font.DrawString(sb, helper, new Vector2(_structureFinderListRect.Center.X - helperSize.X / 2f, _structureFinderListRect.Center.Y + 4), new Color(175, 195, 220));
+        }
+        else
+        {
+            for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+            {
+                var rect = _structureFinderBiomeRects[i];
+                var selected = i == _structureFinderSelectedBiomeIndex;
+                sb.Draw(_pixel, rect, selected ? new Color(38, 78, 118, 210) : new Color(20, 20, 20, 175));
+                DrawBorder(sb, rect, selected ? new Color(190, 230, 255) : new Color(120, 120, 120));
+                _font.DrawString(sb, FinderBiomeLabels[i], new Vector2(rect.X + 10, rect.Y + 10), Color.White);
+            }
+        }
+
+        _structureFinderRadiusBtn.Draw(sb, _pixel, _font);
+        _structureFinderFindBtn.Draw(sb, _pixel, _font);
+        _structureFinderCloseBtn.Draw(sb, _pixel, _font);
+
+        var hint = "Find posts one clickable X Y Z result in chat.";
+        _font.DrawString(sb, hint, new Vector2(_structureFinderPanelRect.X + 16, _structureFinderRadiusBtn.Bounds.Y - _font.LineHeight - 4), new Color(182, 202, 224));
+        if (!string.IsNullOrWhiteSpace(_structureFinderStatus))
+            _font.DrawString(sb, _structureFinderStatus, new Vector2(_structureFinderPanelRect.X + 16, _structureFinderPanelRect.Bottom - _font.LineHeight - 8), new Color(235, 235, 180));
+    }
+
+    private void CycleStructureFinderRadius()
+    {
+        _structureFinderRadiusIndex++;
+        if (_structureFinderRadiusIndex >= FinderRadiusOptions.Length)
+            _structureFinderRadiusIndex = 0;
+        SyncStructureFinderRadiusLabel();
+    }
+
+    private void SyncStructureFinderRadiusLabel()
+    {
+        var index = Math.Clamp(_structureFinderRadiusIndex, 0, FinderRadiusOptions.Length - 1);
+        _structureFinderRadiusIndex = index;
+        _structureFinderRadiusBtn.Label = $"RADIUS: {FinderRadiusOptions[index]}";
+    }
+
+    private void ExecuteStructureFinderSearchFromGui()
+    {
+        if (_structureFinderStructureTab)
+        {
+            SetStructureFinderStatus("No structures configured yet.");
+            return;
+        }
+
+        var biomeIndex = Math.Clamp(_structureFinderSelectedBiomeIndex, 0, FinderBiomeTokens.Length - 1);
+        var radiusIndex = Math.Clamp(_structureFinderRadiusIndex, 0, FinderRadiusOptions.Length - 1);
+        var token = FinderBiomeTokens[biomeIndex];
+        var label = FinderBiomeLabels[biomeIndex];
+        var radius = FinderRadiusOptions[radiusIndex];
+        if (TryReportBiomeLocation(token, label, radius))
+            SetStructureFinderStatus($"Located {label}.");
+        else
+            SetStructureFinderStatus($"Unable to locate {label}.");
+    }
+
+    private void SetStructureFinderStatus(string message)
+    {
+        _structureFinderStatus = message;
+        _structureFinderStatusTimer = 4f;
+    }
+
     private void ExecuteMeCommand(string[] commandParts)
     {
         if (commandParts.Length < 2)
@@ -7344,8 +8788,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _chatInputActive || _commandInputActive)
             return false;
 
-        var altDown = input.IsKeyDown(Keys.LeftAlt) || input.IsKeyDown(Keys.RightAlt);
-        if (!_gamemodeWheelVisible && altDown && input.IsNewKeyPress(Keys.G))
+        var modifierDown = input.IsKeyDown(_gamemodeModifierKey);
+        if (!_gamemodeWheelVisible && modifierDown && input.IsNewKeyPress(_gamemodeWheelKey))
         {
             OpenGamemodeWheel(holdToOpen: true);
             return true;
@@ -7370,7 +8814,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (_gamemodeWheelHoldToOpen)
         {
-            if (!altDown || !input.IsKeyDown(Keys.G))
+            if (!modifierDown)
             {
                 if (!_gamemodeWheelWaitForRelease)
                     ApplyGameModeChange(_gamemodeWheelHoverMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
@@ -7409,23 +8853,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var ringRadius = Math.Clamp(_viewport.Height / 4, 120, 240);
         var buttonWidth = 220;
         var buttonHeight = 152;
-        var mouse = new Vector2(mousePoint.X, mousePoint.Y);
-        var bestDistSq = float.MaxValue;
-        var bestMode = _gamemodeWheelHoverMode;
 
         for (var i = 0; i < GameModeWheelModes.Length; i++)
         {
             var rect = GetGamemodeWheelButtonRect(center, ringRadius, buttonWidth, buttonHeight, i);
-            var buttonCenter = new Vector2(rect.Center.X, rect.Center.Y);
-            var distSq = Vector2.DistanceSquared(mouse, buttonCenter);
-            if (distSq >= bestDistSq)
+            if (!rect.Contains(mousePoint))
                 continue;
 
-            bestDistSq = distSq;
-            bestMode = GameModeWheelModes[i];
+            _gamemodeWheelHoverMode = GameModeWheelModes[i];
+            return;
         }
-
-        _gamemodeWheelHoverMode = bestMode;
     }
 
     private void DrawGamemodeToast(SpriteBatch sb)
@@ -7470,7 +8907,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         var help = _gamemodeWheelHoldToOpen
-            ? "ALT+G HOLD: release to apply | 1/2/3 quick select"
+            ? $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)} HOLD: release to apply | 1/2/3 quick select"
             : "Click or Enter to apply | Esc to cancel";
         var helpSize = _font.MeasureString(help);
         _font.DrawString(sb, help, new Vector2(center.X - helpSize.X / 2f, center.Y - _font.LineHeight / 2f), new Color(235, 235, 235));
@@ -7599,11 +9036,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         foundZ = originZ;
         distance = 0f;
 
-        if (_world == null)
+        if (_world == null || _meta == null)
             return false;
+
+        originX = Math.Clamp(originX, 0, Math.Max(0, _meta.Size.Width - 1));
+        originZ = Math.Clamp(originZ, 0, Math.Max(0, _meta.Size.Depth - 1));
+        foundX = originX;
+        foundZ = originZ;
 
         if (IsBiomeMatch(_world.GetBiomeNameAt(originX, originZ), targetBiomeToken))
             return true;
+
+        EnsureBiomeCatalog();
+        var hasCatalogTarget = BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId);
 
         var step = maxRadius >= 4096 ? 8 : 4;
         var bestDistSq = long.MaxValue;
@@ -7613,6 +9058,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         void EvaluateCandidate(int wx, int wz)
         {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+
             var biome = _world.GetBiomeNameAt(wx, wz);
             if (!IsBiomeMatch(biome, targetBiomeToken))
                 return;
@@ -7627,6 +9075,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             bestX = wx;
             bestZ = wz;
             found = true;
+        }
+
+        if (hasCatalogTarget
+            && _biomeCatalog != null
+            && _biomeCatalog.TryFindNearest(targetBiomeId, originX, originZ, maxRadius, out var catalogX, out var catalogZ, out _))
+        {
+            for (var wz = catalogZ - BiomeSearchRefineWindow; wz <= catalogZ + BiomeSearchRefineWindow; wz++)
+            {
+                for (var wx = catalogX - BiomeSearchRefineWindow; wx <= catalogX + BiomeSearchRefineWindow; wx++)
+                    EvaluateCandidate(wx, wz);
+            }
         }
 
         for (var radius = step; radius <= maxRadius; radius += step)
@@ -7648,7 +9107,49 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         if (!found)
-            return false;
+        {
+            var worldRadius = GetBiomeSearchWorldRadius();
+
+            if (hasCatalogTarget
+                && _biomeCatalog != null
+                && _biomeCatalog.TryFindNearest(targetBiomeId, originX, originZ, worldRadius, out var globalCatalogX, out var globalCatalogZ, out _))
+            {
+                for (var wz = globalCatalogZ - BiomeSearchRefineWindow; wz <= globalCatalogZ + BiomeSearchRefineWindow; wz++)
+                {
+                    for (var wx = globalCatalogX - BiomeSearchRefineWindow; wx <= globalCatalogX + BiomeSearchRefineWindow; wx++)
+                        EvaluateCandidate(wx, wz);
+                }
+            }
+        }
+
+        if (!found)
+        {
+            var stride = Math.Max(step, 8);
+            var maxX = Math.Max(0, _meta.Size.Width - 1);
+            var maxZ = Math.Max(0, _meta.Size.Depth - 1);
+            for (var wz = 0; wz <= maxZ; wz += stride)
+            {
+                for (var wx = 0; wx <= maxX; wx += stride)
+                    EvaluateCandidate(wx, wz);
+                EvaluateCandidate(maxX, wz);
+            }
+
+            for (var wx = 0; wx <= maxX; wx += stride)
+                EvaluateCandidate(wx, maxZ);
+            EvaluateCandidate(maxX, maxZ);
+        }
+
+        if (!found)
+        {
+            if (!TryFindBestBiomeClimateCandidate(targetBiomeToken, originX, originZ, out bestX, out bestZ))
+            {
+                bestX = originX;
+                bestZ = originZ;
+            }
+
+            bestDistSq = (long)(bestX - originX) * (bestX - originX) + (long)(bestZ - originZ) * (bestZ - originZ);
+            found = true;
+        }
 
         var coarseX = bestX;
         var coarseZ = bestZ;
@@ -7659,10 +9160,249 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 EvaluateCandidate(wx, wz);
         }
 
+        if (!found)
+        {
+            bestX = originX;
+            bestZ = originZ;
+            bestDistSq = 0;
+            found = true;
+        }
+
         foundX = bestX;
         foundZ = bestZ;
         distance = MathF.Sqrt(bestDistSq);
+        return found;
+    }
+
+    private bool TryFindExactBiomeCoordinate(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ, out float distance)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        distance = 0f;
+
+        if (_world == null || _meta == null)
+            return false;
+
+        originX = Math.Clamp(originX, 0, Math.Max(0, _meta.Size.Width - 1));
+        originZ = Math.Clamp(originZ, 0, Math.Max(0, _meta.Size.Depth - 1));
+        foundX = originX;
+        foundZ = originZ;
+        if (IsBiomeMatch(_world.GetBiomeNameAt(originX, originZ), targetBiomeToken))
+            return true;
+
+        var radiusDistSq = (long)Math.Max(16, maxRadius) * Math.Max(16, maxRadius);
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        var bestXLocal = originX;
+        var bestZLocal = originZ;
+
+        void EvaluateCandidate(int wx, int wz, bool ignoreRadius = false)
+        {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+            if (!IsBiomeMatch(_world.GetBiomeNameAt(wx, wz), targetBiomeToken))
+                return;
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (!ignoreRadius && distSq > radiusDistSq)
+                return;
+            if (distSq >= bestDistSq)
+                return;
+
+            bestDistSq = distSq;
+            bestXLocal = wx;
+            bestZLocal = wz;
+            found = true;
+        }
+
+        EnsureBiomeCatalog();
+        if (BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId) && _biomeCatalog != null)
+        {
+            var points = _biomeCatalog.GetPoints(targetBiomeId);
+            for (var i = 0; i < points.Count; i++)
+                EvaluateCandidate(points[i].X, points[i].Z);
+
+            if (found)
+            {
+                var cx = bestXLocal;
+                var cz = bestZLocal;
+                for (var wz = cz - BiomeSearchRefineWindow; wz <= cz + BiomeSearchRefineWindow; wz++)
+                {
+                    for (var wx = cx - BiomeSearchRefineWindow; wx <= cx + BiomeSearchRefineWindow; wx++)
+                        EvaluateCandidate(wx, wz);
+                }
+            }
+        }
+
+        if (!found)
+        {
+            var step = maxRadius >= 4096 ? 8 : 4;
+            for (var radius = step; radius <= maxRadius; radius += step)
+            {
+                for (var dx = -radius; dx <= radius; dx += step)
+                {
+                    EvaluateCandidate(originX + dx, originZ - radius);
+                    EvaluateCandidate(originX + dx, originZ + radius);
+                }
+
+                for (var dz = -radius + step; dz <= radius - step; dz += step)
+                {
+                    EvaluateCandidate(originX - radius, originZ + dz);
+                    EvaluateCandidate(originX + radius, originZ + dz);
+                }
+
+                if (found)
+                    break;
+            }
+        }
+
+        if (!found)
+        {
+            var maxX = Math.Max(0, _meta.Size.Width - 1);
+            var maxZ = Math.Max(0, _meta.Size.Depth - 1);
+            foreach (var stride in new[] { 16, 8, 4, 2 })
+            {
+                for (var wz = 0; wz <= maxZ; wz += stride)
+                {
+                    for (var wx = 0; wx <= maxX; wx += stride)
+                        EvaluateCandidate(wx, wz);
+                    EvaluateCandidate(maxX, wz);
+                }
+
+                for (var wx = 0; wx <= maxX; wx += stride)
+                    EvaluateCandidate(wx, maxZ);
+                EvaluateCandidate(maxX, maxZ);
+
+                if (found)
+                    break;
+            }
+
+            if (!found)
+            {
+                // Final exact sweep across the whole world to guarantee accuracy when a biome exists.
+                for (var wz = 0; wz <= maxZ; wz++)
+                {
+                    for (var wx = 0; wx <= maxX; wx++)
+                        EvaluateCandidate(wx, wz, ignoreRadius: true);
+                }
+            }
+        }
+
+        if (!found)
+            return false;
+
+        foundX = bestXLocal;
+        foundZ = bestZLocal;
+        distance = MathF.Sqrt(bestDistSq);
         return true;
+    }
+
+    private int GetBiomeSearchWorldRadius()
+    {
+        if (_meta?.Size == null)
+            return CommandFindBiomeMaxRadius;
+
+        var width = Math.Max(1, _meta.Size.Width);
+        var depth = Math.Max(1, _meta.Size.Depth);
+        var diag = Math.Sqrt((double)width * width + (double)depth * depth);
+        return Math.Max(CommandFindBiomeMaxRadius, (int)Math.Ceiling(diag));
+    }
+
+    private bool TryFindBestBiomeClimateCandidate(string targetBiomeToken, int originX, int originZ, out int bestX, out int bestZ)
+    {
+        if (_world == null || _meta?.Size == null)
+        {
+            bestX = originX;
+            bestZ = originZ;
+            return false;
+        }
+
+        var stride = 8;
+        var bestScore = float.NegativeInfinity;
+        var bestDistSq = long.MaxValue;
+        var maxX = Math.Max(0, _meta.Size.Width - 1);
+        var maxZ = Math.Max(0, _meta.Size.Depth - 1);
+        var bestXLocal = originX;
+        var bestZLocal = originZ;
+
+        void Evaluate(int wx, int wz)
+        {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+
+            var ocean = _world.GetOceanWeightAt(wx, wz);
+            var desert = _world.GetDesertWeightAt(wx, wz);
+            var score = targetBiomeToken switch
+            {
+                "ocean" => ocean,
+                "desert" => desert * (1f - ocean * 0.9f),
+                _ => Math.Clamp(1f - MathF.Max(ocean, desert), 0f, 1f)
+            };
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (score < bestScore)
+                return;
+            if (MathF.Abs(score - bestScore) < 0.0001f && distSq >= bestDistSq)
+                return;
+
+            bestScore = score;
+            bestDistSq = distSq;
+            bestXLocal = wx;
+            bestZLocal = wz;
+        }
+
+        for (var wz = 0; wz <= maxZ; wz += stride)
+        {
+            for (var wx = 0; wx <= maxX; wx += stride)
+                Evaluate(wx, wz);
+            Evaluate(maxX, wz);
+        }
+
+        for (var wx = 0; wx <= maxX; wx += stride)
+            Evaluate(wx, maxZ);
+        Evaluate(maxX, maxZ);
+
+        bestX = bestXLocal;
+        bestZ = bestZLocal;
+        return !float.IsNegativeInfinity(bestScore);
+    }
+
+    private void EnsureBiomeCatalog()
+    {
+        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+
+        if (_biomeCatalog != null && _biomeCatalog.IsCompatible(_meta))
+            return;
+
+        _biomeCatalog = BiomeCatalog.Load(_worldPath, _log);
+        if (_biomeCatalog != null && _biomeCatalog.IsCompatible(_meta))
+            return;
+
+        try
+        {
+            _biomeCatalog = BiomeCatalog.BuildAndSave(_meta, _worldPath, _log);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Biome catalog rebuild failed: {ex.Message}");
+            _biomeCatalog = null;
+        }
+    }
+
+    private bool IsWithinBiomeSearchBounds(int wx, int wz)
+    {
+        if (_meta == null)
+            return false;
+
+        return wx >= 0
+            && wz >= 0
+            && wx < _meta.Size.Width
+            && wz < _meta.Size.Depth;
     }
 
     private static bool IsBiomeMatch(string biomeName, string targetBiomeToken)
@@ -7799,11 +9539,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
-    private void SetCommandStatus(string text, float seconds = 5f)
+    private void SetCommandStatus(string text, float seconds = 5f, bool echoToChat = true)
     {
         _commandStatusText = text;
         _commandStatusTimer = Math.Max(0f, seconds);
-        AddChatLine(text, isSystem: true);
+        if (echoToChat)
+            AddChatLine(text, isSystem: true);
     }
 
     private void DrawCommandOverlay(SpriteBatch sb)
@@ -7879,8 +9620,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 {
                     HasTeleport = true,
                     TeleportX = line.TeleportX,
+                    TeleportY = line.TeleportY,
                     TeleportZ = line.TeleportZ,
-                    HoverText = $"Teleport to {line.TeleportX}, {line.TeleportZ}"
+                    HoverText = string.IsNullOrWhiteSpace(line.HoverText)
+                        ? $"Teleport to {line.TeleportX} {line.TeleportY} {line.TeleportZ}"
+                        : line.HoverText
                 };
                 y = DrawCommandLine(sb, x, y, line.Text, new Color(0, 0, 0, 145), fg, action: action, fixedWidth: overlayWidth);
             }
@@ -7920,20 +9664,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         EnsureCommandRegistry();
-        if (!_commandLookup.TryGetValue("help", out var helpDescriptor))
+        if (!TryParseCommandCompletionContext(input, out var context))
             return;
 
-        var token = input.Length > 1 ? input.Substring(1).Trim() : string.Empty;
-        var matchesHelp = token.Length == 0
-            || helpDescriptor.Name.StartsWith(token, StringComparison.OrdinalIgnoreCase)
-            || helpDescriptor.Aliases.Any(alias => alias.StartsWith(token, StringComparison.OrdinalIgnoreCase));
-
-        if (!matchesHelp)
+        BuildCommandCompletionCandidates(context, _commandTabBuildBuffer);
+        if (_commandTabBuildBuffer.Count == 0)
             return;
 
-        _commandPredictionBuffer.Add(new CommandPredictionItem(
-            "/help",
-            $"{helpDescriptor.Description} Usage: {helpDescriptor.Usage}"));
+        var maxCount = Math.Min(MaxCommandPredictions, _commandTabBuildBuffer.Count);
+        for (var i = 0; i < maxCount; i++)
+        {
+            var candidate = _commandTabBuildBuffer[i];
+            var preview = context.TokenIndex == 0
+                ? "/" + candidate.Value
+                : context.PrefixText + candidate.Value;
+            _commandPredictionBuffer.Add(new CommandPredictionItem(preview, candidate.HoverText));
+        }
     }
 
     private int DrawCommandLine(
@@ -8125,6 +9871,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public Rectangle Bounds;
         public bool HasTeleport;
         public int TeleportX;
+        public int TeleportY;
         public int TeleportZ;
         public string HoverText;
     }
@@ -8180,6 +9927,34 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public string HoverText { get; }
     }
 
+    private readonly struct CommandCompletionCandidate
+    {
+        public CommandCompletionCandidate(string value, string hoverText)
+        {
+            Value = value;
+            HoverText = hoverText;
+        }
+
+        public string Value { get; }
+        public string HoverText { get; }
+    }
+
+    private readonly struct CommandCompletionContext
+    {
+        public CommandCompletionContext(string prefixText, string tokenPrefix, int tokenIndex, string[] tokens)
+        {
+            PrefixText = prefixText;
+            TokenPrefix = tokenPrefix;
+            TokenIndex = tokenIndex;
+            Tokens = tokens;
+        }
+
+        public string PrefixText { get; }
+        public string TokenPrefix { get; }
+        public int TokenIndex { get; }
+        public string[] Tokens { get; }
+    }
+
     private sealed class ChatLine
     {
         public string Text = "";
@@ -8187,7 +9962,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public float TimeRemaining;
         public bool HasTeleportAction;
         public int TeleportX;
+        public int TeleportY;
         public int TeleportZ;
+        public string HoverText = "";
     }
 
     private struct PlayerHomeEntry

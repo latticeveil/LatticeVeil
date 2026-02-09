@@ -194,13 +194,16 @@ public sealed class ProfileScreen : IScreen
 
         // EOS info
         var infoY = _nameRect.Bottom + 18;
-        var eosStatus = _eos == null ? "EOS: disabled" : (_eos.IsLoggedIn ? "EOS: ready" : "EOS: connecting...");
+        var eosSnapshot = EosRuntimeStatus.Evaluate(_eos);
+        var eosStatus = eosSnapshot.StatusText;
         _font.DrawString(sb, eosStatus, new Vector2(x, infoY), new Color(220, 180, 80));
         infoY += _font.LineHeight + 4;
         _font.DrawString(sb, "HOST CODE (YOUR ID):", new Vector2(x, infoY), Color.White);
         infoY += _font.LineHeight + 2;
         var id = _eos?.LocalProductUserId;
         _font.DrawString(sb, string.IsNullOrWhiteSpace(id) ? "(waiting...)" : id, new Vector2(x, infoY), Color.White);
+        infoY += _font.LineHeight + 2;
+        _font.DrawString(sb, $"EOS Config: {EosRuntimeStatus.DescribeConfigSource()}", new Vector2(x, infoY), new Color(180, 180, 180));
 
         // Status
         if (!string.IsNullOrWhiteSpace(_status))

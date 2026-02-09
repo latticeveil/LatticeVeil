@@ -17,6 +17,7 @@ public sealed class SingleplayerScreen : IScreen
     private readonly MenuStack _menus;
     private readonly AssetLoader _assets;
     private readonly PixelFont _font;
+    private readonly PixelFont _rowFont;
     private readonly Texture2D _pixel;
     private readonly Logger _log;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
@@ -46,6 +47,10 @@ public sealed class SingleplayerScreen : IScreen
     private double _statusUntil;
     private Point _overlayMousePos;
     private int _hoverWorldIndex = -1;
+    private readonly Dictionary<string, PreviewTextureCacheEntry> _previewTextures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _previewLoadFailures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _seedRevealByWorld = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, Rectangle> _seedEyeRects = new();
 
     private List<WorldListEntry> _worlds = new();
 
@@ -54,6 +59,7 @@ public sealed class SingleplayerScreen : IScreen
         _menus = menus;
         _assets = assets;
         _font = font;
+        _rowFont = new PixelFont(pixel, scale: 3);
         _pixel = pixel;
         _log = log;
         _graphics = graphics;
@@ -127,7 +133,7 @@ public sealed class SingleplayerScreen : IScreen
         
         _log.Info($"SingleplayerScreen - ListRect: {_listRect.Width}x{_listRect.Height} at ({_listRect.X},{_listRect.Y})");
 
-        _rowHeight = _font.LineHeight + 4; // Reduced from +8 to make rows smaller
+        _rowHeight = Math.Max(_rowFont.LineHeight + 22, 72);
 
         var buttonW = Math.Clamp((int)(_panelRect.Width * 0.28f), 160, 260);
         var buttonH = Math.Clamp((int)(buttonW * 0.28f), 40, 70);
@@ -146,7 +152,6 @@ public sealed class SingleplayerScreen : IScreen
         }
 
         var buttonY = _panelRect.Bottom - margin - buttonH - 90; // Move up by 90 pixels (3 inches)
-        var deleteY = buttonY - (deleteSize - buttonH);
         // Position back button in bottom-left corner of full screen with proper aspect ratio
         var backBtnMargin = 20;
         var backBtnBaseW = Math.Max(_backBtn.Texture?.Width ?? 0, 320);
@@ -164,12 +169,11 @@ public sealed class SingleplayerScreen : IScreen
         // Center create button on the GUI backdrop
         var createBtnW = panelW / 3 - 15; // Match options screen apply button size
         var createBtnH = (int)(createBtnW * 0.25f); // Match options screen apply button ratio
-        var createBtnX = _panelRect.X + (_panelRect.Width - createBtnW) / 2;
-        _createBtn.Bounds = new Rectangle(createBtnX, buttonY, createBtnW, createBtnH);
-        
-        // Position delete button to the right of create button - make it square and match create button height
-        deleteSize = createBtnH; // Make delete button square and same height as create button
-        _deleteBtn.Bounds = new Rectangle(createBtnX + createBtnW + gap, buttonY, deleteSize, deleteSize);
+        deleteSize = createBtnH;
+        var actionsTotal = createBtnW + deleteSize + gap;
+        var actionsStartX = _panelRect.X + (_panelRect.Width - actionsTotal) / 2;
+        _createBtn.Bounds = new Rectangle(actionsStartX, buttonY, createBtnW, createBtnH);
+        _deleteBtn.Bounds = new Rectangle(_createBtn.Bounds.Right + gap, buttonY, deleteSize, deleteSize);
 
         var infoW = 170;
         var infoH = Math.Max(30, _font.LineHeight + 12);
@@ -303,6 +307,7 @@ public sealed class SingleplayerScreen : IScreen
     private void DrawWorldList(SpriteBatch sb)
     {
         _hoverWorldIndex = -1;
+        _seedEyeRects.Clear();
         if (_worlds.Count == 0)
         {
             var msg = "NO WORLDS FOUND";
@@ -326,15 +331,42 @@ public sealed class SingleplayerScreen : IScreen
             DrawBorder(sb, rowRect, Color.White);
 
             var entry = _worlds[i];
-            var modeText = entry.CurrentMode.ToString().ToUpperInvariant();
-            var label = $"{entry.Name}  [{modeText}]";
-            if (_showSeedInfo)
-                label += $"  Seed:{ShortSeed(entry.Seed)}";
-            var pos = new Vector2(rowRect.X + 10, rowRect.Y + (_rowHeight - _font.LineHeight) / 2f);
-            _font.DrawString(sb, label, pos, Color.White);
+            var previewSize = rowRect.Height - 12;
+            var previewRect = new Rectangle(rowRect.X + 6, rowRect.Y + (rowRect.Height - previewSize) / 2, previewSize, previewSize);
+            DrawWorldPreviewTile(sb, entry, previewRect);
 
-            if (_showSeedInfo && rowRect.Contains(_overlayMousePos))
-                _hoverWorldIndex = i;
+            var seedSectionWidth = _showSeedInfo ? 230 : 0;
+            var textLeft = previewRect.Right + 10;
+            var textWidth = Math.Max(40, rowRect.Right - textLeft - 10 - seedSectionWidth);
+            var titleText = TruncateToWidth(entry.Name, textWidth, _rowFont);
+            var subtitle = $"MODE: {entry.CurrentMode.ToString().ToUpperInvariant()}";
+            subtitle = TruncateToWidth(subtitle, textWidth, _font);
+
+            var titlePos = new Vector2(textLeft, rowRect.Y + 6);
+            var subtitlePos = new Vector2(textLeft, rowRect.Bottom - _font.LineHeight - 6);
+            _rowFont.DrawString(sb, titleText, titlePos, Color.White);
+            _font.DrawString(sb, subtitle, subtitlePos, new Color(220, 220, 220));
+
+            if (_showSeedInfo)
+            {
+                var seedRect = new Rectangle(rowRect.Right - seedSectionWidth, rowRect.Y + 4, seedSectionWidth - 6, rowRect.Height - 8);
+                sb.Draw(_pixel, seedRect, new Color(12, 12, 12, 170));
+                DrawBorder(sb, seedRect, new Color(180, 180, 180));
+
+                var seedLabel = "SEED";
+                _font.DrawString(sb, seedLabel, new Vector2(seedRect.X + 8, seedRect.Y + 6), new Color(220, 220, 220));
+
+                var eyeRect = new Rectangle(seedRect.Right - 28, seedRect.Y + 6, 20, 20);
+                var revealed = IsSeedRevealed(entry);
+                DrawEyeIcon(sb, eyeRect, revealed);
+                _seedEyeRects[i] = eyeRect;
+
+                var seedValue = revealed ? ShortSeed(entry.Seed) : "HIDDEN";
+                _font.DrawString(sb, seedValue, new Vector2(seedRect.X + 8, seedRect.Bottom - _font.LineHeight - 6), Color.White);
+
+                if (rowRect.Contains(_overlayMousePos) && revealed)
+                    _hoverWorldIndex = i;
+            }
         }
     }
 
@@ -344,6 +376,8 @@ public sealed class SingleplayerScreen : IScreen
             return;
 
         var entry = _worlds[_hoverWorldIndex];
+        if (!IsSeedRevealed(entry))
+            return;
         var tooltip = $"Seed: {entry.Seed} | Initial: {entry.InitialMode.ToString().ToUpperInvariant()}";
         var size = _font.MeasureString(tooltip);
         var rect = new Rectangle(
@@ -354,6 +388,87 @@ public sealed class SingleplayerScreen : IScreen
         sb.Draw(_pixel, rect, new Color(0, 0, 0, 220));
         DrawBorder(sb, rect, new Color(200, 200, 200));
         _font.DrawString(sb, tooltip, new Vector2(rect.X + 7, rect.Y + 5), new Color(230, 230, 230));
+    }
+
+    private void DrawWorldPreviewTile(SpriteBatch sb, WorldListEntry entry, Rectangle rect)
+    {
+        var preview = GetPreviewTexture(entry.PreviewPath);
+        if (preview != null)
+        {
+            sb.Draw(preview, rect, Color.White);
+        }
+        else
+        {
+            sb.Draw(_pixel, rect, new Color(42, 42, 42, 220));
+            var label = "MAP";
+            var labelSize = _font.MeasureString(label);
+            var labelPos = new Vector2(
+                rect.Center.X - labelSize.X / 2f,
+                rect.Center.Y - labelSize.Y / 2f);
+            _font.DrawString(sb, label, labelPos, new Color(200, 200, 200));
+        }
+
+        DrawBorder(sb, rect, new Color(220, 220, 220));
+    }
+
+    private void DrawEyeIcon(SpriteBatch sb, Rectangle rect, bool revealed)
+    {
+        var bg = revealed ? new Color(64, 112, 164, 210) : new Color(50, 50, 50, 210);
+        sb.Draw(_pixel, rect, bg);
+        DrawBorder(sb, rect, new Color(220, 220, 220));
+
+        var iris = new Rectangle(rect.X + rect.Width / 2 - 3, rect.Y + rect.Height / 2 - 3, 6, 6);
+        sb.Draw(_pixel, iris, revealed ? new Color(235, 245, 255) : new Color(150, 150, 150));
+    }
+
+    private bool IsSeedRevealed(WorldListEntry entry)
+    {
+        if (!_seedRevealByWorld.TryGetValue(entry.WorldPath, out var revealed))
+            return false;
+        return revealed;
+    }
+
+    private Texture2D? GetPreviewTexture(string previewPath)
+    {
+        if (string.IsNullOrWhiteSpace(previewPath))
+            return null;
+
+        if (!File.Exists(previewPath))
+            return null;
+
+        var stamp = File.GetLastWriteTimeUtc(previewPath);
+        if (_previewTextures.TryGetValue(previewPath, out var cached))
+        {
+            if (cached.LastWriteUtc == stamp && !cached.Texture.IsDisposed)
+                return cached.Texture;
+
+            cached.Texture.Dispose();
+            _previewTextures.Remove(previewPath);
+        }
+
+        try
+        {
+            using var fs = new FileStream(previewPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var texture = Texture2D.FromStream(_assets.GraphicsDevice, fs);
+            _previewTextures[previewPath] = new PreviewTextureCacheEntry(texture, stamp);
+            _previewLoadFailures.Remove(previewPath);
+            return texture;
+        }
+        catch (Exception ex)
+        {
+            if (_previewLoadFailures.Add(previewPath))
+                _log.Warn($"Failed to load world preview '{previewPath}': {ex.Message}");
+            return null;
+        }
+    }
+
+    private void DisposePreviewTextures()
+    {
+        foreach (var cached in _previewTextures.Values)
+            cached.Texture.Dispose();
+
+        _previewTextures.Clear();
+        _previewLoadFailures.Clear();
     }
 
     private void HandleListInput(InputState input)
@@ -367,6 +482,22 @@ public sealed class SingleplayerScreen : IScreen
 
         if (input.IsNewLeftClick() && _listRect.Contains(input.MousePosition))
         {
+            if (_showSeedInfo)
+            {
+                foreach (var pair in _seedEyeRects)
+                {
+                    if (!pair.Value.Contains(input.MousePosition))
+                        continue;
+                    var worldIndex = pair.Key;
+                    if (worldIndex >= 0 && worldIndex < _worlds.Count)
+                    {
+                        var entry = _worlds[worldIndex];
+                        _seedRevealByWorld[entry.WorldPath] = !IsSeedRevealed(entry);
+                    }
+                    return;
+                }
+            }
+
             var idx = (int)((input.MousePosition.Y - _listRect.Y + _scroll) / _rowHeight);
             if (idx >= 0 && idx < _worlds.Count)
             {
@@ -389,31 +520,25 @@ public sealed class SingleplayerScreen : IScreen
     private void RefreshWorlds()
     {
         _hoverWorldIndex = -1;
+        DisposePreviewTextures();
         try
         {
-            Directory.CreateDirectory(Paths.WorldsDir);
-            _worlds = Directory.GetDirectories(Paths.WorldsDir)
-                .Select(path =>
-                {
-                    var name = Path.GetFileName(path) ?? string.Empty;
-                    var metaPath = Path.Combine(path, "world.json");
-                    var meta = File.Exists(metaPath) ? WorldMeta.Load(metaPath, _log) : null;
-                    return new WorldListEntry
-                    {
-                        Name = name,
-                        CurrentMode = meta?.CurrentWorldGameMode ?? meta?.GameMode ?? GameMode.Artificer,
-                        InitialMode = meta?.InitialGameMode ?? meta?.GameMode ?? GameMode.Artificer,
-                        Seed = meta?.Seed ?? 0
-                    };
-                })
-                .Where(x => !string.IsNullOrWhiteSpace(x.Name))
-                .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            _worlds = WorldListService.LoadSingleplayerWorlds(_log);
         }
         catch (Exception ex)
         {
             _log.Warn($"Failed to read worlds: {ex.Message}");
             _worlds = new List<WorldListEntry>();
+        }
+
+        var validWorldPaths = new HashSet<string>(_worlds.Select(w => w.WorldPath), StringComparer.OrdinalIgnoreCase);
+        var stale = _seedRevealByWorld.Keys.Where(k => !validWorldPaths.Contains(k)).ToArray();
+        for (var i = 0; i < stale.Length; i++)
+            _seedRevealByWorld.Remove(stale[i]);
+        for (var i = 0; i < _worlds.Count; i++)
+        {
+            if (!_seedRevealByWorld.ContainsKey(_worlds[i].WorldPath))
+                _seedRevealByWorld[_worlds[i].WorldPath] = false;
         }
 
         if (_worlds.Count == 0)
@@ -464,7 +589,8 @@ public sealed class SingleplayerScreen : IScreen
             return;
         }
 
-        var name = _worlds[_selectedIndex].Name;
+        var entry = _worlds[_selectedIndex];
+        var name = entry.Name;
         var result = System.Windows.Forms.MessageBox.Show(
             $"Delete world?\n\n{name}",
             "Confirm Delete",
@@ -476,7 +602,7 @@ public sealed class SingleplayerScreen : IScreen
 
         try
         {
-            var path = Path.Combine(Paths.WorldsDir, name);
+            var path = entry.WorldPath;
             if (Directory.Exists(path))
                 Directory.Delete(path, true);
 
@@ -504,8 +630,9 @@ public sealed class SingleplayerScreen : IScreen
             return;
         }
 
-        var name = _worlds[_selectedIndex].Name;
-        var worldPath = Path.Combine(Paths.WorldsDir, name);
+        var entry = _worlds[_selectedIndex];
+        var name = entry.Name;
+        var worldPath = entry.WorldPath;
         var metaPath = Path.Combine(worldPath, "world.json");
         if (!Directory.Exists(worldPath) || !File.Exists(metaPath))
         {
@@ -547,12 +674,42 @@ public sealed class SingleplayerScreen : IScreen
         return $"{value.Substring(0, 4)}...{value.Substring(value.Length - 2)}";
     }
 
-    private sealed class WorldListEntry
+    private static string TruncateToWidth(string value, int maxWidth, PixelFont font)
     {
-        public string Name { get; init; } = string.Empty;
-        public GameMode CurrentMode { get; init; } = GameMode.Artificer;
-        public GameMode InitialMode { get; init; } = GameMode.Artificer;
-        public int Seed { get; init; }
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+
+        if (font.MeasureString(value).X <= maxWidth)
+            return value;
+
+        const string ellipsis = "...";
+        var maxChars = Math.Max(1, value.Length - 1);
+        while (maxChars > 1)
+        {
+            var candidate = value.Substring(0, maxChars).TrimEnd() + ellipsis;
+            if (font.MeasureString(candidate).X <= maxWidth)
+                return candidate;
+            maxChars--;
+        }
+
+        return ellipsis;
+    }
+
+    public void OnClose()
+    {
+        DisposePreviewTextures();
+    }
+
+    private sealed class PreviewTextureCacheEntry
+    {
+        public PreviewTextureCacheEntry(Texture2D texture, DateTime lastWriteUtc)
+        {
+            Texture = texture;
+            LastWriteUtc = lastWriteUtc;
+        }
+
+        public Texture2D Texture { get; }
+        public DateTime LastWriteUtc { get; }
     }
 }
 

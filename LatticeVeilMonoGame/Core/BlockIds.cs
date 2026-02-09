@@ -69,4 +69,5 @@ public static class BlockIds
     public const byte SkyboundPhilter = 62;
     public const byte PyroskinTonic = 63;
     public const byte BrineveilElixir = 64;
+    public const byte WaterBucket = 65;
 }

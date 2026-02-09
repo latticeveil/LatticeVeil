@@ -76,7 +76,7 @@ public static class AdvancedPerformanceOptimizer
         // Convert chunks to render distance (square area)
         int renderDistance = (int)Math.Sqrt(maxChunks);
         
-        // Increase to Minecraft-like pregeneration range (20 chunks = 400 total chunks)
+        // Increase pregeneration range for broader spawn-area readiness (20 chunks = 400 total chunks)
         return Math.Clamp(renderDistance, 20, 80); // Increased from 16-64 to 20-80
     }
     

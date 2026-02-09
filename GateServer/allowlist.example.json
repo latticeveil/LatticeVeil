@@ -1,0 +1,9 @@
+{
+  "proofTokens": [
+    "REDACTED_OFFICIAL_TOKEN"
+  ],
+  "exeSha256": [
+    "REDACTED_EXE_SHA256"
+  ],
+  "minVersion": "0.1.0"
+}

@@ -123,10 +123,14 @@ public sealed class Game1 : Game
         _font = new PixelFont(_pixel, scale: 2);
         _assets = new AssetLoader(GraphicsDevice, _log);
 
-        // EOS Device-ID only (no login UI).
-        // TEMPORARILY DISABLED TO FIX LOADING SCREEN HANG
-        _log.Info("EOS initialization temporarily disabled to fix loading screen hang.");
+        // EOS initialization is deferred to Update() to avoid blocking load-time hangs.
+        // Update() will retry creation when not in offline mode.
+        _log.Info("EOS initialization deferred to update loop.");
         _eosClient = null;
+        var eosSnapshot = EosRuntimeStatus.Evaluate(_eosClient);
+        _log.Info($"EOS SDK compiled: {eosSnapshot.IsSdkCompiled}");
+        _log.Info($"EOS config available: {eosSnapshot.HasConfig} ({EosRuntimeStatus.DescribeConfigSource()})");
+        _log.Info("EOS login bootstrap mode: deviceid.");
 
         if (_startOptions?.AssetView == true)
         {
@@ -211,7 +215,7 @@ public sealed class Game1 : Game
         UpdateMouseCapture(computeDelta: true);
         if (_eosClient == null && _startOptions?.Offline != true)
         {
-            var created = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+            var created = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
             if (created != null)
             {
                 _eosClient = created;

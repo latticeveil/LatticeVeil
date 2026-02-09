@@ -41,7 +41,7 @@ public static class BlockRegistry
         Register(new BlockDef(BlockId.Grass, "Grass", solid: true, transparent: false, hardness: 0.6f, atlasIndex: 1));
         Register(new BlockDef(BlockId.Dirt, "Dirt", solid: true, transparent: false, hardness: 0.5f, atlasIndex: 2));
         Register(new BlockDef(BlockId.Stone, "Stone", solid: true, transparent: false, hardness: 1.5f, atlasIndex: 3));
-        Register(new BlockDef(BlockId.Water, "Water", solid: false, transparent: true, hardness: 0f, atlasIndex: 4));
+        Register(new BlockDef(BlockId.Water, "Water", solid: false, transparent: true, hardness: 0f, atlasIndex: 4, visible: false));
         Register(new BlockDef(BlockId.Sand, "Sand", solid: true, transparent: false, hardness: 0.4f, atlasIndex: 5));
         Register(new BlockDef(BlockId.Wood, "Wood", solid: true, transparent: false, hardness: 1.0f, atlasIndex: 6));
         Register(new BlockDef(BlockId.Leaves, "Leaves", solid: true, transparent: true, hardness: 0.2f, atlasIndex: 7));
@@ -100,6 +100,7 @@ public static class BlockRegistry
         Register(new BlockDef(BlockId.SkyboundPhilter, "Skybound Philter", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 62, textureName: "skybound_philter"));
         Register(new BlockDef(BlockId.PyroskinTonic, "Pyroskin Tonic", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 63, textureName: "pyroskin_tonic"));
         Register(new BlockDef(BlockId.BrineveilElixir, "Brineveil Elixir", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 64, textureName: "brineveil_elixir"));
+        Register(new BlockDef(BlockId.WaterBucket, "Water Bucket", solid: false, transparent: true, hardness: 0.0f, atlasIndex: 65, textureName: "water_bucket", customModel: true));
 
         AllDefs.Sort((a, b) => a.AtlasIndex.CompareTo(b.AtlasIndex));
     }

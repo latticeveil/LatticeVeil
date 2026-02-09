@@ -55,6 +55,7 @@ public static class VoxelMesherGreedy
     {
         var opaque = new List<VertexPositionTexture>();
         var transparent = new List<VertexPositionTexture>();
+        var water = new List<VertexPositionTexture>();
 
         var sizeX = VoxelChunkData.ChunkSizeX;
         var sizeY = VoxelChunkData.ChunkSizeY;
@@ -159,7 +160,11 @@ public static class VoxelMesherGreedy
 
                         atlas.GetFaceUvRect(cell.BlockId, cell.Face, out var uv00, out var uv10, out var uv11, out var uv01);
                         AdjustFaceUvs(cell.Face, ref uv00, ref uv10, ref uv11, ref uv01);
-                        var list = cell.Transparent ? transparent : opaque;
+                        List<VertexPositionTexture> list;
+                        if (cell.BlockId == BlockIds.Water)
+                            list = water;
+                        else
+                            list = cell.Transparent ? transparent : opaque;
                         AddTiledQuad(list, originX, originY, originZ, px, py, pz, u, v, w, h, bs, uv00, uv10, uv11, uv01, IsBackFace(cell.Face));
 
                         for (var y = 0; y < h; y++)
@@ -178,7 +183,7 @@ public static class VoxelMesherGreedy
 
         var min = new Vector3(originX * bs, originY * bs, originZ * bs);
         var max = min + new Vector3(sizeX * bs, sizeY * bs, sizeZ * bs);
-        return new ChunkMesh(chunk.Coord, opaque.ToArray(), transparent.ToArray(), new BoundingBox(min, max));
+        return new ChunkMesh(chunk.Coord, opaque.ToArray(), transparent.ToArray(), water.ToArray(), new BoundingBox(min, max));
     }
 
     private static void AppendCustomModels(

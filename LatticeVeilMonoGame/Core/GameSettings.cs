@@ -72,6 +72,7 @@ public sealed class GameSettings
     public float Brightness { get; set; } = 1f;
     public int FieldOfView { get; set; } = 70;
     public int RenderDistanceChunks { get; set; } = EngineRenderDistanceMax;
+    public string ParticlePreset { get; set; } = "AUTO";
     public bool ShowSeedInfoInWorldList { get; set; } = false;
 
     // Launcher
@@ -112,7 +113,10 @@ public sealed class GameSettings
         ["GiveItem"] = Keys.F,
         ["Pause"] = Keys.Escape,
         ["Chat"] = Keys.T,
-        ["Command"] = Keys.OemQuestion
+        ["Command"] = Keys.OemQuestion,
+        ["HomeGui"] = Keys.H,
+        ["GamemodeModifier"] = Keys.LeftAlt,
+        ["GamemodeWheel"] = Keys.G
     };
 
     // Packs
@@ -156,6 +160,7 @@ public sealed class GameSettings
         s.Brightness = ClampRange(s.Brightness, 0.5f, 1.5f);
         s.FieldOfView = Math.Clamp(s.FieldOfView, 60, 110);
         s.RenderDistanceChunks = Math.Clamp(s.RenderDistanceChunks, RenderDistanceMin, EngineRenderDistanceMax);
+        s.ParticlePreset = NormalizeParticlePreset(s.ParticlePreset);
         s.MouseSensitivity = ClampRange(s.MouseSensitivity, 0.0005f, 0.01f);
         s.QualityPreset = NormalizeQuality(s.QualityPreset);
         s.AudioInputDeviceId ??= "";
@@ -187,6 +192,12 @@ public sealed class GameSettings
     {
         var quality = string.IsNullOrWhiteSpace(value) ? "MEDIUM" : value.Trim().ToUpperInvariant();
         return quality is "LOW" or "MEDIUM" or "HIGH" or "ULTRA" ? quality : "MEDIUM";
+    }
+
+    private static string NormalizeParticlePreset(string? value)
+    {
+        var preset = string.IsNullOrWhiteSpace(value) ? "AUTO" : value.Trim().ToUpperInvariant();
+        return preset is "AUTO" or "OFF" or "LOW" or "MEDIUM" or "HIGH" or "ULTRA" ? preset : "AUTO";
     }
 
     private static string NormalizeReticleStyle(string? value)

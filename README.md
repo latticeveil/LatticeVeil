@@ -20,7 +20,7 @@ LatticeVeil is a sophisticated voxel game featuring:
 
 ## 🎮 **Current Features**
 
-### **✅ Implemented (V7.0.0 "Quantum Genesis")**
+### **✅ Implemented (V8.0.0 "Cacheforge Update")**
 - Advanced voxel world generation with biomes
 - Chunk loading optimization with priority queuing
 - Desert biome with terrain smoothing
@@ -62,9 +62,71 @@ LatticeVeil is a sophisticated voxel game featuring:
 - **Scripts**: `Tools/` - PowerShell automation scripts
 - **Assets**: `assets/` - Images and layout configurations
 
+## 🔐 **EOS Config (Secure Split)**
+
+LatticeVeil now uses a split EOS config model:
+
+- `eos.public.json` (safe identifiers only, no secret)
+- `eos.private.json` (secret-only, not committed)
+- `eos.public.example.json` (committed placeholder template)
+
+Load order:
+
+1. Public config:
+   - `EOS_PUBLIC_CONFIG_PATH`
+   - `<repo>/eos.public.json`
+   - `%USERPROFILE%/Documents/LatticeVeil/Config/eos.public.json`
+   - `AppContext.BaseDirectory/eos.public.json`
+2. Secret:
+   - `EOS_CLIENT_SECRET` (recommended)
+   - `EOS_PRIVATE_CONFIG_PATH`
+   - `<repo>/eos.private.json`
+   - `%USERPROFILE%/Documents/LatticeVeil/Config/eos.private.json`
+   - `AppContext.BaseDirectory/eos.private.json` (official runtime only)
+
+If config is missing or incomplete, EOS is disabled and LAN remains available.
+
+### Migrate legacy combined config once
+
+```powershell
+.\Tools\migrate-eos-config.ps1
+```
+
+This splits legacy `eos.config.json` into public/private files locally.
+
+## 🌐 **Official Online Gate (Optional but Recommended)**
+
+Official online ecosystem features can be protected by a gate ticket.
+LAN/offline still works without gate.
+
+Client environment variables:
+
+- `LV_GATE_URL` - Gate server base URL (example: `https://your-gate.example.com`)
+- `LV_GATE_REQUIRED` - `1` to enforce official ticket for online ecosystem features
+- `LV_OFFICIAL_PROOF_PATH` - Optional path to `official_build.sig` (defaults to app directory)
+
+When gate is required and verification fails, official online actions are disabled with:
+
+`Official online disabled (unverified build). LAN still available.`
+
+Gate server environment variables:
+
+- `GATE_JWT_SIGNING_KEY` (required)
+- `GITHUB_ALLOWLIST_REPO` (example: `latticeveil/online-allowlist`)
+- `GITHUB_ALLOWLIST_PATH` (default: `allowlist.json`)
+- `GITHUB_ALLOWLIST_BRANCH` (default: `main`)
+- `GITHUB_TOKEN` (server-side only)
+- Optional: `GATE_TICKET_MINUTES`, `GATE_ISSUER`, `GATE_AUDIENCE`, `ALLOWLIST_FILE`
+
+Run local gate server:
+
+```powershell
+dotnet run --project GateServer/GateServer.csproj
+```
+
 ## 🎯 **Development Status**
 
-**Version**: V7.0.0 "Quantum Genesis"  
+**Version**: V8.0.0 "Cacheforge Update"  
 **Framework**: .NET 8.0 Windows  
 **Rendering**: MonoGame DesktopGL (OpenGL)  
 **Status**: Release Ready - Foundation Complete, Survival Features In Progress
@@ -118,7 +180,7 @@ See [MASTER_DEVELOPMENT_PLAN.md](docs/implementation/MASTER_DEVELOPMENT_PLAN.md)
 ---
 
 **Last Updated**: 2026-02-03  
-**Version**: V7.0.0 "Quantum Genesis"  
+**Version**: V8.0.0 "Cacheforge Update"  
 **Next Milestone**: Survival Mode Implementation
 
 ## 🤝 **Contributing**
@@ -142,6 +204,7 @@ This project is licensed under the terms specified in the LICENSE file.
 
 ---
 
-**Version**: V7.0.0 "Quantum Genesis"  
+**Version**: V8.0.0 "Cacheforge Update"  
 **Status**: Active Development  
 **Last Updated**: 2026-01-31
+

@@ -8,6 +8,13 @@ namespace LatticeVeilMonoGame.Core;
 public sealed class VoxelWorld
 {
     private static readonly Regex ChunkNameRegex = new(@"chunk_(?<x>-?\d+)_(?<y>-?\d+)_(?<z>-?\d+)\.bin", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private const float OceanColumnThreshold = 0.70f;
+    private const float ShallowWaterThreshold = 0.56f;
+    private const float OceanBiomeThreshold = 0.67f;
+    private const float DesertMaterialThreshold = 0.45f;
+    private const float DesertBiomeThreshold = 0.44f;
+    private const float BeachMaterialThreshold = 0.46f;
+    private const float TreeSpawnChance = 0.065f;
 
     private readonly Dictionary<ChunkCoord, VoxelChunkData> _chunks = new();
     private readonly object _chunksLock = new();
@@ -215,11 +222,24 @@ public sealed class VoxelWorld
     {
         if (wy < 0)
             return false;
-        return wy < Meta.Size.Height;
+        if (wy >= Meta.Size.Height)
+            return false;
+        return IsWithinWorldXZ(wx, wz);
+    }
+
+    public bool IsWithinWorldXZ(int wx, int wz)
+    {
+        return wx >= 0
+            && wz >= 0
+            && wx < Meta.Size.Width
+            && wz < Meta.Size.Depth;
     }
 
     public VoxelChunkData GetOrCreateChunk(ChunkCoord coord)
     {
+        if (!IsChunkYInRange(coord.Y) || !IsChunkWithinWorldXZ(coord))
+            return CreateVoidChunk(coord);
+
         lock (_chunksLock)
         {
             if (_chunks.TryGetValue(coord, out var existing))
@@ -268,17 +288,24 @@ public sealed class VoxelWorld
                 var wx = originX + lx;
                 var wz = originZ + lz;
 
-                var desertWeight = ComputeDesertWeight(wx, wz, seed);
-                var oceanWeight = ComputeOceanWeight(wx, wz, seed);
+                GetBiomeWeightsAt(wx, wz, seed, out var desertWeight, out var oceanWeight);
                 desertWeights[lx, lz] = desertWeight;
                 oceanWeights[lx, lz] = oceanWeight;
 
                 var effectiveDesertWeight = desertWeight * (1f - oceanWeight * 0.9f);
-                var surface = ComputeBaseSurfaceHeight(wx, wz, effectiveDesertWeight, oceanWeight, seed, maxHeight, seaLevel);
+                var baseSurface = ComputeBaseSurfaceHeight(wx, wz, effectiveDesertWeight, oceanWeight, seed, maxHeight, seaLevel);
+                var coastBlend = ComputeCoastBlend(oceanWeight);
+                var shoreNoise = FractalValueNoise2D(wx * 0.013f, wz * 0.013f, seed + 1603, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
+                var shore01 = Math.Clamp((shoreNoise + 1f) * 0.5f, 0f, 1f);
+                var coastalShelfHeight = seaLevel - Lerp(2.6f, 0.4f, shore01);
+                var coastalBeachHeight = seaLevel + Lerp(0.6f, 2.8f, shore01);
+                var coastShaped = Lerp(baseSurface, coastalShelfHeight, coastBlend * 0.82f);
+                coastShaped = Lerp(coastShaped, coastalBeachHeight, coastBlend * 0.34f);
+                var surface = Math.Clamp((int)MathF.Round(coastShaped), 10, maxHeight);
                 var poolDepth = ComputePoolDepth(wx, wz, surface, effectiveDesertWeight, seed, seaLevel);
                 var carvedSurface = Math.Clamp(surface - poolDepth, 8, maxHeight);
-                var oceanColumn = oceanWeight >= 0.56f;
-                var shallowWaterColumn = !oceanColumn && oceanWeight >= 0.42f && carvedSurface <= seaLevel - 1;
+                var oceanColumn = oceanWeight >= OceanColumnThreshold;
+                var shallowWaterColumn = !oceanColumn && oceanWeight >= ShallowWaterThreshold && carvedSurface <= seaLevel + 2;
                 if (oceanColumn || shallowWaterColumn)
                     carvedSurface = Math.Min(seaLevel - 1, carvedSurface);
 
@@ -305,16 +332,29 @@ public sealed class VoxelWorld
                     var poolLevel = poolLevels[lx, lz];
                     var desertWeight = desertWeights[lx, lz];
                     var oceanWeight = oceanWeights[lx, lz];
-                    var oceanColumn = oceanWeight >= 0.56f && surface <= seaLevel - 1;
-                    var shallowWaterColumn = !oceanColumn && oceanWeight >= 0.42f && surface <= seaLevel - 1;
+                    var oceanColumn = oceanWeight >= OceanColumnThreshold && surface <= seaLevel - 1;
+                    var shallowWaterColumn = !oceanColumn && oceanWeight >= ShallowWaterThreshold && surface <= seaLevel - 1;
                     var waterColumn = oceanColumn || shallowWaterColumn;
                     var effectiveDesertWeight = waterColumn ? 0f : desertWeight * (1f - oceanWeight * 0.9f);
-                    var useDesertMaterial = !oceanColumn && effectiveDesertWeight >= 0.5f;
-                    var fillerDepth = waterColumn ? 4 : (int)MathF.Round(Lerp(3f, 5f, effectiveDesertWeight));
+                    var useDesertMaterial = !oceanColumn && effectiveDesertWeight >= DesertMaterialThreshold;
+                    var beachWeight = ComputeBeachWeight(surface, seaLevel, oceanWeight);
+                    var useBeachMaterial = !waterColumn && !useDesertMaterial && beachWeight >= BeachMaterialThreshold;
+                    var beachPatchNoise = useBeachMaterial
+                        ? ValueNoise2D(wx * 0.23f, wz * 0.23f, seed + 5501)
+                        : -1f;
+                    var useBeachGravelPatch = useBeachMaterial && beachPatchNoise > 0.92f;
+
+                    var fillerDepth = waterColumn
+                        ? 4
+                        : useBeachMaterial
+                            ? 2 + (beachWeight > 0.72f ? 1 : 0)
+                            : (int)MathF.Round(Lerp(3f, 5f, effectiveDesertWeight));
                     // Desert and ocean columns keep a gravel sub-layer under sand before reaching stone.
                     var gravelDepth = waterColumn
                         ? 3
-                        : (useDesertMaterial ? 2 + (int)MathF.Round(Lerp(0f, 3f, effectiveDesertWeight)) : 0);
+                        : useBeachMaterial
+                            ? (useBeachGravelPatch ? 1 : 0)
+                            : (useDesertMaterial ? 2 + (int)MathF.Round(Lerp(0f, 3f, effectiveDesertWeight)) : 0);
                     var waterTopY = waterColumn
                         ? seaLevel
                         : (poolLevel >= 0 ? poolLevel : -1);
@@ -341,13 +381,26 @@ public sealed class VoxelWorld
                         }
                         else if (wy == surface)
                         {
-                            block = (useDesertMaterial || waterColumn) ? BlockIds.Sand : BlockIds.Grass;
+                            if (useBeachMaterial)
+                                block = useBeachGravelPatch ? BlockIds.Gravel : BlockIds.Sand;
+                            else
+                                block = (useDesertMaterial || waterColumn) ? BlockIds.Sand : BlockIds.Grass;
                         }
                         else if (wy >= surface - fillerDepth)
                         {
-                            block = (useDesertMaterial || waterColumn) ? BlockIds.Sand : BlockIds.Dirt;
+                            if (useBeachMaterial)
+                            {
+                                var depthFromTop = surface - wy;
+                                block = (useBeachGravelPatch && depthFromTop >= 1 && depthFromTop <= 2)
+                                    ? BlockIds.Gravel
+                                    : BlockIds.Sand;
+                            }
+                            else
+                            {
+                                block = (useDesertMaterial || waterColumn) ? BlockIds.Sand : BlockIds.Dirt;
+                            }
                         }
-                        else if ((useDesertMaterial || waterColumn) && wy >= surface - fillerDepth - gravelDepth)
+                        else if ((useDesertMaterial || waterColumn || useBeachMaterial) && wy >= surface - fillerDepth - gravelDepth)
                         {
                             block = BlockIds.Gravel;
                         }
@@ -370,13 +423,220 @@ public sealed class VoxelWorld
             }
         }
 
+        ApplyDeterministicTreePass(chunk, blocks, surfaceHeights, desertWeights, oceanWeights, seaLevel, maxHeight, seed);
         chunk.Load(blocks);
+    }
+
+    private void ApplyDeterministicTreePass(
+        VoxelChunkData chunk,
+        byte[] blocks,
+        int[,] surfaceHeights,
+        float[,] desertWeights,
+        float[,] oceanWeights,
+        int seaLevel,
+        int maxHeight,
+        int seed)
+    {
+        var originX = chunk.Coord.X * VoxelChunkData.ChunkSizeX;
+        var originY = chunk.Coord.Y * VoxelChunkData.ChunkSizeY;
+        var originZ = chunk.Coord.Z * VoxelChunkData.ChunkSizeZ;
+
+        for (var lx = 0; lx < VoxelChunkData.ChunkSizeX; lx++)
+        {
+            for (var lz = 0; lz < VoxelChunkData.ChunkSizeZ; lz++)
+            {
+                var surface = surfaceHeights[lx, lz];
+                if (surface <= seaLevel + 2 || surface >= maxHeight - 10)
+                    continue;
+
+                var localSurfaceY = surface - originY;
+                if ((uint)localSurfaceY >= VoxelChunkData.ChunkSizeY)
+                    continue;
+
+                var surfaceIndex = ((lx * VoxelChunkData.ChunkSizeY) + localSurfaceY) * VoxelChunkData.ChunkSizeZ + lz;
+                if (blocks[surfaceIndex] != BlockIds.Grass)
+                    continue;
+
+                var oceanWeight = oceanWeights[lx, lz];
+                if (oceanWeight >= 0.34f)
+                    continue;
+
+                var effectiveDesert = desertWeights[lx, lz] * (1f - oceanWeight * 0.9f);
+                if (effectiveDesert >= DesertMaterialThreshold - 0.05f)
+                    continue;
+
+                if (!HasGentleSlope(surfaceHeights, lx, lz, maxDelta: 2))
+                    continue;
+
+                var wx = originX + lx;
+                var wz = originZ + lz;
+                if (!ShouldSpawnTreeAt(wx, wz, seed))
+                    continue;
+
+                var heightSignal = HashNoise2D(wx + 5021, wz - 1877, seed + 7711);
+                var trunkHeight = heightSignal > 0.10f ? 5 : 4;
+                var canopyRadius = trunkHeight >= 5 ? 2 : 1;
+                var treeBaseY = localSurfaceY + 1;
+                if (!CanPlaceTreeChunkSafe(blocks, lx, treeBaseY, lz, trunkHeight, canopyRadius))
+                    continue;
+
+                TryPlaceTreeChunkSafe(blocks, lx, treeBaseY, lz, trunkHeight, canopyRadius);
+            }
+        }
+    }
+
+    private static bool HasGentleSlope(int[,] surfaceHeights, int lx, int lz, int maxDelta)
+    {
+        var center = surfaceHeights[lx, lz];
+        for (var dz = -1; dz <= 1; dz++)
+        {
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dz == 0)
+                    continue;
+
+                var nx = lx + dx;
+                var nz = lz + dz;
+                if ((uint)nx >= VoxelChunkData.ChunkSizeX || (uint)nz >= VoxelChunkData.ChunkSizeZ)
+                    continue;
+
+                if (Math.Abs(surfaceHeights[nx, nz] - center) > maxDelta)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ShouldSpawnTreeAt(int wx, int wz, int seed)
+    {
+        const int cellSize = 7;
+        var cellX = FloorDiv(wx, cellSize);
+        var cellZ = FloorDiv(wz, cellSize);
+        var baseX = cellX * cellSize;
+        var baseZ = cellZ * cellSize;
+
+        var jitterX01 = Math.Clamp((HashNoise2D(cellX + 137, cellZ - 73, seed + 1811) + 1f) * 0.5f, 0f, 1f);
+        var jitterZ01 = Math.Clamp((HashNoise2D(cellX - 211, cellZ + 59, seed + 2467) + 1f) * 0.5f, 0f, 1f);
+        var candidateX = baseX + Math.Min(cellSize - 1, (int)MathF.Floor(jitterX01 * cellSize));
+        var candidateZ = baseZ + Math.Min(cellSize - 1, (int)MathF.Floor(jitterZ01 * cellSize));
+        if (wx != candidateX || wz != candidateZ)
+            return false;
+
+        var spawnSignal = Math.Clamp((HashNoise2D(wx + 401, wz - 619, seed + 9031) + 1f) * 0.5f, 0f, 1f);
+        if (spawnSignal < 1f - TreeSpawnChance)
+            return false;
+
+        var clusterSignal = Math.Clamp((FractalValueNoise2D(wx * 0.0036f, wz * 0.0036f, seed + 12791, octaves: 2, lacunarity: 2.0f, persistence: 0.5f) + 1f) * 0.5f, 0f, 1f);
+        return clusterSignal >= 0.45f;
+    }
+
+    private static void TryPlaceTreeChunkSafe(byte[] blocks, int baseLocalX, int baseLocalY, int baseLocalZ, int trunkHeight, int canopyRadius)
+    {
+        for (var i = 0; i < trunkHeight; i++)
+            TrySetLocalBlockReplaceable(blocks, baseLocalX, baseLocalY + i, baseLocalZ, BlockIds.Wood);
+
+        var canopyCenterY = baseLocalY + trunkHeight - 1;
+        for (var dy = -2; dy <= 2; dy++)
+        {
+            var layerRadius = canopyRadius - (Math.Abs(dy) > 1 ? 1 : 0);
+            if (layerRadius <= 0)
+                continue;
+
+            for (var dz = -layerRadius; dz <= layerRadius; dz++)
+            {
+                for (var dx = -layerRadius; dx <= layerRadius; dx++)
+                {
+                    if (Math.Abs(dx) + Math.Abs(dz) > layerRadius + 1)
+                        continue;
+                    TrySetLocalBlockReplaceable(blocks, baseLocalX + dx, canopyCenterY + dy, baseLocalZ + dz, BlockIds.Leaves);
+                }
+            }
+        }
+
+        TrySetLocalBlockReplaceable(blocks, baseLocalX, canopyCenterY + 2, baseLocalZ, BlockIds.Leaves);
+    }
+
+    private static bool CanPlaceTreeChunkSafe(byte[] blocks, int baseLocalX, int baseLocalY, int baseLocalZ, int trunkHeight, int canopyRadius)
+    {
+        if (!IsLocalInBounds(baseLocalX, baseLocalY, baseLocalZ))
+            return false;
+
+        // Ensure tree footprint stays fully inside this chunk section so trees are never sliced.
+        var canopyCenterY = baseLocalY + trunkHeight - 1;
+        var minX = baseLocalX - canopyRadius;
+        var maxX = baseLocalX + canopyRadius;
+        var minZ = baseLocalZ - canopyRadius;
+        var maxZ = baseLocalZ + canopyRadius;
+        var minY = baseLocalY;
+        var maxY = canopyCenterY + 2;
+        if (!IsLocalInBounds(minX, minY, minZ) || !IsLocalInBounds(maxX, maxY, maxZ))
+            return false;
+
+        for (var i = 0; i < trunkHeight; i++)
+        {
+            if (!IsLocalReplaceable(blocks, baseLocalX, baseLocalY + i, baseLocalZ))
+                return false;
+        }
+
+        for (var dy = -2; dy <= 2; dy++)
+        {
+            var layerRadius = canopyRadius - (Math.Abs(dy) > 1 ? 1 : 0);
+            if (layerRadius <= 0)
+                continue;
+
+            for (var dz = -layerRadius; dz <= layerRadius; dz++)
+            {
+                for (var dx = -layerRadius; dx <= layerRadius; dx++)
+                {
+                    if (Math.Abs(dx) + Math.Abs(dz) > layerRadius + 1)
+                        continue;
+                    if (!IsLocalReplaceable(blocks, baseLocalX + dx, canopyCenterY + dy, baseLocalZ + dz))
+                        return false;
+                }
+            }
+        }
+
+        if (!IsLocalReplaceable(blocks, baseLocalX, canopyCenterY + 2, baseLocalZ))
+            return false;
+
+        return true;
+    }
+
+    private static bool IsLocalReplaceable(byte[] blocks, int lx, int ly, int lz)
+    {
+        if (!IsLocalInBounds(lx, ly, lz))
+            return false;
+
+        var index = ((lx * VoxelChunkData.ChunkSizeY) + ly) * VoxelChunkData.ChunkSizeZ + lz;
+        var existing = blocks[index];
+        return existing == BlockIds.Air || existing == BlockIds.Leaves;
+    }
+
+    private static bool IsLocalInBounds(int lx, int ly, int lz)
+    {
+        return (uint)lx < VoxelChunkData.ChunkSizeX
+            && (uint)ly < VoxelChunkData.ChunkSizeY
+            && (uint)lz < VoxelChunkData.ChunkSizeZ;
+    }
+
+    private static void TrySetLocalBlockReplaceable(byte[] blocks, int lx, int ly, int lz, byte block)
+    {
+        if ((uint)lx >= VoxelChunkData.ChunkSizeX || (uint)ly >= VoxelChunkData.ChunkSizeY || (uint)lz >= VoxelChunkData.ChunkSizeZ)
+            return;
+
+        var index = ((lx * VoxelChunkData.ChunkSizeY) + ly) * VoxelChunkData.ChunkSizeZ + lz;
+        var existing = blocks[index];
+        if (existing != BlockIds.Air && existing != BlockIds.Leaves)
+            return;
+
+        blocks[index] = block;
     }
 
     private static float ComputeDesertWeight(int wx, int wz, int seed)
     {
-        // Blend wide climate regions with rare pockets so grasslands remain dominant.
-        const int smoothOffset = 20;
+        // Blend wide climate regions with controlled pocketing so deserts spawn consistently.
+        const int smoothOffset = 24;
         var center = ComputeRawDesertClimateSignal(wx, wz, seed);
         var north = ComputeRawDesertClimateSignal(wx, wz - smoothOffset, seed);
         var south = ComputeRawDesertClimateSignal(wx, wz + smoothOffset, seed);
@@ -384,30 +644,31 @@ public sealed class VoxelWorld
         var west = ComputeRawDesertClimateSignal(wx - smoothOffset, wz, seed);
         var climate = center * 0.44f + (north + south + east + west) * 0.14f;
 
-        // Macro bands produce medium-to-large deserts, but with reduced overall frequency.
-        var macroWeight = ComputeBandWeight(climate, center: 0.33f, halfWidth: 0.19f);
+        // Macro bands are the primary source of desert regions.
+        var macroWeight = ComputeBandWeight(climate, center: 0.30f, halfWidth: 0.15f);
 
-        // Rare medium pockets create non-uniform outlines and occasional mid-size islands.
-        var mediumPocketNoise = FractalValueNoise2D(wx * 0.0029f, wz * 0.0029f, seed + 941, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
-        var mediumPocketWeight = ComputeBandWeight(mediumPocketNoise, center: 0.67f, halfWidth: 0.09f) * 0.72f;
+        // Medium pockets add variation while preserving larger biome identity.
+        var mediumPocketNoise = FractalValueNoise2D(wx * 0.0026f, wz * 0.0026f, seed + 941, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
+        var mediumPocketWeight = ComputeBandWeight(mediumPocketNoise, center: 0.67f, halfWidth: 0.09f) * 0.38f;
 
-        // Very small pockets can still appear, but are intentionally uncommon.
+        // Small pockets remain possible but do not dominate.
         var smallPocketNoise = FractalValueNoise2D(wx * 0.0064f, wz * 0.0064f, seed + 2141, octaves: 2, lacunarity: 2.0f, persistence: 0.53f);
-        var smallPocketWeight = ComputeBandWeight(smallPocketNoise, center: 0.76f, halfWidth: 0.07f) * 0.58f;
+        var smallPocketWeight = ComputeBandWeight(smallPocketNoise, center: 0.76f, halfWidth: 0.06f) * 0.18f;
 
-        // Wet climates suppress pockets so grasslands remain the dominant biome.
+        // Wet climates suppress pockets so grasslands still remain dominant overall.
         var pocketClimateGate = ComputeBandWeight(climate, center: 0.18f, halfWidth: 0.34f);
         mediumPocketWeight *= Lerp(0.45f, 1f, pocketClimateGate);
         smallPocketWeight *= Lerp(0.35f, 0.9f, pocketClimateGate);
 
-        var combined = MathF.Max(macroWeight, MathF.Max(mediumPocketWeight, smallPocketWeight));
+        var combined = macroWeight * 0.92f + mediumPocketWeight * 0.24f + smallPocketWeight * 0.08f;
+        combined = MathF.Max(combined, macroWeight * 0.92f);
         return Math.Clamp(combined, 0f, 1f);
     }
 
     private static float ComputeOceanWeight(int wx, int wz, int seed)
     {
-        // Ocean macro signal (very low frequency) with smoothing for large contiguous bodies.
-        const int smoothOffset = 28;
+        // Ocean macro signal tuned for medium-size basins with clear coastlines.
+        const int smoothOffset = 20;
         var center = ComputeRawOceanClimateSignal(wx, wz, seed);
         var north = ComputeRawOceanClimateSignal(wx, wz - smoothOffset, seed);
         var south = ComputeRawOceanClimateSignal(wx, wz + smoothOffset, seed);
@@ -415,17 +676,29 @@ public sealed class VoxelWorld
         var west = ComputeRawOceanClimateSignal(wx - smoothOffset, wz, seed);
         var continental = center * 0.46f + (north + south + east + west) * 0.135f;
 
-        // Convert to [0..1] and invert "landness" to get ocean dominance.
+        // Convert to [0..1], then derive ocean primarily from low continental values.
         var continental01 = Math.Clamp((continental + 1f) * 0.5f, 0f, 1f);
-        var landness = ComputeBandWeight(continental01, center: 0.50f, halfWidth: 0.22f);
-        var macroOcean = 1f - landness;
+        var macroOcean = ComputeBandWeight(1f - continental01, center: 0.68f, halfWidth: 0.21f);
 
-        // Coast variation adds natural inlets and jagged shorelines.
-        var coastNoise = FractalValueNoise2D(wx * 0.0034f, wz * 0.0034f, seed + 1451, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
+        // Coast variation adds inlets and bays.
+        var coastNoise = FractalValueNoise2D(wx * 0.0042f, wz * 0.0042f, seed + 1451, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
         var coast01 = Math.Clamp((coastNoise + 1f) * 0.5f, 0f, 1f);
-        var coastPerturb = ComputeBandWeight(1f - coast01, center: 0.48f, halfWidth: 0.26f) * 0.24f;
+        var coastPerturb = (coast01 - 0.5f) * 0.16f;
 
-        return Math.Clamp(MathF.Max(macroOcean, macroOcean * 0.82f + coastPerturb), 0f, 1f);
+        // Basin clusters create medium pockets instead of one giant connected ocean.
+        var basinNoise = FractalValueNoise2D(wx * 0.0025f, wz * 0.0025f, seed + 2453, octaves: 3, lacunarity: 2.0f, persistence: 0.5f);
+        var basin01 = Math.Clamp((basinNoise + 1f) * 0.5f, 0f, 1f);
+        var basinWeight = ComputeBandWeight(basin01, center: 0.70f, halfWidth: 0.16f) * 0.24f;
+
+        // Inland break-up noise prevents ocean blankets while keeping water common.
+        var inlandBreakNoise = FractalValueNoise2D(wx * 0.0028f, wz * 0.0028f, seed + 1993, octaves: 3, lacunarity: 2.0f, persistence: 0.5f);
+        var inlandBreak01 = Math.Clamp((inlandBreakNoise + 1f) * 0.5f, 0f, 1f);
+        var inlandBreak = ComputeBandWeight(inlandBreak01, center: 0.62f, halfWidth: 0.18f) * 0.32f;
+
+        var ocean = macroOcean * 0.82f + basinWeight + coastPerturb - inlandBreak;
+        if (macroOcean < 0.32f)
+            ocean *= 0.80f;
+        return Math.Clamp(ocean, 0f, 1f);
     }
 
     private static float ComputeBandWeight(float sample, float center, float halfWidth)
@@ -433,6 +706,21 @@ public sealed class VoxelWorld
         var range = MathF.Max(0.0001f, halfWidth * 2f);
         var t = (sample - (center - halfWidth)) / range;
         return SmoothStep(Math.Clamp(t, 0f, 1f));
+    }
+
+    private static float ComputeCoastBlend(float oceanWeight)
+    {
+        // Wide coastal band so shore transitions are gradual instead of abrupt walls.
+        var band = 1f - MathF.Abs(oceanWeight - 0.58f) / 0.34f;
+        return SmoothStep(Math.Clamp(band, 0f, 1f));
+    }
+
+    private static float ComputeBeachWeight(int surface, int seaLevel, float oceanWeight)
+    {
+        // Beach likelihood rises near sea level and in coastal climate bands.
+        var heightBand = 1f - Math.Clamp(MathF.Abs(surface - seaLevel) / 7f, 0f, 1f);
+        var coastBand = ComputeCoastBlend(oceanWeight);
+        return Math.Clamp(coastBand * 0.76f + heightBand * 0.56f, 0f, 1f);
     }
 
     private static int ComputeBaseSurfaceHeight(int wx, int wz, float desertWeight, float oceanWeight, int seed, int maxHeight, int seaLevel)
@@ -445,7 +733,11 @@ public sealed class VoxelWorld
         var grassyHeight = 58f + macro * 10f + detail * 3.5f;
         var desertHeight = 55f + macro * 6.5f + detail * 2.2f + dunes * 3.8f;
         var landHeight = Lerp(grassyHeight, desertHeight, desertWeight);
-        var oceanFloorHeight = (seaLevel - 1f) + oceanRipple * 0.35f;
+        var coastErosionNoise = FractalValueNoise2D(wx * 0.013f, wz * 0.013f, seed + 2711, octaves: 2, lacunarity: 2.0f, persistence: 0.5f);
+        var coastErosion01 = Math.Clamp((coastErosionNoise + 1f) * 0.5f, 0f, 1f);
+        var coastErosionStrength = Lerp(2.5f, 5.5f, coastErosion01);
+        landHeight -= ComputeCoastBlend(oceanWeight) * coastErosionStrength;
+        var oceanFloorHeight = (seaLevel - 1f) + oceanRipple * 0.45f;
         var rawHeight = Lerp(landHeight, oceanFloorHeight, oceanWeight);
 
         return Math.Clamp((int)MathF.Round(rawHeight), 10, maxHeight);
@@ -486,21 +778,113 @@ public sealed class VoxelWorld
     public float GetDesertWeightAt(int wx, int wz)
     {
         var seed = Meta.Seed == 0 ? 1337 : Meta.Seed;
-        return ComputeDesertWeight(wx, wz, seed);
+        GetBiomeWeightsAt(wx, wz, seed, out var desertWeight, out _);
+        return desertWeight;
     }
 
     public float GetOceanWeightAt(int wx, int wz)
     {
         var seed = Meta.Seed == 0 ? 1337 : Meta.Seed;
-        return ComputeOceanWeight(wx, wz, seed);
+        GetBiomeWeightsAt(wx, wz, seed, out _, out var oceanWeight);
+        return oceanWeight;
+    }
+
+    private void GetBiomeWeightsAt(int wx, int wz, int seed, out float desertWeight, out float oceanWeight)
+    {
+        desertWeight = ComputeDesertWeight(wx, wz, seed);
+        oceanWeight = ComputeOceanWeight(wx, wz, seed);
+        ApplyBiomeAnchors(wx, wz, seed, ref desertWeight, ref oceanWeight);
+    }
+
+    private void ApplyBiomeAnchors(int wx, int wz, int seed, ref float desertWeight, ref float oceanWeight)
+    {
+        var width = Math.Max(1, Meta.Size.Width);
+        var depth = Math.Max(1, Meta.Size.Depth);
+        var minDim = MathF.Min(width, depth);
+        if (minDim <= 0f)
+            return;
+
+        var marginX = Math.Max(48, width / 12);
+        var marginZ = Math.Max(48, depth / 12);
+
+        GetSeededAnchor(seed, width, depth, marginX, marginZ, salt: 97, out var oceanAx, out var oceanAz);
+        GetSeededAnchor(seed, width, depth, marginX, marginZ, salt: 191, out var oceanBx, out var oceanBz);
+        GetSeededAnchor(seed, width, depth, marginX, marginZ, salt: 313, out var desertAx, out var desertAz);
+
+        var minSeparation = MathF.Max(128f, minDim * 0.18f);
+        var minSeparationSq = minSeparation * minSeparation;
+        if (DistanceSq(desertAx, desertAz, oceanAx, oceanAz) < minSeparationSq
+            || DistanceSq(desertAx, desertAz, oceanBx, oceanBz) < minSeparationSq)
+        {
+            desertAx = (desertAx + Math.Max(64, width / 3)) % width;
+            desertAz = (desertAz + Math.Max(64, depth / 4)) % depth;
+        }
+
+        var oceanRadius = MathF.Max(180f, minDim * 0.17f);
+        var desertRadius = MathF.Max(150f, minDim * 0.13f);
+
+        var oceanAnchor = MathF.Max(
+            ComputeAnchorInfluence(wx, wz, oceanAx, oceanAz, oceanRadius),
+            ComputeAnchorInfluence(wx, wz, oceanBx, oceanBz, oceanRadius * 0.9f));
+        var desertAnchor = ComputeAnchorInfluence(wx, wz, desertAx, desertAz, desertRadius);
+
+        oceanWeight = Math.Clamp(MathF.Max(oceanWeight * 0.90f + oceanAnchor * 0.80f, oceanAnchor * 0.78f), 0f, 1f);
+        desertWeight = Math.Clamp(MathF.Max(desertWeight * 0.88f + desertAnchor * 0.76f, desertAnchor * 0.72f), 0f, 1f);
+
+        if (desertAnchor > 0.85f)
+            oceanWeight = MathF.Min(oceanWeight, 0.46f);
+        if (oceanAnchor > 0.85f)
+            desertWeight *= 0.25f;
+
+        desertWeight *= 1f - oceanWeight * 0.70f;
+    }
+
+    private static float DistanceSq(int ax, int az, int bx, int bz)
+    {
+        var dx = ax - bx;
+        var dz = az - bz;
+        return dx * dx + dz * dz;
+    }
+
+    private static void GetSeededAnchor(int seed, int width, int depth, int marginX, int marginZ, int salt, out int x, out int z)
+    {
+        var x01 = Math.Clamp((HashNoise2D(101 + salt, seed + salt * 13, seed + salt * 97) + 1f) * 0.5f, 0f, 1f);
+        var z01 = Math.Clamp((HashNoise2D(211 + salt, seed + salt * 29, seed + salt * 151) + 1f) * 0.5f, 0f, 1f);
+
+        var spanX = Math.Max(1, width - marginX * 2 - 1);
+        var spanZ = Math.Max(1, depth - marginZ * 2 - 1);
+
+        x = marginX + (int)MathF.Round(x01 * spanX);
+        z = marginZ + (int)MathF.Round(z01 * spanZ);
+
+        x = Math.Clamp(x, 0, Math.Max(0, width - 1));
+        z = Math.Clamp(z, 0, Math.Max(0, depth - 1));
+    }
+
+    private static float ComputeAnchorInfluence(int wx, int wz, int anchorX, int anchorZ, float radius)
+    {
+        if (radius <= 0f)
+            return 0f;
+
+        var dx = wx - anchorX;
+        var dz = wz - anchorZ;
+        var dist = MathF.Sqrt(dx * dx + dz * dz);
+        if (dist >= radius)
+            return 0f;
+
+        var t = 1f - dist / radius;
+        var eased = SmoothStep(Math.Clamp(t, 0f, 1f));
+        return eased * eased;
     }
 
     public string GetBiomeNameAt(int wx, int wz)
     {
         var oceanWeight = GetOceanWeightAt(wx, wz);
-        if (oceanWeight >= 0.56f)
+        if (oceanWeight >= OceanBiomeThreshold)
             return "Ocean";
-        return GetDesertWeightAt(wx, wz) >= 0.5f ? "Desert" : "Grasslands";
+        var desertWeight = GetDesertWeightAt(wx, wz);
+        var effectiveDesert = desertWeight * (1f - oceanWeight * 0.9f);
+        return effectiveDesert >= DesertBiomeThreshold ? "Desert" : "Grasslands";
     }
 
     private static bool ShouldCarveCave(int wx, int wy, int wz, int surface, int seed)
@@ -743,6 +1127,9 @@ public sealed class VoxelWorld
                 continue;
             }
 
+            if (!IsChunkYInRange(chunk.Coord.Y) || !IsChunkWithinWorldXZ(chunk.Coord))
+                continue;
+
             _chunks[chunk.Coord] = chunk;
             ChunkSeamRegistry.Register(chunk.Coord, ChunkSurfaceProfile.FromChunk(chunk));
         }
@@ -753,6 +1140,9 @@ public sealed class VoxelWorld
 
     private VoxelChunkData? TryLoadChunk(ChunkCoord coord)
     {
+        if (!IsChunkYInRange(coord.Y) || !IsChunkWithinWorldXZ(coord))
+            return null;
+
         var path = Path.Combine(ChunksDir, $"chunk_{coord.X}_{coord.Y}_{coord.Z}.bin");
         if (!File.Exists(path))
             return null;
@@ -762,6 +1152,28 @@ public sealed class VoxelWorld
     }
 
     private bool IsChunkYInRange(int cy) => cy >= 0 && cy <= _maxChunkY;
+
+    private bool IsChunkWithinWorldXZ(ChunkCoord coord)
+    {
+        var minX = coord.X * VoxelChunkData.ChunkSizeX;
+        var minZ = coord.Z * VoxelChunkData.ChunkSizeZ;
+        var maxX = minX + VoxelChunkData.ChunkSizeX - 1;
+        var maxZ = minZ + VoxelChunkData.ChunkSizeZ - 1;
+        return maxX >= 0
+            && maxZ >= 0
+            && minX < Meta.Size.Width
+            && minZ < Meta.Size.Depth;
+    }
+
+    private static VoxelChunkData CreateVoidChunk(ChunkCoord coord)
+    {
+        var chunk = new VoxelChunkData(coord)
+        {
+            IsDirty = false,
+            NeedsSave = false
+        };
+        return chunk;
+    }
 
     private static ChunkCoord? TryParseCoord(string fileName)
     {

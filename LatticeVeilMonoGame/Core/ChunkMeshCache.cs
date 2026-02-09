@@ -7,7 +7,7 @@ namespace LatticeVeilMonoGame.Core;
 
 public static class ChunkMeshCache
 {
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
 
     public static string GetCacheDirectory(string worldPath)
     {
@@ -41,6 +41,7 @@ public static class ChunkMeshCache
 
         WriteVertices(writer, mesh.OpaqueVertices);
         WriteVertices(writer, mesh.TransparentVertices);
+        WriteVertices(writer, mesh.WaterVertices);
     }
 
     public static bool TryLoadFresh(string worldPath, string chunksDir, ChunkCoord coord, out ChunkMesh mesh)
@@ -79,7 +80,8 @@ public static class ChunkMeshCache
 
             var opaque = ReadVertices(reader);
             var transparent = ReadVertices(reader);
-            mesh = new ChunkMesh(coord, opaque, transparent, new BoundingBox(min, max));
+            var water = ReadVertices(reader);
+            mesh = new ChunkMesh(coord, opaque, transparent, water, new BoundingBox(min, max));
             return true;
         }
         catch
@@ -119,4 +121,3 @@ public static class ChunkMeshCache
         return result;
     }
 }
-

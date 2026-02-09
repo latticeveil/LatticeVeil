@@ -27,6 +27,8 @@ public sealed class PlayerProfile
     {
         public string Label { get; set; } = "";
         public string UserId { get; set; } = "";
+        public string LastKnownDisplayName { get; set; } = "";
+        public string LastKnownPresence { get; set; } = "";
     }
 
     public string GetDisplayUsername()
@@ -103,7 +105,9 @@ public sealed class PlayerProfile
             cleaned.Add(new FriendEntry
             {
                 UserId = id,
-                Label = string.IsNullOrWhiteSpace(f.Label) ? ShortId(id) : f.Label.Trim()
+                Label = string.IsNullOrWhiteSpace(f.Label) ? ShortId(id) : f.Label.Trim(),
+                LastKnownDisplayName = (f.LastKnownDisplayName ?? "").Trim(),
+                LastKnownPresence = (f.LastKnownPresence ?? "").Trim()
             });
         }
         Friends = cleaned;

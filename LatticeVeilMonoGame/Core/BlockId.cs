@@ -72,4 +72,5 @@ public enum BlockId : byte
     SkyboundPhilter = 62,
     PyroskinTonic = 63,
     BrineveilElixir = 64,
+    WaterBucket = 65,
 }

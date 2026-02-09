@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -16,8 +17,9 @@ public sealed class CreateWorldScreen : IScreen
     private const int PanelMaxHeight = 700;
     private const int ControlShrinkPixels = 60; // ~2 inches at 30 px/in
     private const int ContentDownShiftPixels = 30; // ~1 inch at 30 px/in
-    private const int SpawnChunkPregenerationRadius = 8; // Match runtime prewarm radius
-    private const int SpawnMeshPregenerationRadius = 3; // Match runtime gate radius
+    private const int SpawnChunkPregenerationRadius = 8;
+    private const int SpawnMeshPregenerationRadius = 4;
+    private const int SpawnVerticalPregenerationChunkTop = 5;
 
     private readonly MenuStack _menus;
     private readonly AssetLoader _assets;
@@ -57,7 +59,6 @@ public sealed class CreateWorldScreen : IScreen
     // World settings
     private string _worldName = "New World";
     private Core.GameMode _selectedGameMode = Core.GameMode.Artificer;
-    private int _worldSize = 2; // 0=Small, 1=Medium, 2=Large, 3=Huge
     private int _difficulty = 1; // 0=Peaceful, 1=Easy, 2=Normal, 3=Hard
     private bool _structuresEnabled = true;
     private bool _cavesEnabled = true;
@@ -68,6 +69,19 @@ public sealed class CreateWorldScreen : IScreen
     private string _statusMessage = string.Empty;
     private double _statusUntil;
     private double _now;
+    private bool _isGeneratingWorld;
+    private float _generationProgress;
+    private string _generationStage = string.Empty;
+    private Task<WorldCreateResult>? _createTask;
+    private bool _meshPrebakeInProgress;
+    private string _pendingWorldName = string.Empty;
+    private string _pendingWorldPath = string.Empty;
+    private WorldMeta? _pendingWorldMeta;
+    private List<ChunkCoord> _pendingMeshCoords = new();
+    private int _pendingMeshIndex;
+    private int _cachedMeshCount;
+    private VoxelWorld? _meshPrebakeWorld;
+    private CubeNetAtlas? _meshPrebakeAtlas;
 
     public CreateWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, Action<string> onWorldCreated)
     {
@@ -202,6 +216,15 @@ public sealed class CreateWorldScreen : IScreen
         if (_statusUntil > 0 && _now >= _statusUntil)
             _statusMessage = string.Empty;
 
+        if (_isGeneratingWorld)
+        {
+            if (_createTask != null && _createTask.IsCompleted)
+                CompleteCreateTask();
+            if (_meshPrebakeInProgress)
+                ProcessMeshPrebakeStep();
+            return;
+        }
+
         if (input.IsNewKeyPress(Keys.Escape))
         {
             _menus.Pop();
@@ -325,7 +348,6 @@ public sealed class CreateWorldScreen : IScreen
 
         var detailsY = _artificerBtn.Bounds.Bottom + 10;
         var detailColumn = Math.Max(200, _contentArea.Width / 4);
-        _font.DrawString(sb, $"World Size: {GetWorldSizeLabel()}", new Vector2(x, detailsY), Color.White);
         _font.DrawString(sb, $"Difficulty: {GetDifficultyLabel()}", new Vector2(x + detailColumn, detailsY), Color.White);
         _font.DrawString(sb, $"Selected: {_selectedGameMode.ToString().ToUpperInvariant()}", new Vector2(x + detailColumn * 2, detailsY), Color.White);
 
@@ -347,19 +369,12 @@ public sealed class CreateWorldScreen : IScreen
             _font.DrawString(sb, _statusMessage, statusPos, new Color(230, 210, 90));
         }
 
-        sb.End();
-    }
-
-    private string GetWorldSizeLabel()
-    {
-        return _worldSize switch
+        if (_isGeneratingWorld)
         {
-            0 => "Small",
-            1 => "Medium", 
-            2 => "Large",
-            3 => "Huge",
-            _ => "Large"
-        };
+            DrawGeneratingOverlay(sb);
+        }
+
+        sb.End();
     }
 
     private string GetDifficultyLabel()
@@ -452,6 +467,9 @@ public sealed class CreateWorldScreen : IScreen
 
     private void CreateWorld()
     {
+        if (_isGeneratingWorld)
+            return;
+
         var worldName = NormalizeWorldName(_worldName);
         _worldName = worldName;
         if (string.IsNullOrWhiteSpace(worldName))
@@ -461,46 +479,61 @@ public sealed class CreateWorldScreen : IScreen
             return;
         }
 
+        var worldPath = Path.Combine(Paths.WorldsDir, worldName);
+        if (Directory.Exists(worldPath))
+        {
+            _log.Warn($"World directory already exists: {worldPath}");
+            SetStatus("WORLD NAME ALREADY EXISTS");
+            return;
+        }
+
+        var (width, height, depth) = GetWorldDimensions();
+        var seed = Environment.TickCount;
+        var meta = WorldMeta.CreateFlat(worldName, _selectedGameMode, width, height, depth, seed);
+        meta.CreatedAt = DateTimeOffset.UtcNow.ToString("O");
+        meta.PlayerCollision = true;
+        meta.EnableMultipleHomes = _multipleHomesEnabled;
+        meta.MaxHomesPerPlayer = _multipleHomesEnabled ? Math.Clamp(_maxHomesPerPlayer, 1, 32) : 1;
+
+        _isGeneratingWorld = true;
+        _generationProgress = 0f;
+        _generationStage = "PREPARING";
+        _statusMessage = string.Empty;
+        _statusUntil = 0d;
+        _createTask = Task.Run(() => CreateWorldTask(worldName, worldPath, meta));
+    }
+
+    private WorldCreateResult CreateWorldTask(string worldName, string worldPath, WorldMeta meta)
+    {
         try
         {
             _log.Info($"Creating new world: {worldName}");
-            _log.Info($"Settings: GameMode={_selectedGameMode}, Size={_worldSize}, Difficulty={_difficulty}");
+            _log.Info($"Settings: GameMode={_selectedGameMode}, Difficulty={_difficulty}");
             _log.Info($"Features: Structures={_structuresEnabled}, Caves={_cavesEnabled}, Ores={_oresEnabled}");
 
-            // Create world directory
-            var worldPath = Path.Combine(Paths.WorldsDir, worldName);
-            if (Directory.Exists(worldPath))
-            {
-                _log.Warn($"World directory already exists: {worldPath}");
-                SetStatus("WORLD NAME ALREADY EXISTS");
-                return;
-            }
-
+            SetGenerationProgress(0.08f, "METADATA");
             Directory.CreateDirectory(worldPath);
-            var (width, height, depth) = GetWorldDimensions();
-            var seed = Environment.TickCount;
-
-            // Create world metadata
-            var meta = WorldMeta.CreateFlat(worldName, _selectedGameMode, width, height, depth, seed);
-            meta.CreatedAt = DateTimeOffset.UtcNow.ToString("O");
-            meta.PlayerCollision = true;
-            meta.EnableMultipleHomes = _multipleHomesEnabled;
-            meta.MaxHomesPerPlayer = _multipleHomesEnabled ? Math.Clamp(_maxHomesPerPlayer, 1, 32) : 1;
-
-            // Save world metadata
             var metaPath = Path.Combine(worldPath, "world.json");
             meta.Save(metaPath, _log);
-            PregenerateSpawnChunks(meta, worldPath);
+            SetGenerationProgress(0.22f, "BIOME CATALOG");
+            BiomeCatalog.BuildAndSave(meta, worldPath, _log);
 
-            _log.Info($"World created successfully: {worldName}");
-            _onWorldCreated?.Invoke(worldName);
-            _menus.Pop();
+            SetGenerationProgress(0.40f, "SPAWN CHUNKS");
+            var meshCoords = PregenerateSpawnChunks(meta, worldPath, progress =>
+            {
+                var stageProgress = 0.40f + progress * 0.35f;
+                SetGenerationProgress(stageProgress, "SPAWN CHUNKS");
+            });
+
+            SetGenerationProgress(0.78f, "MESH CACHE");
+            _log.Info($"World generation base stages complete: {worldName} (mesh candidates: {meshCoords.Count})");
+            return WorldCreateResult.Success(worldName, worldPath, meta, meshCoords);
         }
         catch (Exception ex)
         {
-            SetStatus("FAILED TO CREATE WORLD");
             _log.Error($"Failed to create world: {ex.Message}");
             _log.Error($"Stack trace: {ex.StackTrace}");
+            return WorldCreateResult.Failure("FAILED TO CREATE WORLD");
         }
     }
 
@@ -586,6 +619,173 @@ public sealed class CreateWorldScreen : IScreen
         _statusUntil = seconds <= 0 ? 0 : _now + seconds;
     }
 
+    private void SetGenerationProgress(float progress, string stage)
+    {
+        _generationProgress = Math.Clamp(progress, 0f, 1f);
+        _generationStage = stage ?? string.Empty;
+    }
+
+    private void CompleteCreateTask()
+    {
+        if (_createTask == null)
+            return;
+
+        WorldCreateResult result;
+        try
+        {
+            result = _createTask.GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Create world task failed: {ex.Message}");
+            result = WorldCreateResult.Failure("FAILED TO CREATE WORLD");
+        }
+
+        _createTask = null;
+
+        if (result.IsSuccess)
+        {
+            BeginMeshPrebake(result);
+            return;
+        }
+
+        _isGeneratingWorld = false;
+        SetStatus(result.ErrorMessage ?? "FAILED TO CREATE WORLD");
+    }
+
+    private void BeginMeshPrebake(WorldCreateResult result)
+    {
+        _pendingWorldName = result.WorldName;
+        _pendingWorldPath = result.WorldPath;
+        _pendingWorldMeta = result.Meta;
+        _pendingMeshCoords = result.MeshCoords ?? new List<ChunkCoord>();
+        _pendingMeshIndex = 0;
+        _cachedMeshCount = 0;
+
+        if (_pendingWorldMeta == null || string.IsNullOrWhiteSpace(_pendingWorldPath))
+        {
+            FailGeneration("FAILED TO PREPARE MESH CACHE");
+            return;
+        }
+
+        try
+        {
+            _meshPrebakeWorld = new VoxelWorld(_pendingWorldMeta, _pendingWorldPath, _log);
+            var settings = GameSettings.LoadOrCreate(_log);
+            _meshPrebakeAtlas = CubeNetAtlas.Build(_assets, _log, settings.QualityPreset);
+            _meshPrebakeInProgress = true;
+            SetGenerationProgress(0.78f, "MESH CACHE");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Mesh cache bootstrap failed: {ex.Message}");
+            _meshPrebakeInProgress = false;
+            FinalizeWorldCreation();
+        }
+    }
+
+    private void ProcessMeshPrebakeStep()
+    {
+        if (!_meshPrebakeInProgress || _meshPrebakeWorld == null || _meshPrebakeAtlas == null)
+        {
+            _meshPrebakeInProgress = false;
+            FinalizeWorldCreation();
+            return;
+        }
+
+        var total = Math.Max(1, _pendingMeshCoords.Count);
+        const int chunksPerFrame = 2;
+        var processed = 0;
+        while (_pendingMeshIndex < _pendingMeshCoords.Count && processed < chunksPerFrame)
+        {
+            var coord = _pendingMeshCoords[_pendingMeshIndex];
+            var chunk = _meshPrebakeWorld.GetOrCreateChunk(coord);
+            var mesh = VoxelMesherGreedy.BuildChunkMeshFast(_meshPrebakeWorld, chunk, _meshPrebakeAtlas, _log);
+            ChunkMeshCache.Save(_pendingWorldPath, mesh);
+            _cachedMeshCount++;
+            _pendingMeshIndex++;
+            processed++;
+        }
+
+        var progress = 0.78f + ((_pendingMeshIndex / (float)total) * 0.12f);
+        SetGenerationProgress(progress, "MESH CACHE");
+
+        if (_pendingMeshIndex >= _pendingMeshCoords.Count)
+        {
+            _meshPrebakeInProgress = false;
+            FinalizeWorldCreation();
+        }
+    }
+
+    private void FinalizeWorldCreation()
+    {
+        try
+        {
+            SetGenerationProgress(0.90f, "WORLD PREVIEW");
+            if (_pendingWorldMeta != null && !string.IsNullOrWhiteSpace(_pendingWorldPath))
+                WorldPreviewGenerator.GenerateAndSave(_pendingWorldMeta, _pendingWorldPath, _log);
+
+            SetGenerationProgress(1.0f, "FINALIZING");
+            _log.Info($"World created successfully: {_pendingWorldName} (cachedMeshes={_cachedMeshCount}).");
+            _isGeneratingWorld = false;
+            _onWorldCreated?.Invoke(_pendingWorldName);
+            _menus.Pop();
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Finalization failed: {ex.Message}");
+            FailGeneration("FAILED TO FINALIZE WORLD");
+        }
+        finally
+        {
+            DisposeMeshPrebakeResources();
+        }
+    }
+
+    private void DisposeMeshPrebakeResources()
+    {
+        if (_meshPrebakeAtlas != null)
+        {
+            _meshPrebakeAtlas.Texture.Dispose();
+            _meshPrebakeAtlas = null;
+        }
+
+        _meshPrebakeWorld = null;
+        _pendingMeshCoords.Clear();
+        _pendingMeshIndex = 0;
+        _cachedMeshCount = 0;
+    }
+
+    private void FailGeneration(string message)
+    {
+        _isGeneratingWorld = false;
+        _meshPrebakeInProgress = false;
+        DisposeMeshPrebakeResources();
+        SetStatus(message);
+    }
+
+    private void DrawGeneratingOverlay(SpriteBatch sb)
+    {
+        var overlay = new Rectangle(_panelRect.X + 40, _panelRect.Center.Y - 72, _panelRect.Width - 80, 144);
+        sb.Draw(_pixel, overlay, new Color(0, 0, 0, 200));
+        DrawBorder(sb, overlay, new Color(190, 190, 190));
+
+        var title = "GENERATING WORLD";
+        var titleSize = _font.MeasureString(title);
+        _font.DrawString(sb, title, new Vector2(overlay.Center.X - titleSize.X / 2f, overlay.Y + 18), Color.White);
+
+        var stage = string.IsNullOrWhiteSpace(_generationStage) ? "PREPARING" : _generationStage.ToUpperInvariant();
+        var stageText = $"STAGE: {stage}";
+        var stageSize = _font.MeasureString(stageText);
+        _font.DrawString(sb, stageText, new Vector2(overlay.Center.X - stageSize.X / 2f, overlay.Y + 18 + _font.LineHeight + 8), new Color(220, 220, 220));
+
+        var barRect = new Rectangle(overlay.X + 24, overlay.Bottom - 34, overlay.Width - 48, 14);
+        sb.Draw(_pixel, barRect, new Color(22, 22, 22, 220));
+        DrawBorder(sb, barRect, new Color(170, 170, 170));
+        var fill = new Rectangle(barRect.X + 2, barRect.Y + 2, Math.Max(0, (int)MathF.Round((barRect.Width - 4) * _generationProgress)), Math.Max(1, barRect.Height - 4));
+        sb.Draw(_pixel, fill, new Color(84, 174, 255, 220));
+    }
+
     private void LayoutCenteredToggle(Checkbox checkbox, int y)
     {
         const int boxSize = 25;
@@ -614,14 +814,7 @@ public sealed class CreateWorldScreen : IScreen
 
     private (int width, int height, int depth) GetWorldDimensions()
     {
-        return _worldSize switch
-        {
-            0 => (256, 256, 256),
-            1 => (384, 256, 384),
-            2 => (512, 256, 512),
-            3 => (768, 256, 768),
-            _ => (512, 256, 512)
-        };
+        return (4096, 256, 4096);
     }
 
     private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)
@@ -632,7 +825,7 @@ public sealed class CreateWorldScreen : IScreen
         sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
     }
 
-    private void PregenerateSpawnChunks(WorldMeta meta, string worldPath)
+    private List<ChunkCoord> PregenerateSpawnChunks(WorldMeta meta, string worldPath, Action<float>? onProgress = null)
     {
         try
         {
@@ -643,6 +836,7 @@ public sealed class CreateWorldScreen : IScreen
             var spawnChunk = VoxelWorld.WorldToChunk((int)spawn.X, 0, (int)spawn.Y, out _, out _, out _);
             var chunkRadius = Math.Max(0, SpawnChunkPregenerationRadius);
             var chunkRadiusSq = chunkRadius * chunkRadius;
+            var maxCy = Math.Min(Math.Max(0, world.MaxChunkY), SpawnVerticalPregenerationChunkTop);
             var generatedCoords = new List<ChunkCoord>();
             var meshCoords = new List<ChunkCoord>();
 
@@ -654,48 +848,33 @@ public sealed class CreateWorldScreen : IScreen
                     if (distSq > chunkRadiusSq)
                         continue;
 
-                    var coord = new ChunkCoord(spawnChunk.X + dx, 0, spawnChunk.Z + dz);
-                    world.GetOrCreateChunk(coord);
-                    generatedCoords.Add(coord);
+                    for (var cy = 0; cy <= maxCy; cy++)
+                    {
+                        var coord = new ChunkCoord(spawnChunk.X + dx, cy, spawnChunk.Z + dz);
+                        world.GetOrCreateChunk(coord);
+                        generatedCoords.Add(coord);
 
-                    if (distSq <= SpawnMeshPregenerationRadius * SpawnMeshPregenerationRadius)
-                        meshCoords.Add(coord);
+                        if (distSq <= SpawnMeshPregenerationRadius * SpawnMeshPregenerationRadius)
+                            meshCoords.Add(coord);
+                    }
                 }
             }
 
             // Save all pregenerated chunks now (do not use batched SaveModifiedChunks limit).
-            foreach (var coord in generatedCoords)
-                world.SaveChunk(coord);
-
-            // Prebake gate meshes and cache them to disk to make first join much faster.
-            var settings = GameSettings.LoadOrCreate(_log);
-            var atlas = CubeNetAtlas.Build(_assets, _log, settings.QualityPreset);
-            var cachedMeshes = 0;
-            if (atlas != null)
+            for (int i = 0; i < generatedCoords.Count; i++)
             {
-                try
-                {
-                    foreach (var coord in meshCoords)
-                    {
-                        if (!world.TryGetChunk(coord, out var chunk) || chunk == null)
-                            continue;
-
-                        var mesh = VoxelMesherGreedy.BuildChunkMeshFast(world, chunk, atlas, _log);
-                        ChunkMeshCache.Save(worldPath, mesh);
-                        cachedMeshes++;
-                    }
-                }
-                finally
-                {
-                    atlas.Texture.Dispose();
-                }
+                var coord = generatedCoords[i];
+                world.SaveChunk(coord);
+                onProgress?.Invoke((i + 1f) / Math.Max(1, generatedCoords.Count));
             }
 
-            _log.Info($"Spawn pregeneration complete: chunks={generatedCoords.Count}, cachedMeshes={cachedMeshes}, center={spawnChunk}.");
+            _log.Info($"Spawn pregeneration complete: chunks={generatedCoords.Count}, meshCandidates={meshCoords.Count}, center={spawnChunk}, maxCy={maxCy}.");
+            return meshCoords;
         }
         catch (Exception ex)
         {
             _log.Warn($"Spawn pregeneration failed: {ex.Message}");
+            return new List<ChunkCoord>();
         }
     }
 
@@ -706,5 +885,30 @@ public sealed class CreateWorldScreen : IScreen
         spawnX = Math.Max(16f, Math.Min(spawnX, meta.Size.Width - 16f));
         spawnZ = Math.Max(16f, Math.Min(spawnZ, meta.Size.Depth - 16f));
         return new Vector2(spawnX, spawnZ);
+    }
+
+    private readonly struct WorldCreateResult
+    {
+        private WorldCreateResult(bool success, string worldName, string worldPath, WorldMeta? meta, List<ChunkCoord>? meshCoords, string? errorMessage)
+        {
+            IsSuccess = success;
+            WorldName = worldName;
+            WorldPath = worldPath;
+            Meta = meta;
+            MeshCoords = meshCoords;
+            ErrorMessage = errorMessage;
+        }
+
+        public bool IsSuccess { get; }
+        public string WorldName { get; }
+        public string WorldPath { get; }
+        public WorldMeta? Meta { get; }
+        public List<ChunkCoord>? MeshCoords { get; }
+        public string? ErrorMessage { get; }
+
+        public static WorldCreateResult Success(string worldName, string worldPath, WorldMeta meta, List<ChunkCoord> meshCoords)
+            => new(true, worldName, worldPath, meta, meshCoords, null);
+        public static WorldCreateResult Failure(string errorMessage)
+            => new(false, string.Empty, string.Empty, null, null, errorMessage);
     }
 }

@@ -7,6 +7,7 @@ using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using LatticeVeilMonoGame.Core;
 using LatticeVeilMonoGame.Online.Eos;
+using LatticeVeilMonoGame.Online.Gate;
 using LatticeVeilMonoGame.Online.Lan;
 using LatticeVeilMonoGame.UI;
 
@@ -31,11 +32,14 @@ public sealed class MultiplayerScreen : IScreen
 
     private readonly LanDiscovery _lanDiscovery;
     private EosClient? _eosClient;
+    private readonly OnlineGateClient _onlineGate;
 
     private readonly Button _refreshBtn;
     private readonly Button _hostBtn;
     private readonly Button _joinBtn;
 	private readonly Button _yourIdBtn;
+    private readonly Button _friendsBtn;
+    private readonly Button _saveNameBtn;
     private readonly Button _backBtn;
 
     private List<LanServerEntry> _lanServers = new();
@@ -59,6 +63,11 @@ public sealed class MultiplayerScreen : IScreen
     private Rectangle _tabOnlineRect;
     private Rectangle _buttonRowRect;
     private Rectangle _infoRect;
+    private Rectangle _playerNameInputRect;
+
+    private EosIdentityStore _identityStore;
+    private string _playerNameInput = string.Empty;
+    private bool _playerNameActive;
 
     private double _now;
     private const double DoubleClickSeconds = 0.35;
@@ -76,10 +85,12 @@ public sealed class MultiplayerScreen : IScreen
         _profile = profile;
         _graphics = graphics;
 
-        // Device-ID only.
-        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
         if (_eosClient == null)
             _log.Warn("MultiplayerScreen: EOS client not available.");
+        _onlineGate = OnlineGateClient.GetOrCreate();
+        _identityStore = EosIdentityStore.LoadOrCreate(_log);
+        _playerNameInput = _identityStore.GetDisplayNameOrDefault("Player");
 
         _lanDiscovery = new LanDiscovery(_log);
         _lanDiscovery.StartListening();
@@ -88,6 +99,8 @@ public sealed class MultiplayerScreen : IScreen
         _hostBtn = new Button("HOST", OpenHostWorlds) { BoldText = true };
         _joinBtn = new Button("JOIN", OnJoinClicked) { BoldText = true };
 		_yourIdBtn = new Button("YOUR ID", OnYourIdClicked) { BoldText = true };
+        _friendsBtn = new Button("FRIENDS", OnFriendsClicked) { BoldText = true };
+        _saveNameBtn = new Button("SAVE NAME", SavePlayerName) { BoldText = true };
         _backBtn = new Button("BACK", () => { Cleanup(); _menus.Pop(); }) { BoldText = true };
 
         try
@@ -126,22 +139,34 @@ public sealed class MultiplayerScreen : IScreen
         _tabLanRect = new Rectangle(_listRect.X + 4, _listRect.Y + 4, (_listRect.Width - 12) / 2, _font.LineHeight + 2);
         _tabOnlineRect = new Rectangle(_tabLanRect.Right + 4, _tabLanRect.Y, (_listRect.Width - 12) / 2, _tabLanRect.Height);
         _listBodyRect = new Rectangle(_listRect.X, _listRect.Y + listHeaderH, _listRect.Width, Math.Max(0, _listRect.Height - listHeaderH));
+        _playerNameInputRect = new Rectangle(
+            _listBodyRect.X + 10,
+            _listBodyRect.Y + _font.LineHeight + 36,
+            Math.Max(180, Math.Min(360, _listBodyRect.Width - 180)),
+            _font.LineHeight + 12);
+        _saveNameBtn.Bounds = new Rectangle(_playerNameInputRect.Right + 8, _playerNameInputRect.Y, 120, _playerNameInputRect.Height);
 
 		var gap = 20; // Increased gap to prevent button overlap
 		if (_tab == MultiplayerTab.Online)
 		{
 			_refreshBtn.Visible = false;
 			_yourIdBtn.Visible = true;
+            _friendsBtn.Visible = true;
+            _saveNameBtn.Visible = true;
 
 			// Match button bounds to their textures with proper spacing
 			_hostBtn.Bounds = new Rectangle(_buttonRowRect.X, _buttonRowRect.Y, _hostBtn.Texture?.Width ?? 0, _hostBtn.Texture?.Height ?? 0);
 			_joinBtn.Bounds = new Rectangle(_hostBtn.Bounds.Right + gap, _buttonRowRect.Y, _joinBtn.Texture?.Width ?? 0, _joinBtn.Texture?.Height ?? 0);
 			_yourIdBtn.Bounds = new Rectangle(_joinBtn.Bounds.Right + gap, _buttonRowRect.Y, _yourIdBtn.Texture?.Width ?? 0, _yourIdBtn.Texture?.Height ?? 0);
+            _friendsBtn.Bounds = new Rectangle(_yourIdBtn.Bounds.Right + gap, _buttonRowRect.Y, _friendsBtn.Texture?.Width ?? 140, _friendsBtn.Texture?.Height ?? _buttonRowRect.Height);
 		}
 		else
 		{
 			_refreshBtn.Visible = true;
 			_yourIdBtn.Visible = false;
+            _friendsBtn.Visible = false;
+            _saveNameBtn.Visible = false;
+            _playerNameActive = false;
 
 			// Match button bounds to their textures with proper spacing
 			_refreshBtn.Bounds = new Rectangle(_buttonRowRect.X, _buttonRowRect.Y, _refreshBtn.Texture?.Width ?? 0, _refreshBtn.Texture?.Height ?? 0);
@@ -149,7 +174,6 @@ public sealed class MultiplayerScreen : IScreen
 			_joinBtn.Bounds = new Rectangle(_hostBtn.Bounds.Right + gap, _buttonRowRect.Y, _joinBtn.Texture?.Width ?? 0, _joinBtn.Texture?.Height ?? 0);
 		}
 
-        var margin = 20;
         // Standard back button with proper aspect ratio positioned in bottom-left corner
         var backBtnMargin = 20;
         var backBtnBaseW = Math.Max(_backBtn.Texture?.Width ?? 0, 320);
@@ -178,12 +202,24 @@ public sealed class MultiplayerScreen : IScreen
                 SetTab(MultiplayerTab.Lan);
             else if (_tabOnlineRect.Contains(p))
                 SetTab(MultiplayerTab.Online);
+            else if (_tab == MultiplayerTab.Online)
+                _playerNameActive = _playerNameInputRect.Contains(p);
+        }
+
+        if (_tab == MultiplayerTab.Online && _playerNameActive)
+        {
+            HandleTextInput(input, ref _playerNameInput, EosIdentityStore.MaxDisplayNameLength);
+            if (input.IsNewKeyPress(Keys.Enter))
+                SavePlayerName();
         }
 
         _refreshBtn.Update(input);
         _hostBtn.Update(input);
         _joinBtn.Update(input);
 		_yourIdBtn.Update(input);
+        _friendsBtn.Update(input);
+        _saveNameBtn.Enabled = _tab == MultiplayerTab.Online;
+        _saveNameBtn.Update(input);
         _backBtn.Update(input);
 
         if (_tab == MultiplayerTab.Lan)
@@ -191,6 +227,8 @@ public sealed class MultiplayerScreen : IScreen
             HandleLanListSelection(input);
             UpdateLanDiscovery(gameTime);
         }
+
+        RefreshIdentityState(EnsureEosClient());
     }
 
     public void Draw(SpriteBatch sb, Rectangle viewport)
@@ -278,10 +316,8 @@ public sealed class MultiplayerScreen : IScreen
 
         if (_tab == MultiplayerTab.Online)
         {
-            var eos = EnsureEosClient();
-            var label = eos == null
-                ? (EosConfig.IsRemoteFetchPending ? "EOS: LOADING..." : "EOS: DISABLED")
-                : (eos.IsLoggedIn ? "EOS: READY" : "EOS: CONNECTING...");
+            var snapshot = EosRuntimeStatus.Evaluate(EnsureEosClient());
+            var label = snapshot.StatusText;
             var size = _font.MeasureString(label);
             var pos = new Vector2(_infoRect.Right - size.X - 4, _infoRect.Y + 2);
             _font.DrawString(sb, label, pos, new Color(220, 180, 80));
@@ -352,6 +388,7 @@ public sealed class MultiplayerScreen : IScreen
     private void DrawOnlineInfo(SpriteBatch sb)
     {
         var eos = EnsureEosClient();
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
         var x = _listBodyRect.X + 10;
         var y = _listBodyRect.Y + 10;
 
@@ -359,12 +396,22 @@ public sealed class MultiplayerScreen : IScreen
         DrawTextBold(sb, header, new Vector2(x, y), Color.White);
         y += _font.LineHeight + 10;
 
-        if (eos == null)
+        _font.DrawString(sb, "PLAYER NAME:", new Vector2(x, y), new Color(220, 220, 220));
+        y += _font.LineHeight + 2;
+        sb.Draw(_pixel, _playerNameInputRect, _playerNameActive ? new Color(36, 36, 36, 240) : new Color(26, 26, 26, 240));
+        DrawBorder(sb, _playerNameInputRect, Color.White);
+        var nameText = string.IsNullOrWhiteSpace(_playerNameInput) ? "Player" : _playerNameInput;
+        _font.DrawString(sb, nameText, new Vector2(_playerNameInputRect.X + 6, _playerNameInputRect.Y + 4), Color.White);
+        y = _playerNameInputRect.Bottom + 6;
+
+        if (snapshot.Reason is EosRuntimeReason.SdkNotCompiled or EosRuntimeReason.ConfigMissing or EosRuntimeReason.DisabledByEnvironment or EosRuntimeReason.ClientUnavailable)
         {
-            var msg = EosConfig.IsRemoteFetchPending
-                ? "EOS config loading... please wait."
-                : "EOS is disabled in this build.";
+            var msg = snapshot.StatusText;
             _font.DrawString(sb, msg, new Vector2(x, y), Color.White);
+            y += _font.LineHeight + 6;
+            _font.DrawString(sb, $"Assets: {Paths.ToUiPath(Paths.GetAssetsDir())}", new Vector2(x, y), new Color(180, 180, 180));
+            y += _font.LineHeight + 2;
+            _font.DrawString(sb, $"EOS Config: {EosRuntimeStatus.DescribeConfigSource()}", new Vector2(x, y), new Color(180, 180, 180));
             return;
         }
 
@@ -373,11 +420,29 @@ public sealed class MultiplayerScreen : IScreen
         _font.DrawString(sb, "Join: click JOIN and enter the host code.", new Vector2(x, y), Color.White);
         y += _font.LineHeight + 10;
 
-        var id = eos.LocalProductUserId;
+        var id = eos?.LocalProductUserId;
         var idLabel = string.IsNullOrWhiteSpace(id) ? "(waiting for EOS login...)" : id;
+        var friendCode = _identityStore.GetFriendCode();
+        if (string.IsNullOrWhiteSpace(friendCode) && !string.IsNullOrWhiteSpace(id))
+            friendCode = EosIdentityStore.GenerateFriendCode(id);
+        var normalizedName = EosIdentityStore.NormalizeDisplayName(_playerNameInput);
+        if (string.IsNullOrWhiteSpace(normalizedName))
+            normalizedName = _identityStore.GetDisplayNameOrDefault("Player");
+        var identityLabel = BuildIdentityLabel(normalizedName, friendCode, id);
+        _font.DrawString(sb, $"YOU: {identityLabel}", new Vector2(x, y), new Color(220, 220, 220));
+        y += _font.LineHeight + 2;
+        _font.DrawString(sb, $"YOUR FRIEND CODE: {(string.IsNullOrWhiteSpace(friendCode) ? "(waiting for EOS login...)" : friendCode)}", new Vector2(x, y), new Color(220, 220, 220));
+        y += _font.LineHeight + 6;
         DrawTextBold(sb, "YOUR HOST CODE:", new Vector2(x, y), new Color(220, 180, 80));
         y += _font.LineHeight + 2;
         _font.DrawString(sb, idLabel, new Vector2(x, y), Color.White);
+        y += _font.LineHeight + 8;
+        _font.DrawString(sb, $"Assets: {Paths.ToUiPath(Paths.GetAssetsDir())}", new Vector2(x, y), new Color(180, 180, 180));
+        y += _font.LineHeight + 2;
+        _font.DrawString(sb, $"EOS Config: {EosRuntimeStatus.DescribeConfigSource()}", new Vector2(x, y), new Color(180, 180, 180));
+        y += _font.LineHeight + 2;
+        var gateLabel = _onlineGate.HasValidTicket ? "GATE: VERIFIED" : $"GATE: {_onlineGate.StatusText}";
+        _font.DrawString(sb, gateLabel, new Vector2(x, y), new Color(180, 180, 180));
     }
 
     private void DrawButtons(SpriteBatch sb)
@@ -386,6 +451,8 @@ public sealed class MultiplayerScreen : IScreen
         _hostBtn.Draw(sb, _pixel, _font);
         _joinBtn.Draw(sb, _pixel, _font);
 		_yourIdBtn.Draw(sb, _pixel, _font);
+        _friendsBtn.Draw(sb, _pixel, _font);
+        _saveNameBtn.Draw(sb, _pixel, _font);
     }
 
     private void DrawStatus(SpriteBatch sb)
@@ -417,9 +484,15 @@ public sealed class MultiplayerScreen : IScreen
             return;
 
         var eos = EnsureEosClient();
-        if (eos == null)
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason is EosRuntimeReason.SdkNotCompiled or EosRuntimeReason.ConfigMissing or EosRuntimeReason.DisabledByEnvironment or EosRuntimeReason.ClientUnavailable)
         {
-            _status = EosConfig.IsRemoteFetchPending ? "EOS config loading..." : "EOS disabled.";
+            _status = snapshot.StatusText;
+            return;
+        }
+        if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            _status = gateDenied;
             return;
         }
 
@@ -432,24 +505,51 @@ public sealed class MultiplayerScreen : IScreen
             return;
 
         var eos = EnsureEosClient();
-        if (eos == null)
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason is EosRuntimeReason.SdkNotCompiled or EosRuntimeReason.ConfigMissing or EosRuntimeReason.DisabledByEnvironment or EosRuntimeReason.ClientUnavailable)
         {
-            _status = EosConfig.IsRemoteFetchPending ? "EOS config loading..." : "EOS disabled.";
+            _status = snapshot.StatusText;
             return;
         }
 
-        if (!eos.IsLoggedIn)
+        if (eos == null || !eos.IsLoggedIn)
         {
             _status = "Signing into EOS...";
             return;
         }
+        if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            _status = gateDenied;
+            return;
+        }
 
-		_menus.Push(new ShareJoinCodeScreen(_menus, _assets, _font, _pixel, _log, eos.LocalProductUserId, eos.LocalProductUserId), _viewport);
+		_menus.Push(new ShareJoinCodeScreen(_menus, _assets, _font, _pixel, _log, eos?.LocalProductUserId ?? string.Empty, eos?.LocalProductUserId), _viewport);
+    }
+
+    private void OnFriendsClicked()
+    {
+        if (_tab != MultiplayerTab.Online)
+            return;
+
+        if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            _status = gateDenied;
+            return;
+        }
+
+        var eos = EnsureEosClient();
+        _menus.Push(new InviteFriendsScreen(_menus, _assets, _font, _pixel, _log, eos, "Online"), _viewport);
     }
 
     private void OpenHostWorlds()
     {
         var hostOnline = _tab == MultiplayerTab.Online;
+        if (hostOnline && !_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            _status = gateDenied;
+            return;
+        }
+
         _menus.Push(new MultiplayerHostScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient, hostOnline), _viewport);
     }
 
@@ -516,10 +616,119 @@ public sealed class MultiplayerScreen : IScreen
         if (_eosClient != null)
             return _eosClient;
 
-        _eosClient = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+        _eosClient = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
         if (_eosClient == null)
             _log.Warn("MultiplayerScreen: EOS client not available.");
         return _eosClient;
+    }
+
+    private void SavePlayerName()
+    {
+        if (_tab != MultiplayerTab.Online)
+            return;
+
+        var normalized = EosIdentityStore.NormalizeDisplayName(_playerNameInput);
+        if (string.IsNullOrWhiteSpace(normalized))
+            normalized = "Player";
+
+        var eos = EnsureEosClient();
+        if (eos != null && !string.IsNullOrWhiteSpace(eos.LocalProductUserId))
+            _identityStore.ProductUserId = eos.LocalProductUserId;
+
+        _identityStore.DisplayName = normalized;
+        _identityStore.Save(_log);
+        _playerNameInput = normalized;
+        _status = $"Player name saved: {normalized}";
+    }
+
+    private void RefreshIdentityState(EosClient? eos)
+    {
+        if (eos == null || string.IsNullOrWhiteSpace(eos.LocalProductUserId))
+            return;
+
+        if (!string.Equals(_identityStore.ProductUserId, eos.LocalProductUserId, StringComparison.Ordinal))
+        {
+            _identityStore.ProductUserId = eos.LocalProductUserId;
+            if (string.IsNullOrWhiteSpace(_identityStore.DisplayName))
+                _identityStore.DisplayName = EosIdentityStore.NormalizeDisplayName(_playerNameInput);
+            if (string.IsNullOrWhiteSpace(_identityStore.DisplayName))
+                _identityStore.DisplayName = "Player";
+            _identityStore.Save(_log);
+        }
+    }
+
+    private static string BuildIdentityLabel(string displayName, string friendCode, string? puid)
+    {
+        if (!string.IsNullOrWhiteSpace(friendCode))
+            return $"{displayName} ({friendCode})";
+
+        var suffix = "----";
+        if (!string.IsNullOrWhiteSpace(puid))
+        {
+            var trimmed = puid.Trim();
+            suffix = trimmed.Length <= 4 ? trimmed : trimmed.Substring(trimmed.Length - 4);
+        }
+
+        return $"{displayName}#{suffix}";
+    }
+
+    private void HandleTextInput(InputState input, ref string value, int maxLen)
+    {
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        foreach (var key in input.GetNewKeys())
+        {
+            if (key == Keys.Back)
+            {
+                if (value.Length > 0)
+                    value = value.Substring(0, value.Length - 1);
+                continue;
+            }
+
+            if (key == Keys.Space)
+            {
+                Append(ref value, ' ', maxLen);
+                continue;
+            }
+
+            if (key == Keys.OemMinus || key == Keys.Subtract)
+            {
+                Append(ref value, shift ? '_' : '-', maxLen);
+                continue;
+            }
+
+            if (key == Keys.OemPeriod || key == Keys.Decimal)
+            {
+                Append(ref value, '.', maxLen);
+                continue;
+            }
+
+            if (key >= Keys.D0 && key <= Keys.D9)
+            {
+                Append(ref value, (char)('0' + (key - Keys.D0)), maxLen);
+                continue;
+            }
+
+            if (key >= Keys.NumPad0 && key <= Keys.NumPad9)
+            {
+                Append(ref value, (char)('0' + (key - Keys.NumPad0)), maxLen);
+                continue;
+            }
+
+            if (key >= Keys.A && key <= Keys.Z)
+            {
+                var c = (char)('A' + (key - Keys.A));
+                if (!shift)
+                    c = char.ToLowerInvariant(c);
+                Append(ref value, c, maxLen);
+            }
+        }
+    }
+
+    private static void Append(ref string value, char c, int maxLen)
+    {
+        if (value.Length >= maxLen)
+            return;
+        value += c;
     }
 
     private void RefreshLanServers()

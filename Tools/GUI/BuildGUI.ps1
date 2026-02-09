@@ -5,11 +5,16 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # Global variables
-$ScriptRoot = $PSScriptRoot
-$LogFile = Join-Path $ScriptRoot ".builder\logs\build.log"
+$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
+$ScriptRoot = $RepoRoot
+$LogDir = Join-Path $ScriptRoot ".builder\logs"
+$LogFile = Join-Path $LogDir "build.log"
+Set-Location $ScriptRoot
 
 # Create directories if they don't exist
-if (-not (Test-Path ".builder\logs")) { New-Item -ItemType Directory -Path ".builder\logs" -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
 
 # Main Form
 $Form = New-Object System.Windows.Forms.Form

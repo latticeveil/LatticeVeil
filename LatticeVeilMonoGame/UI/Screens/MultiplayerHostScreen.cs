@@ -1,13 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using LatticeVeilMonoGame.Core;
 using LatticeVeilMonoGame.Online.Eos;
-using LatticeVeilMonoGame.Online.Lan;
+using LatticeVeilMonoGame.Online.Gate;
 using LatticeVeilMonoGame.UI;
 
 namespace LatticeVeilMonoGame.UI.Screens;
@@ -15,7 +14,6 @@ namespace LatticeVeilMonoGame.UI.Screens;
 public sealed class MultiplayerHostScreen : IScreen
 {
     private const int ScrollStep = 40;
-    private const int DefaultLanServerPort = 27037;
 
     private readonly MenuStack _menus;
     private readonly AssetLoader _assets;
@@ -26,12 +24,6 @@ public sealed class MultiplayerHostScreen : IScreen
     private readonly PlayerProfile _profile;
     private EosClient? _eosClient;
     private readonly bool _hostForFriends;
-
-    private readonly LanDiscovery _lanDiscovery;
-
-    private LanHostSession? _lanHostSession;
-    private EosP2PHostSession? _eosHostSession;
-    private ILanSession? _activeSession;
 
     private Texture2D? _bg;
     private Texture2D? _panel;
@@ -56,11 +48,20 @@ public sealed class MultiplayerHostScreen : IScreen
     private string? _statusMessage;
     private double _statusUntil;
 
-    private List<WorldEntry> _worlds = new();
-    private bool _hostingSessionActive;
+    private List<WorldListEntry> _worlds = new();
+    private readonly Dictionary<string, PreviewTextureCacheEntry> _previewTextures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _previewLoadFailures = new(StringComparer.OrdinalIgnoreCase);
 
-    public MultiplayerHostScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile,
-        global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient, bool hostForFriends)
+    public MultiplayerHostScreen(
+        MenuStack menus,
+        AssetLoader assets,
+        PixelFont font,
+        Texture2D pixel,
+        Logger log,
+        PlayerProfile profile,
+        global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics,
+        EosClient? eosClient,
+        bool hostForFriends)
     {
         _menus = menus;
         _assets = assets;
@@ -69,10 +70,8 @@ public sealed class MultiplayerHostScreen : IScreen
         _log = log;
         _graphics = graphics;
         _profile = profile;
-        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
+        _eosClient = eosClient;
         _hostForFriends = hostForFriends;
-
-        _lanDiscovery = new LanDiscovery(_log);
 
         _createBtn = new Button("CREATE WORLD", OpenCreateWorld) { BoldText = true };
         _deleteBtn = new Button("DELETE", DeleteSelectedWorld) { BoldText = true };
@@ -116,47 +115,15 @@ public sealed class MultiplayerHostScreen : IScreen
             _panelRect.Width - margin * 2,
             _panelRect.Height - headerH - buttonAreaH - margin);
 
-        _rowHeight = _font.LineHeight + 8;
+        _rowHeight = Math.Max(_font.LineHeight + 12, 72);
 
-        var buttonW = Math.Clamp((int)(_panelRect.Width * 0.26f), 150, 240);
-        var buttonH = Math.Clamp((int)(buttonW * 0.28f), 40, 70);
-        var gap = 14;
-
-        // Layout: create | delete | host | back
-        var totalW = buttonW * 3 + gap * 3 + buttonH; // delete is square
-        var available = _panelRect.Width - margin * 2;
-        if (totalW > available)
-        {
-            var scale = available / (float)totalW;
-            buttonW = Math.Max(120, (int)(buttonW * scale));
-            buttonH = Math.Max(34, (int)(buttonH * scale));
-            gap = Math.Max(8, (int)(gap * scale));
-            totalW = buttonW * 3 + gap * 3 + buttonH;
-        }
-
-        var buttonY = _panelRect.Bottom - margin - buttonH;
-        var startX = _panelRect.X + (_panelRect.Width - totalW) / 2;
-
-        // Position back button in bottom-left corner of full screen with proper aspect ratio
-        var backBtnMargin = 20;
-        var backBtnBaseW = Math.Max(_backBtn.Texture?.Width ?? 0, 320);
-        var backBtnBaseH = Math.Max(_backBtn.Texture?.Height ?? 0, (int)(backBtnBaseW * 0.28f));
-        var backBtnScale = Math.Min(1f, Math.Min(240f / backBtnBaseW, 240f / backBtnBaseH));
-        var backBtnW = Math.Max(1, (int)Math.Round(backBtnBaseW * backBtnScale));
-        var backBtnH = Math.Max(1, (int)Math.Round(backBtnBaseH * backBtnScale));
-        _backBtn.Bounds = new Rectangle(
-            viewport.X + backBtnMargin, 
-            viewport.Bottom - backBtnMargin - backBtnH, 
-            backBtnW, 
-            backBtnH
-        );
-        
-        // Adjust other buttons to account for back button position
-        var availableWidth = _panelRect.Width - backBtnW - backBtnMargin * 2 - gap * 2;
-        var hostButtonW = availableWidth / 3;
-        _createBtn.Bounds = new Rectangle(_panelRect.X + backBtnW + backBtnMargin * 2, buttonY, hostButtonW, buttonH);
-        _deleteBtn.Bounds = new Rectangle(_createBtn.Bounds.Right + gap, buttonY, hostButtonW, buttonH);
-        _hostBtn.Bounds = new Rectangle(_deleteBtn.Bounds.Right + gap, buttonY, hostButtonW, buttonH);
+        var buttonY = _panelRect.Bottom - margin - 48;
+        var gap = 10;
+        var btnW = Math.Max(110, (_panelRect.Width - margin * 2 - gap * 3) / 4);
+        _createBtn.Bounds = new Rectangle(_panelRect.X + margin, buttonY, btnW, 48);
+        _deleteBtn.Bounds = new Rectangle(_createBtn.Bounds.Right + gap, buttonY, btnW, 48);
+        _hostBtn.Bounds = new Rectangle(_deleteBtn.Bounds.Right + gap, buttonY, btnW, 48);
+        _backBtn.Bounds = new Rectangle(_hostBtn.Bounds.Right + gap, buttonY, btnW, 48);
 
         ClampScroll();
     }
@@ -166,10 +133,6 @@ public sealed class MultiplayerHostScreen : IScreen
         _now = gameTime.TotalGameTime.TotalSeconds;
         if (_statusMessage != null && _now > _statusUntil)
             _statusMessage = null;
-
-        // If a hosting session died unexpectedly, stop it.
-        if (_hostingSessionActive && _activeSession != null && !_activeSession.IsConnected)
-            StopHosting();
 
         if (input.IsNewKeyPress(Keys.Escape))
         {
@@ -209,7 +172,7 @@ public sealed class MultiplayerHostScreen : IScreen
         else
             sb.Draw(_pixel, _panelRect, new Color(25, 25, 25));
 
-        var title = _hostForFriends ? "HOST ONLINE (EOS)" : "HOST LAN";
+        var title = _hostForFriends ? "HOST ONLINE" : "HOST LAN";
         var titleSize = _font.MeasureString(title);
         var titlePos = new Vector2(_panelRect.Center.X - titleSize.X / 2f, _panelRect.Y + 16);
         _font.DrawString(sb, title, titlePos, Color.White);
@@ -247,7 +210,6 @@ public sealed class MultiplayerHostScreen : IScreen
         var clip = sb.GraphicsDevice.ScissorRectangle;
         sb.End();
 
-        // Re-begin with scissor to clip list area.
         var raster = new RasterizerState { ScissorTestEnable = true };
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: raster);
         sb.GraphicsDevice.ScissorRectangle = UiLayout.ToScreenRect(_listRect);
@@ -265,15 +227,25 @@ public sealed class MultiplayerHostScreen : IScreen
             if (rowRect.Top > _listRect.Bottom)
                 break;
 
-            if (i == _selectedIndex)
-                sb.Draw(_pixel, rowRect, new Color(40, 40, 40, 200));
+            var bg = i == _selectedIndex ? new Color(48, 48, 48, 220) : new Color(10, 10, 10, 150);
+            sb.Draw(_pixel, rowRect, bg);
+            DrawBorder(sb, rowRect, new Color(200, 200, 200));
 
-            var name = _worlds[i].DisplayName;
-            _font.DrawString(sb, name, new Vector2(rowRect.X + 8, rowRect.Y + 4), Color.White);
+            var entry = _worlds[i];
+            var previewSize = rowRect.Height - 8;
+            var previewRect = new Rectangle(rowRect.X + 4, rowRect.Y + 4, previewSize, previewSize);
+            DrawWorldPreviewTile(sb, entry, previewRect);
+
+            var textX = previewRect.Right + 10;
+            var textWidth = Math.Max(20, rowRect.Right - textX - 8);
+            var title = TruncateToWidth(WorldListService.BuildDisplayTitle(entry), textWidth);
+            var seedText = TruncateToWidth($"SEED: {entry.Seed}", textWidth);
+
+            _font.DrawString(sb, title, new Vector2(textX, rowRect.Y + 6), Color.White);
+            _font.DrawString(sb, seedText, new Vector2(textX, rowRect.Bottom - _font.LineHeight - 6), new Color(210, 210, 210));
             y += _rowHeight;
         }
 
-        // Restore scissor and end, then begin normally again.
         sb.End();
         sb.GraphicsDevice.ScissorRectangle = clip;
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
@@ -305,7 +277,6 @@ public sealed class MultiplayerHostScreen : IScreen
 
         _selectedIndex = idx;
 
-        // Double click to host.
         if (_lastClickIndex == idx && (_now - _lastClickTime) <= DoubleClickSeconds)
         {
             _lastClickIndex = -1;
@@ -320,54 +291,15 @@ public sealed class MultiplayerHostScreen : IScreen
 
     private void RefreshWorlds()
     {
-        try
-        {
-            _worlds = new List<WorldEntry>();
-            LoadWorldEntries(Paths.MultiplayerWorldsDir, isMultiplayer: true);
-            LoadWorldEntries(Paths.WorldsDir, isMultiplayer: false);
-            _worlds.Sort((a, b) => string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase));
-
-            _selectedIndex = _worlds.Count > 0 ? 0 : -1;
-            _scroll = 0;
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Failed to list multiplayer worlds: {ex.Message}");
-            _worlds = new List<WorldEntry>();
-            _selectedIndex = -1;
-        }
-    }
-
-    private void LoadWorldEntries(string rootDir, bool isMultiplayer)
-    {
-        Directory.CreateDirectory(rootDir);
-        foreach (var dir in Directory.GetDirectories(rootDir))
-        {
-            var folder = Path.GetFileName(dir);
-            if (string.IsNullOrWhiteSpace(folder))
-                continue;
-            if (string.Equals(folder, "Joined", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var metaPath = Path.Combine(dir, "world.json");
-            WorldMeta? meta = null;
-            if (File.Exists(metaPath))
-                meta = WorldMeta.Load(metaPath, _log);
-            var displayName = !string.IsNullOrWhiteSpace(meta?.Name) ? meta!.Name : folder;
-            var prefix = isMultiplayer ? "[MP]" : "[SP]";
-            _worlds.Add(new WorldEntry
-            {
-                DisplayName = $"{prefix} {displayName}",
-                WorldPath = dir,
-                MetaPath = metaPath,
-                IsMultiplayer = isMultiplayer
-            });
-        }
+        _worlds = WorldListService.LoadSingleplayerWorlds(_log);
+        _selectedIndex = _worlds.Count > 0 ? 0 : -1;
+        _scroll = 0;
+        TrimPreviewCache();
+        ClampScroll();
     }
 
     private void OpenCreateWorld()
     {
-        _log.Info("Opening Create World screen with new world generation system");
         _menus.Push(new CreateWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, OnWorldCreated), _viewport);
     }
 
@@ -380,15 +312,8 @@ public sealed class MultiplayerHostScreen : IScreen
         }
 
         var entry = _worlds[_selectedIndex];
-        if (!entry.IsMultiplayer)
-        {
-            ShowStatus("DELETE ONLY FOR MP WORLDS");
-            return;
-        }
-
-        var name = entry.DisplayName;
         var result = System.Windows.Forms.MessageBox.Show(
-            $"Delete world?\n\n{name}",
+            $"Delete world?\n\n{entry.Name}",
             "Confirm Delete",
             System.Windows.Forms.MessageBoxButtons.YesNo,
             System.Windows.Forms.MessageBoxIcon.Warning);
@@ -400,12 +325,11 @@ public sealed class MultiplayerHostScreen : IScreen
         {
             if (Directory.Exists(entry.WorldPath))
                 Directory.Delete(entry.WorldPath, true);
-            _log.Info($"Deleted multiplayer world: {entry.DisplayName}");
             RefreshWorlds();
         }
         catch (Exception ex)
         {
-            _log.Warn($"Failed to delete multiplayer world {entry.DisplayName}: {ex.Message}");
+            _log.Warn($"Failed to delete world {entry.Name}: {ex.Message}");
             ShowStatus("DELETE FAILED");
         }
     }
@@ -413,12 +337,12 @@ public sealed class MultiplayerHostScreen : IScreen
     private void OnWorldCreated(string worldName)
     {
         RefreshWorlds();
-        if (!string.IsNullOrWhiteSpace(worldName))
-        {
-            var idx = _worlds.FindIndex(w => string.Equals(w.DisplayName, worldName, StringComparison.OrdinalIgnoreCase));
-            if (idx >= 0)
-                _selectedIndex = idx;
-        }
+        if (string.IsNullOrWhiteSpace(worldName))
+            return;
+
+        var idx = _worlds.FindIndex(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
+        if (idx >= 0)
+            _selectedIndex = idx;
     }
 
     private void HostSelectedWorld()
@@ -430,136 +354,58 @@ public sealed class MultiplayerHostScreen : IScreen
         }
 
         var entry = _worlds[_selectedIndex];
-        var worldPath = entry.WorldPath;
-        var metaPath = entry.MetaPath;
-        if (!Directory.Exists(worldPath) || !File.Exists(metaPath))
+        if (!Directory.Exists(entry.WorldPath) || !File.Exists(entry.MetaPath))
         {
-            _log.Warn($"World data missing for '{entry.DisplayName}'.");
             ShowStatus("WORLD DATA MISSING");
             return;
         }
 
+        WorldHostStartResult result;
         if (_hostForFriends)
         {
-            _ = StartEosHostingAsync(worldPath, metaPath);
-            return;
-        }
-
-        StartLanHosting(worldPath, metaPath);
-    }
-
-    private EosClient? EnsureEosClient()
-    {
-        if (_eosClient != null)
-            return _eosClient;
-
-        _eosClient = EosClientProvider.GetOrCreate(_log, "device", allowRetry: true);
-        return _eosClient;
-    }
-
-    private void StartLanHosting(string worldPath, string metaPath)
-    {
-        var world = VoxelWorld.Load(worldPath, metaPath, _log);
-        if (world == null)
-        {
-            ShowStatus("WORLD FAILED TO LOAD");
-            return;
-        }
-
-        var meta = world.Meta;
-
-        StopHosting();
-
-        var hostName = _profile.GetDisplayUsername();
-        _lanHostSession = new LanHostSession(_log, hostName, new LanWorldInfo
-        {
-            WorldName = meta.Name,
-            GameMode = meta.GameMode,
-            Width = meta.Size.Width,
-            Height = meta.Size.Height,
-            Depth = meta.Size.Depth,
-            Seed = meta.Seed,
-            PlayerCollision = meta.PlayerCollision
-        }, world);
-
-        _lanHostSession.Start(DefaultLanServerPort);
-        _activeSession = _lanHostSession;
-        _lanDiscovery.StartBroadcast(meta.Name, GetBuildVersion(), DefaultLanServerPort);
-        _hostingSessionActive = true;
-
-        _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldPath, metaPath, _activeSession, world), _viewport);
-    }
-
-    private Task StartEosHostingAsync(string worldPath, string metaPath)
-    {
-        var eos = EnsureEosClient();
-        if (eos == null || !eos.IsLoggedIn)
-        {
-            ShowStatus("EOS NOT READY");
-            return Task.CompletedTask;
-        }
-
-        var world = VoxelWorld.Load(worldPath, metaPath, _log);
-        if (world == null)
-        {
-            ShowStatus("WORLD FAILED TO LOAD");
-            return Task.CompletedTask;
-        }
-        
-        var meta = world.Meta;
-
-        try
-        {
-            StopHosting();
-
-            var hostName = _profile.GetDisplayUsername();
-            _eosHostSession = new EosP2PHostSession(_log, eos, hostName, new LanWorldInfo
+            var gate = OnlineGateClient.GetOrCreate();
+            if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
             {
-                WorldName = meta.Name,
-                GameMode = meta.GameMode,
-                Width = meta.Size.Width,
-                Height = meta.Size.Height,
-                Depth = meta.Size.Depth,
-                Seed = meta.Seed,
-                PlayerCollision = meta.PlayerCollision
-            }, world);
+                ShowStatus(gateDenied);
+                return;
+            }
 
-            _activeSession = _eosHostSession;
-            _hostingSessionActive = true;
-            _statusMessage = "EOS HOST READY";
+            _eosClient = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
+            if (_eosClient == null)
+            {
+                ShowStatus("EOS CLIENT UNAVAILABLE");
+                return;
+            }
 
-            _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldPath, metaPath, _activeSession, world), _viewport);
+            var snapshot = EosRuntimeStatus.Evaluate(_eosClient);
+            if (snapshot.Reason != EosRuntimeReason.Ready)
+            {
+                if (snapshot.Reason == EosRuntimeReason.Connecting)
+                    _eosClient.StartLogin();
+                ShowStatus(snapshot.StatusText);
+                return;
+            }
+
+            result = WorldHostBootstrap.TryStartEosHost(_log, _profile, _eosClient, entry.WorldPath, entry.MetaPath);
         }
-        catch (Exception ex)
+        else
         {
-            _log.Warn($"EOS host failed: {ex.Message}");
-            ShowStatus("EOS HOST FAILED");
+            result = WorldHostBootstrap.TryStartLanHost(_log, _profile, entry.WorldPath, entry.MetaPath);
         }
 
-        return Task.CompletedTask;
-    }
-
-    private void StopHosting()
-    {
-        if (!_hostingSessionActive && _activeSession == null)
+        if (!result.Success || result.Session == null || result.World == null)
+        {
+            ShowStatus(result.Error);
             return;
+        }
 
-        _hostingSessionActive = false;
-        _lanDiscovery.StopBroadcast();
-
-        _lanHostSession?.Dispose();
-        _lanHostSession = null;
-
-        _eosHostSession?.Dispose();
-        _eosHostSession = null;
-
-        _activeSession = null;
-
+        _menus.Push(
+            new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, entry.WorldPath, entry.MetaPath, result.Session, result.World),
+            _viewport);
     }
 
     private void BackToMultiplayer()
     {
-        StopHosting();
         _menus.Pop();
     }
 
@@ -576,10 +422,119 @@ public sealed class MultiplayerHostScreen : IScreen
         _scroll = Math.Clamp(_scroll, 0, max);
     }
 
-    private static string GetBuildVersion()
+    public void OnClose()
     {
-        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString();
-        return string.IsNullOrWhiteSpace(version) ? "dev" : version;
+        DisposePreviewTextures();
+    }
+
+    private void DrawWorldPreviewTile(SpriteBatch sb, WorldListEntry entry, Rectangle rect)
+    {
+        var preview = GetPreviewTexture(entry.PreviewPath);
+        if (preview != null)
+        {
+            sb.Draw(preview, rect, Color.White);
+        }
+        else
+        {
+            sb.Draw(_pixel, rect, new Color(42, 42, 42, 220));
+            var label = "MAP";
+            var labelSize = _font.MeasureString(label);
+            var labelPos = new Vector2(rect.Center.X - labelSize.X / 2f, rect.Center.Y - labelSize.Y / 2f);
+            _font.DrawString(sb, label, labelPos, new Color(200, 200, 200));
+        }
+
+        DrawBorder(sb, rect, new Color(220, 220, 220));
+    }
+
+    private Texture2D? GetPreviewTexture(string previewPath)
+    {
+        if (string.IsNullOrWhiteSpace(previewPath))
+            return null;
+        if (!File.Exists(previewPath))
+            return null;
+
+        var stamp = File.GetLastWriteTimeUtc(previewPath);
+        if (_previewTextures.TryGetValue(previewPath, out var cached))
+        {
+            if (cached.LastWriteUtc == stamp && !cached.Texture.IsDisposed)
+                return cached.Texture;
+
+            cached.Texture.Dispose();
+            _previewTextures.Remove(previewPath);
+        }
+
+        try
+        {
+            using var fs = new FileStream(previewPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var texture = Texture2D.FromStream(_assets.GraphicsDevice, fs);
+            _previewTextures[previewPath] = new PreviewTextureCacheEntry(texture, stamp);
+            _previewLoadFailures.Remove(previewPath);
+            return texture;
+        }
+        catch (Exception ex)
+        {
+            if (_previewLoadFailures.Add(previewPath))
+                _log.Warn($"Failed to load host-world preview '{previewPath}': {ex.Message}");
+            return null;
+        }
+    }
+
+    private void TrimPreviewCache()
+    {
+        if (_previewTextures.Count == 0)
+            return;
+
+        var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < _worlds.Count; i++)
+        {
+            var previewPath = _worlds[i].PreviewPath;
+            if (!string.IsNullOrWhiteSpace(previewPath))
+                keep.Add(previewPath);
+        }
+
+        var remove = new List<string>();
+        foreach (var key in _previewTextures.Keys)
+        {
+            if (!keep.Contains(key))
+                remove.Add(key);
+        }
+
+        for (var i = 0; i < remove.Count; i++)
+        {
+            if (_previewTextures.TryGetValue(remove[i], out var cached))
+                cached.Texture.Dispose();
+            _previewTextures.Remove(remove[i]);
+            _previewLoadFailures.Remove(remove[i]);
+        }
+    }
+
+    private void DisposePreviewTextures()
+    {
+        foreach (var cached in _previewTextures.Values)
+            cached.Texture.Dispose();
+
+        _previewTextures.Clear();
+        _previewLoadFailures.Clear();
+    }
+
+    private string TruncateToWidth(string value, int maxWidth)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+        if (_font.MeasureString(value).X <= maxWidth)
+            return value;
+
+        const string ellipsis = "...";
+        var maxChars = Math.Max(1, value.Length - 1);
+        while (maxChars > 1)
+        {
+            var candidate = value.Substring(0, maxChars).TrimEnd() + ellipsis;
+            if (_font.MeasureString(candidate).X <= maxWidth)
+                return candidate;
+            maxChars--;
+        }
+
+        return ellipsis;
     }
 
     private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)
@@ -590,12 +545,15 @@ public sealed class MultiplayerHostScreen : IScreen
         sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
     }
 
-    private sealed class WorldEntry
+    private sealed class PreviewTextureCacheEntry
     {
-        public string DisplayName { get; init; } = "";
-        public string WorldPath { get; init; } = "";
-        public string MetaPath { get; init; } = "";
-        public bool IsMultiplayer { get; init; }
+        public PreviewTextureCacheEntry(Texture2D texture, DateTime lastWriteUtc)
+        {
+            Texture = texture;
+            LastWriteUtc = lastWriteUtc;
+        }
+
+        public Texture2D Texture { get; }
+        public DateTime LastWriteUtc { get; }
     }
 }
-

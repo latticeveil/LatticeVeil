@@ -6,6 +6,7 @@ using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using LatticeVeilMonoGame.Core;
 using LatticeVeilMonoGame.Online.Eos;
+using LatticeVeilMonoGame.Online.Gate;
 using LatticeVeilMonoGame.UI;
 
 namespace LatticeVeilMonoGame.UI.Screens;
@@ -49,7 +50,7 @@ public sealed class InviteFriendsScreen : IScreen
         _pixel = pixel;
         _log = log;
         _worldName = string.IsNullOrWhiteSpace(worldName) ? "World" : worldName.Trim();
-        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "epic");
+        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
         if (_eosClient == null)
             _log.Warn("InviteFriendsScreen: EOS client not available.");
         _friendLabels = FriendLabelsStore.LoadOrCreate(log);
@@ -160,9 +161,10 @@ public sealed class InviteFriendsScreen : IScreen
         var left = new Vector2(_infoRect.X + 4, _infoRect.Y + 2);
         DrawTextBold(sb, title, left, Color.White);
 
-        var eos = _eosClient == null
-            ? "EOS: DISABLED"
-            : (_eosClient.IsEpicLoggedIn ? $"HOSTING: {_worldName}" : "EPIC: NOT LOGGED IN");
+        var eosSnapshot = EosRuntimeStatus.Evaluate(_eosClient);
+        var eos = eosSnapshot.Reason == EosRuntimeReason.Ready
+            ? $"HOSTING: {_worldName}"
+            : eosSnapshot.StatusText;
         var size = _font.MeasureString(eos);
         var pos = new Vector2(_infoRect.Right - size.X - 4, _infoRect.Y + 2);
         _font.DrawString(sb, eos, pos, new Color(220, 180, 80));
@@ -175,15 +177,9 @@ public sealed class InviteFriendsScreen : IScreen
 
         _font.DrawString(sb, "FRIENDS (EOS)", new Vector2(_listRect.X + 4, _listRect.Y + 2), Color.White);
 
-        if (_eosClient == null)
+        if (EosRuntimeStatus.Evaluate(_eosClient).Reason != EosRuntimeReason.Ready)
         {
-            DrawCenteredMessage(sb, "EOS IS DISABLED IN THIS BUILD");
-            return;
-        }
-
-        if (!_eosClient.IsEpicLoggedIn)
-        {
-            DrawCenteredMessage(sb, "EPIC LOGIN REQUIRED");
+            DrawCenteredMessage(sb, EosRuntimeStatus.Evaluate(_eosClient).StatusText);
             return;
         }
 
@@ -259,30 +255,37 @@ public sealed class InviteFriendsScreen : IScreen
         if (_busy)
             return;
 
+        var gate = OnlineGateClient.GetOrCreate();
+        if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            _friends.Clear();
+            _selectedFriend = -1;
+            SetStatus(gateDenied);
+            return;
+        }
+
         var eos = EnsureEosClient();
         if (eos == null)
         {
             _friends.Clear();
             _selectedFriend = -1;
-            SetStatus("EOS disabled.");
+            SetStatus("EOS CLIENT UNAVAILABLE");
             return;
         }
-
-        if (!eos.IsEpicLoggedIn)
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason != EosRuntimeReason.Ready)
         {
             _friends.Clear();
             _selectedFriend = -1;
-            SetStatus("Epic login required.");
+            SetStatus(snapshot.StatusText);
             return;
         }
 
         _busy = true;
         try
         {
-            // var list = await eos.GetFriendsWithPresenceAsync();
+            var list = await eos.GetFriendsWithPresenceAsync();
             _friends.Clear();
-            var list = new List<object>(); // Empty list for now
-            /*
             foreach (var f in list)
             {
                 var alias = _friendLabels.GetNickname(f.AccountId);
@@ -299,7 +302,6 @@ public sealed class InviteFriendsScreen : IScreen
                     IsPinned = _friendLabels.IsPinned(f.AccountId) || !string.IsNullOrWhiteSpace(alias)
                 });
             }
-            */
 
             _friends.Sort((a, b) =>
             {
@@ -324,16 +326,23 @@ public sealed class InviteFriendsScreen : IScreen
 
     private async Task InviteSelectedAsync()
     {
-        var eos = EnsureEosClient();
-        if (eos == null)
+        var gate = OnlineGateClient.GetOrCreate();
+        if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
         {
-            SetStatus("EOS disabled.");
+            SetStatus(gateDenied);
             return;
         }
 
-        if (!eos.IsEpicLoggedIn)
+        var eos = EnsureEosClient();
+        if (eos == null)
         {
-            SetStatus("Epic login required.");
+            SetStatus("EOS CLIENT UNAVAILABLE");
+            return;
+        }
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason != EosRuntimeReason.Ready)
+        {
+            SetStatus(snapshot.StatusText);
             return;
         }
 
@@ -356,8 +365,7 @@ public sealed class InviteFriendsScreen : IScreen
         _busy = true;
         try
         {
-            // var ok = await eos.SetHostingPresenceAsync(_worldName, true);
-            var ok = true; // Always true for now
+            var ok = await eos.SetHostingPresenceAsync(_worldName, true);
             if (!ok)
             {
                 SetStatus("Invite failed (presence).");
@@ -382,7 +390,7 @@ public sealed class InviteFriendsScreen : IScreen
         if (_eosClient != null)
             return _eosClient;
 
-        _eosClient = EosClientProvider.GetOrCreate(_log, "epic");
+        _eosClient = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
         if (_eosClient == null)
             _log.Warn("InviteFriendsScreen: EOS client not available.");
         return _eosClient;

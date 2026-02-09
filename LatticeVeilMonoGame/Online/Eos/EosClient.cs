@@ -40,6 +40,7 @@ public sealed class EosClient : IDisposable
     private bool _allowDeviceFallback;
     private bool _silentLoginOnly;
     private bool _silentLoginFailed;
+    private string _lastDeviceDisplayName = "Player";
     private EpicAuthStage _epicAuthStage = EpicAuthStage.None;
     private readonly Dictionary<string, string> _displayNameCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _displayNameCacheStamp = new(StringComparer.OrdinalIgnoreCase);
@@ -151,7 +152,7 @@ public sealed class EosClient : IDisposable
 #if EOS_SDK
         return LogoutInternalAsync();
 #else
-        return Task.FromResult((false, "EOS SDK not available."));
+        return Task.FromResult((Ok: false, Error: (string?)"EOS SDK not available."));
 #endif
     }
 
@@ -160,7 +161,7 @@ public sealed class EosClient : IDisposable
 #if EOS_SDK
         return DeletePersistentAuthInternalAsync();
 #else
-        return Task.FromResult((false, "EOS SDK not available."));
+        return Task.FromResult((Ok: false, Error: (string?)"EOS SDK not available."));
 #endif
     }
 
@@ -204,6 +205,23 @@ public sealed class EosClient : IDisposable
         try { PlatformInterface.Shutdown(); } catch { }
 #endif
     }
+
+#if !EOS_SDK
+    public Task<List<EosFriendSnapshot>> GetFriendsWithPresenceAsync()
+        => Task.FromResult(new List<EosFriendSnapshot>());
+
+    public Task<(bool Ok, string? Error)> SendFriendInviteByDisplayNameAsync(string displayName)
+        => Task.FromResult((Ok: false, Error: (string?)"EOS SDK not available."));
+
+    public Task<(bool Ok, string? Error)> AcceptFriendInviteAsync(string targetAccountId)
+        => Task.FromResult((Ok: false, Error: (string?)"EOS SDK not available."));
+
+    public Task<(bool Ok, string? Error)> RejectFriendInviteAsync(string targetAccountId)
+        => Task.FromResult((Ok: false, Error: (string?)"EOS SDK not available."));
+
+    public Task<bool> SetHostingPresenceAsync(string? worldName, bool hosting)
+        => Task.FromResult(false);
+#endif
 
 #if EOS_SDK
     private bool Initialize()
@@ -525,6 +543,9 @@ public sealed class EosClient : IDisposable
         if (_connect == null)
             return;
 
+        var displayName = BuildDeviceDisplayName();
+        _lastDeviceDisplayName = displayName;
+
         var loginOptions = new LoginOptions
         {
             Credentials = new Credentials
@@ -534,7 +555,7 @@ public sealed class EosClient : IDisposable
             },
             UserLoginInfo = new UserLoginInfo
             {
-                DisplayName = BuildDeviceDisplayName()
+                DisplayName = displayName
             }
         };
 
@@ -546,6 +567,7 @@ public sealed class EosClient : IDisposable
         if (info.ResultCode == Result.Success)
         {
             _localUserId = info.LocalUserId;
+            PersistIdentityAfterLogin(_lastDeviceDisplayName);
             _log.Info($"EOS login success. PUID={_localUserId}");
             _silentLoginOnly = false;
             return;
@@ -576,6 +598,7 @@ public sealed class EosClient : IDisposable
         }
 
         _localUserId = info.LocalUserId;
+        PersistIdentityAfterLogin(_lastDeviceDisplayName);
         _log.Info($"EOS user created. PUID={_localUserId}");
     }
 
@@ -852,12 +875,34 @@ public sealed class EosClient : IDisposable
         _deviceLoginStarted = false;
         _epicLoginStarted = false;
         _allowDeviceFallback = false;
+        _lastDeviceDisplayName = "Player";
         _epicAuthStage = EpicAuthStage.None;
         lock (_displayNameCache)
         {
             _displayNameCache.Clear();
             _displayNameCacheStamp.Clear();
         }
+    }
+
+    private void PersistIdentityAfterLogin(string preferredName)
+    {
+        if (_localUserId == null || !_localUserId.IsValid())
+            return;
+
+        var store = EosIdentityStore.LoadOrCreate(_log);
+        store.ProductUserId = _localUserId.ToString();
+
+        if (string.IsNullOrWhiteSpace(store.DisplayName))
+        {
+            var normalized = EosIdentityStore.NormalizeDisplayName(preferredName);
+            if (string.IsNullOrWhiteSpace(normalized))
+                normalized = EosIdentityStore.NormalizeDisplayName(BuildDeviceDisplayName());
+            if (string.IsNullOrWhiteSpace(normalized))
+                normalized = "Player";
+            store.DisplayName = normalized;
+        }
+
+        store.Save(_log);
     }
 
     private Task<Result> QueryFriendsInternalAsync()
@@ -1103,20 +1148,38 @@ public sealed class EosClient : IDisposable
         public string? JoinInfo { get; set; }
     }
 
-    private static string BuildDeviceDisplayName()
+    private string BuildDeviceDisplayName()
     {
-        var name = Environment.UserName;
-        if (string.IsNullOrWhiteSpace(name))
-            name = Environment.MachineName;
-        if (string.IsNullOrWhiteSpace(name))
+        var store = EosIdentityStore.LoadOrCreate(_log);
+        var stored = EosIdentityStore.NormalizeDisplayName(store.DisplayName);
+        if (!string.IsNullOrWhiteSpace(stored))
+            return stored;
+
+        var name = EosIdentityStore.NormalizeDisplayName(Environment.UserName);
+        if (IsGenericOrEmptyName(name))
+            name = EosIdentityStore.NormalizeDisplayName(Environment.MachineName);
+        if (IsGenericOrEmptyName(name))
             name = "Player";
 
-        name = name.Trim();
         const int max = ConnectInterface.USERLOGININFO_DISPLAYNAME_MAX_LENGTH;
         if (name.Length > max)
             name = name.Substring(0, max);
-
         return name;
+    }
+
+    private static bool IsGenericOrEmptyName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return true;
+
+        var name = value.Trim().ToLowerInvariant();
+        if (name is "user" or "users" or "default" or "player" or "administrator" or "admin" or "desktop" or "pc")
+            return true;
+
+        return name.StartsWith("desktop-")
+            || name.StartsWith("laptop-")
+            || name.StartsWith("user-")
+            || name.StartsWith("pc-");
     }
 #endif
 }

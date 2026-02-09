@@ -11,6 +11,17 @@ Builds/
 **/eos.local.json
 .aider*
 
+# EOS secure config split
+eos.private.json
+eos.public.json
+eos.config.json
+eos.*.secret.json
+*.secret.json
+official_build.sig
+LatticeVeil_project/eos.private.json
+LatticeVeil_project/eos.public.json
+LatticeVeil_project/eos.config.json
+
 # Builder directories (safe to ignore)
 .builder/
 .builder/staging/
@@ -20,6 +31,7 @@ Builds/
 # Documentation files (never commit)
 *.md
 !README.md
+!CHANGELOG.md
 !RELEASE_TEMPLATE.md
 
 # Executable files

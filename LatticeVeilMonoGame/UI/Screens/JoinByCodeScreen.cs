@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using WinClipboard = System.Windows.Forms.Clipboard;
@@ -8,6 +9,7 @@ using Microsoft.Xna.Framework.Input;
 using LatticeVeilMonoGame.Core;
 using LatticeVeilMonoGame.Online.Lan;
 using LatticeVeilMonoGame.Online.Eos;
+using LatticeVeilMonoGame.Online.Gate;
 using LatticeVeilMonoGame.UI;
 
 namespace LatticeVeilMonoGame.UI.Screens;
@@ -18,16 +20,17 @@ namespace LatticeVeilMonoGame.UI.Screens;
 public sealed class JoinByCodeScreen : IScreen
 {
     private const int MaxCodeLength = 96;
+    private const double PresenceRefreshIntervalSeconds = 5.0;
 
     private readonly MenuStack _menus;
-	private readonly Game1 _game;
     private readonly AssetLoader _assets;
     private readonly PixelFont _font;
     private readonly Texture2D _pixel;
     private readonly Logger _log;
     private readonly PlayerProfile _profile;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
-    private readonly EosClient _eos;
+    private readonly EosIdentityStore _identityStore;
+    private EosClient? _eos;
 
     private readonly Button _joinBtn;
     private readonly Button _pasteBtn;
@@ -50,12 +53,17 @@ public sealed class JoinByCodeScreen : IScreen
     private string _code = string.Empty;
 
     private bool _busy;
+    private bool _presenceBusy;
+    private double _lastPresenceRefresh = -100;
+    private string _localUsername = string.Empty;
+    private string _localFriendCode = string.Empty;
     private double _now;
     private string _status = string.Empty;
     private double _statusUntil;
+    private readonly Dictionary<string, EosFriendSnapshot> _friendPresenceByJoinCode = new(StringComparer.OrdinalIgnoreCase);
 
     public JoinByCodeScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile,
-        global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient eos, string? initialCode)
+        global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eos, string? initialCode)
     {
         _menus = menus;
         _assets = assets;
@@ -65,6 +73,8 @@ public sealed class JoinByCodeScreen : IScreen
         _profile = profile;
         _graphics = graphics;
         _eos = eos;
+        _identityStore = EosIdentityStore.LoadOrCreate(_log);
+        RefreshLocalIdentity();
 
         _code = (initialCode ?? string.Empty).Trim();
         if (_code.Length > MaxCodeLength)
@@ -156,11 +166,15 @@ public sealed class JoinByCodeScreen : IScreen
                 _ = JoinAsync();
         }
 
+        RefreshLocalIdentity();
+        if (!_busy && !_presenceBusy && _now - _lastPresenceRefresh >= PresenceRefreshIntervalSeconds)
+            _ = RefreshFriendPresenceAsync();
 
 		// Enabled/disabled state
-		_joinBtn.Enabled = !_busy && _eos.IsLoggedIn && !string.IsNullOrWhiteSpace(_code);
+        var snapshot = EosRuntimeStatus.Evaluate(_eos);
+		_joinBtn.Enabled = !_busy && snapshot.Reason == EosRuntimeReason.Ready && !string.IsNullOrWhiteSpace(_code);
 		_pasteBtn.Enabled = !_busy;
-		_saveFriendBtn.Enabled = !_busy && _eos.IsLoggedIn && !string.IsNullOrWhiteSpace(_code);
+		_saveFriendBtn.Enabled = !_busy && !string.IsNullOrWhiteSpace(_code);
 		_backBtn.Enabled = true;
 
 		_joinBtn.Update(input);
@@ -210,6 +224,13 @@ public sealed class JoinByCodeScreen : IScreen
         var cColor = string.IsNullOrWhiteSpace(_code) ? new Color(180, 180, 180) : Color.White;
         _font.DrawString(sb, codeText, new Vector2(_codeRect.X + 6, _codeRect.Y + 6), cColor);
 
+        var infoY = _codeRect.Bottom + 8;
+        _font.DrawString(sb, $"YOU: {_localUsername}", new Vector2(_codeRect.X, infoY), new Color(220, 220, 220));
+        infoY += _font.LineHeight + 2;
+        _font.DrawString(sb, $"FRIEND CODE: {(string.IsNullOrWhiteSpace(_localFriendCode) ? "(waiting for EOS login...)" : _localFriendCode)}", new Vector2(_codeRect.X, infoY), new Color(220, 220, 220));
+        infoY += _font.LineHeight + 2;
+        _font.DrawString(sb, EosRuntimeStatus.Evaluate(_eos).StatusText, new Vector2(_codeRect.X, infoY), new Color(220, 180, 80));
+
 		// Saved friends list
 		_font.DrawString(sb, "SAVED FRIENDS", new Vector2(_friendsRect.X, _friendsRect.Y - _font.LineHeight - 6), new Color(220, 220, 220));
 		if (_profile.Friends.Count == 0)
@@ -248,9 +269,17 @@ public sealed class JoinByCodeScreen : IScreen
             return;
         }
 
-        if (!_eos.IsLoggedIn)
+        var snapshot = EosRuntimeStatus.Evaluate(_eos);
+        if (snapshot.Reason != EosRuntimeReason.Ready)
         {
-            SetStatus("EOS is still logging in...");
+            SetStatus(snapshot.StatusText);
+            return;
+        }
+
+        var gate = OnlineGateClient.GetOrCreate();
+        if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            SetStatus(gateDenied);
             return;
         }
 
@@ -259,6 +288,12 @@ public sealed class JoinByCodeScreen : IScreen
 
         try
         {
+            if (_eos == null)
+            {
+                SetStatus("EOS CLIENT UNAVAILABLE");
+                return;
+            }
+
 			// Relay connections can take longer (especially on first connect).
 			var result = await EosP2PClientSession.ConnectAsync(_log, _eos, code, _profile.GetDisplayUsername(), TimeSpan.FromSeconds(25));
             if (!result.Success || result.Session == null)
@@ -304,8 +339,8 @@ public sealed class JoinByCodeScreen : IScreen
 
 			// Keep it simple: trim and cap to the same limit the input box uses.
 			text = text.Trim();
-			if (text.Length > 64)
-				text = text.Substring(0, 64);
+			if (text.Length > MaxCodeLength)
+				text = text.Substring(0, MaxCodeLength);
 
 			_code = text;
 			SetStatus("Pasted.", 2);
@@ -319,11 +354,6 @@ public sealed class JoinByCodeScreen : IScreen
 
 	private void SaveFriend()
 	{
-		if (!_eos.IsLoggedIn)
-		{
-			SetStatus("EOS not logged in yet.", 3);
-			return;
-		}
 		var id = _code.Trim();
 		if (string.IsNullOrWhiteSpace(id))
 		{
@@ -335,6 +365,7 @@ public sealed class JoinByCodeScreen : IScreen
 		_profile.Save(_log);
 		SetStatus($"Saved friend {PlayerProfile.ShortId(id)}", 3);
 		RebuildFriendButtons();
+        _ = RefreshFriendPresenceAsync();
 	}
 
 	private void RemoveFriend(string userId)
@@ -365,9 +396,7 @@ public sealed class JoinByCodeScreen : IScreen
 			var joinBounds = new Rectangle(_friendsRect.X, y, joinW, rowH);
 			var removeBounds = new Rectangle(_friendsRect.Right - 44, y, 44, rowH);
 
-			var label = string.IsNullOrWhiteSpace(f.Label)
-				? $"FRIEND {PlayerProfile.ShortId(f.UserId)}"
-				: $"{f.Label} ({PlayerProfile.ShortId(f.UserId)})";
+            var label = BuildFriendRowLabel(f);
 
 			var joinBtn = new Button(label, () =>
 			{
@@ -383,6 +412,139 @@ public sealed class JoinByCodeScreen : IScreen
 			_friendRemoveBtns.Add(removeBtn);
 		}
 	}
+
+    private string BuildFriendRowLabel(PlayerProfile.FriendEntry friend)
+    {
+        if (_friendPresenceByJoinCode.TryGetValue(friend.UserId, out var snapshot))
+        {
+            var name = string.IsNullOrWhiteSpace(snapshot.DisplayName)
+                ? (!string.IsNullOrWhiteSpace(friend.Label) ? friend.Label : PlayerProfile.ShortId(friend.UserId))
+                : snapshot.DisplayName;
+            var friendCode = TryFormatFriendCode(string.IsNullOrWhiteSpace(snapshot.JoinInfo) ? friend.UserId : snapshot.JoinInfo);
+            if (!string.IsNullOrWhiteSpace(friendCode))
+                name = $"{name} ({friendCode})";
+            var state = snapshot.IsHosting
+                ? $"HOSTING {snapshot.WorldName ?? "WORLD"}"
+                : snapshot.Presence.ToUpperInvariant();
+            return $"{name} | {state}";
+        }
+
+        var fallbackName = !string.IsNullOrWhiteSpace(friend.LastKnownDisplayName)
+            ? friend.LastKnownDisplayName
+            : (!string.IsNullOrWhiteSpace(friend.Label) ? friend.Label : $"FRIEND {PlayerProfile.ShortId(friend.UserId)}");
+        var fallbackCode = TryFormatFriendCode(friend.UserId);
+        if (!string.IsNullOrWhiteSpace(fallbackCode))
+            fallbackName = $"{fallbackName} ({fallbackCode})";
+        if (!string.IsNullOrWhiteSpace(friend.LastKnownPresence))
+            return $"{fallbackName} | {friend.LastKnownPresence.ToUpperInvariant()}";
+
+        if (!string.IsNullOrWhiteSpace(fallbackCode))
+            return fallbackName;
+
+        return $"{fallbackName} ({PlayerProfile.ShortId(friend.UserId)})";
+    }
+
+    private void RefreshLocalIdentity()
+    {
+        _eos ??= EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
+        var dirty = false;
+        if (!string.IsNullOrWhiteSpace(_eos?.LocalProductUserId)
+            && !string.Equals(_identityStore.ProductUserId, _eos.LocalProductUserId, StringComparison.Ordinal))
+        {
+            _identityStore.ProductUserId = _eos.LocalProductUserId;
+            dirty = true;
+        }
+
+        var displayName = EosIdentityStore.NormalizeDisplayName(_identityStore.DisplayName);
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            displayName = EosIdentityStore.NormalizeDisplayName(_profile.GetDisplayUsername());
+            if (string.IsNullOrWhiteSpace(displayName))
+                displayName = "Player";
+            _identityStore.DisplayName = displayName;
+            dirty = true;
+        }
+
+        if (dirty)
+            _identityStore.Save(_log);
+
+        _localUsername = displayName;
+        _localFriendCode = _identityStore.GetFriendCode();
+        if (string.IsNullOrWhiteSpace(_localFriendCode) && !string.IsNullOrWhiteSpace(_eos?.LocalProductUserId))
+            _localFriendCode = EosIdentityStore.GenerateFriendCode(_eos.LocalProductUserId);
+    }
+
+    private static string TryFormatFriendCode(string? value)
+    {
+        var trimmed = value?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+            return string.Empty;
+        return EosIdentityStore.GenerateFriendCode(trimmed);
+    }
+
+    private async Task RefreshFriendPresenceAsync()
+    {
+        _lastPresenceRefresh = _now;
+        var gate = OnlineGateClient.GetOrCreate();
+        if (!gate.CanUseOfficialOnline(_log, out _))
+            return;
+
+        var eos = _eos ?? EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
+        _eos = eos;
+        if (EosRuntimeStatus.Evaluate(eos).Reason != EosRuntimeReason.Ready || eos == null)
+            return;
+
+        _presenceBusy = true;
+        try
+        {
+            var snapshots = await eos.GetFriendsWithPresenceAsync();
+            _friendPresenceByJoinCode.Clear();
+            for (var i = 0; i < snapshots.Count; i++)
+            {
+                var joinCode = snapshots[i].JoinInfo?.Trim();
+                if (string.IsNullOrWhiteSpace(joinCode))
+                    continue;
+
+                _friendPresenceByJoinCode[joinCode] = snapshots[i];
+            }
+
+            var changed = false;
+            foreach (var friend in _profile.Friends)
+            {
+                if (!_friendPresenceByJoinCode.TryGetValue(friend.UserId, out var snap))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(snap.DisplayName))
+                    continue;
+
+                if (!string.Equals(friend.LastKnownDisplayName, snap.DisplayName, StringComparison.Ordinal))
+                {
+                    friend.LastKnownDisplayName = snap.DisplayName;
+                    changed = true;
+                }
+
+                var presence = snap.IsHosting ? $"hosting {snap.WorldName ?? "world"}" : snap.Presence;
+                if (!string.Equals(friend.LastKnownPresence, presence, StringComparison.Ordinal))
+                {
+                    friend.LastKnownPresence = presence;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+                _profile.Save(_log);
+
+            RebuildFriendButtons();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"JoinByCode friend presence refresh failed: {ex.Message}");
+        }
+        finally
+        {
+            _presenceBusy = false;
+        }
+    }
     private void HandleTextInput(InputState input, ref string value, int maxLen)
     {
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);

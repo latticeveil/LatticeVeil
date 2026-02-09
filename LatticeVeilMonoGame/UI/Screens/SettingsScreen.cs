@@ -46,6 +46,7 @@ public sealed class OptionsScreen : IScreen
     };
     private static readonly string[] GuiScaleLabels = GuiScaleCandidates.Select(c => c.label).ToArray();
     private static readonly string[] QualityPresets = { "LOW", "MEDIUM", "HIGH", "ULTRA" };
+    private static readonly string[] ParticlePresets = { "AUTO", "OFF", "LOW", "MEDIUM", "HIGH", "ULTRA" };
     private const int ReticleSizeMin = 2;
     private const int ReticleSizeMax = 32;
     private const int ReticleThicknessMin = 1;
@@ -160,6 +161,8 @@ public sealed class OptionsScreen : IScreen
     private bool _guiScaleOpen;
     private Rectangle _qualityBox;
     private bool _qualityOpen;
+    private Rectangle _particleBox;
+    private bool _particleOpen;
     private Slider _brightness;
     private Slider _fov;
     private Slider _renderDistance;
@@ -198,7 +201,7 @@ public sealed class OptionsScreen : IScreen
     // Controls binding
     private readonly List<string> _bindOrder = new()
     {
-        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command"
+        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","GamemodeModifier","GamemodeWheel"
     };
     private string? _bindingAction;
     private Rectangle _controlsListRect;
@@ -447,6 +450,7 @@ public sealed class OptionsScreen : IScreen
         _brightness.Bounds = new Rectangle(rightX, videoContentY + 120, Math.Min(420, columnW), 18);
         _fov.Bounds = new Rectangle(rightX, videoContentY + 180, Math.Min(420, columnW), 18);
         _renderDistance.Bounds = new Rectangle(rightX, videoContentY + 240, Math.Min(420, columnW), 18);
+        _particleBox = new Rectangle(rightX, videoContentY + 290, Math.Min(420, columnW), 40);
 
         // Audio device dropdowns + sliders
         var audioBoxW = contentW - 120; // Reduce audio box width to match left spacing
@@ -535,6 +539,7 @@ public sealed class OptionsScreen : IScreen
                 UpdateSliderWithScroll(_brightness, input);
                 UpdateSliderWithScroll(_fov, input);
                 UpdateSliderWithScroll(_renderDistance, input);
+                UpdateParticleDropdown(input);
                 break;
 
             case Tab.Audio:
@@ -643,6 +648,9 @@ public sealed class OptionsScreen : IScreen
         var qualityIndex = GetQualityIndex(_working.QualityPreset);
         var qualityBox = ScrollRect(_qualityBox, scroll);
         DrawSimpleDropdownBox(sb, qualityBox, "QUALITY", _qualityOpen, QualityPresets, qualityIndex);
+        var particleIndex = GetParticlePresetIndex(_working.ParticlePreset);
+        var particleBox = ScrollRect(_particleBox, scroll);
+        DrawSimpleDropdownBox(sb, particleBox, "PARTICLES", _particleOpen, ParticlePresets, particleIndex);
 
         DrawSliderWithScroll(_brightness, sb);
         DrawSliderWithScroll(_fov, sb);
@@ -655,6 +663,8 @@ public sealed class OptionsScreen : IScreen
             DrawSimpleDropdownList(sb, guiScaleBox, GuiScaleLabels, guiIndex);
         if (_qualityOpen)
             DrawSimpleDropdownList(sb, qualityBox, QualityPresets, qualityIndex);
+        if (_particleOpen)
+            DrawSimpleDropdownList(sb, particleBox, ParticlePresets, particleIndex);
     }
 
     private void UpdateResolutionDropdown(InputState input)
@@ -729,6 +739,17 @@ public sealed class OptionsScreen : IScreen
         {
             _working.QualityPreset = QualityPresets[idx];
             _log.Info($"Option changed: QualityPreset = {_working.QualityPreset}");
+        });
+    }
+
+    private void UpdateParticleDropdown(InputState input)
+    {
+        var scroll = GetScrollOffset();
+        var box = ScrollRect(_particleBox, scroll);
+        UpdateSimpleDropdown(input, box, ref _particleOpen, ParticlePresets, idx =>
+        {
+            _working.ParticlePreset = ParticlePresets[idx];
+            _log.Info($"Option changed: ParticlePreset = {_working.ParticlePreset}");
         });
     }
 
@@ -988,7 +1009,9 @@ public sealed class OptionsScreen : IScreen
 
             foreach (var k in input.GetNewKeys())
             {
-                if ((k == Keys.LeftShift || k == Keys.RightShift) && !string.Equals(_bindingAction, "Crouch", StringComparison.Ordinal))
+                if ((k == Keys.LeftShift || k == Keys.RightShift)
+                    && !string.Equals(_bindingAction, "Crouch", StringComparison.Ordinal)
+                    && !string.Equals(_bindingAction, "GamemodeModifier", StringComparison.Ordinal))
                     continue;
                 _working.Keybinds[_bindingAction] = k;
                 _log.Info($"Option changed: Keybind {_bindingAction} = {k}");
@@ -1037,7 +1060,7 @@ public sealed class OptionsScreen : IScreen
             sb.Draw(_pixel, row, new Color(18,18,18));
             DrawBorder(sb, row, Color.White);
 
-            _font.DrawString(sb, action.ToUpperInvariant(), new Vector2(row.X + 10, row.Y + 10), Color.White);
+            _font.DrawString(sb, GetBindActionLabel(action), new Vector2(row.X + 10, row.Y + 10), Color.White);
 
             var key = _working.Keybinds.TryGetValue(action, out var k) ? k.ToString() : "UNBOUND";
             var keyText = _bindingAction == action ? "PRESS KEY..." : key.ToUpperInvariant();
@@ -1142,6 +1165,7 @@ public sealed class OptionsScreen : IScreen
         _resolutionOpen = false;
         _guiScaleOpen = false;
         _qualityOpen = false;
+        _particleOpen = false;
         _inputOpen = false;
         _outputOpen = false;
         _voiceOutputOpen = false;
@@ -1637,6 +1661,7 @@ public sealed class OptionsScreen : IScreen
                 bottom = Math.Max(bottom, _brightness.Bounds.Bottom);
                 bottom = Math.Max(bottom, _renderDistance.Bounds.Bottom);
                 bottom = Math.Max(bottom, _qualityBox.Bottom);
+                bottom = Math.Max(bottom, _particleBox.Bottom);
                 bottom = Math.Max(bottom, _guiScaleBox.Bottom);
                 bottom = Math.Max(bottom, _vsync.Bounds.Bottom);
                 return Math.Max(0, bottom - top + padding);
@@ -1701,6 +1726,41 @@ public sealed class OptionsScreen : IScreen
         return 1;
     }
 
+    private static int GetParticlePresetIndex(string? value)
+    {
+        var normalized = NormalizeParticlePreset(value);
+        for (int i = 0; i < ParticlePresets.Length; i++)
+        {
+            if (ParticlePresets[i] == normalized)
+                return i;
+        }
+
+        return 0;
+    }
+
+    private static string GetBindActionLabel(string action)
+    {
+        return action switch
+        {
+            "MoveUp" => "MOVE FORWARD",
+            "MoveDown" => "MOVE BACKWARD",
+            "MoveLeft" => "MOVE LEFT",
+            "MoveRight" => "MOVE RIGHT",
+            "Jump" => "JUMP",
+            "Crouch" => "CROUCH",
+            "Inventory" => "INVENTORY",
+            "DropItem" => "DROP ITEM",
+            "GiveItem" => "GIVE ITEM",
+            "Pause" => "PAUSE",
+            "Chat" => "OPEN CHAT",
+            "Command" => "OPEN COMMAND (/)",
+            "HomeGui" => "HOME GUI",
+            "GamemodeModifier" => "MODE MODIFIER",
+            "GamemodeWheel" => "MODE WHEEL",
+            _ => action.ToUpperInvariant()
+        };
+    }
+
     private static int GetReticleStyleIndex(string? value)
     {
         var normalized = NormalizeReticleStyleValue(value);
@@ -1727,6 +1787,12 @@ public sealed class OptionsScreen : IScreen
     {
         var quality = string.IsNullOrWhiteSpace(value) ? "MEDIUM" : value.Trim().ToUpperInvariant();
         return quality is "LOW" or "MEDIUM" or "HIGH" or "ULTRA" ? quality : "MEDIUM";
+    }
+
+    private static string NormalizeParticlePreset(string? value)
+    {
+        var preset = string.IsNullOrWhiteSpace(value) ? "AUTO" : value.Trim().ToUpperInvariant();
+        return preset is "AUTO" or "OFF" or "LOW" or "MEDIUM" or "HIGH" or "ULTRA" ? preset : "AUTO";
     }
 
     private static string NormalizeReticleStyleValue(string? value)
@@ -1809,6 +1875,7 @@ public sealed class OptionsScreen : IScreen
     {
         _working.GuiScale = GuiScaleCandidates[GetGuiScaleIndex(_working.GuiScale)].value;
         _working.QualityPreset = NormalizeQuality(_working.QualityPreset);
+        _working.ParticlePreset = NormalizeParticlePreset(_working.ParticlePreset);
         _working.Brightness = ClampRange(_working.Brightness, BrightnessMin, BrightnessMax);
         _working.FieldOfView = Math.Clamp(_working.FieldOfView, FovMin, FovMax);
         _working.RenderDistanceChunks = Math.Clamp(_working.RenderDistanceChunks, RenderDistanceMin, RenderDistanceMax);

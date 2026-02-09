@@ -42,21 +42,30 @@ public sealed class BlockModel
             return cached;
 
         var name = BlockRegistry.Get(id).Name.Trim().ToLowerInvariant().Replace(' ', '_');
-        var primaryPath = Path.Combine(Paths.AssetsDir, "Models", "Blocks", $"{name}.json");
-        var legacyPath = Path.Combine(Paths.AssetsDir, "models", $"{name}.json");
+        var roots = new List<string> { Paths.GetAssetsDir() };
+        if (!string.Equals(Paths.AssetsDir, Paths.GetAssetsDir(), StringComparison.OrdinalIgnoreCase))
+            roots.Add(Paths.AssetsDir);
 
         BlockModel? model = null;
-        if (File.Exists(primaryPath))
+        for (var i = 0; i < roots.Count && model == null; i++)
         {
-            model = LoadModel(primaryPath, log);
+            var root = roots[i];
+            var primaryPath = Path.Combine(root, "Models", "Blocks", $"{name}.json");
+            var legacyPath = Path.Combine(root, "models", $"{name}.json");
+            if (File.Exists(primaryPath))
+            {
+                model = LoadModel(primaryPath, log);
+                continue;
+            }
+
+            if (File.Exists(legacyPath))
+                model = LoadModel(legacyPath, log);
         }
-        else if (File.Exists(legacyPath))
+
+        if (model == null)
         {
-            model = LoadModel(legacyPath, log);
-        }
-        else
-        {
-            log.Warn($"Missing model for {name}: {primaryPath}");
+            var expected = Path.Combine(Paths.GetAssetsDir(), "Models", "Blocks", $"{name}.json");
+            log.Warn($"Missing model for {name}: {expected}");
         }
 
         if (model == null)

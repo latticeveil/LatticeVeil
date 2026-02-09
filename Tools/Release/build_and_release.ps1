@@ -12,14 +12,16 @@ param(
 
 Write-Host "=== LatticeVeil Build & Release Automation ===" -ForegroundColor Green
 
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$toolsRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot ".."))
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot "..\.."))
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 function Build-Project {
     Write-Host "Building LatticeVeil project..." -ForegroundColor Yellow
     
-    # Run main build script
-    $buildScript = Join-Path $projectRoot "Build.ps1"
+    # Run main build script when present, otherwise use direct dotnet build.
+    $buildScript = Join-Path $toolsRoot "Build.ps1"
     if (Test-Path $buildScript) {
         & $buildScript
         if ($LASTEXITCODE -ne 0) {
@@ -27,8 +29,12 @@ function Build-Project {
             exit 1
         }
     } else {
-        Write-Host "Build script not found!" -ForegroundColor Red
-        exit 1
+        $project = Join-Path $repoRoot "LatticeVeilMonoGame\LatticeVeilMonoGame.csproj"
+        dotnet build $project
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Build failed!" -ForegroundColor Red
+            exit 1
+        }
     }
     
     Write-Host "Build completed successfully!" -ForegroundColor Green
@@ -44,7 +50,7 @@ function Create-Release {
     Write-Host "Creating release $ReleaseVersion..." -ForegroundColor Yellow
     
     # Run release creation script
-    $releaseScript = Join-Path $projectRoot "Tools\create_release.ps1"
+    $releaseScript = Join-Path $scriptRoot "create_release.ps1"
     if (Test-Path $releaseScript) {
         & $releaseScript -Version $ReleaseVersion
     } else {
@@ -65,7 +71,7 @@ function Create-GitHub-Release {
     Write-Host "Creating GitHub release $ReleaseVersion..." -ForegroundColor Yellow
     
     # Run GitHub release script
-    $githubScript = Join-Path $projectRoot "Tools\create_github_release.ps1"
+    $githubScript = Join-Path $scriptRoot "create_github_release.ps1"
     if (Test-Path $githubScript) {
         & $githubScript -Version $ReleaseVersion
     } else {
@@ -86,7 +92,7 @@ function Verify-Release {
     Write-Host "Verifying release $ReleaseVersion..." -ForegroundColor Yellow
     
     # Run verification script
-    $verifyScript = Join-Path $projectRoot "Tools\verify_release.ps1"
+    $verifyScript = Join-Path $scriptRoot "verify_release.ps1"
     if (Test-Path $verifyScript) {
         & $verifyScript -Version $ReleaseVersion
     } else {
