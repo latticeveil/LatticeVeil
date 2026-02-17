@@ -338,6 +338,7 @@ public class OnlineGateClient
             // Try to get server hash (new public endpoint doesn't require authentication)
             var serverHashResult = await GetCurrentHashAsync(target);
             log.Info($"Server response: Ok={serverHashResult.Ok}, Hash={serverHashResult.Hash}, Message={serverHashResult.Message}");
+            log.Info($"Hash comparison: Local={currentHash}, Server={serverHashResult.Hash}, Match={string.Equals(currentHash, serverHashResult.Hash, StringComparison.OrdinalIgnoreCase)}");
             
             if (!serverHashResult.Ok)
             {
