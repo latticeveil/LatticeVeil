@@ -159,6 +159,7 @@ public sealed class LauncherForm : Form
     private const string DefaultVeilnetLauncherPageUrl = "https://latticeveil.github.io/veilnet/launcher/";
     private const string DefaultVeilnetFunctionsBaseUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
     private const string DefaultGameHashesGetUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1/game-hashes-get";
+    private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
     private static readonly string VeilnetAuthDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "RedactedCraft");
@@ -662,14 +663,6 @@ public sealed class LauncherForm : Form
         if (!string.IsNullOrWhiteSpace(fromEnv))
             return fromEnv.TrimEnd('/');
 
-        var legacy = (Environment.GetEnvironmentVariable("LV_VEILNET_URL") ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(legacy)
-            && legacy.Contains("supabase.co", StringComparison.OrdinalIgnoreCase)
-            && legacy.Contains("/functions/v1", StringComparison.OrdinalIgnoreCase))
-        {
-            return legacy.TrimEnd('/');
-        }
-
         if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.VeilnetFunctionsBaseUrl))
             return _launcherRuntimeConfig.VeilnetFunctionsBaseUrl;
 
@@ -685,14 +678,6 @@ public sealed class LauncherForm : Form
         var functionsEnv = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
         if (!string.IsNullOrWhiteSpace(functionsEnv))
             return $"{functionsEnv.TrimEnd('/')}/game-hashes-get";
-
-        var legacy = (Environment.GetEnvironmentVariable("LV_VEILNET_URL") ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(legacy)
-            && legacy.Contains("supabase.co", StringComparison.OrdinalIgnoreCase)
-            && legacy.Contains("/functions/v1", StringComparison.OrdinalIgnoreCase))
-        {
-            return $"{legacy.TrimEnd('/')}/game-hashes-get";
-        }
 
         if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.GameHashesGetUrl))
             return _launcherRuntimeConfig.GameHashesGetUrl;
@@ -1565,19 +1550,17 @@ public sealed class LauncherForm : Form
                     return;
                 }
 
-                SetProgress(85, "Fetching EOS config...");
                 string? ticket = null;
-                gate.TryGetValidTicketForChildProcess(out ticket, out _);
-                if (!EosRemoteConfigBootstrap.TryBootstrap(_log, gate, allowRetry: false, ticket))
+                DateTime ticketExpiresUtc;
+                if (gate.TryGetValidTicketForChildProcess(out ticket, out ticketExpiresUtc) && !string.IsNullOrWhiteSpace(ticket))
                 {
-                    SetProgress(100, "Online services unavailable");
-                    ApplyOnlineStartupState(
-                        OnlineStartupState.ServiceUnavailable,
-                        "Official build verified, but EOS config bootstrap failed. Online services are unavailable right now. LAN/offline still available.",
-                        officialBuildVerified: true,
-                        onlineServicesReachable: false);
-                    return;
+                    Environment.SetEnvironmentVariable("LV_GATE_TICKET", ticket);
+                    Environment.SetEnvironmentVariable("LV_GATE_TICKET_EXPIRES_UTC", ticketExpiresUtc.ToString("o"));
                 }
+
+                SetProgress(85, "Preparing EOS config...");
+                if (!EosRemoteConfigBootstrap.TryBootstrap(_log, gate, allowRetry: false, ticket))
+                    _log.Warn("EOS config bootstrap failed; continuing with local EOS config sources.");
 
                 SetProgress(100, "Official online ready");
                 ApplyOnlineStartupState(
@@ -2263,9 +2246,20 @@ public sealed class LauncherForm : Form
             startInfo.EnvironmentVariables["LV_LAUNCHER_ONLINE_AUTH"] =
                 (officialVerifiedForRun && servicesReachableForRun) ? "1" : "0";
 
+            var veilnetFunctionsBase = GetVeilnetFunctionsBaseUrl();
+            startInfo.EnvironmentVariables["LV_VEILNET_FUNCTIONS_URL"] = veilnetFunctionsBase;
+
+            var supabaseAnonKey = (Environment.GetEnvironmentVariable("LV_SUPABASE_ANON_KEY") ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(supabaseAnonKey))
+                supabaseAnonKey = (Environment.GetEnvironmentVariable("SUPABASE_ANON_KEY") ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(supabaseAnonKey))
+                supabaseAnonKey = DefaultSupabaseAnonKey;
+            if (!string.IsNullOrWhiteSpace(supabaseAnonKey))
+                startInfo.EnvironmentVariables["LV_SUPABASE_ANON_KEY"] = supabaseAnonKey;
+
             var veilnetUrl = (Environment.GetEnvironmentVariable("LV_VEILNET_URL") ?? string.Empty).Trim();
             if (string.IsNullOrWhiteSpace(veilnetUrl))
-                veilnetUrl = "https://veilnet.onrender.com";
+                veilnetUrl = "https://latticeveil.github.io/veilnet";
             startInfo.EnvironmentVariables["LV_VEILNET_URL"] = veilnetUrl;
 
             var veilnetUsername = (Environment.GetEnvironmentVariable("LV_VEILNET_USERNAME") ?? string.Empty).Trim();
@@ -2275,6 +2269,16 @@ public sealed class LauncherForm : Form
             var veilnetToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
             if (!launchingOffline && !string.IsNullOrWhiteSpace(veilnetToken))
                 startInfo.EnvironmentVariables["LV_VEILNET_ACCESS_TOKEN"] = veilnetToken;
+
+            if (!launchingOffline
+                && officialVerifiedForRun
+                && servicesReachableForRun
+                && OnlineGateClient.GetOrCreate().TryGetValidTicketForChildProcess(out var gateTicket, out var gateTicketExpiresUtc)
+                && !string.IsNullOrWhiteSpace(gateTicket))
+            {
+                startInfo.EnvironmentVariables["LV_GATE_TICKET"] = gateTicket;
+                startInfo.EnvironmentVariables["LV_GATE_TICKET_EXPIRES_UTC"] = gateTicketExpiresUtc.ToString("o");
+            }
             
             _gameProcess = Process.Start(startInfo);
 

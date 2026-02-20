@@ -23,8 +23,9 @@ public class OnlineGateClient
     private static readonly object TicketSync = new();
     private static readonly HttpClient Http = CreateHttpClient();
     private static OnlineGateClient? _instance;
-    private const string DefaultGateUrl = "https://eos-service.onrender.com";
-    private const string DefaultVeilnetUrl = "https://veilnet.onrender.com";
+    private const string DefaultGateUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
+    private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
+    private const string DefaultVeilnetUrl = "https://latticeveil.github.io/veilnet";
     private static readonly TimeSpan DefaultTicketTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan[] TicketRetryDelays =
     {
@@ -544,11 +545,64 @@ public class OnlineGateClient
 
     public bool ValidatePeerTicket(string? ticket, Logger log, out string denialReason, TimeSpan? timeout = null)
     {
-        denialReason = ""; if (string.IsNullOrWhiteSpace(ticket)) { denialReason = "No ticket"; return false; }
-        var endpoint = $"{_gateUrl}/ticket/validate";
-        var request = new GateTicketValidateRequest { Ticket = ticket, RequiredChannel = _buildFlavor == "dev" ? "dev" : "release" };
-        try { using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout); var (ok, response, error) = PostAuthorizedAsync<GateTicketValidateRequest, GateTicketValidateResponse>(endpoint, request, cts.Token).GetAwaiter().GetResult(); if (!ok || response == null) { denialReason = error ?? "Network error"; return false; } if (!response.Ok) { denialReason = response.Reason ?? "Invalid ticket"; return false; } return true; }
-        catch (Exception ex) { denialReason = ex.Message; return false; }
+        denialReason = "";
+        if (string.IsNullOrWhiteSpace(ticket))
+        {
+            denialReason = "No ticket";
+            return false;
+        }
+
+        var endpoint = $"{_gateUrl.TrimEnd('/')}/online-ticket-validate";
+        var requiredChannel = _buildFlavor == "dev" ? "dev" : "release";
+        var anonKey = ResolveSupabaseAnonKey();
+        if (string.IsNullOrWhiteSpace(anonKey))
+        {
+            denialReason = "Gate validation misconfigured: SUPABASE_ANON_KEY is missing.";
+            return false;
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
+            var body = JsonSerializer.Serialize(
+                new GateTicketValidateRequest { Ticket = ticket.Trim(), RequiredChannel = requiredChannel },
+                JsonOptions);
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            };
+            ApplyTicketFunctionHeaders(request, string.Empty, anonKey);
+
+            using var response = Http.SendAsync(request, cts.Token).GetAwaiter().GetResult();
+            var responseBody = response.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                denialReason = $"Ticket validation failed (HTTP {(int)response.StatusCode}).";
+                return false;
+            }
+
+            GateTicketValidateResponse? parsed;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<GateTicketValidateResponse>(responseBody, JsonOptions);
+            }
+            catch
+            {
+                denialReason = "Invalid ticket validation response.";
+                return false;
+            }
+
+            if (parsed?.Ok == true)
+                return true;
+
+            denialReason = string.IsNullOrWhiteSpace(parsed?.Reason) ? "Invalid ticket" : parsed!.Reason!;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            denialReason = ex.Message;
+            return false;
+        }
     }
 
     private async Task<TicketCheckResult> EnsureTicketAsync(Logger log, CancellationToken ct, string? target)
@@ -567,13 +621,12 @@ public class OnlineGateClient
         log.Info($"Executable path used for hash: {executablePath}");
         log.Info($"Computed EXE SHA256: {hash}");
 
-        var eos = EosClientProvider.Current;
         var payload = new
         {
-            ProductUserId = eos?.LocalProductUserId,
-            DisplayName = "Player",
-            BuildFlavor = _buildFlavor,
-            ExeHash = hash
+            target = _buildFlavor == "dev" ? "dev" : "release",
+            exe_hash_sha256 = hash,
+            build_nonce = (Environment.GetEnvironmentVariable("LV_BUILD_NONCE") ?? string.Empty).Trim(),
+            client_version = (Environment.GetEnvironmentVariable("LV_CLIENT_VERSION") ?? string.Empty).Trim()
         };
 
         var endpointCandidates = ResolveTicketEndpointCandidates(_gateUrl);
@@ -756,7 +809,7 @@ public class OnlineGateClient
 
             if (parsed.Ok != true)
             {
-                var reason = (parsed.Reason ?? string.Empty).Trim();
+                var reason = (parsed.Reason ?? parsed.Error ?? parsed.Message ?? string.Empty).Trim();
                 if (string.IsNullOrWhiteSpace(reason)
                     && responseBody.Contains("Hello from Functions", StringComparison.OrdinalIgnoreCase))
                 {
@@ -799,7 +852,7 @@ public class OnlineGateClient
             }
 
             _ticket = ticket;
-            if (DateTimeOffset.TryParse(parsed.ExpiresUtc, out var expires))
+            if (DateTimeOffset.TryParse(parsed.ExpiresUtc ?? parsed.ExpiresAt, out var expires))
                 _ticketExpiresUtc = expires.UtcDateTime;
             else
                 _ticketExpiresUtc = DateTime.UtcNow.AddMinutes(25);
@@ -807,6 +860,7 @@ public class OnlineGateClient
             _ticketProductUserId = EosClientProvider.Current?.LocalProductUserId ?? "";
             _status = "VERIFIED";
             _denialReason = string.Empty;
+            ApplyEosConfigFromTicket(parsed.Eos);
 
             return new TicketCheckResult
             {
@@ -827,6 +881,16 @@ public class OnlineGateClient
     {
         var bodyText = (body ?? string.Empty).Trim();
         var message = $"Ticket request failed (HTTP {(int)statusCode}).";
+
+        if (IsHashMismatchBody(bodyText))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.HashMismatch,
+                Message = "Unofficial build - online disabled."
+            };
+        }
 
         if (statusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed)
         {
@@ -934,7 +998,7 @@ public class OnlineGateClient
             };
         }
 
-        if (ContainsAny(normalized, "hash", "allowlist", "unofficial", "not allowed", "rejected", "denied"))
+        if (ContainsAny(normalized, "hash_mismatch", "hash", "allowlist", "unofficial", "not allowed", "rejected", "denied"))
         {
             return new TicketCheckResult
             {
@@ -1000,46 +1064,18 @@ public class OnlineGateClient
 
     private static List<string> ResolveTicketEndpointCandidates(string baseUrl)
     {
-        var candidates = new List<string>();
-
         var explicitUrl = (Environment.GetEnvironmentVariable("LV_GATE_TICKET_URL") ?? string.Empty).Trim();
         if (!string.IsNullOrWhiteSpace(explicitUrl))
-        {
-            candidates.Add(explicitUrl.TrimEnd('/'));
-            return candidates;
-        }
+            return new List<string> { explicitUrl.TrimEnd('/') };
 
         var normalizedBase = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
         if (string.IsNullOrWhiteSpace(normalizedBase))
-            return candidates;
+            return new List<string>();
 
-        if (normalizedBase.EndsWith("/ticket", StringComparison.OrdinalIgnoreCase)
-            || normalizedBase.EndsWith("/online-ticket", StringComparison.OrdinalIgnoreCase))
-        {
-            candidates.Add(normalizedBase);
-            return candidates;
-        }
+        if (normalizedBase.EndsWith("/online-ticket", StringComparison.OrdinalIgnoreCase))
+            return new List<string> { normalizedBase };
 
-        var explicitPath = (Environment.GetEnvironmentVariable("LV_GATE_TICKET_PATH") ?? string.Empty).Trim().Trim('/');
-        if (!string.IsNullOrWhiteSpace(explicitPath))
-        {
-            candidates.Add($"{normalizedBase}/{explicitPath}");
-            return candidates;
-        }
-
-        var isSupabase = IsSupabaseFunctionsEndpoint(normalizedBase);
-        if (isSupabase)
-        {
-            candidates.Add($"{normalizedBase}/online-ticket");
-            candidates.Add($"{normalizedBase}/ticket");
-        }
-        else
-        {
-            candidates.Add($"{normalizedBase}/ticket");
-            candidates.Add($"{normalizedBase}/online-ticket");
-        }
-
-        return candidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return new List<string> { $"{normalizedBase}/online-ticket" };
     }
 
     private static bool IsSupabaseFunctionsEndpoint(string url)
@@ -1067,7 +1103,7 @@ public class OnlineGateClient
                 return value;
         }
 
-        return string.Empty;
+        return DefaultSupabaseAnonKey;
     }
 
     private static string ResolveVeilnetAccessToken()
@@ -1090,13 +1126,13 @@ public class OnlineGateClient
     private static HttpClient CreateHttpClient() { var h = new HttpClientHandler(); if (h.SupportsAutomaticDecompression) h.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate; return new HttpClient(h) { Timeout = TimeSpan.FromSeconds(30) }; }
     private static string ResolveGateUrl()
     {
-        var explicitGate = (Environment.GetEnvironmentVariable("LV_GATE_URL") ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(explicitGate))
-            return explicitGate.TrimEnd('/');
-
         var veilnetFunctions = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
         if (!string.IsNullOrWhiteSpace(veilnetFunctions))
             return veilnetFunctions.TrimEnd('/');
+
+        var legacyGate = (Environment.GetEnvironmentVariable("LV_GATE_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(legacyGate) && IsSupabaseFunctionsEndpoint(legacyGate))
+            return legacyGate.TrimEnd('/');
 
         return DefaultGateUrl;
     }
@@ -1138,7 +1174,56 @@ public class OnlineGateClient
     }
     private void TryRestorePreAuthorizedTicketFromEnvironment() { }
 
-    private class GateTicketResponse { public bool Ok { get; set; } public string? Ticket { get; set; } public string? ExpiresUtc { get; set; } public string? Reason { get; set; } }
+    private static bool IsHashMismatchBody(string body)
+    {
+        return ContainsAny(
+            body ?? string.Empty,
+            "hash_mismatch",
+            "UNOFFICIAL_BUILD",
+            "\"error\":\"hash_mismatch\"",
+            "\"error\":\"UNOFFICIAL_BUILD\"");
+    }
+
+    private static void ApplyEosConfigFromTicket(GateTicketEosPayload? eos)
+    {
+        if (eos == null)
+            return;
+
+        static void SetIfPresent(string key, string? value)
+        {
+            var v = (value ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(v))
+                Environment.SetEnvironmentVariable(key, v);
+        }
+
+        SetIfPresent("EOS_PRODUCT_ID", eos.ProductId);
+        SetIfPresent("EOS_SANDBOX_ID", eos.SandboxId);
+        SetIfPresent("EOS_DEPLOYMENT_ID", eos.DeploymentId);
+        SetIfPresent("EOS_CLIENT_ID", eos.ClientId);
+        SetIfPresent("EOS_PRODUCT_NAME", eos.ProductName);
+        SetIfPresent("EOS_PRODUCT_VERSION", eos.ProductVersion);
+    }
+
+    private class GateTicketResponse
+    {
+        public bool Ok { get; set; }
+        public string? Ticket { get; set; }
+        public string? ExpiresUtc { get; set; }
+        public string? ExpiresAt { get; set; }
+        public string? Reason { get; set; }
+        public string? Error { get; set; }
+        public string? Message { get; set; }
+        public GateTicketEosPayload? Eos { get; set; }
+    }
+    private class GateTicketEosPayload
+    {
+        public string? ProductId { get; set; }
+        public string? SandboxId { get; set; }
+        public string? DeploymentId { get; set; }
+        public string? ClientId { get; set; }
+        public string? ProductName { get; set; }
+        public string? ProductVersion { get; set; }
+    }
     private class GatePresenceQueryRequest { public List<string> ProductUserIds { get; set; } = new(); }
     private class GatePresenceQueryResponse { public bool Ok { get; set; } public List<GatePresenceEntry>? Entries { get; set; } }
     private class GatePresenceUpsertRequest { public string? ProductUserId { get; set; } public string? DisplayName { get; set; } public bool IsHosting { get; set; } public string? WorldName { get; set; } public string? GameMode { get; set; } public string? JoinTarget { get; set; } public string? Status { get; set; } public bool Cheats { get; set; } public int PlayerCount { get; set; } public int MaxPlayers { get; set; } }
@@ -1163,7 +1248,11 @@ public class OnlineGateClient
     private class GateFriendRespondRequest { public string? RequesterProductUserId { get; set; } public bool Accept { get; set; } public bool Block { get; set; } }
     private class GateFriendBlockRequest { public string? Query { get; set; } }
     private class GateFriendUnblockRequest { public string? ProductUserId { get; set; } }
-    private class GateTicketValidateRequest { public string Ticket { get; set; } = ""; public string RequiredChannel { get; set; } = "release"; }
+    private class GateTicketValidateRequest
+    {
+        public string Ticket { get; set; } = "";
+        public string RequiredChannel { get; set; } = "release";
+    }
     private class GateTicketValidateResponse { public bool Ok { get; set; } public string? Reason { get; set; } }
 }
 

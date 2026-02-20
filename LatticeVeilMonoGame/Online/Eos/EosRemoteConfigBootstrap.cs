@@ -23,6 +23,7 @@ public static class EosRemoteConfigBootstrap
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(350);
     private const int InitialFetchAttempts = 2;
     private const int RetryFetchAttempts = 4;
+    private const string DefaultFunctionsBaseUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
 
     public static bool TryBootstrap(Logger log, OnlineGateClient gate, bool allowRetry = false, string? ticket = null)
     {
@@ -32,9 +33,10 @@ public static class EosRemoteConfigBootstrap
             return false;
         }
 
-        if (EosConfig.HasPublicConfigSource() && EosConfig.HasSecretSource())
+        // EOS secret is intentionally not required on client.
+        if (EosConfig.HasPublicConfigSource())
         {
-            log.Info("EOS config already has both public and secret sources");
+            log.Info("EOS public config already available locally.");
             return true;
         }
 
@@ -44,18 +46,14 @@ public static class EosRemoteConfigBootstrap
             return false;
         }
 
-        // Use provided ticket or try to get one from gate
         var authTicket = ticket;
-        if (string.IsNullOrEmpty(authTicket) && !gate.TryGetValidTicketForChildProcess(out authTicket, out _))
-        {
-            log.Warn("EOS remote config bootstrap skipped: no valid gate ticket available");
-            return false;
-        }
+        if (string.IsNullOrEmpty(authTicket))
+            gate.TryGetValidTicketForChildProcess(out authTicket, out _);
 
-        log.Info($"EOS remote config bootstrap attempting with ticket: {(!string.IsNullOrEmpty(authTicket) ? authTicket.Substring(0, Math.Min(10, authTicket.Length)) + "..." : "null")}");
+        log.Info("EOS remote config bootstrap attempting.");
 
         var attempts = allowRetry ? RetryFetchAttempts : InitialFetchAttempts;
-        if (!TryFetchWithGateTicketWithRetry(log, authTicket, attempts, out var payload))
+        if (!TryFetchWithRetry(log, authTicket, attempts, out var payload))
         {
             log.Error("EOS remote config bootstrap failed: unable to fetch config");
             return false;
@@ -66,9 +64,9 @@ public static class EosRemoteConfigBootstrap
         return true;
     }
 
-    private static bool TryFetchWithGateTicketWithRetry(
+    private static bool TryFetchWithRetry(
         Logger log,
-        string ticket,
+        string? ticket,
         int attempts,
         out EosConfigPayload payload)
     {
@@ -76,7 +74,7 @@ public static class EosRemoteConfigBootstrap
         var maxAttempts = Math.Max(1, attempts);
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            if (TryFetchWithGateTicket(log, ticket, out payload))
+            if (TryFetch(log, ticket, out payload))
                 return true;
 
             if (attempt >= maxAttempts)
@@ -110,22 +108,26 @@ public static class EosRemoteConfigBootstrap
         }
     }
 
-    private static bool TryFetchWithGateTicket(Logger log, string ticket, out EosConfigPayload payload)
+    private static bool TryFetch(Logger log, string? ticket, out EosConfigPayload payload)
     {
         payload = new EosConfigPayload();
-        var endpoint = ResolveGateConfigEndpoint();
+        var endpoint = ResolveEosConfigEndpoint();
         if (string.IsNullOrWhiteSpace(endpoint))
         {
-            log.Warn("EOS remote config bootstrap skipped: gate endpoint URL is not configured.");
+            log.Warn("EOS remote config bootstrap skipped: config endpoint URL is not configured.");
             return false;
         }
 
         try
         {
-            log.Info($"EOS config fetch endpoint: {endpoint}");
-            
             using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ticket);
+            if (!string.IsNullOrWhiteSpace(ticket))
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ticket);
+
+            var anonKey = (Environment.GetEnvironmentVariable("LV_SUPABASE_ANON_KEY") ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(anonKey))
+                request.Headers.TryAddWithoutValidation("apikey", anonKey);
+
             request.Headers.CacheControl = new CacheControlHeaderValue
             {
                 NoCache = true,
@@ -134,20 +136,14 @@ public static class EosRemoteConfigBootstrap
             };
             request.Headers.Pragma.ParseAdd("no-cache");
 
-            log.Info($"EOS config sending request to {endpoint} with ticket {ticket.Substring(0, Math.Min(10, ticket.Length))}...");
-
             using var response = Http.Send(request);
             var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            
-            log.Info($"EOS config response status: HTTP {(int)response.StatusCode} {response.StatusCode}");
-            
+
             if (!response.IsSuccessStatusCode)
             {
                 log.Warn($"EOS remote config request failed: HTTP {(int)response.StatusCode} - {body}");
                 return false;
             }
-
-            log.Info($"EOS config response received: {body.Length} bytes");
 
             var parsed = JsonSerializer.Deserialize<EosConfigPayload>(body, JsonOptions);
             if (parsed == null || !parsed.IsValid())
@@ -155,8 +151,6 @@ public static class EosRemoteConfigBootstrap
                 log.Warn("EOS remote config request failed: payload missing required fields.");
                 return false;
             }
-
-            log.Info($"EOS config payload fields present: productId={!string.IsNullOrWhiteSpace(parsed.ProductId)}, sandboxId={!string.IsNullOrWhiteSpace(parsed.SandboxId)}, deploymentId={!string.IsNullOrWhiteSpace(parsed.DeploymentId)}, clientId={!string.IsNullOrWhiteSpace(parsed.ClientId)}, clientSecretLength={(parsed.ClientSecret ?? string.Empty).Length}, loginMode={(string.IsNullOrWhiteSpace(parsed.LoginMode) ? "(default)" : parsed.LoginMode)}");
 
             payload = parsed;
             return true;
@@ -168,7 +162,7 @@ public static class EosRemoteConfigBootstrap
         }
     }
 
-    private static string ResolveGateConfigEndpoint()
+    private static string ResolveEosConfigEndpoint()
     {
         var explicitUrl = (Environment.GetEnvironmentVariable("LV_EOS_CONFIG_URL") ?? string.Empty).Trim();
         if (!string.IsNullOrWhiteSpace(explicitUrl))
@@ -178,16 +172,14 @@ public static class EosRemoteConfigBootstrap
             return explicitUrl;
         }
 
-        var gateUrl = (Environment.GetEnvironmentVariable("LV_GATE_URL") ?? string.Empty).Trim();
-        if (IsDisabled(gateUrl))
+        var functionsBase = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(functionsBase))
+            functionsBase = DefaultFunctionsBaseUrl;
+
+        if (IsDisabled(functionsBase))
             return string.Empty;
 
-        if (string.IsNullOrWhiteSpace(gateUrl))
-            gateUrl = (Environment.GetEnvironmentVariable("LV_GATE_DEFAULT_URL") ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(gateUrl))
-            gateUrl = "https://eos-service.onrender.com";
-
-        return gateUrl.TrimEnd('/') + "/eos/config/gate";
+        return functionsBase.TrimEnd('/') + "/eos-config";
     }
 
     private static bool IsDisabled(string value)
@@ -203,7 +195,6 @@ public static class EosRemoteConfigBootstrap
         Environment.SetEnvironmentVariable("EOS_SANDBOX_ID", payload.SandboxId);
         Environment.SetEnvironmentVariable("EOS_DEPLOYMENT_ID", payload.DeploymentId);
         Environment.SetEnvironmentVariable("EOS_CLIENT_ID", payload.ClientId);
-        Environment.SetEnvironmentVariable("EOS_CLIENT_SECRET", payload.ClientSecret);
         Environment.SetEnvironmentVariable("EOS_PRODUCT_NAME", string.IsNullOrWhiteSpace(payload.ProductName) ? "LatticeVeil" : payload.ProductName);
         Environment.SetEnvironmentVariable("EOS_PRODUCT_VERSION", string.IsNullOrWhiteSpace(payload.ProductVersion) ? "1.0.0" : payload.ProductVersion);
         Environment.SetEnvironmentVariable("EOS_LOGIN_MODE", string.IsNullOrWhiteSpace(payload.LoginMode) ? "deviceid" : payload.LoginMode);
@@ -224,7 +215,6 @@ public static class EosRemoteConfigBootstrap
         public string SandboxId { get; set; } = string.Empty;
         public string DeploymentId { get; set; } = string.Empty;
         public string ClientId { get; set; } = string.Empty;
-        public string ClientSecret { get; set; } = string.Empty;
         public string ProductName { get; set; } = string.Empty;
         public string ProductVersion { get; set; } = string.Empty;
         public string LoginMode { get; set; } = string.Empty;
@@ -234,8 +224,7 @@ public static class EosRemoteConfigBootstrap
             return !string.IsNullOrWhiteSpace(ProductId)
                 && !string.IsNullOrWhiteSpace(SandboxId)
                 && !string.IsNullOrWhiteSpace(DeploymentId)
-                && !string.IsNullOrWhiteSpace(ClientId)
-                && !string.IsNullOrWhiteSpace(ClientSecret);
+                && !string.IsNullOrWhiteSpace(ClientId);
         }
     }
 }

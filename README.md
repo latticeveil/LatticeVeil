@@ -59,21 +59,21 @@ Flow:
 
 1. Launcher requests a gate ticket for the local EXE hash.
 2. Game process receives a pre-authorized ticket from launcher.
-3. EOS host validates peer tickets using `POST /ticket/validate`.
+3. EOS host validates peer tickets using `POST /online-ticket-validate`.
 4. If gate verification fails, game falls back to LAN-only behavior.
 
 Important:
 
 - Secrets are not shipped in client artifacts.
-- Official EOS private credentials remain server-side on Render.
+- Official EOS private credentials remain server-side in Supabase Edge Function secrets.
 - Public forks can run offline/LAN or their own EOS/gate backend, but not the official backend unless explicitly allowlisted.
 
 See `OFFICIAL_ONLINE_SERVICE_TERMS.md` for policy and restrictions.
 
 ### Client Environment Variables
 
-- `LV_GATE_URL`
-- `LV_GATE_DEFAULT_URL`
+- `LV_VEILNET_FUNCTIONS_URL`
+- `LV_SUPABASE_ANON_KEY`
 - `LV_EOS_CONFIG_URL`
 - `LV_GATE_REQUIRED`
 - `LV_REQUIRE_LAUNCHER_HANDSHAKE`
@@ -114,7 +114,7 @@ Run this before committing:
 
 The script reports filename + line for suspicious secret-like strings and exits non-zero when matches are found.
 
-### Gate Server Environment Variables
+### Legacy Gate Server Environment Variables
 
 - `GATE_JWT_SIGNING_KEY` (required)
 - `GATE_ADMIN_TOKEN` (required for admin runtime endpoints)
@@ -131,9 +131,7 @@ The script reports filename + line for suspicious secret-like strings and exits 
 - `ALLOWLIST_SOURCE`
 - `ALLOWLIST_JSON_PATH` (recommended)
 
-Template:
-
-- `GateServer/render.example.env`
+This section is for legacy self-hosted gate setups only. Official online now uses Supabase Edge Functions.
 
 ## EOS Configuration
 
@@ -280,7 +278,7 @@ Or GUI:
 .\Tools\UpdateGateHashGUI.ps1
 ```
 
-This updates runtime allowlist memory on the gate service. A Render restart clears runtime overrides unless persisted in source allowlist config.
+This updates runtime allowlist memory on the gate service. Persist final hashes in the authoritative backend config.
 
 ## Contributing
 

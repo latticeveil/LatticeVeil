@@ -161,15 +161,21 @@ public static class EosClientProvider
                 || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
         }
 
+        static bool HasGateTicket()
+        {
+            var ticket = (Environment.GetEnvironmentVariable("LV_GATE_TICKET") ?? string.Empty).Trim();
+            return !string.IsNullOrWhiteSpace(ticket);
+        }
+
         var authorized = Environment.GetEnvironmentVariable("LV_LAUNCHER_ONLINE_AUTH");
         var official = Environment.GetEnvironmentVariable("LV_OFFICIAL_BUILD_VERIFIED");
         var servicesOk = Environment.GetEnvironmentVariable("LV_ONLINE_SERVICES_OK");
 
         var hasDetailedFlags = !string.IsNullOrWhiteSpace(official) || !string.IsNullOrWhiteSpace(servicesOk);
         if (hasDetailedFlags)
-            return IsTrue(authorized) && IsTrue(official) && IsTrue(servicesOk);
+            return IsTrue(authorized) && IsTrue(official) && IsTrue(servicesOk) && HasGateTicket();
 
-        return IsTrue(authorized);
+        return IsTrue(authorized) && HasGateTicket();
     }
 
     private static bool HasVeilnetLogin()
