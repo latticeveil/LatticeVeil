@@ -144,6 +144,12 @@ public sealed class EosConfig
 
     private static PublicEosConfigFile LoadPublicConfigOrThrow(out string source)
     {
+        if (TryBuildPublicConfigFromEnvironment(out var envConfig))
+        {
+            source = "environment variables EOS_PRODUCT_ID/EOS_SANDBOX_ID/EOS_DEPLOYMENT_ID/EOS_CLIENT_ID";
+            return envConfig;
+        }
+
         var searched = new List<string>();
 
         foreach (var candidate in EnumeratePublicConfigCandidates())
@@ -160,6 +166,32 @@ public sealed class EosConfig
         }
 
         throw new FileNotFoundException($"Could not find eos.public.json. Searched: {string.Join(", ", searched)}");
+    }
+
+    private static bool TryBuildPublicConfigFromEnvironment(out PublicEosConfigFile config)
+    {
+        config = new PublicEosConfigFile();
+
+        var productId = GetEnv("EOS_PRODUCT_ID");
+        var sandboxId = GetEnv("EOS_SANDBOX_ID");
+        var deploymentId = GetEnv("EOS_DEPLOYMENT_ID");
+        var clientId = GetEnv("EOS_CLIENT_ID");
+
+        if (string.IsNullOrWhiteSpace(productId)
+            || string.IsNullOrWhiteSpace(sandboxId)
+            || string.IsNullOrWhiteSpace(deploymentId)
+            || string.IsNullOrWhiteSpace(clientId))
+        {
+            return false;
+        }
+
+        config.ProductId = productId;
+        config.SandboxId = sandboxId;
+        config.DeploymentId = deploymentId;
+        config.ClientId = clientId;
+        config.ProductName = Normalize(GetEnv("EOS_PRODUCT_NAME"), DefaultProductName);
+        config.ProductVersion = Normalize(GetEnv("EOS_PRODUCT_VERSION"), DefaultProductVersion);
+        return true;
     }
 
     private static string? ResolveClientSecret(out string source)
