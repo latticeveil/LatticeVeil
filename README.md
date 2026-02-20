@@ -81,6 +81,39 @@ See `OFFICIAL_ONLINE_SERVICE_TERMS.md` for policy and restrictions.
 - `LV_OFFICIAL_PROOF_PATH`
 - `LV_DEV_ONLINE_KEY`
 
+## Launcher Endpoint Config (Local-Only)
+
+Launcher endpoint overrides can be set without editing source code.
+
+Local config path:
+
+- `%APPDATA%/RedactedCraft/launcher_config.json`
+
+Precedence order:
+
+1. Environment variables (`LV_VEILNET_FUNCTIONS_URL`, `LV_GAME_HASHES_GET_URL`, `LV_VEILNET_LAUNCHER_URL`)
+2. `%APPDATA%/RedactedCraft/launcher_config.json`
+3. Built-in launcher defaults
+
+Template:
+
+- `LatticeVeilMonoGame/Launcher/launcher_config.template.json`
+
+Important:
+
+- `launcher_config.json` is gitignored and should never be committed.
+- Do not place service-role or private keys in launcher config.
+
+## Secret Scan Helper
+
+Run this before committing:
+
+```powershell
+.\Tools\scan-secrets.ps1
+```
+
+The script reports filename + line for suspicious secret-like strings and exits non-zero when matches are found.
+
 ### Gate Server Environment Variables
 
 - `GATE_JWT_SIGNING_KEY` (required)

@@ -1,0 +1,5 @@
+{
+  "VeilnetFunctionsBaseUrl": "https://YOUR_SUPABASE_PROJECT.supabase.co/functions/v1",
+  "GameHashesGetUrl": "https://YOUR_SUPABASE_PROJECT.supabase.co/functions/v1/game-hashes-get",
+  "VeilnetLauncherPageUrl": "https://YOUR_SITE_DOMAIN/veilnet/launcher/"
+}

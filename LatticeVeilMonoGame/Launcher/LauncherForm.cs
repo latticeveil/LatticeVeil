@@ -154,6 +154,7 @@ public sealed class LauncherForm : Form
     private VeilnetClient? _veilnetClient;
     private string _veilnetFunctionsBaseUrl = string.Empty;
     private readonly OfficialBuildVerifier _officialBuildVerifier;
+    private readonly LauncherRuntimeConfig _launcherRuntimeConfig;
 
     private const string DefaultVeilnetLauncherPageUrl = "https://latticeveil.github.io/veilnet/launcher/";
     private const string DefaultVeilnetFunctionsBaseUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
@@ -192,6 +193,7 @@ public sealed class LauncherForm : Form
         _log = log;
         _profile = profile;
         _settings = GameSettings.LoadOrCreate(_log);
+        _launcherRuntimeConfig = LauncherRuntimeConfig.Load(_log);
         _officialBuildVerifier = new OfficialBuildVerifier(_log, GetGameHashesGetUrl());
         _assetInstaller = new AssetPackInstaller(_log);
         _logFilePath = _log.LogFilePath;
@@ -642,6 +644,9 @@ public sealed class LauncherForm : Form
         if (!string.IsNullOrWhiteSpace(fromEnv))
             return fromEnv;
 
+        if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.VeilnetLauncherPageUrl))
+            return _launcherRuntimeConfig.VeilnetLauncherPageUrl;
+
         return DefaultVeilnetLauncherPageUrl;
     }
 
@@ -659,6 +664,9 @@ public sealed class LauncherForm : Form
             return legacy.TrimEnd('/');
         }
 
+        if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.VeilnetFunctionsBaseUrl))
+            return _launcherRuntimeConfig.VeilnetFunctionsBaseUrl;
+
         return DefaultVeilnetFunctionsBaseUrl;
     }
 
@@ -667,6 +675,24 @@ public sealed class LauncherForm : Form
         var fromEnv = (Environment.GetEnvironmentVariable("LV_GAME_HASHES_GET_URL") ?? string.Empty).Trim();
         if (!string.IsNullOrWhiteSpace(fromEnv))
             return fromEnv;
+
+        var functionsEnv = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(functionsEnv))
+            return $"{functionsEnv.TrimEnd('/')}/game-hashes-get";
+
+        var legacy = (Environment.GetEnvironmentVariable("LV_VEILNET_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(legacy)
+            && legacy.Contains("supabase.co", StringComparison.OrdinalIgnoreCase)
+            && legacy.Contains("/functions/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{legacy.TrimEnd('/')}/game-hashes-get";
+        }
+
+        if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.GameHashesGetUrl))
+            return _launcherRuntimeConfig.GameHashesGetUrl;
+
+        if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.VeilnetFunctionsBaseUrl))
+            return $"{_launcherRuntimeConfig.VeilnetFunctionsBaseUrl.TrimEnd('/')}/game-hashes-get";
 
         return DefaultGameHashesGetUrl;
     }
@@ -711,7 +737,7 @@ public sealed class LauncherForm : Form
         {
             _log.Warn($"Official build verification exception: {ex.Message}");
             MessageBox.Show(
-                "Failed to verify official build hash for online play.",
+                "Online services unavailable. LAN/offline still available.",
                 "Build Verification Failed",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -724,9 +750,18 @@ public sealed class LauncherForm : Form
             return true;
         }
 
-        var message = verify.Failure == OfficialBuildVerifier.VerifyFailure.HashMismatch
-            ? "This build is not official for online play. Please download the official release."
-            : verify.Message;
+        var message = verify.Failure switch
+        {
+            OfficialBuildVerifier.VerifyFailure.HashMismatch =>
+                "Unofficial build - online disabled. LAN/offline still available.",
+            OfficialBuildVerifier.VerifyFailure.FetchFailed =>
+                "Online services unavailable. LAN/offline still available.",
+            OfficialBuildVerifier.VerifyFailure.InvalidRemotePayload =>
+                "Online services unavailable. LAN/offline still available.",
+            _ => string.IsNullOrWhiteSpace(verify.Message)
+                ? "Online launch blocked by build verification. LAN/offline still available."
+                : $"{verify.Message}\n\nLAN/offline still available."
+        };
 
         _log.Warn($"Official hash verification failed ({verify.Failure}) channel={channel}: {verify.Message}");
         MessageBox.Show(

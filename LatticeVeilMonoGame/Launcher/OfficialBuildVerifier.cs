@@ -50,6 +50,12 @@ internal sealed class OfficialBuildVerifier
         [JsonPropertyName("hash_sha256")]
         public string HashSha256 { get; set; } = string.Empty;
 
+        [JsonPropertyName("sha256")]
+        public string Sha256 { get; set; } = string.Empty;
+
+        [JsonPropertyName("hash")]
+        public string Hash { get; set; } = string.Empty;
+
         [JsonPropertyName("version")]
         public string? Version { get; set; }
 
@@ -110,7 +116,7 @@ internal sealed class OfficialBuildVerifier
         }
 
         var remoteEntry = channel == "dev" ? fetch.Payload.Dev : fetch.Payload.Release;
-        var expectedHash = (remoteEntry?.HashSha256 ?? string.Empty).Trim().ToLowerInvariant();
+        var expectedHash = ResolveRemoteHash(remoteEntry);
         if (!IsSha256(expectedHash))
         {
             return new VerifyResult
@@ -225,5 +231,24 @@ internal sealed class OfficialBuildVerifier
         }
 
         return true;
+    }
+
+    private static string ResolveRemoteHash(OfficialHashEntry? entry)
+    {
+        var candidates = new[]
+        {
+            entry?.HashSha256,
+            entry?.Sha256,
+            entry?.Hash
+        };
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            var c = (candidates[i] ?? string.Empty).Trim().ToLowerInvariant();
+            if (IsSha256(c))
+                return c;
+        }
+
+        return string.Empty;
     }
 }

@@ -19,6 +19,8 @@ Tools/gate.cfg
 eos/eos.private.json
 **/eos.private.json
 *.private.json
+launcher_config.json
+**/launcher_config.json
 eos.config.json
 eos.*.secret.json
 *.secret.json
@@ -68,6 +70,7 @@ Desktop.ini
 _temp/
 _tmp*/
 temp*/
+supabase/
 
 # Archive files
 *.zip
