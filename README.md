@@ -70,6 +70,12 @@ Important:
 
 See `OFFICIAL_ONLINE_SERVICE_TERMS.md` for policy and restrictions.
 
+### Hosting/Discovery Transport
+
+- LAN hosting/discovery uses local network broadcast/listening (`LanDiscovery`).
+- Official online transport is EOS P2P.
+- Supabase is used only for identity/friends plus lightweight signaling (host presence + join requests), not for world/session transport.
+
 ### Client Environment Variables
 
 - `LV_VEILNET_FUNCTIONS_URL`

@@ -30,9 +30,9 @@ public sealed class OnlineSocialStateService
     private bool _friendsEndpointUnavailable;
     private string _lastStatus = string.Empty;
 
-    private static readonly TimeSpan FriendsPollInterval = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan PresencePollInterval = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan RetryPollInterval = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan FriendsPollInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan PresencePollInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan RetryPollInterval = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan MissingEndpointRetryInterval = TimeSpan.FromSeconds(45);
 
     private OnlineSocialStateService(Logger log)
@@ -107,12 +107,6 @@ public sealed class OnlineSocialStateService
         _pollInProgress = true;
         try
         {
-            if (!_gate.CanUseOfficialOnline(_log, out _))
-            {
-                _nextFriendsPollUtc = DateTime.UtcNow.Add(RetryPollInterval);
-                return;
-            }
-
             var result = await _gate.GetFriendsAsync().ConfigureAwait(false);
             if (!result.Ok)
             {
@@ -199,6 +193,7 @@ public sealed class OnlineSocialStateService
             var result = await _gate.QueryPresenceAsync(friendIds).ConfigureAwait(false);
             if (!result.Ok)
             {
+                _log.Warn($"Social service presence poll failed: requested={friendIds.Count} returned=0");
                 _nextPresencePollUtc = DateTime.UtcNow.Add(RetryPollInterval);
                 return;
             }
@@ -218,6 +213,7 @@ public sealed class OnlineSocialStateService
                 _presenceByUserId = map;
             }
 
+            _log.Info($"Social service presence poll ok: requested={friendIds.Count} activeHosts={map.Count}");
             _nextPresencePollUtc = DateTime.UtcNow.Add(PresencePollInterval);
         }
         catch (Exception ex)

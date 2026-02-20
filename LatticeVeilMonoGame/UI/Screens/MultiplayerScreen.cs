@@ -45,7 +45,9 @@ public sealed class MultiplayerScreen : IScreen
         public string Title = "";
         public string HostName = "";
         public string Status = "";
+        public string FriendUserId = "";
         public string JoinTarget = "";
+        public string LobbyId = "";
         public string WorldName = "";
         public string GameMode = "";
         public bool Cheats;
@@ -64,12 +66,17 @@ public sealed class MultiplayerScreen : IScreen
 
     private List<SessionEntry> _sessions = new();
     private int _selectedIndex = -1;
+    private int _hoveredIndex = -1;
     private Vector2 _lastMousePos = Vector2.Zero;
+    private string _hoveredWorldDetails = string.Empty;
 
-    private Dictionary<string, string> _pendingInvitesByHostPuid = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, string> _pendingInvitesByFriendUserId = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _nextInvitePollUtc = DateTime.MinValue;
     private DateTime _nextSessionRefreshUtc = DateTime.MinValue;
     private bool _isRefreshing = false;
+    private bool _invitePollInProgress;
+    private int _invitePollFailures;
+    private int _sessionRefreshFailures;
     private float _refreshIconRotation = 0f;
     private bool _justReturnedFromHosting = false;
     private List<IncomingJoinRequest> _incomingJoinRequests = new();
@@ -81,7 +88,10 @@ public sealed class MultiplayerScreen : IScreen
     private Texture2D? _panel;
 
     private double _lastLanRefresh;
-    private const double LanRefreshIntervalSeconds = 1.0;
+    private int _lastLoggedLanDiscoveryCount = -1;
+    private const double LanRefreshIntervalSeconds = 2.0;
+    private const double DefaultListRefreshSeconds = 4.0;
+    private const double RefreshBackoffSeconds = 20.0;
 
     private Rectangle _viewport;
     private Rectangle _panelRect;
@@ -114,9 +124,19 @@ public sealed class MultiplayerScreen : IScreen
         _profile = profile;
         _graphics = graphics;
 
-        _eosClient = eosClient ?? EosClientProvider.GetOrCreate(_log, "epic", allowRetry: true);
+        _eosClient = eosClient;
+        var launchMode = (Environment.GetEnvironmentVariable("LV_LAUNCH_MODE") ?? string.Empty).Trim();
+        var offlineLaunch = string.Equals(launchMode, "offline", StringComparison.OrdinalIgnoreCase);
+        if (!offlineLaunch && _eosClient == null)
+            _eosClient = EosClientProvider.GetOrCreate(_log, "epic", allowRetry: true);
+
         if (_eosClient == null)
-            _log.Warn("MultiplayerScreen: EOS client not available.");
+        {
+            if (offlineLaunch)
+                _log.Info("MultiplayerScreen: offline launch mode; EOS online features disabled.");
+            else
+                _log.Warn("MultiplayerScreen: EOS client not available.");
+        }
         _onlineGate = OnlineGateClient.GetOrCreate();
         _social = OnlineSocialStateService.GetOrCreate(_log);
         _identityStore = EosIdentityStore.LoadOrCreate(_log);
@@ -144,6 +164,8 @@ public sealed class MultiplayerScreen : IScreen
         }
 
         RefreshSessions();
+        _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(DefaultListRefreshSeconds);
+        _nextInvitePollUtc = DateTime.UtcNow;
     }
 
     public void OnResize(Rectangle viewport)
@@ -224,24 +246,24 @@ public sealed class MultiplayerScreen : IScreen
                 _refreshIconRotation -= 360f;
         }
 
-        if (DateTime.UtcNow >= _nextInvitePollUtc)
-        {
-            _nextInvitePollUtc = DateTime.UtcNow.AddSeconds(1); // Poll every 1 second instead of 3
-            _ = PollInvitesAsync();
-            _ = PollIncomingJoinRequestsAsync(); // Also poll for incoming requests
-        }
+        var nowUtc = DateTime.UtcNow;
+        if (!_invitePollInProgress && nowUtc >= _nextInvitePollUtc)
+            _ = PollInviteStateAsync();
 
-        // Auto-refresh every 10 seconds, but also refresh immediately after returning from host screen
-        if (_justReturnedFromHosting || DateTime.UtcNow >= _nextSessionRefreshUtc)
+        // Auto-refresh list while screen is active.
+        if (_justReturnedFromHosting || nowUtc >= _nextSessionRefreshUtc)
         {
-            _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(10);
             _isRefreshing = true;
+            _social.Tick();
             RefreshSessions();
+            var nextSeconds = _sessionRefreshFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds;
+            _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(nextSeconds);
             _justReturnedFromHosting = false; // Reset flag
         }
 
         _social.Tick();
         UpdateLanDiscovery(gameTime);
+        UpdateHoveredSession();
         RefreshIdentityStateFromEos(EnsureEosClient());
         if (!_identitySyncBusy && _now - _lastIdentitySyncAttempt >= IdentitySyncIntervalSeconds)
         {
@@ -261,6 +283,23 @@ public sealed class MultiplayerScreen : IScreen
         _hostBtn.Enabled = true;
         _joinBtn.Enabled = true;
         _yourIdBtn.Enabled = onlineAvailable;
+
+        if (_selectedIndex >= 0 && _selectedIndex < _sessions.Count)
+        {
+            var selected = _sessions[_selectedIndex];
+            if (selected.Type == SessionType.Friend)
+            {
+                if (_pendingInvitesByFriendUserId.TryGetValue(selected.FriendUserId, out var inviteStatus)
+                    && string.Equals(inviteStatus, "pending", StringComparison.OrdinalIgnoreCase))
+                {
+                    _joinBtn.Enabled = false;
+                }
+                else if (string.IsNullOrWhiteSpace(selected.JoinTarget))
+                {
+                    _joinBtn.Enabled = false;
+                }
+            }
+        }
     }
 
     public void Draw(SpriteBatch sb, Rectangle viewport)
@@ -351,6 +390,8 @@ public sealed class MultiplayerScreen : IScreen
 
     private void DrawList(SpriteBatch sb)
     {
+        _hoveredWorldDetails = string.Empty;
+
         sb.Draw(_pixel, _listRect, new Color(20, 20, 20, 200));
         DrawBorder(sb, _listRect, Color.White);
 
@@ -414,13 +455,14 @@ public sealed class MultiplayerScreen : IScreen
         {
             var s = _sessions[i];
             var rowRect = new Rectangle(_listBodyRect.X, rowY - 1, _listBodyRect.Width, rowH);
+            var rowIsHovered = i == _hoveredIndex;
             
             if (i == _selectedIndex)
             {
                 sb.Draw(_pixel, rowRect, new Color(100, 100, 100, 200));
                 DrawBorder(sb, rowRect, Color.Yellow); // Bright border for selection
             }
-            else if (rowRect.Contains(_lastMousePos))
+            else if (rowIsHovered)
             {
                 sb.Draw(_pixel, rowRect, new Color(40, 40, 40, 150));
             }
@@ -444,12 +486,16 @@ public sealed class MultiplayerScreen : IScreen
 
             // Username column (shifted right)
             var user = s.HostName;
-            _font.DrawString(sb, Trunc(user, userColW - 6), new Vector2(textX + 8, textY), Color.White); // Shift USERNAME text right
+            var userFit = FitTextToWidth(user, Math.Max(24, userColW - 16), out _);
+            _font.DrawString(sb, userFit, new Vector2(textX + 8, textY), Color.White);
             textX += userColW;
 
             // World column (shifted right)
             var world = s.WorldName;
-            _font.DrawString(sb, Trunc(world, worldColW - 6), new Vector2(textX + 8, textY), Color.White); // Shift WORLD text right
+            var worldFit = FitTextToWidth(world, Math.Max(24, worldColW - 16), out var worldWasTrimmed);
+            _font.DrawString(sb, worldFit, new Vector2(textX + 8, textY), Color.White);
+            if (worldWasTrimmed && (i == _selectedIndex || rowIsHovered))
+                _hoveredWorldDetails = world;
             textX += worldColW;
 
             // Cheats pill (shifted right)
@@ -472,7 +518,7 @@ public sealed class MultiplayerScreen : IScreen
                 "veilseer" => new Color(220, 220, 120),
                 _ => new Color(160, 160, 160)
             };
-            var modeText = Trunc(s.GameMode ?? "", modeColW - 6);
+            var modeText = FitTextToWidth(s.GameMode ?? "", Math.Max(20, modeColW - 24), out _);
             var modeSize = _font.MeasureString(modeText);
             var modePillRect = new Rectangle(textX + 8, rowRect.Y + (rowRect.Height - pillHeight) / 2, (int)modeSize.X + pillPad * 2, pillHeight); // Shift MODE right
             sb.Draw(_pixel, modePillRect, modePillColor * 0.3f);
@@ -498,10 +544,15 @@ public sealed class MultiplayerScreen : IScreen
         if (_selectedIndex >= 0 && _selectedIndex < _sessions.Count)
         {
             var s = _sessions[_selectedIndex];
-            if (s.Type == SessionType.Friend && _pendingInvitesByHostPuid.TryGetValue(s.JoinTarget, out var status))
+            if (s.Type == SessionType.Friend)
             {
-                if (status == "pending") joinText = "PENDING";
-                else if (status == "accepted") joinText = "CAN JOIN";
+                joinText = "REQUEST JOIN";
+                if (_pendingInvitesByFriendUserId.TryGetValue(s.FriendUserId, out var status))
+                {
+                    if (status == "pending") joinText = "REQUESTED";
+                    else if (status == "accepted") joinText = "JOIN";
+                    else if (status == "rejected") joinText = "REQUEST JOIN";
+                }
             }
         }
         _joinBtn.Label = joinText;
@@ -523,6 +574,13 @@ public sealed class MultiplayerScreen : IScreen
         {
             var pos = new Vector2(_panelRect.X + 14, _panelRect.Bottom - _font.LineHeight - 8);
             _font.DrawString(sb, _status, pos, Color.White);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_hoveredWorldDetails))
+        {
+            var worldDetails = $"WORLD: {_hoveredWorldDetails}";
+            var detailsPos = new Vector2(_panelRect.X + 14, _panelRect.Bottom - (_font.LineHeight * 2) - 12);
+            _font.DrawString(sb, worldDetails, detailsPos, new Color(220, 220, 220));
         }
         
         // Draw incoming join requests
@@ -570,10 +628,14 @@ public sealed class MultiplayerScreen : IScreen
     private void OnRefreshClicked()
     {
         _isRefreshing = true;
+        _sessionRefreshFailures = 0;
+        _invitePollFailures = 0;
         _social.ForceRefresh();
+        _social.Tick();
         RefreshSessions();
         _status = "";
-        _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(5); // Next auto-refresh in 5 seconds
+        _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(DefaultListRefreshSeconds);
+        _nextInvitePollUtc = DateTime.UtcNow;
     }
 
     private void OnAddClicked()
@@ -604,13 +666,20 @@ public sealed class MultiplayerScreen : IScreen
         }
         else if (entry.Type == SessionType.Friend)
         {
-            if (_pendingInvitesByHostPuid.TryGetValue(entry.JoinTarget, out var status))
+            if (_pendingInvitesByFriendUserId.TryGetValue(entry.FriendUserId, out var status))
             {
                 if (status == "accepted")
                 {
-                    _status = $"Connecting to {entry.HostName} via P2P...";
+                    if (string.IsNullOrWhiteSpace(entry.JoinTarget))
+                    {
+                        _status = "Host join target is unavailable. Refresh and try again.";
+                        _joining = false;
+                        return;
+                    }
+
+                    _status = $"Connecting to {entry.HostName} via EOS...";
                     _joining = true;
-                    _ = JoinP2PAsync(entry.JoinTarget, entry.HostName);
+                    _ = JoinOnlineSessionAsync(entry);
                     return;
                 }
                 else if (status == "rejected")
@@ -626,9 +695,9 @@ public sealed class MultiplayerScreen : IScreen
             }
             else
             {
-                _status = $"Sending invite to {entry.HostName}...";
+                _status = $"Sending join request to {entry.HostName}...";
                 _joining = true;
-                _ = SendInviteAsync(entry.JoinTarget, entry.WorldName);
+                _ = SendInviteAsync(entry.FriendUserId, entry.JoinTarget, entry.WorldName);
             }
         }
         else
@@ -834,27 +903,30 @@ public sealed class MultiplayerScreen : IScreen
         }
     }
 
-    private async Task SendInviteAsync(string targetPuid, string worldName)
+    private async Task SendInviteAsync(string targetUserId, string targetJoinTarget, string worldName)
     {
-        _log.Info($"Sending invite to {targetPuid} for world '{worldName}'");
-        var ok = await _onlineGate.SendWorldInviteAsync(targetPuid, worldName);
+        var eos = EnsureEosClient();
+        var senderJoinTarget = (eos?.LocalProductUserId ?? string.Empty).Trim();
+        _log.Info($"JOIN_REQUEST send targetUserId={targetUserId} world='{worldName}' senderJoinTargetPresent={!string.IsNullOrWhiteSpace(senderJoinTarget)}");
+        var ok = await _onlineGate.SendWorldInviteAsync(targetUserId, worldName, senderJoinTarget);
         if (ok)
         {
-            _status = "Invite sent! Waiting for response...";
-            _pendingInvitesByHostPuid[targetPuid] = "pending";
-            _log.Info($"Invite sent successfully to {targetPuid}");
+            _status = "Join request sent. Waiting for host approval...";
+            _pendingInvitesByFriendUserId[targetUserId] = "pending";
+            _log.Info($"JOIN_REQUEST sent targetUserId={targetUserId}");
             
             // Trigger immediate refresh and polling
             RefreshSessions();
-            _ = PollInvitesAsync(); // Immediate poll to check response
+            _nextInvitePollUtc = DateTime.UtcNow;
+            _ = PollInviteStateAsync(); // Immediate poll to check response
             
             // Also trigger more frequent polling for the next few seconds
-            _nextInvitePollUtc = DateTime.UtcNow.AddMilliseconds(500);
+            _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(2);
         }
         else
         {
-            _status = "Failed to send invite.";
-            _log.Warn($"Failed to send invite to {targetPuid}");
+            _status = "Failed to send join request.";
+            _log.Warn($"JOIN_REQUEST failed targetUserId={targetUserId} targetJoinTarget={targetJoinTarget}");
         }
         _joining = false;
     }
@@ -884,6 +956,32 @@ public sealed class MultiplayerScreen : IScreen
         _joining = false;
 
         _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldDir, metaPath, result.Session), _viewport);
+    }
+
+    private async Task JoinOnlineSessionAsync(SessionEntry entry)
+    {
+        var eos = EnsureEosClient();
+        if (eos == null)
+        {
+            _status = "EOS not ready.";
+            _joining = false;
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(entry.LobbyId))
+        {
+            _status = $"Joining lobby for {entry.HostName}...";
+            var joinedLobby = await eos.JoinLobbyAsync(entry.LobbyId);
+            _log.Info($"EOS_LOBBY_JOIN_ATTEMPT lobbyId={entry.LobbyId} ok={joinedLobby}");
+            if (!joinedLobby)
+            {
+                _status = "Could not join lobby.";
+                _joining = false;
+                return;
+            }
+        }
+
+        await JoinP2PAsync(entry.JoinTarget, entry.HostName);
     }
 
     private Task SyncIdentityStateAsync()
@@ -976,53 +1074,57 @@ public sealed class MultiplayerScreen : IScreen
         }
     }
 
-    private async Task PollInvitesAsync()
+    private async Task PollInviteStateAsync()
     {
-        var result = await _onlineGate.GetMyWorldInvitesAsync();
-        if (result.Ok)
+        if (_invitePollInProgress)
+            return;
+
+        _invitePollInProgress = true;
+        try
         {
+            var result = await _onlineGate.GetMyWorldInvitesAsync().ConfigureAwait(false);
+            if (!result.Ok)
+            {
+                _invitePollFailures++;
+                _nextInvitePollUtc = DateTime.UtcNow.AddSeconds(_invitePollFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds);
+                _sessionRefreshFailures = Math.Max(_sessionRefreshFailures, _invitePollFailures);
+                _log.Warn("Failed to poll invites.");
+                return;
+            }
+
+            _invitePollFailures = 0;
+            _nextInvitePollUtc = DateTime.UtcNow.AddSeconds(DefaultListRefreshSeconds);
+            _sessionRefreshFailures = 0;
+
             _log.Info($"Polled {result.Outgoing.Count} outgoing invites");
             var serverInvites = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var invite in result.Outgoing)
             {
+                if (string.IsNullOrWhiteSpace(invite.TargetProductUserId))
+                    continue;
+
                 serverInvites[invite.TargetProductUserId] = invite.Status;
                 _log.Info($"Invite to {invite.TargetProductUserId}: {invite.Status}");
             }
 
-            // Sync server state to local, but keep local "pending" if it's missing from server (just sent)
+            // Sync server state to local, but keep local "pending" if it's missing from server (just sent).
             foreach (var kvp in serverInvites)
-            {
-                _pendingInvitesByHostPuid[kvp.Key] = kvp.Value;
-            }
+                _pendingInvitesByFriendUserId[kvp.Key] = kvp.Value;
 
-            // If an invite is in our local list but NOT on the server, and it's NOT "pending", clear it.
-            // If it IS "pending" locally but missing on server, we assume it's still being processed by backend.
             var toRemove = new List<string>();
-            foreach (var localPuid in _pendingInvitesByHostPuid.Keys)
+            foreach (var localPuid in _pendingInvitesByFriendUserId.Keys)
             {
-                if (!serverInvites.ContainsKey(localPuid) && _pendingInvitesByHostPuid[localPuid] != "pending")
-                {
+                if (!serverInvites.ContainsKey(localPuid) && _pendingInvitesByFriendUserId[localPuid] != "pending")
                     toRemove.Add(localPuid);
-                }
             }
-            foreach (var puid in toRemove) _pendingInvitesByHostPuid.Remove(puid);
+            foreach (var puid in toRemove)
+                _pendingInvitesByFriendUserId.Remove(puid);
 
-            RefreshSessions();
-        }
-        else
-        {
-            _log.Warn("Failed to poll invites");
-        }
-    }
-
-    private async Task PollIncomingJoinRequestsAsync()
-    {
-        // Check for incoming join requests (invites sent TO us)
-        var result = await _onlineGate.GetMyWorldInvitesAsync();
-        if (result.Ok && result.Incoming != null)
-        {
+            // Check incoming join requests using the same response (single network call).
             foreach (var incoming in result.Incoming)
             {
+                if (string.IsNullOrWhiteSpace(incoming.SenderProductUserId))
+                    continue;
                 if (!_incomingJoinRequests.Any(r => r.RequesterPuid == incoming.SenderProductUserId))
                 {
                     _incomingJoinRequests.Add(new IncomingJoinRequest
@@ -1036,9 +1138,20 @@ public sealed class MultiplayerScreen : IScreen
                     _log.Info($"Received join request from {incoming.SenderDisplayName} to join {incoming.WorldName}");
                 }
             }
+
+            RefreshSessions();
         }
-        
-        await Task.CompletedTask; // Fix async warning
+        catch (Exception ex)
+        {
+            _invitePollFailures++;
+            _nextInvitePollUtc = DateTime.UtcNow.AddSeconds(_invitePollFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds);
+            _sessionRefreshFailures = Math.Max(_sessionRefreshFailures, _invitePollFailures);
+            _log.Warn($"Invite polling failed: {ex.Message}");
+        }
+        finally
+        {
+            _invitePollInProgress = false;
+        }
     }
 
     private async Task RespondToJoinRequestAsync(string requesterPuid, string response)
@@ -1057,10 +1170,19 @@ public sealed class MultiplayerScreen : IScreen
 
     private void RefreshSessions()
     {
+        var previousSelectionKey = _selectedIndex >= 0 && _selectedIndex < _sessions.Count
+            ? BuildSessionKey(_sessions[_selectedIndex])
+            : string.Empty;
+
         var newSessions = new List<SessionEntry>();
 
         // 1. LAN
         var lan = _lanDiscovery.GetServers();
+        if (lan.Count != _lastLoggedLanDiscoveryCount)
+        {
+            _lastLoggedLanDiscoveryCount = lan.Count;
+            _log.Info($"LAN_DISCOVERY_FOUND n={lan.Count}");
+        }
         foreach (var s in lan)
         {
             newSessions.Add(new SessionEntry
@@ -1069,6 +1191,7 @@ public sealed class MultiplayerScreen : IScreen
                 Title = s.ServerName,
                 HostName = "Local Network",
                 Status = "Online",
+                FriendUserId = DescribeEndpoint(s),
                 JoinTarget = DescribeEndpoint(s),
                 WorldName = "LAN World",
                 GameMode = s.GameMode,
@@ -1082,44 +1205,74 @@ public sealed class MultiplayerScreen : IScreen
         var social = _social.GetSnapshot();
         foreach (var friend in social.Friends)
         {
-            if (social.PresenceByUserId.TryGetValue(friend.ProductUserId, out var presence) && presence.IsHosting)
+            var friendId = (friend.ProductUserId ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(friendId))
+                continue;
+
+            var displayName = !string.IsNullOrWhiteSpace(friend.DisplayName)
+                ? friend.DisplayName
+                : (!string.IsNullOrWhiteSpace(friend.Username) ? friend.Username : PlayerProfile.ShortId(friendId));
+
+            if (!social.PresenceByUserId.TryGetValue(friendId, out var presenceEntry) || presenceEntry == null)
+                continue;
+
+            if (!IsPresenceEligibleAsActiveHost(presenceEntry))
+                continue;
+
+            var worldName = string.IsNullOrWhiteSpace(presenceEntry.WorldName)
+                ? $"{displayName}'s World"
+                : presenceEntry.WorldName.Trim();
+            var mode = (presenceEntry.GameMode ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(mode))
+                mode = "Unknown";
+            var status = string.IsNullOrWhiteSpace(presenceEntry.Status)
+                ? "Hosting"
+                : presenceEntry.Status.Trim();
+
+            newSessions.Add(new SessionEntry
             {
-                newSessions.Add(new SessionEntry
-                {
-                    Type = SessionType.Friend,
-                    Title = string.IsNullOrWhiteSpace(presence.WorldName) ? $"{friend.DisplayName}'s World" : presence.WorldName,
-                    HostName = friend.DisplayName,
-                    Status = presence.Status,
-                    JoinTarget = presence.JoinTarget,
-                    WorldName = presence.WorldName,
-                    GameMode = presence.GameMode,
-                    Cheats = presence.Cheats,
-                    PlayerCount = presence.PlayerCount,
-                    MaxPlayers = presence.MaxPlayers
-                });
-            }
+                Type = SessionType.Friend,
+                Title = worldName,
+                HostName = displayName,
+                Status = status,
+                FriendUserId = friendId,
+                JoinTarget = (presenceEntry.JoinTarget ?? string.Empty).Trim(),
+                LobbyId = (presenceEntry.LobbyId ?? string.Empty).Trim(),
+                WorldName = worldName,
+                GameMode = mode,
+                Cheats = presenceEntry.Cheats,
+                PlayerCount = Math.Max(1, presenceEntry.PlayerCount),
+                MaxPlayers = presenceEntry.MaxPlayers
+            });
         }
 
         // 3. Servers (Placeholder)
         // (Empty for now)
 
-        _sessions = newSessions.OrderByDescending(s => s.Type == SessionType.Friend && _pendingInvitesByHostPuid.TryGetValue(s.JoinTarget, out var status) && status == "accepted")
+        _sessions = newSessions.OrderByDescending(s => s.Type == SessionType.Friend && _pendingInvitesByFriendUserId.TryGetValue(s.FriendUserId, out var status) && status == "accepted")
                                .ThenBy(s => s.Type)
                                .ToList();
 
         // Clean up pending invites for hosts that are no longer in the list
-        var activeHostPuids = new HashSet<string>(newSessions.Where(s => s.Type == SessionType.Friend).Select(s => s.JoinTarget), StringComparer.OrdinalIgnoreCase);
-        var toRemove = _pendingInvitesByHostPuid.Keys.Where(puid => !activeHostPuids.Contains(puid)).ToList();
+        var activeHostPuids = new HashSet<string>(newSessions.Where(s => s.Type == SessionType.Friend).Select(s => s.FriendUserId), StringComparer.OrdinalIgnoreCase);
+        var toRemove = _pendingInvitesByFriendUserId.Keys.Where(puid => !activeHostPuids.Contains(puid)).ToList();
         foreach (var puid in toRemove)
         {
-            _pendingInvitesByHostPuid.Remove(puid);
+            _pendingInvitesByFriendUserId.Remove(puid);
+        }
+
+        if (!string.IsNullOrWhiteSpace(previousSelectionKey))
+        {
+            var restoredIndex = _sessions.FindIndex(s => string.Equals(BuildSessionKey(s), previousSelectionKey, StringComparison.Ordinal));
+            if (restoredIndex >= 0)
+                _selectedIndex = restoredIndex;
         }
 
         if (_selectedIndex >= _sessions.Count)
             _selectedIndex = _sessions.Count - 1;
         if (_selectedIndex < 0 && _sessions.Count > 0)
             _selectedIndex = 0;
-        
+
         _isRefreshing = false; // Stop refreshing after update completes
     }
 
@@ -1180,12 +1333,76 @@ public sealed class MultiplayerScreen : IScreen
         _font.DrawString(sb, text, pos, color);
     }
 
-    private static string Trunc(string s, int maxW)
+    private string FitTextToWidth(string text, int maxWidth, out bool trimmed)
     {
-        if (string.IsNullOrEmpty(s)) return s;
-        // Simple truncation - you could make this smarter with font measurement
-        if (s.Length <= maxW / 8) return s; // Rough estimate
-        return s.Substring(0, Math.Max(1, maxW / 8)) + "...";
+        text = (text ?? string.Empty).Trim();
+        trimmed = false;
+        if (string.IsNullOrEmpty(text) || maxWidth <= 8)
+            return text;
+
+        if (_font.MeasureString(text).X <= maxWidth)
+            return text;
+
+        trimmed = true;
+        const string Ellipsis = "...";
+        var low = 0;
+        var high = text.Length;
+        var best = Ellipsis;
+
+        while (low <= high)
+        {
+            var mid = (low + high) / 2;
+            var candidate = text.Substring(0, mid) + Ellipsis;
+            if (_font.MeasureString(candidate).X <= maxWidth)
+            {
+                best = candidate;
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return best;
+    }
+
+    private void UpdateHoveredSession()
+    {
+        _hoveredIndex = -1;
+        if (!_listBodyRect.Contains(_lastMousePos))
+            return;
+
+        var rowH = (int)(64 * 0.80f) + 4;
+        var idx = (int)((_lastMousePos.Y - _listBodyRect.Y) / rowH);
+        if (idx >= 0 && idx < _sessions.Count)
+            _hoveredIndex = idx;
+    }
+
+    private static string BuildSessionKey(SessionEntry entry)
+    {
+        var type = entry.Type.ToString();
+        var friendUserId = (entry.FriendUserId ?? string.Empty).Trim();
+        var joinTarget = (entry.JoinTarget ?? string.Empty).Trim();
+        var worldName = (entry.WorldName ?? string.Empty).Trim();
+        return $"{type}|{friendUserId}|{joinTarget}|{worldName}";
+    }
+
+    private static bool IsPresenceEligibleAsActiveHost(GatePresenceEntry presence)
+    {
+        if (presence == null)
+            return false;
+
+        var nowUtc = DateTime.UtcNow;
+        if (presence.ExpiresUtc != default && presence.ExpiresUtc <= nowUtc)
+            return false;
+        if (presence.UpdatedUtc != default && (nowUtc - presence.UpdatedUtc) > TimeSpan.FromSeconds(30))
+            return false;
+
+        var isHosting = presence.IsHosting && presence.IsInWorld;
+        if (!isHosting)
+            return false;
+        return !string.IsNullOrWhiteSpace(presence.JoinTarget);
     }
 
     private void DrawRefreshIcon(SpriteBatch sb, Rectangle rect, Color color)

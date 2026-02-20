@@ -535,9 +535,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     }
 
     private DateTime _nextWorldInvitePollUtc = DateTime.MinValue;
+    private DateTime _nextSessionHeartbeatUtc = DateTime.MinValue;
     private HashSet<string> _notifiedInviteKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _usernameCache = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _whitelist = new(StringComparer.OrdinalIgnoreCase);
+    private bool _sessionHeartbeatInFlight;
+    private int _sessionHeartbeatTickCount;
     private string WhitelistPath => Path.Combine(_worldPath, "whitelist.json");
 
     public void Update(GameTime gameTime, InputState input)
@@ -594,6 +597,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _nextWorldInvitePollUtc = DateTime.UtcNow.AddSeconds(5);
             _ = PollWorldInvitesAsync();
         }
+
+        TickHostedOnlineSessionHeartbeat();
 
         if (_commandStatusTimer > 0f)
         {
@@ -1083,14 +1088,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             foreach (var invite in result.Incoming)
             {
-                var senderPuid = (invite.SenderProductUserId ?? string.Empty).Trim();
-                var senderName = await ResolveUsernameAsync(senderPuid);
+                var senderUserId = (invite.SenderProductUserId ?? string.Empty).Trim();
+                var senderJoinTarget = (invite.SenderJoinTarget ?? string.Empty).Trim();
+                var senderName = await ResolveUsernameAsync(senderUserId);
 
                 if (invite.Status == "accepted")
                 {
                     if (_lanSession is EosP2PHostSession hostSession)
                     {
-                        hostSession.PreApprovePuid(senderPuid);
+                        var approvedPuid = string.IsNullOrWhiteSpace(senderJoinTarget) ? senderUserId : senderJoinTarget;
+                        hostSession.PreApprovePuid(approvedPuid);
                     }
                     continue;
                 }
@@ -1100,32 +1107,114 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 // Case-insensitive whitelist check for both name and PUID
                 var isWhitelisted = _whitelist.Any(w => 
                     string.Equals(w, senderName, StringComparison.OrdinalIgnoreCase) || 
-                    string.Equals(w, senderPuid, StringComparison.OrdinalIgnoreCase));
+                    string.Equals(w, senderUserId, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(senderJoinTarget) && string.Equals(w, senderJoinTarget, StringComparison.OrdinalIgnoreCase)));
 
                 if (isWhitelisted)
                 {
-                    _log.Info($"Auto-accepting whitelisted friend: {senderName} ({senderPuid})");
-                    _ = _onlineGate.RespondToWorldInviteAsync(senderPuid, "accepted");
+                    _log.Info($"Auto-accepting whitelisted friend: {senderName} ({senderUserId})");
+                    _ = _onlineGate.RespondToWorldInviteAsync(senderUserId, "accepted");
                     if (_lanSession is EosP2PHostSession hostSession)
                     {
-                        hostSession.PreApprovePuid(senderPuid);
+                        var approvedPuid = string.IsNullOrWhiteSpace(senderJoinTarget) ? senderUserId : senderJoinTarget;
+                        hostSession.PreApprovePuid(approvedPuid);
                     }
                     continue;
                 }
                 
-                var key = $"{senderPuid}:{invite.CreatedUtc.Ticks}";
+                var key = $"{senderUserId}:{invite.CreatedUtc.Ticks}";
                 if (_notifiedInviteKeys.Add(key))
                 {
                     var nameToShow = senderName;
                     AddChatLine($"{nameToShow} wants to join! Accept?", isSystem: true,
                         actionLabel: "ACCEPT",
-                        customActionToken: WorldInviteAcceptPrefix + senderPuid,
+                        customActionToken: WorldInviteAcceptPrefix + senderUserId,
                         customActionStatus: $"{nameToShow} joined.",
                         actionLabel2: "REJECT",
-                        customActionToken2: WorldInviteRejectPrefix + senderPuid,
+                        customActionToken2: WorldInviteRejectPrefix + senderUserId,
                         customActionStatus2: $"{nameToShow} rejected.");
                 }
             }
+        }
+    }
+
+    private void TickHostedOnlineSessionHeartbeat()
+    {
+        if (_lanSession is not EosP2PHostSession || !_lanSession.IsConnected)
+            return;
+
+        var nowUtc = DateTime.UtcNow;
+        if (_sessionHeartbeatInFlight || nowUtc < _nextSessionHeartbeatUtc)
+            return;
+
+        var eos = EnsureEosClient();
+        var hostPuid = (eos?.LocalProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostPuid))
+            return;
+
+        var worldName = (_meta?.Name ?? _world?.Meta?.Name ?? "WORLD").Trim();
+        if (string.IsNullOrWhiteSpace(worldName))
+            worldName = "WORLD";
+
+        var gameMode = (_meta?.CurrentWorldGameMode ?? _gameMode).ToString();
+        var displayName = _profile.GetDisplayUsername();
+        var playerCount = Math.Max(1, _playerNames.Count);
+        const int maxPlayers = 8;
+        var isInWorld = _hasLoadedWorld && !_worldSyncInProgress && !_isClosing;
+        var status = isInWorld ? $"Hosting {worldName}" : "Online";
+
+        _sessionHeartbeatInFlight = true;
+        var tick = ++_sessionHeartbeatTickCount;
+        _log.Info($"HOST_HEARTBEAT tick={tick} world={worldName} inWorld={isInWorld} players={playerCount}");
+        _ = SendHostedOnlineSessionHeartbeatAsync(
+            tick,
+            hostPuid,
+            displayName,
+            worldName,
+            gameMode,
+            status,
+            isInWorld,
+            playerCount,
+            maxPlayers);
+    }
+
+    private async Task SendHostedOnlineSessionHeartbeatAsync(
+        int tick,
+        string hostPuid,
+        string displayName,
+        string worldName,
+        string gameMode,
+        string status,
+        bool isInWorld,
+        int playerCount,
+        int maxPlayers)
+    {
+        try
+        {
+            var ok = await _onlineGate.HeartbeatPresenceAsync(
+                productUserId: hostPuid,
+                displayName: displayName,
+                isHosting: true,
+                worldName: worldName,
+                gameMode: gameMode,
+                joinTarget: hostPuid,
+                status: status,
+                isInWorld: isInWorld,
+                cheats: false,
+                playerCount: playerCount,
+                maxPlayers: maxPlayers);
+
+            _log.Info($"HOST_HEARTBEAT_RESULT tick={tick} ok={ok}");
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(ok ? 6 : 10);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"HOST_HEARTBEAT_RESULT tick={tick} ok=false error={ex.Message}");
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(10);
+        }
+        finally
+        {
+            _sessionHeartbeatInFlight = false;
         }
     }
 
@@ -4487,6 +4576,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        _log.Info($"HOST_CLICKED world={_world.Meta.Name} mode=pause_online transport=online");
         var eos = EnsureEosClient();
         if (eos == null)
         {
@@ -4671,7 +4761,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _chunkGenerationInFlight.Clear();
         if (_lanSession is EosP2PHostSession)
         {
-            _ = _onlineGate.StopHostingAsync(_profile.PlayerId);
+            var hostPuid = (EnsureEosClient()?.LocalProductUserId ?? string.Empty).Trim();
+            _log.Info($"HOST_STOP requested hasProductUserId={!string.IsNullOrWhiteSpace(hostPuid)}");
+            _ = _onlineGate.StopHostingAsync(hostPuid);
             WorldHostBootstrap.TryClearHostingPresence(_log, EnsureEosClient());
         }
         _lanSession?.Dispose();
@@ -8408,7 +8500,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var invite = invites.Incoming.FirstOrDefault(i => 
             (string.Equals(i.SenderDisplayName, username, StringComparison.OrdinalIgnoreCase) || 
-             string.Equals(i.SenderProductUserId, username, StringComparison.OrdinalIgnoreCase)) && 
+             string.Equals(i.SenderProductUserId, username, StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(i.SenderJoinTarget, username, StringComparison.OrdinalIgnoreCase)) && 
             i.Status == "pending");
             
         if (invite == null)
@@ -8427,7 +8520,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             if (response == "accepted" && _lanSession is EosP2PHostSession hostSession)
             {
-                hostSession.PreApprovePuid(invite.SenderProductUserId);
+                var approvedPuid = string.IsNullOrWhiteSpace(invite.SenderJoinTarget)
+                    ? invite.SenderProductUserId
+                    : invite.SenderJoinTarget;
+                hostSession.PreApprovePuid(approvedPuid);
             }
         }
         else

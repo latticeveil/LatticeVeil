@@ -30,6 +30,7 @@ public static class WorldHostBootstrap
 
             var discovery = new LanDiscovery(log);
             discovery.StartBroadcast(meta.Name, GetBuildVersion(), serverPort, meta.CurrentWorldGameMode.ToString());
+            log.Info($"LAN_HOST_ADVERTISE_START world={meta.Name} port={serverPort} mode={meta.CurrentWorldGameMode}");
 
             ILanSession session = new LanDiscoveryHostSession(hostSession, discovery);
             return WorldHostStartResult.CreateSuccess(session, world);
@@ -65,6 +66,7 @@ public static class WorldHostBootstrap
 
             var meta = world.Meta;
             var hostName = profile.GetDisplayUsername();
+            log.Info($"HOST_CLICKED world={meta.Name} mode={meta.CurrentWorldGameMode} transport=online");
             var session = new EosP2PHostSession(log, eosClient, hostName, BuildWorldInfo(meta), world);
 
             _ = eosClient.SetHostingPresenceAsync(meta.Name, true);
@@ -97,6 +99,7 @@ public static class WorldHostBootstrap
 
             var discovery = new LanDiscovery(log);
             discovery.StartBroadcast(meta.Name, GetBuildVersion(), serverPort, meta.CurrentWorldGameMode.ToString());
+            log.Info($"LAN_HOST_ADVERTISE_START world={meta.Name} port={serverPort} mode={meta.CurrentWorldGameMode}");
 
             ILanSession session = new LanDiscoveryHostSession(hostSession, discovery);
             return WorldHostStartResult.CreateSuccess(session, world);
@@ -129,6 +132,7 @@ public static class WorldHostBootstrap
         {
             var meta = world.Meta;
             var hostName = profile.GetDisplayUsername();
+            log.Info($"HOST_CLICKED world={meta.Name} mode={meta.CurrentWorldGameMode} transport=online");
             var session = new EosP2PHostSession(log, eosClient, hostName, BuildWorldInfo(meta), world);
 
             _ = eosClient.SetHostingPresenceAsync(meta.Name, true);
@@ -167,25 +171,47 @@ public static class WorldHostBootstrap
         try
         {
             var gate = OnlineGateClient.GetOrCreate();
+            if (!gate.EnsureTicket(log))
+            {
+                log.Warn("HOST_ADVERTISE skipped: unable to ensure online ticket for presence signaling.");
+                return;
+            }
+
             var identity = EosIdentityStore.LoadOrCreate(log);
             var puid = eos.LocalProductUserId;
             var displayName = identity.GetDisplayNameOrDefault(puid ?? "Player");
+            if (string.IsNullOrWhiteSpace(puid))
+            {
+                log.Warn("HOST_ADVERTISE skipped: local product user id is missing.");
+                return;
+            }
 
-            await gate.UpsertPresenceAsync(
-                productUserId: puid,
-                displayName: displayName,
-                isHosting: hosting,
-                worldName: meta?.Name,
-                gameMode: meta?.CurrentWorldGameMode.ToString(),
-                joinTarget: puid, // For P2P, join target is the host's PUID
-                status: hosting ? $"Hosting {meta?.Name}" : "Online",
-                cheats: false, // TODO: derive from world/host settings
-                playerCount: 1, // TODO: derive from current player count
-                maxPlayers: 8); // TODO: derive from world/host settings
+            bool ok;
+            if (hosting)
+            {
+                ok = await gate.UpsertPresenceAsync(
+                    productUserId: puid,
+                    displayName: displayName,
+                    isHosting: true,
+                    worldName: meta?.Name,
+                    gameMode: meta?.CurrentWorldGameMode.ToString(),
+                    joinTarget: puid, // For P2P, join target is the host's PUID
+                    status: $"Hosting {meta?.Name}",
+                    cheats: false,
+                    playerCount: 1,
+                    maxPlayers: 8,
+                    isInWorld: false);
+            }
+            else
+            {
+                ok = await gate.StopHostingAsync(puid);
+            }
+
+            log.Info($"HOST_ADVERTISE { (hosting ? "start" : "stop") } ok={ok} world={meta?.Name ?? "N/A"} transport=EOS_P2P+SUPABASE_PRESENCE");
         }
         catch (Exception ex)
         {
-            log.Warn($"Failed to update central gate presence: {ex.Message}");
+            log.Warn($"Failed to update online presence signaling: {ex.Message}");
         }
     }
 
