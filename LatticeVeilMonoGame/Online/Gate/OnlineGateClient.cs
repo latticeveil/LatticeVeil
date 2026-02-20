@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -25,6 +26,12 @@ public class OnlineGateClient
     private const string DefaultGateUrl = "https://eos-service.onrender.com";
     private const string DefaultVeilnetUrl = "https://veilnet.onrender.com";
     private static readonly TimeSpan DefaultTicketTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan[] TicketRetryDelays =
+    {
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(1500),
+        TimeSpan.FromMilliseconds(3000)
+    };
 
     /// <summary>
     /// Admin-only: submits the current build hash for runtime allowlist approval.
@@ -166,8 +173,9 @@ public class OnlineGateClient
 
     public enum TicketCheckStatus
     {
-        Verified,
+        VerifiedAndTicketIssued,
         HashMismatch,
+        MisconfiguredEndpoint,
         ServiceUnavailable,
         Unauthorized,
         BadResponse
@@ -240,7 +248,7 @@ public class OnlineGateClient
                 return new TicketCheckResult
                 {
                     Ok = true,
-                    Status = TicketCheckStatus.Verified,
+                    Status = TicketCheckStatus.VerifiedAndTicketIssued,
                     Message = "Ticket already valid."
                 };
             }
@@ -248,22 +256,18 @@ public class OnlineGateClient
             using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
             try
             {
-                var ok = Task.Run(() => EnsureTicketAsync(log, cts.Token, target)).GetAwaiter().GetResult();
-                if (ok)
-                {
-                    return new TicketCheckResult
-                    {
-                        Ok = true,
-                        Status = TicketCheckStatus.Verified,
-                        Message = "Ticket approved."
-                    };
-                }
-
+                var result = Task.Run(() => EnsureTicketAsync(log, cts.Token, target)).GetAwaiter().GetResult();
+                _denialReason = result.Ok ? string.Empty : result.Message;
+                return result;
+            }
+            catch (OperationCanceledException ex)
+            {
+                _denialReason = ex.Message;
                 return new TicketCheckResult
                 {
                     Ok = false,
-                    Status = ClassifyTicketFailure(_denialReason),
-                    Message = string.IsNullOrWhiteSpace(_denialReason) ? "Ticket denied." : _denialReason
+                    Status = TicketCheckStatus.ServiceUnavailable,
+                    Message = "Ticket request timed out."
                 };
             }
             catch (Exception ex)
@@ -273,7 +277,7 @@ public class OnlineGateClient
                 {
                     Ok = false,
                     Status = TicketCheckStatus.ServiceUnavailable,
-                    Message = ex.Message
+                    Message = $"Ticket request failed: {ex.Message}"
                 };
             }
         }
@@ -547,27 +551,536 @@ public class OnlineGateClient
         catch (Exception ex) { denialReason = ex.Message; return false; }
     }
 
-    private async Task<bool> EnsureTicketAsync(Logger log, CancellationToken ct, string? target)
+    private async Task<TicketCheckResult> EnsureTicketAsync(Logger log, CancellationToken ct, string? target)
     {
         if (!TryComputeExecutableHash(target, out var executablePath, out var hash))
         {
             _denialReason = "Unable to compute executable hash.";
-            return false;
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.BadResponse,
+                Message = _denialReason
+            };
         }
 
         log.Info($"Executable path used for hash: {executablePath}");
         log.Info($"Computed EXE SHA256: {hash}");
 
         var eos = EosClientProvider.Current;
-        var request = new { ProductUserId = eos?.LocalProductUserId, DisplayName = "Player", BuildFlavor = _buildFlavor, ExeHash = hash };
-        var (ok, res, err) = await PostAsync<object, GateTicketResponse>($"{_gateUrl}/ticket", request, ct).ConfigureAwait(false);
-        if (!ok || res?.Ok != true) { _denialReason = res?.Reason ?? err ?? "Gate denied."; return false; }
-        _ticket = res.Ticket ?? "";
-        if (DateTimeOffset.TryParse(res.ExpiresUtc, out var exp)) _ticketExpiresUtc = exp.UtcDateTime;
-        else _ticketExpiresUtc = DateTime.UtcNow.AddMinutes(25);
-        _ticketProductUserId = eos?.LocalProductUserId ?? "";
-        _status = "VERIFIED";
-        return true;
+        var payload = new
+        {
+            ProductUserId = eos?.LocalProductUserId,
+            DisplayName = "Player",
+            BuildFlavor = _buildFlavor,
+            ExeHash = hash
+        };
+
+        var endpointCandidates = ResolveTicketEndpointCandidates(_gateUrl);
+        if (endpointCandidates.Count == 0)
+        {
+            _denialReason = "Gate endpoint misconfigured: no ticket endpoint URL could be resolved.";
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = _denialReason
+            };
+        }
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        var lastResult = new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.MisconfiguredEndpoint,
+            Message = "Gate endpoint misconfigured."
+        };
+
+        for (var i = 0; i < endpointCandidates.Count; i++)
+        {
+            var endpointUrl = endpointCandidates[i];
+            var isSupabaseFunctions = IsSupabaseFunctionsEndpoint(endpointUrl);
+            if (isSupabaseFunctions && string.IsNullOrWhiteSpace(anonKey))
+            {
+                lastResult = new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.MisconfiguredEndpoint,
+                    Message = "Gate endpoint misconfigured: SUPABASE_ANON_KEY is missing for function invocation."
+                };
+                _denialReason = lastResult.Message;
+                log.Warn($"[gate] ticket config issue url={endpointUrl}: {lastResult.Message}");
+                continue;
+            }
+
+            lastResult = await RequestTicketWithRetriesAsync(
+                log,
+                endpointUrl,
+                payload,
+                isSupabaseFunctions,
+                accessToken,
+                anonKey,
+                ct).ConfigureAwait(false);
+
+            if (lastResult.Ok)
+                return lastResult;
+
+            if (lastResult.Status != TicketCheckStatus.MisconfiguredEndpoint || i == endpointCandidates.Count - 1)
+                return lastResult;
+
+            log.Warn($"[gate] ticket endpoint fallback after misconfigured result at {endpointUrl}");
+        }
+
+        return lastResult;
+    }
+
+    private async Task<TicketCheckResult> RequestTicketWithRetriesAsync(
+        Logger log,
+        string endpointUrl,
+        object payload,
+        bool isSupabaseFunctions,
+        string accessToken,
+        string anonKey,
+        CancellationToken ct)
+    {
+        var maxAttempts = TicketRetryDelays.Length;
+        TicketCheckResult lastResult = new()
+        {
+            Ok = false,
+            Status = TicketCheckStatus.ServiceUnavailable,
+            Message = "Ticket request failed."
+        };
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            lastResult = await RequestTicketOnceAsync(
+                log,
+                endpointUrl,
+                payload,
+                isSupabaseFunctions,
+                accessToken,
+                anonKey,
+                attempt + 1,
+                maxAttempts,
+                ct).ConfigureAwait(false);
+
+            if (lastResult.Ok)
+                return lastResult;
+
+            if (lastResult.Status != TicketCheckStatus.ServiceUnavailable || attempt == maxAttempts - 1)
+                return lastResult;
+
+            var baseDelay = TicketRetryDelays[attempt];
+            var jitterMs = Random.Shared.Next(50, 250);
+            var retryDelay = baseDelay + TimeSpan.FromMilliseconds(jitterMs);
+            log.Warn($"[gate] ticket retry in {retryDelay.TotalMilliseconds:0}ms after ServiceUnavailable (attempt {attempt + 1}/{maxAttempts}).");
+            await Task.Delay(retryDelay, ct).ConfigureAwait(false);
+        }
+
+        return lastResult;
+    }
+
+    private async Task<TicketCheckResult> RequestTicketOnceAsync(
+        Logger log,
+        string endpointUrl,
+        object payload,
+        bool isSupabaseFunctions,
+        string accessToken,
+        string anonKey,
+        int attempt,
+        int maxAttempts,
+        CancellationToken ct)
+    {
+        var serialized = JsonSerializer.Serialize(payload, JsonOptions);
+        log.Info($"[gate] ticket request attempt {attempt}/{maxAttempts} url={endpointUrl}");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpointUrl)
+        {
+            Content = new StringContent(serialized, Encoding.UTF8, "application/json")
+        };
+
+        if (isSupabaseFunctions)
+        {
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+        }
+
+        try
+        {
+            using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
+            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var snippet = TrimSnippet(responseBody, 200);
+            var statusCode = (int)response.StatusCode;
+            log.Info($"[gate] ticket response url={endpointUrl} status={statusCode} body=\"{snippet}\"");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return BuildStatusFromHttpFailure(response.StatusCode, responseBody);
+            }
+
+            if (string.IsNullOrWhiteSpace(responseBody))
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned an empty response."
+                };
+            }
+
+            GateTicketResponse? parsed;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<GateTicketResponse>(responseBody, JsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                log.Warn($"[gate] ticket parse error ({ex.GetType().Name}): {ex.Message}");
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned non-JSON or malformed JSON."
+                };
+            }
+
+            if (parsed == null)
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned an empty JSON payload."
+                };
+            }
+
+            if (parsed.Ok != true)
+            {
+                var reason = (parsed.Reason ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(reason)
+                    && responseBody.Contains("Hello from Functions", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new TicketCheckResult
+                    {
+                        Ok = false,
+                        Status = TicketCheckStatus.MisconfiguredEndpoint,
+                        Message = "Online ticket service not deployed/configured."
+                    };
+                }
+
+                var mapped = BuildStatusFromReason(reason);
+                return mapped;
+            }
+
+            var ticket = (parsed.Ticket ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(ticket))
+            {
+                var appearsUnimplemented =
+                    responseBody.Contains("Hello from Functions", StringComparison.OrdinalIgnoreCase)
+                    || responseBody.Contains("not deployed", StringComparison.OrdinalIgnoreCase)
+                    || responseBody.Contains("not configured", StringComparison.OrdinalIgnoreCase);
+
+                if (appearsUnimplemented)
+                {
+                    return new TicketCheckResult
+                    {
+                        Ok = false,
+                        Status = TicketCheckStatus.MisconfiguredEndpoint,
+                        Message = "Online ticket service not deployed/configured."
+                    };
+                }
+
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket response is missing the ticket value."
+                };
+            }
+
+            _ticket = ticket;
+            if (DateTimeOffset.TryParse(parsed.ExpiresUtc, out var expires))
+                _ticketExpiresUtc = expires.UtcDateTime;
+            else
+                _ticketExpiresUtc = DateTime.UtcNow.AddMinutes(25);
+
+            _ticketProductUserId = EosClientProvider.Current?.LocalProductUserId ?? "";
+            _status = "VERIFIED";
+            _denialReason = string.Empty;
+
+            return new TicketCheckResult
+            {
+                Ok = true,
+                Status = TicketCheckStatus.VerifiedAndTicketIssued,
+                Message = "Ticket issued."
+            };
+        }
+        catch (Exception ex)
+        {
+            var status = BuildStatusFromException(ex);
+            log.Warn($"[gate] ticket request exception url={endpointUrl} type={ex.GetType().Name} message={ex.Message}");
+            return status;
+        }
+    }
+
+    private static TicketCheckResult BuildStatusFromHttpFailure(HttpStatusCode statusCode, string body)
+    {
+        var bodyText = (body ?? string.Empty).Trim();
+        var message = $"Ticket request failed (HTTP {(int)statusCode}).";
+
+        if (statusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Gate endpoint misconfigured (ticket route missing or wrong HTTP method)."
+            };
+        }
+
+        if (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.Unauthorized,
+                Message = "Online auth failed. Please re-login."
+            };
+        }
+
+        if (statusCode is HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout
+            or HttpStatusCode.RequestTimeout
+            or HttpStatusCode.TooManyRequests)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if ((int)statusCode >= 500)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if (bodyText.Contains("function not found", StringComparison.OrdinalIgnoreCase)
+            || bodyText.Contains("not deployed", StringComparison.OrdinalIgnoreCase))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Online ticket service not deployed/configured."
+            };
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.BadResponse,
+            Message = message
+        };
+    }
+
+    private static TicketCheckResult BuildStatusFromReason(string reason)
+    {
+        var normalized = (reason ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.BadResponse,
+                Message = "Ticket endpoint denied the request."
+            };
+        }
+
+        if (ContainsAny(normalized, "not found", "route", "endpoint", "method", "not deployed", "not configured"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Gate endpoint misconfigured."
+            };
+        }
+
+        if (ContainsAny(normalized, "unauthorized", "forbidden", "401", "403", "auth"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.Unauthorized,
+                Message = "Online auth failed. Please re-login."
+            };
+        }
+
+        if (ContainsAny(normalized, "service unavailable", "timeout", "timed out", "network", "connection", "temporarily unavailable", "dns", "5"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if (ContainsAny(normalized, "hash", "allowlist", "unofficial", "not allowed", "rejected", "denied"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.HashMismatch,
+                Message = string.IsNullOrWhiteSpace(reason) ? "Build hash rejected." : reason
+            };
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.BadResponse,
+            Message = reason
+        };
+    }
+
+    private static TicketCheckResult BuildStatusFromException(Exception ex)
+    {
+        if (ex is TaskCanceledException or OperationCanceledException)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services timed out."
+            };
+        }
+
+        if (ex is HttpRequestException httpEx)
+        {
+            if (httpEx.StatusCode.HasValue)
+                return BuildStatusFromHttpFailure(httpEx.StatusCode.Value, string.Empty);
+
+            if (httpEx.InnerException is SocketException)
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.ServiceUnavailable,
+                    Message = "Online services are unreachable."
+                };
+            }
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.ServiceUnavailable,
+            Message = "Online services unavailable right now."
+        };
+    }
+
+    private static void ApplyTicketFunctionHeaders(HttpRequestMessage request, string accessToken, string anonKey)
+    {
+        if (!string.IsNullOrWhiteSpace(anonKey))
+            request.Headers.TryAddWithoutValidation("apikey", anonKey);
+
+        var bearer = !string.IsNullOrWhiteSpace(accessToken) ? accessToken : anonKey;
+        if (!string.IsNullOrWhiteSpace(bearer))
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
+    }
+
+    private static List<string> ResolveTicketEndpointCandidates(string baseUrl)
+    {
+        var candidates = new List<string>();
+
+        var explicitUrl = (Environment.GetEnvironmentVariable("LV_GATE_TICKET_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(explicitUrl))
+        {
+            candidates.Add(explicitUrl.TrimEnd('/'));
+            return candidates;
+        }
+
+        var normalizedBase = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(normalizedBase))
+            return candidates;
+
+        if (normalizedBase.EndsWith("/ticket", StringComparison.OrdinalIgnoreCase)
+            || normalizedBase.EndsWith("/online-ticket", StringComparison.OrdinalIgnoreCase))
+        {
+            candidates.Add(normalizedBase);
+            return candidates;
+        }
+
+        var explicitPath = (Environment.GetEnvironmentVariable("LV_GATE_TICKET_PATH") ?? string.Empty).Trim().Trim('/');
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+        {
+            candidates.Add($"{normalizedBase}/{explicitPath}");
+            return candidates;
+        }
+
+        var isSupabase = IsSupabaseFunctionsEndpoint(normalizedBase);
+        if (isSupabase)
+        {
+            candidates.Add($"{normalizedBase}/online-ticket");
+            candidates.Add($"{normalizedBase}/ticket");
+        }
+        else
+        {
+            candidates.Add($"{normalizedBase}/ticket");
+            candidates.Add($"{normalizedBase}/online-ticket");
+        }
+
+        return candidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static bool IsSupabaseFunctionsEndpoint(string url)
+    {
+        var value = (url ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.Contains(".supabase.co/functions/v1", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ResolveSupabaseAnonKey()
+    {
+        var keys = new[]
+        {
+            "LV_SUPABASE_ANON_KEY",
+            "SUPABASE_ANON_KEY",
+            "VEILNET_SUPABASE_ANON_KEY"
+        };
+
+        for (var i = 0; i < keys.Length; i++)
+        {
+            var value = (Environment.GetEnvironmentVariable(keys[i]) ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return string.Empty;
+    }
+
+    private static string ResolveVeilnetAccessToken()
+    {
+        return (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+    }
+
+    private static string TrimSnippet(string value, int maxLen)
+    {
+        var normalized = (value ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (normalized.Length <= maxLen)
+            return normalized;
+        return normalized.Substring(0, maxLen);
     }
 
     private async Task<(bool, T?, string?)> PostAsync<TReq, T>(string url, TReq req, CancellationToken ct) where T : class { try { var j = JsonSerializer.Serialize(req, JsonOptions); using var c = new StringContent(j, Encoding.UTF8, "application/json"); var r = await Http.PostAsync(url, c, ct).ConfigureAwait(false); if (!r.IsSuccessStatusCode) return (false, null, r.ReasonPhrase); var b = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false); return (true, JsonSerializer.Deserialize<T>(b, JsonOptions), null); } catch (Exception e) { return (false, null, e.Message); } }
@@ -575,26 +1088,21 @@ public class OnlineGateClient
     private async Task<(bool, T?, string?)> GetAuthorizedAsync<T>(string url, CancellationToken ct) where T : class { if (string.IsNullOrWhiteSpace(_ticket)) return (false, null, "No ticket"); try { using var m = new HttpRequestMessage(HttpMethod.Get, url); m.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _ticket); var r = await Http.SendAsync(m, ct).ConfigureAwait(false); if (!r.IsSuccessStatusCode) return (false, null, r.ReasonPhrase); var b = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false); return (true, JsonSerializer.Deserialize<T>(b, JsonOptions), null); } catch (Exception e) { return (false, null, e.Message); } }
 
     private static HttpClient CreateHttpClient() { var h = new HttpClientHandler(); if (h.SupportsAutomaticDecompression) h.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate; return new HttpClient(h) { Timeout = TimeSpan.FromSeconds(30) }; }
-    private static string ResolveGateUrl() => Environment.GetEnvironmentVariable("LV_GATE_URL")?.TrimEnd('/') ?? DefaultGateUrl;
+    private static string ResolveGateUrl()
+    {
+        var explicitGate = (Environment.GetEnvironmentVariable("LV_GATE_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(explicitGate))
+            return explicitGate.TrimEnd('/');
+
+        var veilnetFunctions = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(veilnetFunctions))
+            return veilnetFunctions.TrimEnd('/');
+
+        return DefaultGateUrl;
+    }
     private static bool ParseBool(string? v) => v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
     private void InvalidateTicket() { _ticket = ""; _ticketExpiresUtc = DateTime.MinValue; }
     private bool HasUsableTicketForCurrentIdentity() => HasValidTicket && string.Equals(_ticketProductUserId, EosClientProvider.Current?.LocalProductUserId ?? "", StringComparison.Ordinal);
-
-    private static TicketCheckStatus ClassifyTicketFailure(string? reason)
-    {
-        var value = (reason ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(value))
-            return TicketCheckStatus.BadResponse;
-
-        if (ContainsAny(value, "service unavailable", "timeout", "timed out", "network", "connection", "temporarily unavailable", "http", "dns"))
-            return TicketCheckStatus.ServiceUnavailable;
-        if (ContainsAny(value, "unauthorized", "forbidden", "401", "403", "auth"))
-            return TicketCheckStatus.Unauthorized;
-        if (ContainsAny(value, "hash", "allowlist", "unofficial", "not allowed", "rejected", "denied"))
-            return TicketCheckStatus.HashMismatch;
-
-        return TicketCheckStatus.BadResponse;
-    }
 
     private static bool ContainsAny(string source, params string[] tokens)
     {

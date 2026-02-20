@@ -187,6 +187,7 @@ public sealed class LauncherForm : Form
     {
         Verified,
         HashMismatch,
+        MisconfiguredEndpoint,
         ServiceUnavailable,
         Unauthorized,
         BadResponse,
@@ -1545,12 +1546,16 @@ public sealed class LauncherForm : Form
                     var detail = startupState switch
                     {
                         OnlineStartupState.HashMismatch => "Official build verified, but gate rejected this hash. Online temporarily unavailable. LAN/offline still available.",
-                        OnlineStartupState.Unauthorized => "Official build verified, but online services rejected authorization. LAN/offline still available.",
+                        OnlineStartupState.MisconfiguredEndpoint => "Online not configured (endpoint missing/wrong). LAN/offline available.",
+                        OnlineStartupState.Unauthorized => "Online auth failed. Please re-login. LAN/offline available.",
                         OnlineStartupState.BadResponse => "Official build verified, but online services returned an invalid response. LAN/offline still available.",
                         _ => "Official build verified, but online services are unavailable right now. Try again later. LAN/offline still available."
                     };
 
-                    SetProgress(100, "Online services unavailable");
+                    var progressText = startupState == OnlineStartupState.MisconfiguredEndpoint
+                        ? "Online endpoint misconfigured"
+                        : "Online services unavailable";
+                    SetProgress(100, progressText);
                     ApplyOnlineStartupState(
                         startupState,
                         detail,
@@ -1614,6 +1619,7 @@ public sealed class LauncherForm : Form
     {
         return status switch
         {
+            OnlineGateClient.TicketCheckStatus.MisconfiguredEndpoint => OnlineStartupState.MisconfiguredEndpoint,
             OnlineGateClient.TicketCheckStatus.HashMismatch => OnlineStartupState.HashMismatch,
             OnlineGateClient.TicketCheckStatus.Unauthorized => OnlineStartupState.Unauthorized,
             OnlineGateClient.TicketCheckStatus.BadResponse => OnlineStartupState.BadResponse,
