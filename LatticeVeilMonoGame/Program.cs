@@ -86,6 +86,9 @@ public static class Program
 
         var forceLauncher = HasArg(args, "--launcher");
         var runGame = !forceLauncher && IsGameEntry(args);
+        var startupLinkCode = LauncherProtocolLinking.TryExtractLinkCodeFromArgs(args);
+        if (!string.IsNullOrWhiteSpace(startupLinkCode))
+            log.Info("Launcher deep-link code detected from protocol URL.");
 
         if (runGame)
         {
@@ -269,9 +272,10 @@ public static class Program
         log.Info("Starting LAUNCHER mode.");
         try
         {
+            LauncherProtocolLinking.TryEnsureProtocolRegistration(log);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new LauncherForm(log, profile));
+            Application.Run(new LauncherForm(log, profile, startupLinkCode));
             log.Info("Launcher: Application.Run finished.");
         }
         catch (Exception ex)

@@ -153,6 +153,7 @@ public sealed class LauncherForm : Form
     private bool _veilnetAutoLoginAttempted;
     private VeilnetClient? _veilnetClient;
     private string _veilnetFunctionsBaseUrl = string.Empty;
+    private readonly string _startupLinkCode;
     private readonly OfficialBuildVerifier _officialBuildVerifier;
     private readonly LauncherRuntimeConfig _launcherRuntimeConfig;
 
@@ -195,11 +196,12 @@ public sealed class LauncherForm : Form
         ComputeFailed
     }
 
-    public LauncherForm(Logger log, PlayerProfile profile)
+    public LauncherForm(Logger log, PlayerProfile profile, string? startupLinkCode = null)
     {
         _log = log;
         _profile = profile;
         _settings = GameSettings.LoadOrCreate(_log);
+        _startupLinkCode = (startupLinkCode ?? string.Empty).Trim();
         _launcherRuntimeConfig = LauncherRuntimeConfig.Load(_log);
         _officialBuildVerifier = new OfficialBuildVerifier(_log, GetGameHashesGetUrl());
         _assetInstaller = new AssetPackInstaller(_log);
@@ -277,7 +279,12 @@ public sealed class LauncherForm : Form
 
         // Kick off startup checks after the window is shown.
         // (Constructors cannot be async, and we want the UI visible before any network-bound checks.)
-        Shown += async (_, _) => await BeginStartupOnlineChecks();
+        Shown += async (_, _) =>
+        {
+            var startupChecksTask = BeginStartupOnlineChecks();
+            var deepLinkTask = TryConsumeStartupLinkCodeAsync();
+            await Task.WhenAll(startupChecksTask, deepLinkTask);
+        };
 
         _log.Info("Launcher UI ready.");
     }
@@ -623,12 +630,45 @@ public sealed class LauncherForm : Form
                 return;
             }
 
-            var exchange = await GetVeilnetClient().ExchangeCodeAsync(code).ConfigureAwait(false);
+            var exchange = await LinkVeilnetWithCodeAsync(code).ConfigureAwait(false);
+            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: linked as {exchange.Username}")));
+        }
+        catch (Exception ex)
+        {
+            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: {ex.Message}")));
+        }
+        finally
+        {
+            BeginInvoke(new Action(() => _hubGoogleBtn.Enabled = true));
+        }
+    }
 
-            Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", exchange.Username);
-            Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", exchange.Token);
-            TrySaveVeilnetAuth(exchange.Username, exchange.Token, exchange.UserId);
+    private async Task<VeilnetClient.ExchangeResponse> LinkVeilnetWithCodeAsync(string code)
+    {
+        var exchange = await GetVeilnetClient().ExchangeCodeAsync(code).ConfigureAwait(false);
 
+        Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", exchange.Username);
+        Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", exchange.Token);
+        TrySaveVeilnetAuth(exchange.Username, exchange.Token, exchange.UserId);
+
+        BeginInvoke(new Action(() => RefreshVeilnetLoginVisuals(exchange.Username)));
+        return exchange;
+    }
+
+    private async Task TryConsumeStartupLinkCodeAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_startupLinkCode))
+            return;
+
+        try
+        {
+            BeginInvoke(new Action(() =>
+            {
+                _hubGoogleBtn.Enabled = false;
+                UpdateHubStatus("Veilnet: processing launcher link code...");
+            }));
+
+            var exchange = await LinkVeilnetWithCodeAsync(_startupLinkCode).ConfigureAwait(false);
             BeginInvoke(new Action(() =>
             {
                 RefreshVeilnetLoginVisuals(exchange.Username);
@@ -637,7 +677,8 @@ public sealed class LauncherForm : Form
         }
         catch (Exception ex)
         {
-            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: {ex.Message}")));
+            _log.Warn($"Veilnet deep-link exchange failed: {ex.Message}");
+            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: deep-link failed ({ex.Message})")));
         }
         finally
         {
