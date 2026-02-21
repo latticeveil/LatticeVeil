@@ -115,6 +115,20 @@ public sealed class EosP2PHostSession : ILanSession
 #endif
     }
 
+    public bool RevokePuidPreApproval(string puid)
+    {
+#if EOS_SDK
+        if (string.IsNullOrWhiteSpace(puid))
+            return false;
+
+        var key = puid.Trim();
+        lock (_clientLock)
+            return _sociallyApprovedPuids.Remove(key);
+#else
+        return false;
+#endif
+    }
+
     public void SendBlockSet(int x, int y, int z, byte id)
     {
 #if EOS_SDK
@@ -664,16 +678,35 @@ public sealed class EosP2PHostSession : ILanSession
         {
             if (_sociallyApprovedPuids.Contains(key))
             {
-                _log.Info($"EOS P2P: Auto-approving pre-approved peer {key}.");
-                
-                // We MUST ensure they are in the pending dictionary for ApproveJoinRequest to find them
-                if (!_pendingJoinByPeer.ContainsKey(key))
+                if (!_pendingJoinByPeer.TryGetValue(key, out var pendingApproved))
                 {
-                    _pendingJoinByPeer[key] = new PendingJoinState(peerId, name);
+                    pendingApproved = new PendingJoinState(peerId, name);
+                    _pendingJoinByPeer[key] = pendingApproved;
                 }
-                
-                // Run on a thread to avoid deadlocking the pump
-                Task.Run(() => ApproveJoinRequest(key));
+                else if (!string.IsNullOrWhiteSpace(name))
+                {
+                    pendingApproved.Name = name.Trim();
+                }
+
+                if (pendingApproved.ApprovalQueued)
+                    return;
+
+                pendingApproved.ApprovalQueued = true;
+                _log.Info($"EOS P2P: Auto-approving pre-approved peer {key}.");
+
+                // Run on a thread to avoid deadlocking the pump. Keep single-flight semantics per peer.
+                Task.Run(() =>
+                {
+                    var ok = ApproveJoinRequest(key);
+                    if (ok)
+                        return;
+
+                    lock (_clientLock)
+                    {
+                        if (_pendingJoinByPeer.TryGetValue(key, out var pending) && pending != null)
+                            pending.ApprovalQueued = false;
+                    }
+                });
                 return;
             }
 
@@ -933,6 +966,7 @@ public sealed class EosP2PHostSession : ILanSession
         public ProductUserId PeerId { get; }
         public string Key { get; }
         public string Name { get; set; }
+        public bool ApprovalQueued { get; set; }
     }
 #endif
 }

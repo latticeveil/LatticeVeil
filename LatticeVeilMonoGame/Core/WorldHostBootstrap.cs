@@ -70,7 +70,7 @@ public static class WorldHostBootstrap
             var session = new EosP2PHostSession(log, eosClient, hostName, BuildWorldInfo(meta), world);
 
             _ = eosClient.SetHostingPresenceAsync(meta.Name, true);
-            _ = UpdateGatePresenceAsync(log, eosClient, meta, true);
+            _ = UpdateHostedLobbyAdvertisementAsync(log, eosClient, meta, true, hostName, true);
 
             return WorldHostStartResult.CreateSuccess(session, world);
         }
@@ -136,7 +136,7 @@ public static class WorldHostBootstrap
             var session = new EosP2PHostSession(log, eosClient, hostName, BuildWorldInfo(meta), world);
 
             _ = eosClient.SetHostingPresenceAsync(meta.Name, true);
-            _ = UpdateGatePresenceAsync(log, eosClient, meta, true);
+            _ = UpdateHostedLobbyAdvertisementAsync(log, eosClient, meta, true, hostName, true);
 
             return WorldHostStartResult.CreateSuccess(session, world);
         }
@@ -155,7 +155,7 @@ public static class WorldHostBootstrap
         try
         {
             _ = eosClient.SetHostingPresenceAsync(null, false);
-            _ = UpdateGatePresenceAsync(log, eosClient, null, false);
+            _ = UpdateHostedLobbyAdvertisementAsync(log, eosClient, null, false, null, false);
         }
         catch (Exception ex)
         {
@@ -163,55 +163,46 @@ public static class WorldHostBootstrap
         }
     }
 
-    private static async Task UpdateGatePresenceAsync(Logger log, EosClient? eos, WorldMeta? meta, bool hosting)
+    private static async Task UpdateHostedLobbyAdvertisementAsync(
+        Logger log,
+        EosClient? eos,
+        WorldMeta? meta,
+        bool hosting,
+        string? hostUsername,
+        bool isInWorld)
     {
         if (eos == null || !eos.IsLoggedIn)
             return;
 
         try
         {
-            var gate = OnlineGateClient.GetOrCreate();
-            if (!gate.EnsureTicket(log))
-            {
-                log.Warn("HOST_ADVERTISE skipped: unable to ensure online ticket for presence signaling.");
-                return;
-            }
-
-            var identity = EosIdentityStore.LoadOrCreate(log);
-            var puid = eos.LocalProductUserId;
-            var displayName = identity.GetDisplayNameOrDefault(puid ?? "Player");
-            if (string.IsNullOrWhiteSpace(puid))
-            {
-                log.Warn("HOST_ADVERTISE skipped: local product user id is missing.");
-                return;
-            }
-
             bool ok;
             if (hosting)
             {
-                ok = await gate.UpsertPresenceAsync(
-                    productUserId: puid,
-                    displayName: displayName,
-                    isHosting: true,
-                    worldName: meta?.Name,
-                    gameMode: meta?.CurrentWorldGameMode.ToString(),
-                    joinTarget: puid, // For P2P, join target is the host's PUID
-                    status: $"Hosting {meta?.Name}",
+                var worldName = meta?.Name;
+                var mode = meta?.CurrentWorldGameMode.ToString();
+                var normalizedHostUsername = string.IsNullOrWhiteSpace(hostUsername) ? "Host" : hostUsername.Trim();
+                var worldId = meta?.WorldId;
+                ok = await eos.StartOrUpdateHostedLobbyAsync(
+                    worldName,
+                    mode,
                     cheats: false,
                     playerCount: 1,
                     maxPlayers: 8,
-                    isInWorld: false);
+                    isInWorld: isInWorld,
+                    hostUsername: normalizedHostUsername,
+                    worldId: worldId);
             }
             else
             {
-                ok = await gate.StopHostingAsync(puid);
+                ok = await eos.StopHostedLobbyAsync();
             }
 
-            log.Info($"HOST_ADVERTISE { (hosting ? "start" : "stop") } ok={ok} world={meta?.Name ?? "N/A"} transport=EOS_P2P+SUPABASE_PRESENCE");
+            log.Info($"HOST_ADVERTISE {(hosting ? "start" : "stop")} ok={ok} world={meta?.Name ?? "N/A"} transport=EOS_LOBBY_P2P");
         }
         catch (Exception ex)
         {
-            log.Warn($"Failed to update online presence signaling: {ex.Message}");
+            log.Warn($"Failed to update EOS lobby advertisement: {ex.Message}");
         }
     }
 

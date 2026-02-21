@@ -299,46 +299,62 @@ public class OnlineGateClient
         if (requestedIds.Length == 0)
             return new GatePresenceQueryResult { Ok = true, Entries = new List<GatePresenceEntry>() };
 
-        var endpoint = $"{_gateUrl}/presence/query";
-        var request = new GatePresenceQueryRequest { ProductUserIds = requestedIds };
-        var (ok, response, err) = await PostSupabaseUserAuthorizedAsync<GatePresenceQueryRequest, GatePresenceQueryResponse>(endpoint, request, default).ConfigureAwait(false);
-        if (!ok || response?.Ok != true)
+        var eos = EosClientProvider.Current;
+        if (eos == null || !eos.IsLoggedIn)
         {
-            var detail = response?.Error ?? response?.Message ?? err ?? "presence_query_failed";
-            Debug.WriteLine($"[presence-query] failed detail={detail}");
-            Console.WriteLine($"[presence-query] failed detail={detail}");
+            Debug.WriteLine("[presence-query] skipped: EOS client unavailable.");
+            Console.WriteLine("[presence-query] skipped: EOS client unavailable.");
+            return new GatePresenceQueryResult { Ok = true, Entries = new List<GatePresenceEntry>() };
+        }
+
+        try
+        {
+            var lobbies = await eos.FindHostedLobbiesAsync(requestedIds).ConfigureAwait(false);
+            var nowUtc = DateTime.UtcNow;
+            var entries = new List<GatePresenceEntry>(lobbies.Count);
+
+            for (var i = 0; i < lobbies.Count; i++)
+            {
+                var lobby = lobbies[i];
+                var productUserId = (lobby.HostProductUserId ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(productUserId))
+                    continue;
+
+                var worldName = (lobby.WorldName ?? string.Empty).Trim();
+                var displayName = (lobby.HostUsername ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(displayName))
+                    displayName = PlayerProfile.ShortId(productUserId);
+
+                entries.Add(new GatePresenceEntry
+                {
+                    ProductUserId = productUserId,
+                    DisplayName = displayName,
+                    Status = lobby.IsInWorld ? $"Hosting {worldName}" : "Hosting",
+                    IsHosting = lobby.IsHosting,
+                    IsInWorld = lobby.IsInWorld,
+                    WorldName = worldName,
+                    GameMode = (lobby.GameMode ?? string.Empty).Trim(),
+                    JoinTarget = productUserId,
+                    LobbyId = (lobby.LobbyId ?? string.Empty).Trim(),
+                    Cheats = lobby.Cheats,
+                    PlayerCount = Math.Max(1, lobby.PlayerCount),
+                    MaxPlayers = Math.Max(Math.Max(1, lobby.PlayerCount), lobby.MaxPlayers),
+                    FriendCode = EosIdentityStore.GenerateFriendCode(productUserId),
+                    UpdatedUtc = nowUtc,
+                    ExpiresUtc = nowUtc.AddSeconds(15)
+                });
+            }
+
+            Debug.WriteLine($"[presence-query] response activeEntries={entries.Count} source=EOS_LOBBY");
+            Console.WriteLine($"[presence-query] response activeEntries={entries.Count} source=EOS_LOBBY");
+            return new GatePresenceQueryResult { Ok = true, Entries = entries };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[presence-query] failed detail={ex.Message}");
+            Console.WriteLine($"[presence-query] failed detail={ex.Message}");
             return new GatePresenceQueryResult { Ok = false, Entries = new List<GatePresenceEntry>() };
         }
-
-        var nowUtc = DateTime.UtcNow;
-        var entries = new List<GatePresenceEntry>();
-        foreach (var raw in response.Entries ?? new List<GatePresenceEntry>())
-        {
-            if (raw == null)
-                continue;
-
-            raw.ProductUserId = (raw.ProductUserId ?? string.Empty).Trim();
-            raw.DisplayName = (raw.DisplayName ?? string.Empty).Trim();
-            raw.Status = (raw.Status ?? string.Empty).Trim();
-            raw.WorldName = (raw.WorldName ?? string.Empty).Trim();
-            raw.GameMode = (raw.GameMode ?? string.Empty).Trim();
-            raw.JoinTarget = (raw.JoinTarget ?? string.Empty).Trim();
-            raw.FriendCode = (raw.FriendCode ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(raw.ProductUserId))
-                continue;
-
-            if (raw.ExpiresUtc != default && raw.ExpiresUtc <= nowUtc)
-                continue;
-
-            if (string.IsNullOrWhiteSpace(raw.FriendCode))
-                raw.FriendCode = EosIdentityStore.GenerateFriendCode(raw.ProductUserId);
-
-            entries.Add(raw);
-        }
-
-        Debug.WriteLine($"[presence-query] response activeEntries={entries.Count}");
-        Console.WriteLine($"[presence-query] response activeEntries={entries.Count}");
-        return new GatePresenceQueryResult { Ok = true, Entries = entries };
     }
 
     public async Task<bool> UpsertPresenceAsync(
@@ -357,10 +373,8 @@ public class OnlineGateClient
         if (!isHosting)
             return await StopHostingAsync(productUserId).ConfigureAwait(false);
 
-        var userId = ResolveVeilnetUserIdFromAccessToken();
-        if (string.IsNullOrWhiteSpace(userId))
-            userId = (productUserId ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(userId))
+        var eos = EosClientProvider.Current;
+        if (eos == null || !eos.IsLoggedIn)
             return false;
 
         var normalizedWorld = (worldName ?? string.Empty).Trim();
@@ -369,31 +383,24 @@ public class OnlineGateClient
         var normalizedMode = (gameMode ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(normalizedMode))
             normalizedMode = "Unknown";
-        var normalizedJoinTarget = (joinTarget ?? string.Empty).Trim();
+        var normalizedDisplayName = (displayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedDisplayName))
+            normalizedDisplayName = "Host";
         var normalizedPlayers = Math.Max(1, playerCount);
         var normalizedMaxPlayers = Math.Max(normalizedPlayers, maxPlayers <= 0 ? 8 : maxPlayers);
 
-        var endpoint = $"{_gateUrl}/presence/upsert";
-        var request = new GatePresenceUpsertRequest
-        {
-            ProductUserId = userId,
-            DisplayName = (displayName ?? string.Empty).Trim(),
-            Username = string.Empty,
-            Status = string.IsNullOrWhiteSpace(status) ? (isInWorld ? $"Hosting {normalizedWorld}" : "Hosting") : status.Trim(),
-            IsHosting = true,
-            IsInWorld = isInWorld,
-            WorldName = normalizedWorld,
-            GameMode = normalizedMode,
-            JoinTarget = normalizedJoinTarget,
-            Cheats = cheats,
-            PlayerCount = normalizedPlayers,
-            MaxPlayers = normalizedMaxPlayers
-        };
+        var resultOk = await eos.StartOrUpdateHostedLobbyAsync(
+            worldName: normalizedWorld,
+            gameMode: normalizedMode,
+            cheats: cheats,
+            playerCount: normalizedPlayers,
+            maxPlayers: normalizedMaxPlayers,
+            isInWorld: isInWorld,
+            hostUsername: normalizedDisplayName,
+            worldId: string.Empty).ConfigureAwait(false);
 
-        var (ok, response, err) = await PostSupabaseUserAuthorizedAsync<GatePresenceUpsertRequest, GateBasicOkResponse>(endpoint, request, default).ConfigureAwait(false);
-        var resultOk = ok && response?.Ok == true;
-        Debug.WriteLine($"[presence-upsert] hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk} err={err ?? response?.Error ?? ""}");
-        Console.WriteLine($"[presence-upsert] hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk} err={err ?? response?.Error ?? ""}");
+        Debug.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk}");
+        Console.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk}");
         return resultOk;
     }
 
@@ -426,88 +433,41 @@ public class OnlineGateClient
 
     public async Task<bool> StopHostingAsync(string? productUserId)
     {
-        var userId = ResolveVeilnetUserIdFromAccessToken();
-        if (string.IsNullOrWhiteSpace(userId))
-            userId = (productUserId ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(userId))
+        var eos = EosClientProvider.Current;
+        if (eos == null || !eos.IsLoggedIn)
             return false;
 
-        var endpoint = $"{_gateUrl}/presence/upsert";
-        var request = new GatePresenceUpsertRequest
-        {
-            ProductUserId = userId,
-            DisplayName = string.Empty,
-            Username = string.Empty,
-            Status = "Online",
-            IsHosting = false,
-            IsInWorld = false,
-            WorldName = string.Empty,
-            GameMode = string.Empty,
-            JoinTarget = string.Empty,
-            Cheats = false,
-            PlayerCount = 0,
-            MaxPlayers = 0
-        };
-
-        var (ok, response, err) = await PostSupabaseUserAuthorizedAsync<GatePresenceUpsertRequest, GateBasicOkResponse>(endpoint, request, default).ConfigureAwait(false);
-        var resultOk = ok && response?.Ok == true;
-        Debug.WriteLine($"[presence-upsert] hosting=false ok={resultOk} err={err ?? response?.Error ?? ""}");
-        Console.WriteLine($"[presence-upsert] hosting=false ok={resultOk} err={err ?? response?.Error ?? ""}");
+        var resultOk = await eos.StopHostedLobbyAsync().ConfigureAwait(false);
+        Debug.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=false ok={resultOk}");
+        Console.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=false ok={resultOk}");
         return resultOk;
     }
 
     public async Task<bool> SendWorldInviteAsync(string targetProductUserId, string worldName, string? senderJoinTarget = null)
     {
-        var endpoint = $"{_gateUrl}/presence/invite/send";
-        var request = new GateWorldInviteSendRequest
-        {
-            TargetProductUserId = (targetProductUserId ?? string.Empty).Trim(),
-            WorldName = (worldName ?? string.Empty).Trim(),
-            SenderJoinTarget = (senderJoinTarget ?? string.Empty).Trim()
-        };
-        if (string.IsNullOrWhiteSpace(request.TargetProductUserId))
-            return false;
-
-        var (ok, response, err) = await PostSupabaseUserAuthorizedAsync<GateWorldInviteSendRequest, GateWorldInviteSendResponse>(endpoint, request, default).ConfigureAwait(false);
-        var resultOk = ok && response?.Ok == true;
-        Debug.WriteLine($"[presence-invite-send] target={request.TargetProductUserId} ok={resultOk} err={err ?? ""}");
-        Console.WriteLine($"[presence-invite-send] target={request.TargetProductUserId} ok={resultOk} err={err ?? ""}");
-        return resultOk;
+        await Task.CompletedTask;
+        Debug.WriteLine("[presence-invite-send] disabled: EOS P2P join request flow is used.");
+        Console.WriteLine("[presence-invite-send] disabled: EOS P2P join request flow is used.");
+        return false;
     }
 
     public async Task<GateWorldInvitesMeResult> GetMyWorldInvitesAsync()
     {
-        var endpoint = $"{_gateUrl}/presence/invites/me";
-        var (ok, res, err) = await GetSupabaseUserAuthorizedAsync<GateWorldInvitesMeResponse>(endpoint, default).ConfigureAwait(false);
-        if (!ok || res?.Ok != true)
-            return new GateWorldInvitesMeResult { Ok = false, Incoming = new List<GateWorldInviteEntry>(), Outgoing = new List<GateWorldInviteEntry>() };
-
+        await Task.CompletedTask;
         return new GateWorldInvitesMeResult
         {
             Ok = true,
-            Incoming = res.Incoming ?? new List<GateWorldInviteEntry>(),
-            Outgoing = res.Outgoing ?? new List<GateWorldInviteEntry>()
+            Incoming = new List<GateWorldInviteEntry>(),
+            Outgoing = new List<GateWorldInviteEntry>()
         };
     }
 
     public async Task<bool> RespondToWorldInviteAsync(string senderProductUserId, string response)
     {
-        var endpoint = $"{_gateUrl}/presence/invite/respond";
-        var request = new GateWorldInviteResponseRequest
-        {
-            SenderProductUserId = (senderProductUserId ?? string.Empty).Trim(),
-            Response = (response ?? string.Empty).Trim().ToLowerInvariant()
-        };
-        if (string.IsNullOrWhiteSpace(request.SenderProductUserId))
-            return false;
-        if (request.Response != "accepted" && request.Response != "rejected")
-            request.Response = "rejected";
-
-        var (ok, res, err) = await PostSupabaseUserAuthorizedAsync<GateWorldInviteResponseRequest, GateWorldInviteResponse>(endpoint, request, default).ConfigureAwait(false);
-        var resultOk = ok && res?.Ok == true;
-        Debug.WriteLine($"[presence-invite-respond] sender={request.SenderProductUserId} response={request.Response} ok={resultOk} err={err ?? ""}");
-        Console.WriteLine($"[presence-invite-respond] sender={request.SenderProductUserId} response={request.Response} ok={resultOk} err={err ?? ""}");
-        return resultOk;
+        await Task.CompletedTask;
+        Debug.WriteLine("[presence-invite-respond] disabled: EOS P2P join request flow is used.");
+        Console.WriteLine("[presence-invite-respond] disabled: EOS P2P join request flow is used.");
+        return false;
     }
 
     public async Task<GateIdentityResolveResult> ResolveIdentityAsync(string query)
@@ -944,57 +904,153 @@ public class OnlineGateClient
             return false;
         }
 
-        var endpoint = $"{_gateUrl.TrimEnd('/')}/online-ticket-validate";
-        var requiredChannel = _buildFlavor == "dev" ? "dev" : "release";
-        var anonKey = ResolveSupabaseAnonKey();
-        if (string.IsNullOrWhiteSpace(anonKey))
+        var normalizedTicket = ticket.Trim();
+        var endpoints = new[]
         {
-            denialReason = "Gate validation misconfigured: SUPABASE_ANON_KEY is missing.";
-            return false;
-        }
+            $"{_gateUrl.TrimEnd('/')}/online-ticket-validate",
+            $"{_gateUrl.TrimEnd('/')}/online-ticket/validate"
+        };
+        var requiredChannel = _buildFlavor == "dev" ? "dev" : "release";
+
+        // Prefer local JWT payload checks first so missing validate routes
+        // do not block P2P join for otherwise valid tickets.
+        if (TryValidateTicketLocally(normalizedTicket, requiredChannel, out var localReason))
+            return true;
 
         try
         {
-            using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
-            var body = JsonSerializer.Serialize(
-                new GateTicketValidateRequest { Ticket = ticket.Trim(), RequiredChannel = requiredChannel },
-                JsonOptions);
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+            var anonKey = ResolveSupabaseAnonKey();
+            if (string.IsNullOrWhiteSpace(anonKey))
             {
-                Content = new StringContent(body, Encoding.UTF8, "application/json")
-            };
-            ApplyTicketFunctionHeaders(request, string.Empty, anonKey);
-
-            using var response = Http.SendAsync(request, cts.Token).GetAwaiter().GetResult();
-            var responseBody = response.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
-            if (!response.IsSuccessStatusCode)
-            {
-                denialReason = $"Ticket validation failed (HTTP {(int)response.StatusCode}).";
+                denialReason = string.IsNullOrWhiteSpace(localReason)
+                    ? "Ticket validation failed."
+                    : localReason;
                 return false;
             }
 
-            GateTicketValidateResponse? parsed;
-            try
+            foreach (var endpoint in endpoints)
             {
-                parsed = JsonSerializer.Deserialize<GateTicketValidateResponse>(responseBody, JsonOptions);
-            }
-            catch
-            {
-                denialReason = "Invalid ticket validation response.";
+                using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
+                var body = JsonSerializer.Serialize(
+                    new GateTicketValidateRequest { Ticket = normalizedTicket, RequiredChannel = requiredChannel },
+                    JsonOptions);
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "application/json")
+                };
+                ApplyTicketFunctionHeaders(request, string.Empty, anonKey);
+
+                using var response = Http.SendAsync(request, cts.Token).GetAwaiter().GetResult();
+                var responseBody = response.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.BadRequest or HttpStatusCode.MethodNotAllowed)
+                        continue;
+
+                    denialReason = $"Ticket validation failed (HTTP {(int)response.StatusCode}).";
+                    return false;
+                }
+
+                GateTicketValidateResponse? parsed;
+                try
+                {
+                    parsed = JsonSerializer.Deserialize<GateTicketValidateResponse>(responseBody, JsonOptions);
+                }
+                catch
+                {
+                    denialReason = "Invalid ticket validation response.";
+                    return false;
+                }
+
+                if (parsed?.Ok == true)
+                    return true;
+
+                denialReason = string.IsNullOrWhiteSpace(parsed?.Reason) ? "Invalid ticket" : parsed!.Reason!;
                 return false;
             }
 
-            if (parsed?.Ok == true)
-                return true;
-
-            denialReason = string.IsNullOrWhiteSpace(parsed?.Reason) ? "Invalid ticket" : parsed!.Reason!;
+            denialReason = localReason;
             return false;
         }
         catch (Exception ex)
         {
-            denialReason = ex.Message;
+            denialReason = string.IsNullOrWhiteSpace(localReason) ? ex.Message : localReason;
             return false;
         }
+    }
+
+    private static bool TryValidateTicketLocally(string ticket, string requiredChannel, out string denialReason)
+    {
+        denialReason = "Ticket validation endpoint unavailable.";
+        try
+        {
+            var parts = ticket.Split('.');
+            if (parts.Length < 2)
+            {
+                denialReason = "Malformed gate ticket.";
+                return false;
+            }
+
+            var payloadBytes = Base64UrlDecode(parts[1]);
+            using var payload = JsonDocument.Parse(payloadBytes);
+            var root = payload.RootElement;
+
+            var typ = root.TryGetProperty("typ", out var typProp) ? (typProp.GetString() ?? string.Empty).Trim() : string.Empty;
+            if (!string.Equals(typ, "gate_ticket", StringComparison.OrdinalIgnoreCase))
+            {
+                denialReason = "Invalid gate ticket type.";
+                return false;
+            }
+
+            if (!root.TryGetProperty("exp", out var expProp) || !expProp.TryGetInt64(out var exp))
+            {
+                denialReason = "Gate ticket expiry missing.";
+                return false;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (exp <= now)
+            {
+                denialReason = "Gate ticket expired.";
+                return false;
+            }
+
+            if (!root.TryGetProperty("target", out var targetProp))
+                return true;
+
+            var target = (targetProp.GetString() ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(target))
+                return true;
+
+            if (!string.Equals(target, requiredChannel, StringComparison.OrdinalIgnoreCase))
+            {
+                denialReason = $"Gate ticket channel mismatch ({target} != {requiredChannel}).";
+                return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            denialReason = "Failed to parse gate ticket.";
+            return false;
+        }
+    }
+
+    private static byte[] Base64UrlDecode(string input)
+    {
+        var s = input.Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4)
+        {
+            case 2:
+                s += "==";
+                break;
+            case 3:
+                s += "=";
+                break;
+        }
+
+        return Convert.FromBase64String(s);
     }
 
     private async Task<TicketCheckResult> EnsureTicketAsync(Logger log, CancellationToken ct, string? target)

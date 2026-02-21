@@ -123,8 +123,26 @@ public sealed class WorldMeta
         {
             if (!File.Exists(path))
             {
-                log.Warn($"World data file missing: {path}");
-                return null;
+                var directory = Path.GetDirectoryName(path) ?? string.Empty;
+                var legacyPath = Path.Combine(directory, Paths.LegacyWorldMetaFileName);
+                if (File.Exists(legacyPath))
+                {
+                    try
+                    {
+                        File.Move(legacyPath, path);
+                        log.Info($"Migrated world meta: {Path.GetFileName(legacyPath)} -> {Path.GetFileName(path)}");
+                    }
+                    catch (Exception migrateEx)
+                    {
+                        log.Warn($"Failed to migrate world meta to {Path.GetFileName(path)}: {migrateEx.Message}");
+                        path = legacyPath;
+                    }
+                }
+                else
+                {
+                    log.Warn($"World data file missing: {path}");
+                    return null;
+                }
             }
 
             var json = File.ReadAllText(path);

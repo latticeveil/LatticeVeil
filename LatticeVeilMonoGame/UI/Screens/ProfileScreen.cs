@@ -1,4 +1,8 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using WinClipboard = System.Windows.Forms.Clipboard;
 using Microsoft.Xna.Framework;
@@ -36,6 +40,8 @@ public enum ProfileScreenStartTab
     private readonly EosClient? _eos;
     private readonly EosIdentityStore _identityStore;
     private readonly OnlineGateClient _gate;
+    private readonly VeilnetProfileClient _veilnetProfileClient;
+    private readonly MemoryWebTextureLoader _webTextureLoader;
 
     private readonly Button _tabIdentityBtn;
     private readonly Button _tabFriendsBtn;
@@ -49,6 +55,7 @@ public enum ProfileScreenStartTab
     private readonly Button _blockUserBtn;
     private readonly Button _unblockUserBtn;
     private readonly Button _copyIdBtn;
+    private readonly Button _refreshProfileBtn;
     private readonly Button _backBtn;
 
     private Texture2D? _bg;
@@ -60,6 +67,11 @@ public enum ProfileScreenStartTab
     private Rectangle _tabFriendsRect;
     private Rectangle _usernameRect;
     private Rectangle _iconRect;
+    private Rectangle _identityHeaderRect;
+    private Rectangle _identityNameplateRect;
+    private Rectangle _identityAvatarRect;
+    private Rectangle _identityAboutRect;
+    private Rectangle _identityStatusRect;
     private Rectangle _friendsModeFriendsRect;
     private Rectangle _friendsModeRequestsRect;
     private Rectangle _friendsModeBlockedRect;
@@ -81,6 +93,33 @@ public enum ProfileScreenStartTab
     private string _status = string.Empty;
     private DateTime _statusExpiryUtc = DateTime.MinValue;
 
+    private Texture2D? _veilnetAvatarTexture;
+    private Texture2D? _veilnetBannerTexture;
+    private Texture2D? _veilnetAvatarRingTexture;
+    private Texture2D? _veilnetAvatarPlaceholderTexture;
+    private int _veilnetAvatarDecorSize;
+    private Color _veilnetAvatarRingColor = Color.Transparent;
+    private Color _veilnetAvatarPlaceholderColor = Color.Transparent;
+    private string _veilnetUsername = string.Empty;
+    private string _veilnetAboutMe = string.Empty;
+    private string _veilnetPictureUrl = string.Empty;
+    private string _veilnetBannerUrl = string.Empty;
+    private string _veilnetThemeColorRaw = string.Empty;
+    private string _veilnetTheme = string.Empty;
+    private string _veilnetUpdatedAt = string.Empty;
+    private string _veilnetProfileError = string.Empty;
+    private Color _veilnetAccentColor = new(124, 92, 255);
+    private Color _veilnetAccentTextColor = new(240, 242, 255);
+    private DateTime _lastVeilnetProfileUtc = DateTime.MinValue;
+    private bool _lastVeilnetSyncOk;
+    private string _lastVeilnetSyncError = string.Empty;
+    private DateTime _nextVeilnetProfileRefreshUtc = DateTime.MinValue;
+    private string _lastVeilnetTokenSnapshot = string.Empty;
+    private bool _veilnetProfileRefreshInProgress;
+    private Task<VeilnetProfileRefreshPayload>? _veilnetProfileRefreshTask;
+    private readonly TimeSpan _veilnetProfileRefreshInterval;
+    private static readonly string LegacyVeilnetCacheDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "LatticeVeil", "VeilnetCache");
+
     public ProfileScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile,
         global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient,
         ProfileScreenStartTab startTab = ProfileScreenStartTab.Identity,
@@ -96,6 +135,9 @@ public enum ProfileScreenStartTab
         _eos = eosClient;
         _identityStore = EosIdentityStore.LoadOrCreate(_log);
         _gate = OnlineGateClient.GetOrCreate();
+        _veilnetProfileClient = new VeilnetProfileClient(_log);
+        _webTextureLoader = new MemoryWebTextureLoader();
+        _veilnetProfileRefreshInterval = ResolveProfileRefreshInterval();
 
         _activeTab = startTab;
         _friendsListMode = startFriendsMode;
@@ -112,6 +154,7 @@ public enum ProfileScreenStartTab
         _blockUserBtn = new Button("BLOCK", () => _ = BlockSelectedUserAsync()) { BoldText = true };
         _unblockUserBtn = new Button("UNBLOCK", () => _ = UnblockSelectedUserAsync()) { BoldText = true };
         _copyIdBtn = new Button("COPY MY ID", CopyLocalId) { BoldText = true };
+        _refreshProfileBtn = new Button("REFRESH", () => QueueVeilnetProfileRefresh(force: true)) { BoldText = true };
         _backBtn = new Button("BACK", () => _menus.Pop()) { BoldText = true };
 
         try
@@ -123,6 +166,16 @@ public enum ProfileScreenStartTab
         catch
         {
             // optional
+        }
+
+        _lastVeilnetTokenSnapshot = ResolveVeilnetToken();
+        if (IsUsableToken(_lastVeilnetTokenSnapshot))
+            QueueVeilnetProfileRefresh(force: true);
+        else
+        {
+            _veilnetProfileError = "Sign in via launcher to view your Veilnet profile.";
+            _lastVeilnetSyncOk = false;
+            _lastVeilnetSyncError = "missing_access_token";
         }
     }
 
@@ -148,10 +201,22 @@ public enum ProfileScreenStartTab
         _tabIdentityBtn.Bounds = _tabIdentityRect;
         _tabFriendsBtn.Bounds = _tabFriendsRect;
 
-        var iconSize = 98;
-        var iconGap = 12;
-        _iconRect = new Rectangle(contentRect.X, _tabIdentityRect.Bottom + 16, iconSize, iconSize);
-        _usernameRect = new Rectangle(_iconRect.Right + iconGap, _tabIdentityRect.Bottom + 16, Math.Max(1, contentRect.Width - iconSize - iconGap), _font.LineHeight + 18);
+        var iconSize = 108;
+        var iconGap = 16;
+        _identityHeaderRect = new Rectangle(contentRect.X, _tabIdentityRect.Bottom + 14, contentRect.Width, Math.Min(230, Math.Max(160, contentRect.Height / 3)));
+        _iconRect = new Rectangle(_identityHeaderRect.X + 14, _identityHeaderRect.Y + Math.Max(10, (_identityHeaderRect.Height - iconSize) / 2), iconSize, iconSize);
+        _identityAvatarRect = _iconRect;
+        var nameplateX = _iconRect.Right + iconGap;
+        var nameplateWidth = Math.Max(220, _identityHeaderRect.Width - (nameplateX - _identityHeaderRect.X) - 20);
+        _identityNameplateRect = new Rectangle(nameplateX, _identityHeaderRect.Y + 24, nameplateWidth, _font.LineHeight + 26);
+        _usernameRect = _identityNameplateRect;
+        _refreshProfileBtn.Bounds = new Rectangle(_identityNameplateRect.Right - 132, _identityNameplateRect.Bottom + 8, 132, Math.Max(34, _font.LineHeight + 8));
+        var aboutTop = _identityHeaderRect.Bottom + 14;
+        var bottomButtonsTop = contentRect.Bottom - 60;
+        var infoHeight = Math.Max(120, bottomButtonsTop - aboutTop - 10);
+        var half = Math.Max(56, infoHeight / 2 - 4);
+        _identityAboutRect = new Rectangle(contentRect.X, aboutTop, contentRect.Width, half);
+        _identityStatusRect = new Rectangle(contentRect.X, _identityAboutRect.Bottom + 8, contentRect.Width, Math.Max(56, infoHeight - half - 8));
         
         var modeY = _tabIdentityRect.Bottom + 12;
         var modeH = _font.LineHeight + 10;
@@ -207,6 +272,9 @@ public enum ProfileScreenStartTab
             _statusExpiryUtc = DateTime.MinValue;
         }
 
+        HandleVeilnetTokenChange();
+        ProcessCompletedVeilnetProfileRefresh();
+
         if (input.IsNewKeyPress(Keys.Escape))
         {
             _menus.Pop();
@@ -220,6 +288,9 @@ public enum ProfileScreenStartTab
         if (_activeTab == ProfileScreenStartTab.Identity)
         {
             _copyIdBtn.Update(input);
+            _refreshProfileBtn.Update(input);
+            if (!_veilnetProfileRefreshInProgress && DateTime.UtcNow >= _nextVeilnetProfileRefreshUtc)
+                QueueVeilnetProfileRefresh(force: false);
         }
         else
         {
@@ -293,6 +364,7 @@ public enum ProfileScreenStartTab
         if (_activeTab == ProfileScreenStartTab.Identity)
         {
             _copyIdBtn.Draw(sb, _pixel, _font);
+            _refreshProfileBtn.Draw(sb, _pixel, _font);
         }
         else
         {
@@ -325,6 +397,15 @@ public enum ProfileScreenStartTab
         sb.End();
     }
 
+    public void OnClose()
+    {
+        CancelVeilnetRefreshTask();
+        DisposeVeilnetTextures();
+        DisposeAvatarDecorTextures();
+        _webTextureLoader.Dispose();
+        ClearLegacyVeilnetCacheDir();
+    }
+
     private void DrawTabs(SpriteBatch sb)
     {
         var identityColor = _activeTab == ProfileScreenStartTab.Identity ? new Color(60, 60, 60, 220) : new Color(30, 30, 30, 220);
@@ -337,37 +418,750 @@ public enum ProfileScreenStartTab
 
     private void DrawIdentityTab(SpriteBatch sb)
     {
-        var x = _panelRect.X + 16;
-        var y = _tabIdentityRect.Bottom + 14;
-        
-        // Offset for identity details (1 inch right)
-        var detailX = x + 96;
+        var accent = _veilnetAccentColor;
+        var accentBorder = WithAlpha(BlendColors(accent, Color.White, 0.12f), 228);
+        var sideBarColor = WithAlpha(BlendColors(accent, new Color(18, 22, 36), 0.24f), 212);
+        var headerOverlay = new Color(8, 12, 22, 96);
+        var nameplateFill = WithAlpha(DarkenColor(accent, 0.3f), 220);
+        var nameplateBorder = WithAlpha(BlendColors(accent, Color.White, 0.28f), 245);
+        var infoBorder = WithAlpha(BlendColors(accent, Color.White, 0.14f), 216);
+        var infoTitle = BlendColors(_veilnetAccentTextColor, Color.White, 0.2f);
 
-        sb.Draw(_pixel, _usernameRect, new Color(30, 30, 30, 230));
-        DrawBorder(sb, _usernameRect, Color.White);
-        var name = (_identityStore.ReservedUsername ?? string.Empty).Trim();
+        if (_veilnetBannerTexture is { IsDisposed: false })
+            DrawTextureCover(sb, _veilnetBannerTexture, _identityHeaderRect, Color.White);
+        else
+            DrawFallbackBanner(sb, _identityHeaderRect);
+
+        // Keep banner visible; overlay only improves text readability.
+        sb.Draw(_pixel, _identityHeaderRect, headerOverlay);
+        DrawHeaderSideBars(sb, _identityHeaderRect, sideBarColor);
+        DrawBorder(sb, _identityHeaderRect, accentBorder);
+
+        var ringColor = WithAlpha(BlendColors(accent, Color.White, 0.2f), 235);
+        var placeholderColor = WithAlpha(BlendColors(accent, new Color(18, 20, 30), 0.28f), 220);
+        EnsureAvatarDecorTextures(_identityAvatarRect.Width, ringColor, placeholderColor);
+
+        if (_veilnetAvatarTexture is { IsDisposed: false })
+        {
+            sb.Draw(_veilnetAvatarTexture, _identityAvatarRect, Color.White);
+        }
+        else
+        {
+            if (_veilnetAvatarPlaceholderTexture is { IsDisposed: false })
+                sb.Draw(_veilnetAvatarPlaceholderTexture, _identityAvatarRect, Color.White);
+
+            var noPicX = _identityAvatarRect.X + (_identityAvatarRect.Width / 2f) - (_font.MeasureString("NO PIC").X / 2f);
+            var noPicY = _identityAvatarRect.Y + (_identityAvatarRect.Height - _font.LineHeight) / 2f;
+            _font.DrawString(sb, "NO PIC", new Vector2(noPicX, noPicY), new Color(232, 236, 248));
+        }
+
+        if (_veilnetAvatarRingTexture is { IsDisposed: false })
+            sb.Draw(_veilnetAvatarRingTexture, _identityAvatarRect, Color.White);
+
+        sb.Draw(_pixel, _identityNameplateRect, nameplateFill);
+        DrawBorder(sb, _identityNameplateRect, nameplateBorder);
+        var username = ResolveDisplayUsername();
+        var usernamePos = new Vector2(_identityNameplateRect.X + 12, _identityNameplateRect.Y + (_identityNameplateRect.Height - _font.LineHeight) / 2f);
+        DrawTextBold(sb, username, usernamePos, _veilnetAccentTextColor);
+        _font.DrawString(
+            sb,
+            "VEILNET",
+            new Vector2(_identityNameplateRect.Right - 110, _identityNameplateRect.Y + 8),
+            WithAlpha(_veilnetAccentTextColor, 220));
+
+        DrawIdentityInfoPanel(
+            sb,
+            _identityAboutRect,
+            "ABOUT ME",
+            string.IsNullOrWhiteSpace(_veilnetAboutMe) ? "No about me set." : _veilnetAboutMe,
+            infoBorder,
+            infoTitle);
+
+        var eosSnapshot = EosRuntimeStatus.Evaluate(_eos);
+        var id = (_eos?.LocalProductUserId ?? _identityStore.ProductUserId ?? string.Empty).Trim();
+        var statusLines = $"EOS: {eosSnapshot.StatusText}\nMY ID: {(string.IsNullOrWhiteSpace(id) ? "(waiting...)" : id)}\nCONFIG: {EosRuntimeStatus.DescribeConfigSource()}";
+        DrawIdentityInfoPanel(sb, _identityStatusRect, "STATUS", statusLines, infoBorder, infoTitle);
+    }
+
+    private void HandleVeilnetTokenChange()
+    {
+        var token = ResolveVeilnetToken();
+        if (string.Equals(token, _lastVeilnetTokenSnapshot, StringComparison.Ordinal))
+            return;
+
+        _lastVeilnetTokenSnapshot = token;
+        if (!IsUsableToken(token))
+        {
+            CancelVeilnetRefreshTask();
+            DisposeVeilnetTextures();
+            DisposeAvatarDecorTextures();
+            _veilnetUsername = string.Empty;
+            _veilnetAboutMe = string.Empty;
+            _veilnetPictureUrl = string.Empty;
+            _veilnetBannerUrl = string.Empty;
+            _veilnetThemeColorRaw = string.Empty;
+            _veilnetTheme = string.Empty;
+            _veilnetUpdatedAt = string.Empty;
+            _veilnetProfileError = "You are not signed in. Open launcher online login.";
+            _lastVeilnetSyncOk = false;
+            _lastVeilnetSyncError = "missing_access_token";
+            _lastVeilnetProfileUtc = DateTime.MinValue;
+            ApplyVeilnetTheme(string.Empty, string.Empty);
+            _nextVeilnetProfileRefreshUtc = DateTime.UtcNow.AddSeconds(5);
+            ClearLegacyVeilnetCacheDir();
+            return;
+        }
+
+        _veilnetProfileError = string.Empty;
+        _lastVeilnetSyncOk = false;
+        _lastVeilnetSyncError = string.Empty;
+        _nextVeilnetProfileRefreshUtc = DateTime.MinValue;
+        QueueVeilnetProfileRefresh(force: true);
+    }
+
+    private void QueueVeilnetProfileRefresh(bool force)
+    {
+        if (_veilnetProfileRefreshInProgress)
+            return;
+        if (!force && DateTime.UtcNow < _nextVeilnetProfileRefreshUtc)
+            return;
+
+        var token = ResolveVeilnetToken();
+        if (!IsUsableToken(token))
+        {
+            _veilnetProfileError = "You are not signed in. Open launcher online login.";
+            _lastVeilnetSyncOk = false;
+            _lastVeilnetSyncError = "missing_access_token";
+            _nextVeilnetProfileRefreshUtc = DateTime.UtcNow.AddSeconds(5);
+            return;
+        }
+
+        _veilnetProfileRefreshInProgress = true;
+        _veilnetProfileRefreshTask = FetchVeilnetProfileRefreshPayloadAsync(token, CancellationToken.None);
+    }
+
+    private void ProcessCompletedVeilnetProfileRefresh()
+    {
+        if (_veilnetProfileRefreshTask == null || !_veilnetProfileRefreshTask.IsCompleted)
+            return;
+
+        _veilnetProfileRefreshInProgress = false;
+        _nextVeilnetProfileRefreshUtc = DateTime.UtcNow.Add(_veilnetProfileRefreshInterval);
+
+        try
+        {
+            var payload = _veilnetProfileRefreshTask.GetAwaiter().GetResult();
+            ApplyVeilnetProfileRefreshPayload(payload);
+        }
+        catch (Exception ex)
+        {
+            _veilnetProfileError = "Failed to refresh profile.";
+            _lastVeilnetSyncOk = false;
+            _lastVeilnetSyncError = "sync_exception";
+            _log.Warn($"Veilnet profile refresh failed: {ex.Message}");
+        }
+        finally
+        {
+            _veilnetProfileRefreshTask = null;
+        }
+    }
+
+    private async Task<VeilnetProfileRefreshPayload> FetchVeilnetProfileRefreshPayloadAsync(string token, CancellationToken ct)
+    {
+        var result = await _veilnetProfileClient.GetProfileAsync(token, ct).ConfigureAwait(false);
+        if (!result.Ok || result.Profile == null)
+            return VeilnetProfileRefreshPayload.Fail(string.IsNullOrWhiteSpace(result.Message) ? "profile_lookup_failed" : result.Message);
+
+        var profile = result.Profile;
+        var payload = VeilnetProfileRefreshPayload.Success(profile);
+        var previousPicture = _veilnetPictureUrl;
+        var previousBanner = _veilnetBannerUrl;
+
+        if (!string.IsNullOrWhiteSpace(profile.PictureUrl)
+            && !string.Equals(profile.PictureUrl, previousPicture, StringComparison.OrdinalIgnoreCase))
+        {
+            payload.AvatarBytes = await _webTextureLoader.DownloadImageBytesAsync(profile.PictureUrl, ct).ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(profile.BannerUrl)
+            && !string.Equals(profile.BannerUrl, previousBanner, StringComparison.OrdinalIgnoreCase))
+        {
+            payload.BannerBytes = await _webTextureLoader.DownloadImageBytesAsync(profile.BannerUrl, ct).ConfigureAwait(false);
+        }
+
+        return payload;
+    }
+
+    private void ApplyVeilnetProfileRefreshPayload(VeilnetProfileRefreshPayload payload)
+    {
+        if (!payload.Ok || payload.Profile == null)
+        {
+            var error = string.IsNullOrWhiteSpace(payload.ErrorMessage)
+                ? "Could not load Veilnet profile."
+                : payload.ErrorMessage;
+            _veilnetProfileError = error;
+            _lastVeilnetSyncOk = false;
+            _lastVeilnetSyncError = error;
+            SetStatus("Profile refresh failed.", 1.8);
+            return;
+        }
+
+        var profile = payload.Profile;
+        _veilnetUsername = (profile.Username ?? string.Empty).Trim();
+        _veilnetAboutMe = NormalizeMultiline(profile.AboutMe);
+        _veilnetThemeColorRaw = (profile.ThemeColor ?? string.Empty).Trim();
+        _veilnetTheme = (profile.Theme ?? string.Empty).Trim();
+        ApplyVeilnetTheme(_veilnetThemeColorRaw, _veilnetTheme);
+        _veilnetUpdatedAt = (profile.UpdatedAtRaw ?? string.Empty).Trim();
+        _lastVeilnetProfileUtc = DateTime.UtcNow;
+        _lastVeilnetSyncOk = true;
+        _lastVeilnetSyncError = string.Empty;
+        _veilnetProfileError = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(profile.PictureUrl))
+        {
+            _veilnetPictureUrl = string.Empty;
+            _veilnetAvatarTexture?.Dispose();
+            _veilnetAvatarTexture = null;
+        }
+        else if (payload.AvatarBytes is { Length: > 0 })
+        {
+            var nextAvatar = CreateCircularAvatarTextureFromBytes(payload.AvatarBytes);
+            if (nextAvatar != null)
+            {
+                _veilnetAvatarTexture?.Dispose();
+                _veilnetAvatarTexture = nextAvatar;
+                _veilnetPictureUrl = profile.PictureUrl.Trim();
+            }
+            else
+            {
+                _veilnetProfileError = "Avatar image could not be decoded.";
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(profile.BannerUrl))
+        {
+            _veilnetBannerUrl = string.Empty;
+            _veilnetBannerTexture?.Dispose();
+            _veilnetBannerTexture = null;
+        }
+        else if (payload.BannerBytes is { Length: > 0 })
+        {
+            var nextBanner = _webTextureLoader.CreateTextureFromBytes(_graphics.GraphicsDevice, payload.BannerBytes);
+            if (nextBanner != null)
+            {
+                _veilnetBannerTexture?.Dispose();
+                _veilnetBannerTexture = nextBanner;
+                _veilnetBannerUrl = profile.BannerUrl.Trim();
+            }
+            else
+            {
+                _veilnetProfileError = "Banner image could not be decoded.";
+            }
+        }
+
+        SetStatus("Refreshed.", 1.4);
+    }
+
+    private Texture2D? CreateCircularAvatarTextureFromBytes(byte[] imageBytes)
+    {
+        var source = _webTextureLoader.CreateTextureFromBytes(_graphics.GraphicsDevice, imageBytes);
+        if (source == null)
+            return null;
+
+        try
+        {
+            return CreateCircularAvatarTexture(source);
+        }
+        finally
+        {
+            source.Dispose();
+        }
+    }
+
+    private Texture2D? CreateCircularAvatarTexture(Texture2D source)
+    {
+        try
+        {
+            var sourceWidth = source.Width;
+            var sourceHeight = source.Height;
+            var side = Math.Min(sourceWidth, sourceHeight);
+            if (side <= 1)
+                return null;
+
+            var sourcePixels = new Color[sourceWidth * sourceHeight];
+            source.GetData(sourcePixels);
+
+            var cropX = (sourceWidth - side) / 2;
+            var cropY = (sourceHeight - side) / 2;
+            var output = new Color[side * side];
+            var center = (side - 1) / 2f;
+            var radius = side / 2f;
+            var fadeStart = Math.Max(0f, radius - 1.5f);
+
+            for (var y = 0; y < side; y++)
+            {
+                for (var x = 0; x < side; x++)
+                {
+                    var srcIndex = (cropY + y) * sourceWidth + (cropX + x);
+                    var color = sourcePixels[srcIndex];
+                    var dx = x - center;
+                    var dy = y - center;
+                    var dist = MathF.Sqrt(dx * dx + dy * dy);
+                    if (dist >= radius)
+                    {
+                        color.A = 0;
+                    }
+                    else if (dist > fadeStart)
+                    {
+                        var t = 1f - ((dist - fadeStart) / (radius - fadeStart));
+                        color.A = (byte)Math.Clamp((int)(color.A * t), 0, 255);
+                    }
+
+                    output[y * side + x] = color;
+                }
+            }
+
+            var texture = new Texture2D(_graphics.GraphicsDevice, side, side, false, SurfaceFormat.Color);
+            texture.SetData(output);
+            return texture;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Circular avatar conversion failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void DrawIdentityInfoPanel(SpriteBatch sb, Rectangle rect, string title, string body, Color borderColor, Color titleColor)
+    {
+        sb.Draw(_pixel, rect, new Color(18, 18, 24, 220));
+        var sideBarWidth = Math.Clamp(rect.Width / 200, 3, 6);
+        var sideBarRect = new Rectangle(rect.X, rect.Y, sideBarWidth, rect.Height);
+        sb.Draw(_pixel, sideBarRect, WithAlpha(borderColor, 168));
+        DrawBorder(sb, rect, borderColor);
+        _font.DrawString(sb, title, new Vector2(rect.X + 10, rect.Y + 8), titleColor);
+        var textRect = new Rectangle(rect.X + 10, rect.Y + _font.LineHeight + 14, rect.Width - 20, rect.Height - (_font.LineHeight + 20));
+        DrawWrappedText(sb, body, textRect, new Color(198, 206, 228));
+    }
+
+    private void DrawWrappedText(SpriteBatch sb, string text, Rectangle rect, Color color)
+    {
+        var wrapped = WrapText(text, Math.Max(80, rect.Width));
+        var y = rect.Y;
+        for (var i = 0; i < wrapped.Count; i++)
+        {
+            if (y + _font.LineHeight > rect.Bottom)
+                break;
+            _font.DrawString(sb, wrapped[i], new Vector2(rect.X, y), color);
+            y += _font.LineHeight + 2;
+        }
+    }
+
+    private List<string> WrapText(string text, int maxWidth)
+    {
+        var lines = new List<string>();
+        var content = string.IsNullOrWhiteSpace(text) ? string.Empty : text.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            lines.Add(string.Empty);
+            return lines;
+        }
+
+        var paragraphs = content.Split('\n');
+        for (var p = 0; p < paragraphs.Length; p++)
+        {
+            var paragraph = (paragraphs[p] ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(paragraph))
+            {
+                lines.Add(string.Empty);
+                continue;
+            }
+
+            var words = paragraph.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var current = string.Empty;
+            for (var w = 0; w < words.Length; w++)
+            {
+                var word = words[w];
+                var candidate = string.IsNullOrWhiteSpace(current) ? word : $"{current} {word}";
+                if (_font.MeasureString(candidate).X <= maxWidth)
+                {
+                    current = candidate;
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(current))
+                    lines.Add(current);
+
+                if (_font.MeasureString(word).X <= maxWidth)
+                {
+                    current = word;
+                    continue;
+                }
+
+                var remaining = word;
+                while (remaining.Length > 0)
+                {
+                    var take = remaining.Length;
+                    while (take > 1 && _font.MeasureString(remaining.Substring(0, take)).X > maxWidth)
+                        take--;
+                    lines.Add(remaining.Substring(0, take));
+                    remaining = remaining.Substring(take);
+                }
+
+                current = string.Empty;
+            }
+
+            if (!string.IsNullOrWhiteSpace(current))
+                lines.Add(current);
+        }
+
+        return lines;
+    }
+
+    private string ResolveDisplayUsername()
+    {
+        var name = (_veilnetUsername ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+            return name;
+
+        name = (_identityStore.ReservedUsername ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(name))
             name = _profile.GetDisplayUsername();
         if (string.IsNullOrWhiteSpace(name))
             name = "(unclaimed)";
-        var npos = new Vector2(_usernameRect.X + 8, _usernameRect.Y + (_usernameRect.Height - _font.LineHeight) / 2f);
-        _font.DrawString(sb, name, npos, Color.White);
-        _font.DrawString(sb, "Change username in Lattice Launcher (CLAIM/CHANGE).", new Vector2(detailX, _iconRect.Bottom + 6), new Color(180, 180, 180));
+        return name;
+    }
 
-        sb.Draw(_pixel, _iconRect, new Color(26, 26, 26, 220));
-        DrawBorder(sb, _iconRect, new Color(160, 160, 160));
-        _font.DrawString(sb, "ICON", new Vector2(_iconRect.X + 28, _iconRect.Y + 24), new Color(220, 220, 220));
-        _font.DrawString(sb, "SOON", new Vector2(_iconRect.X + 24, _iconRect.Y + 24 + _font.LineHeight), new Color(170, 170, 170));
+    private void ApplyVeilnetTheme(string? themeColorRaw, string? themeId)
+    {
+        var resolved = new Color(124, 92, 255);
+        if (!TryParseHexColor(themeColorRaw, out resolved) && !TryResolveThemeColorFromId(themeId, out resolved))
+            resolved = new Color(124, 92, 255);
 
-        var infoY = _iconRect.Bottom + 12;
-        var eosSnapshot = EosRuntimeStatus.Evaluate(_eos);
-        _font.DrawString(sb, eosSnapshot.StatusText, new Vector2(detailX, infoY), new Color(220, 180, 80));
-        infoY += _font.LineHeight + 4;
+        if (!_veilnetAccentColor.Equals(resolved))
+            DisposeAvatarDecorTextures();
 
-        var id = (_eos?.LocalProductUserId ?? _identityStore.ProductUserId ?? string.Empty).Trim();
-        _font.DrawString(sb, $"MY ID: {(string.IsNullOrWhiteSpace(id) ? "(waiting...)" : id)}", new Vector2(detailX, infoY), Color.White);
-        infoY += _font.LineHeight + 2;
-        _font.DrawString(sb, $"EOS Config: {EosRuntimeStatus.DescribeConfigSource()}", new Vector2(detailX, infoY), new Color(180, 180, 180));
+        _veilnetAccentColor = resolved;
+        _veilnetAccentTextColor = RelativeLuminance(resolved) >= 0.54f
+            ? new Color(26, 30, 40)
+            : new Color(240, 242, 255);
+    }
+
+    private static bool TryResolveThemeColorFromId(string? themeId, out Color color)
+    {
+        color = default;
+        var key = (themeId ?? string.Empty).Trim().ToLowerInvariant();
+        if (key.Length == 0)
+            return false;
+
+        return key switch
+        {
+            "default" => TryParseHexColor("#7c5cff", out color),
+            "ember" => TryParseHexColor("#ff4d4d", out color),
+            "neon" => TryParseHexColor("#8bff00", out color),
+            "ocean" => TryParseHexColor("#00b3ff", out color),
+            "rose" => TryParseHexColor("#ff4fd8", out color),
+            "mint" => TryParseHexColor("#22c55e", out color),
+            "slate" => TryParseHexColor("#94a3b8", out color),
+            "gold" => TryParseHexColor("#fbbf24", out color),
+            _ => false
+        };
+    }
+
+    private static bool TryParseHexColor(string? raw, out Color color)
+    {
+        color = default;
+        var value = (raw ?? string.Empty).Trim();
+        if (value.StartsWith("#", StringComparison.Ordinal))
+            value = value[1..];
+
+        if (value.Length != 6)
+            return false;
+
+        if (!int.TryParse(value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rgb))
+            return false;
+
+        var r = (byte)((rgb >> 16) & 0xFF);
+        var g = (byte)((rgb >> 8) & 0xFF);
+        var b = (byte)(rgb & 0xFF);
+        color = new Color(r, g, b, (byte)255);
+        return true;
+    }
+
+    private static Color BlendColors(Color baseColor, Color mixColor, float mix)
+    {
+        var t = Math.Clamp(mix, 0f, 1f);
+        var r = (byte)Math.Clamp((int)MathF.Round(baseColor.R + ((mixColor.R - baseColor.R) * t)), 0, 255);
+        var g = (byte)Math.Clamp((int)MathF.Round(baseColor.G + ((mixColor.G - baseColor.G) * t)), 0, 255);
+        var b = (byte)Math.Clamp((int)MathF.Round(baseColor.B + ((mixColor.B - baseColor.B) * t)), 0, 255);
+        return new Color(r, g, b, (byte)255);
+    }
+
+    private static Color DarkenColor(Color color, float amount)
+    {
+        var t = Math.Clamp(amount, 0f, 1f);
+        var scale = 1f - t;
+        var r = (byte)Math.Clamp((int)MathF.Round(color.R * scale), 0, 255);
+        var g = (byte)Math.Clamp((int)MathF.Round(color.G * scale), 0, 255);
+        var b = (byte)Math.Clamp((int)MathF.Round(color.B * scale), 0, 255);
+        return new Color(r, g, b, (byte)255);
+    }
+
+    private static Color WithAlpha(Color color, byte alpha)
+    {
+        return new Color(color.R, color.G, color.B, alpha);
+    }
+
+    private static float RelativeLuminance(Color color)
+    {
+        var r = color.R / 255f;
+        var g = color.G / 255f;
+        var b = color.B / 255f;
+        return (0.2126f * r) + (0.7152f * g) + (0.0722f * b);
+    }
+
+    private void DrawTextureCover(SpriteBatch sb, Texture2D texture, Rectangle dest, Color color)
+    {
+        var src = GetCenterCropSource(texture, dest);
+        sb.Draw(texture, dest, src, color);
+    }
+
+    private static Rectangle GetCenterCropSource(Texture2D texture, Rectangle dest)
+    {
+        if (texture.Width <= 0 || texture.Height <= 0 || dest.Width <= 0 || dest.Height <= 0)
+            return new Rectangle(0, 0, Math.Max(1, texture.Width), Math.Max(1, texture.Height));
+
+        var srcAspect = texture.Width / (float)texture.Height;
+        var destAspect = dest.Width / (float)dest.Height;
+        if (srcAspect > destAspect)
+        {
+            var cropWidth = Math.Max(1, (int)Math.Round(texture.Height * destAspect));
+            var x = Math.Max(0, (texture.Width - cropWidth) / 2);
+            return new Rectangle(x, 0, cropWidth, texture.Height);
+        }
+
+        var cropHeight = Math.Max(1, (int)Math.Round(texture.Width / destAspect));
+        var y = Math.Max(0, (texture.Height - cropHeight) / 2);
+        return new Rectangle(0, y, texture.Width, cropHeight);
+    }
+
+    private void DrawHeaderSideBars(SpriteBatch sb, Rectangle rect, Color color)
+    {
+        var barWidth = Math.Clamp(rect.Width / 170, 4, 8);
+        var left = new Rectangle(rect.X, rect.Y, barWidth, rect.Height);
+        var right = new Rectangle(rect.Right - barWidth, rect.Y, barWidth, rect.Height);
+        sb.Draw(_pixel, left, color);
+        sb.Draw(_pixel, right, color);
+    }
+
+    private void DrawFallbackBanner(SpriteBatch sb, Rectangle rect)
+    {
+        var leftColor = new Color(18, 26, 42, 255);
+        var rightColor = new Color(12, 18, 30, 255);
+        var left = new Rectangle(rect.X, rect.Y, rect.Width / 2, rect.Height);
+        var right = new Rectangle(left.Right, rect.Y, rect.Width - left.Width, rect.Height);
+        sb.Draw(_pixel, left, leftColor);
+        sb.Draw(_pixel, right, rightColor);
+        var horizon = new Rectangle(rect.X, rect.Y + (rect.Height / 2), rect.Width, Math.Max(2, rect.Height / 10));
+        sb.Draw(_pixel, horizon, new Color(36, 52, 78, 130));
+    }
+
+    private void EnsureAvatarDecorTextures(int size, Color ringColor, Color placeholderColor)
+    {
+        var side = Math.Max(24, size);
+        var needsRing = _veilnetAvatarRingTexture == null
+            || _veilnetAvatarRingTexture.IsDisposed
+            || _veilnetAvatarDecorSize != side
+            || !_veilnetAvatarRingColor.Equals(ringColor);
+
+        var needsPlaceholder = _veilnetAvatarPlaceholderTexture == null
+            || _veilnetAvatarPlaceholderTexture.IsDisposed
+            || _veilnetAvatarDecorSize != side
+            || !_veilnetAvatarPlaceholderColor.Equals(placeholderColor);
+
+        if (needsRing)
+        {
+            _veilnetAvatarRingTexture?.Dispose();
+            _veilnetAvatarRingTexture = CreateAvatarRingTexture(_graphics.GraphicsDevice, side, Math.Max(2, side / 44), ringColor);
+            _veilnetAvatarRingColor = ringColor;
+        }
+
+        if (needsPlaceholder)
+        {
+            _veilnetAvatarPlaceholderTexture?.Dispose();
+            _veilnetAvatarPlaceholderTexture = CreateAvatarPlaceholderTexture(
+                _graphics.GraphicsDevice,
+                side,
+                placeholderColor,
+                BlendColors(placeholderColor, Color.White, 0.3f),
+                Math.Max(2, side / 28));
+            _veilnetAvatarPlaceholderColor = placeholderColor;
+        }
+
+        _veilnetAvatarDecorSize = side;
+    }
+
+    private Texture2D CreateAvatarRingTexture(GraphicsDevice graphics, int size, int thickness, Color color)
+    {
+        var side = Math.Max(8, size);
+        var ringThickness = Math.Clamp(thickness, 1, side / 3);
+        var data = new Color[side * side];
+        var center = (side - 1) / 2f;
+        var radius = side / 2f;
+        var inner = Math.Max(0f, radius - ringThickness);
+
+        for (var y = 0; y < side; y++)
+        {
+            for (var x = 0; x < side; x++)
+            {
+                var dx = x - center;
+                var dy = y - center;
+                var dist = MathF.Sqrt(dx * dx + dy * dy);
+                data[y * side + x] = dist <= radius && dist >= inner ? color : Color.Transparent;
+            }
+        }
+
+        var tex = new Texture2D(graphics, side, side, false, SurfaceFormat.Color);
+        tex.SetData(data);
+        return tex;
+    }
+
+    private Texture2D CreateAvatarPlaceholderTexture(GraphicsDevice graphics, int size, Color fill, Color edge, int edgeThickness)
+    {
+        var side = Math.Max(8, size);
+        var data = new Color[side * side];
+        var center = (side - 1) / 2f;
+        var radius = side / 2f;
+        var inner = Math.Max(0f, radius - Math.Max(1, edgeThickness));
+
+        for (var y = 0; y < side; y++)
+        {
+            for (var x = 0; x < side; x++)
+            {
+                var dx = x - center;
+                var dy = y - center;
+                var dist = MathF.Sqrt(dx * dx + dy * dy);
+                if (dist > radius)
+                    data[y * side + x] = Color.Transparent;
+                else if (dist >= inner)
+                    data[y * side + x] = edge;
+                else
+                    data[y * side + x] = fill;
+            }
+        }
+
+        var tex = new Texture2D(graphics, side, side, false, SurfaceFormat.Color);
+        tex.SetData(data);
+        return tex;
+    }
+
+    private void DisposeVeilnetTextures()
+    {
+        _veilnetAvatarTexture?.Dispose();
+        _veilnetAvatarTexture = null;
+        _veilnetBannerTexture?.Dispose();
+        _veilnetBannerTexture = null;
+    }
+
+    private void DisposeAvatarDecorTextures()
+    {
+        _veilnetAvatarRingTexture?.Dispose();
+        _veilnetAvatarRingTexture = null;
+        _veilnetAvatarPlaceholderTexture?.Dispose();
+        _veilnetAvatarPlaceholderTexture = null;
+        _veilnetAvatarDecorSize = 0;
+        _veilnetAvatarRingColor = Color.Transparent;
+        _veilnetAvatarPlaceholderColor = Color.Transparent;
+    }
+
+    private void CancelVeilnetRefreshTask()
+    {
+        _veilnetProfileRefreshTask = null;
+        _veilnetProfileRefreshInProgress = false;
+    }
+
+    private static string NormalizeMultiline(string text)
+    {
+        return (text ?? string.Empty).Replace("\r\n", "\n").Trim();
+    }
+
+    private static string TrimStatus(string text)
+    {
+        var value = (text ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (value.Length <= 90)
+            return value;
+        return value.Substring(0, 90);
+    }
+
+    private static TimeSpan ResolveProfileRefreshInterval()
+    {
+        var raw = (Environment.GetEnvironmentVariable("LV_VEILNET_PROFILE_REFRESH_SECONDS") ?? string.Empty).Trim();
+        if (int.TryParse(raw, out var seconds))
+            return TimeSpan.FromSeconds(Math.Clamp(seconds, 20, 60));
+        return TimeSpan.FromSeconds(25);
+    }
+
+    private static string ResolveVeilnetToken()
+    {
+        return (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+    }
+
+    private static bool IsUsableToken(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        return !string.Equals(token, "null", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(token, "undefined", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(token, "placeholder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private struct VeilnetProfileRefreshPayload
+    {
+        public bool Ok { get; set; }
+        public VeilnetProfileDto? Profile { get; set; }
+        public byte[]? AvatarBytes { get; set; }
+        public byte[]? BannerBytes { get; set; }
+        public string ErrorMessage { get; set; }
+
+        public static VeilnetProfileRefreshPayload Success(VeilnetProfileDto profile)
+        {
+            return new VeilnetProfileRefreshPayload
+            {
+                Ok = true,
+                Profile = profile,
+                AvatarBytes = null,
+                BannerBytes = null,
+                ErrorMessage = string.Empty
+            };
+        }
+
+        public static VeilnetProfileRefreshPayload Fail(string message)
+        {
+            return new VeilnetProfileRefreshPayload
+            {
+                Ok = false,
+                Profile = null,
+                AvatarBytes = null,
+                BannerBytes = null,
+                ErrorMessage = (message ?? string.Empty).Trim()
+            };
+        }
+    }
+
+    private void ClearLegacyVeilnetCacheDir()
+    {
+        try
+        {
+            if (!System.IO.Directory.Exists(LegacyVeilnetCacheDir))
+                return;
+            System.IO.Directory.Delete(LegacyVeilnetCacheDir, recursive: true);
+        }
+        catch
+        {
+            // Best effort cleanup only.
+        }
     }
 
     private void DrawFriendsTab(SpriteBatch sb)

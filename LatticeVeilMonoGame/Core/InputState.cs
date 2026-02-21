@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Input;
 
@@ -15,6 +16,10 @@ public sealed class InputState
     private Vector2 _lookDelta;
     private float _uiScale = 1f;
     private Point _uiOffset = Point.Zero;
+    private readonly Dictionary<Keys, long> _textRepeatTicks = new();
+    private static readonly double StopwatchTickFrequency = Stopwatch.Frequency;
+    private const double TextRepeatInitialDelaySeconds = 0.34;
+    private const double TextRepeatIntervalSeconds = 0.045;
 
     public void Update()
     {
@@ -32,6 +37,7 @@ public sealed class InputState
         _mouse = Microsoft.Xna.Framework.Input.Mouse.GetState();
         _prevMouse = _mouse;
         _lookDelta = Vector2.Zero;
+        _textRepeatTicks.Clear();
     }
 
     public Point MousePosition
@@ -86,6 +92,49 @@ public sealed class InputState
             var k = keys[i];
             if (!_prevKeyboard.IsKeyDown(k))
                 yield return k;
+        }
+    }
+
+    public IEnumerable<Keys> GetTextInputKeys()
+    {
+        var nowTicks = Stopwatch.GetTimestamp();
+
+        var pressed = _keyboard.GetPressedKeys();
+        var pressedSet = new HashSet<Keys>(pressed);
+        if (_textRepeatTicks.Count > 0)
+        {
+            var stale = new List<Keys>();
+            foreach (var kvp in _textRepeatTicks)
+            {
+                if (!pressedSet.Contains(kvp.Key))
+                    stale.Add(kvp.Key);
+            }
+
+            for (int i = 0; i < stale.Count; i++)
+                _textRepeatTicks.Remove(stale[i]);
+        }
+
+        var initialDelayTicks = (long)(TextRepeatInitialDelaySeconds * StopwatchTickFrequency);
+        var repeatIntervalTicks = (long)(TextRepeatIntervalSeconds * StopwatchTickFrequency);
+
+        for (int i = 0; i < pressed.Length; i++)
+        {
+            var key = pressed[i];
+            if (!_prevKeyboard.IsKeyDown(key))
+            {
+                _textRepeatTicks[key] = nowTicks + initialDelayTicks;
+                yield return key;
+                continue;
+            }
+
+            if (!_textRepeatTicks.TryGetValue(key, out var nextTick))
+                continue;
+
+            if (nowTicks >= nextTick)
+            {
+                _textRepeatTicks[key] = nowTicks + repeatIntervalTicks;
+                yield return key;
+            }
         }
     }
 }

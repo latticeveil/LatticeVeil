@@ -15,8 +15,9 @@ public static class WorldListService
             return Directory.GetDirectories(Paths.WorldsDir)
                 .Select(path =>
                 {
+                    MigrateLegacyWorldFiles(path, log);
                     var folderName = Path.GetFileName(path) ?? string.Empty;
-                    var metaPath = Path.Combine(path, "world.json");
+                    var metaPath = Paths.ResolveWorldMetaPath(path);
                     var meta = File.Exists(metaPath) ? WorldMeta.Load(metaPath, log) : null;
                     var worldName = !string.IsNullOrWhiteSpace(meta?.Name) ? meta!.Name : folderName;
                     return new WorldListEntry
@@ -45,6 +46,32 @@ public static class WorldListService
     public static string BuildDisplayTitle(WorldListEntry entry)
     {
         return $"{entry.Name} [{entry.CurrentMode.ToString().ToUpperInvariant()}]";
+    }
+
+    private static void MigrateLegacyWorldFiles(string worldPath, Logger log)
+    {
+        try
+        {
+            var legacyMeta = Paths.GetLegacyWorldMetaPath(worldPath);
+            var newMeta = Paths.GetWorldMetaPath(worldPath);
+            if (File.Exists(legacyMeta) && !File.Exists(newMeta))
+            {
+                File.Move(legacyMeta, newMeta);
+                log.Info($"Migrated world meta: {Path.GetFileName(legacyMeta)} -> {Path.GetFileName(newMeta)}");
+            }
+
+            var legacyConfig = Path.Combine(worldPath, Paths.LegacyWorldConfigFileName);
+            var newConfig = Path.Combine(worldPath, Paths.WorldConfigFileName);
+            if (File.Exists(legacyConfig) && !File.Exists(newConfig))
+            {
+                File.Move(legacyConfig, newConfig);
+                log.Info($"Migrated world config: {Path.GetFileName(legacyConfig)} -> {Path.GetFileName(newConfig)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"World file migration skipped for {worldPath}: {ex.Message}");
+        }
     }
 }
 

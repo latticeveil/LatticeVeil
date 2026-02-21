@@ -245,7 +245,7 @@ public sealed class Logger
             }
 
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-            var basePath = Path.Combine(Paths.LogsDir, $"log-{stamp}.txt");
+            var basePath = Path.Combine(Paths.LogsDir, $"log-{stamp}.lvlog");
             var target = GetUniqueSnapshotPath(basePath);
 
             using var src = new FileStream(LogFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);

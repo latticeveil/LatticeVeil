@@ -320,7 +320,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
         if (_homeSlotsInputActive && _enableHomes)
         {
             // Only accept numbers, no text input
-            foreach (var key in input.GetNewKeys())
+            foreach (var key in input.GetTextInputKeys())
             {
                 if (key == Keys.Back)
                 {

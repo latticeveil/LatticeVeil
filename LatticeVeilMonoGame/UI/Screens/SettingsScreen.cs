@@ -210,7 +210,7 @@ public sealed class OptionsScreen : IScreen
     // Controls binding
     private readonly List<string> _bindOrder = new()
     {
-        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","GamemodeModifier","GamemodeWheel"
+        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","StructureFinder","GamemodeModifier","GamemodeWheel","InviteQuickAction"
     };
     private string? _bindingAction;
     private Rectangle _controlsListRect;
@@ -510,7 +510,9 @@ public sealed class OptionsScreen : IScreen
         _notificationModeBox = new Rectangle(contentX + 60, reticleTop + 230, Math.Min(400, contentW - 120), 40);
         _reticleSize.Bounds = new Rectangle(contentX + 60, reticleTop + 290, Math.Min(400, contentW - 120), 18);
         _reticleThickness.Bounds = new Rectangle(contentX + 60, reticleTop + 350, Math.Min(400, contentW - 120), 18);
-        _controlsListRect = new Rectangle(contentX + 60, reticleTop + 410, Math.Min(500, contentW - 120), 300);
+        var controlsRowHeight = 36;
+        var controlsListHeight = Math.Max(300, (_bindOrder.Count * controlsRowHeight) + 4);
+        _controlsListRect = new Rectangle(contentX + 60, reticleTop + 410, Math.Min(500, contentW - 120), controlsListHeight);
         _packsListRect = new Rectangle(contentX + 60, contentY + 20, Math.Min(500, contentW - 120), 300);
 
         ClampAllScroll();
@@ -1099,6 +1101,19 @@ public sealed class OptionsScreen : IScreen
         _font.DrawString(sb, "MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL OR 1-9 HOTBAR", new Vector2(listRect.X, notesY + _font.LineHeight + 2), new Color(180, 180, 180));
         _font.DrawString(sb, "UI: ENTER SENDS CHAT/COMMAND | ESC CLOSES MENUS", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 2), new Color(180, 180, 180));
 
+        var maxScroll = GetMaxScroll(Tab.Controls);
+        if (maxScroll > 0)
+        {
+            var currentScroll = GetScroll(Tab.Controls);
+            var indicatorWidth = 26;
+            var indicatorHeight = 20;
+            var indicatorX = listRect.Right - indicatorWidth - 6;
+            var upRect = new Rectangle(indicatorX, listRect.Y + 6, indicatorWidth, indicatorHeight);
+            var downRect = new Rectangle(indicatorX, listRect.Bottom - indicatorHeight - 6, indicatorWidth, indicatorHeight);
+            DrawScrollIndicator(sb, upRect, "^", currentScroll > 1f);
+            DrawScrollIndicator(sb, downRect, "v", currentScroll < maxScroll - 1f);
+        }
+
         if (_reticleStyleOpen)
             DrawSimpleDropdownList(sb, styleBox, ReticleStyleLabels, styleIndex);
         if (_reticleColorOpen)
@@ -1192,6 +1207,20 @@ public sealed class OptionsScreen : IScreen
             Tab.Audio => _applyAudioTexture ?? _applyDefaultTexture ?? _apply.Texture,
             _ => _applyDefaultTexture ?? _apply.Texture
         };
+    }
+
+    private void DrawScrollIndicator(SpriteBatch sb, Rectangle rect, string glyph, bool active)
+    {
+        var fill = active ? new Color(20, 24, 34, 235) : new Color(10, 12, 18, 180);
+        var border = active ? new Color(255, 255, 255) : new Color(140, 140, 140);
+        var textColor = active ? new Color(245, 232, 126) : new Color(120, 120, 120);
+        sb.Draw(_pixel, rect, fill);
+        DrawBorder(sb, rect, border, 1);
+        var textSize = _font.MeasureString(glyph);
+        var textPos = new Vector2(
+            rect.X + (rect.Width - textSize.X) * 0.5f,
+            rect.Y + (rect.Height - textSize.Y) * 0.5f);
+        _font.DrawString(sb, glyph, textPos, textColor);
     }
 
     private void CloseAllDropdowns()
@@ -1722,6 +1751,8 @@ public sealed class OptionsScreen : IScreen
                 var bottom = Math.Max(_controlsListRect.Bottom, _mouseSensitivity.Bounds.Bottom);
                 bottom = Math.Max(bottom, _reticleThickness.Bounds.Bottom);
                 bottom = Math.Max(bottom, _notificationModeBox.Bottom);
+                var controlsNotesBottom = _controlsListRect.Bottom + 12 + ((_font.LineHeight + 2) * 3);
+                bottom = Math.Max(bottom, controlsNotesBottom);
                 return Math.Max(0, bottom - top + padding);
             }
             case Tab.Packs:
@@ -1802,8 +1833,10 @@ public sealed class OptionsScreen : IScreen
             "Chat" => "OPEN CHAT",
             "Command" => "OPEN COMMAND (/)",
             "HomeGui" => "HOME GUI",
+            "StructureFinder" => "FINDER GUI",
             "GamemodeModifier" => "MODE MODIFIER",
             "GamemodeWheel" => "MODE WHEEL",
+            "InviteQuickAction" => "INVITE QUICK ACTION",
             _ => action.ToUpperInvariant()
         };
     }

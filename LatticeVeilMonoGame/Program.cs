@@ -65,6 +65,7 @@ public static class Program
 
         // Copy default assets from the app directory to Documents\LatticeVeil\Assets if missing.
         AssetInstaller.EnsureDefaultsInstalled(AppDomain.CurrentDomain.BaseDirectory, log);
+        Paths.RemoveDisallowedAssetEntries(log);
 
         var smoke = HasArg(args, "--smoke");
         var smokeAssetsOk = true;
@@ -87,12 +88,16 @@ public static class Program
         var forceLauncher = HasArg(args, "--launcher");
         var runGame = !forceLauncher && IsGameEntry(args);
         var startupLinkCode = LauncherProtocolLinking.TryExtractLinkCodeFromArgs(args);
+        var hasProtocolArg = args.Any(a => !string.IsNullOrWhiteSpace(a) && a.IndexOf("latticeveil://", StringComparison.OrdinalIgnoreCase) >= 0);
         if (!string.IsNullOrWhiteSpace(startupLinkCode))
             log.Info("Launcher deep-link code detected from protocol URL.");
+        else if (hasProtocolArg)
+            log.Warn("Protocol URL detected but link code parsing failed.");
 
         if (runGame)
         {
             Environment.SetEnvironmentVariable("LV_PROCESS_KIND", "game");
+            Environment.SetEnvironmentVariable("LV_BUILD_CHANNEL", Paths.IsDevBuild ? "dev" : "release");
             var strictStartupGate = ParseBool(Environment.GetEnvironmentVariable("LV_STRICT_STARTUP_GATE"));
 
             var requireLauncherHandshake = ShouldRequireLauncherHandshake();
@@ -122,9 +127,33 @@ public static class Program
             Environment.SetEnvironmentVariable(
                 "LV_LAUNCHER_ONLINE_AUTH",
                 (!effectiveOffline && onlineAuthorizedByLauncher) ? "1" : "0");
+            Environment.SetEnvironmentVariable("LV_LAUNCH_MODE", effectiveOffline ? "offline" : "online");
 
             if (!effectiveOffline)
             {
+                var veilnetToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+                var gateTicket = (Environment.GetEnvironmentVariable("LV_GATE_TICKET") ?? string.Empty).Trim();
+                var hasVeilnetToken = IsUsableToken(veilnetToken);
+                var hasGateTicket = !string.IsNullOrWhiteSpace(gateTicket);
+                if (!hasVeilnetToken || !hasGateTicket)
+                {
+                    effectiveOffline = true;
+                    Environment.SetEnvironmentVariable("LV_LAUNCHER_ONLINE_AUTH", "0");
+                    Environment.SetEnvironmentVariable("LV_LAUNCH_MODE", "offline");
+                    MessageBox.Show(
+                        "Online auth context is missing. This run will start in Offline mode.\n\nUse the launcher Online flow to enable EOS multiplayer.",
+                        "Online Unavailable",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    log.Warn(
+                        $"Online startup context missing; forcing offline mode. " +
+                        $"hasVeilnetToken={hasVeilnetToken}; hasGateTicket={hasGateTicket}");
+                }
+            }
+
+            if (!effectiveOffline)
+            {
+                Environment.SetEnvironmentVariable("EOS_DISABLED", null);
                 var gate = OnlineGateClient.GetOrCreate();
                 var hashTargetPath = (Environment.GetEnvironmentVariable("LV_GATE_HASH_TARGET") ?? string.Empty).Trim();
                 if (string.IsNullOrWhiteSpace(hashTargetPath))
@@ -164,6 +193,12 @@ public static class Program
                         log.Warn("Startup gate precheck failed, but continuing in ONLINE-capable mode. Gate will be checked again when hosting/joining.");
                     }
                 }
+            }
+            else
+            {
+                Environment.SetEnvironmentVariable("LV_GATE_TICKET", null);
+                Environment.SetEnvironmentVariable("LV_GATE_TICKET_EXPIRES_UTC", null);
+                Environment.SetEnvironmentVariable("EOS_DISABLED", "1");
             }
 
             var startOptions = new GameStartOptions
@@ -260,6 +295,19 @@ public static class Program
         using var mutex = new Mutex(true, AppMutexes.LauncherMutexName, out var createdNew);
         if (!createdNew)
         {
+            if (!string.IsNullOrWhiteSpace(startupLinkCode))
+            {
+                if (LauncherProtocolLinking.TryQueueLinkCodeForRunningLauncher(startupLinkCode, log))
+                {
+                    MessageBox.Show(
+                        "Link code sent to the running launcher instance.",
+                        Paths.IsDevBuild ? "[DEV] Lattice Launcher" : "Lattice Launcher",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+            }
+
             log.Warn("Launcher: mutex already held. Another instance is likely running.");
             MessageBox.Show(
                 "Launcher is already running.",
@@ -370,6 +418,16 @@ public static class Program
             || normalized.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsUsableToken(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        return !string.Equals(token, "null", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(token, "undefined", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(token, "placeholder", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string? ResolveCurrentGameExecutablePathForGate()
     {
         try
@@ -447,10 +505,11 @@ public static class Program
             Directory.CreateDirectory(Paths.ScreenshotsDir);
             Directory.CreateDirectory(Paths.WorldsDir);
             Directory.CreateDirectory(Paths.MultiplayerWorldsDir);
-            Directory.CreateDirectory(Paths.ConfigDir);
+            DeleteLegacyMultiplayerWorldCaches(log);
+            DeleteLegacyConfigFolder(log);
 
             Paths.EnsureAssetDirectoriesExist(log);
-            Directory.CreateDirectory(Path.Combine(Paths.AssetsDir, "packs"));
+            Paths.RemoveDisallowedAssetEntries(log);
         }
         catch (Exception ex)
         {
@@ -458,11 +517,64 @@ public static class Program
         }
     }
 
+    private static void DeleteLegacyMultiplayerWorldCaches(Logger log)
+    {
+        try
+        {
+            var legacyFolders = new[]
+            {
+                Path.Combine(Paths.RootDir, "Worlds_Multiplayer"),
+                Path.Combine(Paths.WorldsDir, "_OnlineCache")
+            };
+
+            for (var i = 0; i < legacyFolders.Length; i++)
+            {
+                var legacy = legacyFolders[i];
+                if (!Directory.Exists(legacy))
+                    continue;
+
+                Directory.Delete(legacy, recursive: true);
+                log.Info($"Deleted legacy multiplayer cache folder: {legacy}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to delete legacy multiplayer cache folder: {ex.Message}");
+        }
+    }
+
+    private static void DeleteLegacyConfigFolder(Logger log)
+    {
+        try
+        {
+            var legacyConfig = Path.Combine(Paths.RootDir, "Config");
+            if (!Directory.Exists(legacyConfig))
+                return;
+
+            foreach (var file in Directory.GetFiles(legacyConfig, "*", SearchOption.TopDirectoryOnly))
+            {
+                var target = Path.Combine(Paths.RootDir, Path.GetFileName(file));
+                if (File.Exists(target))
+                    continue;
+
+                File.Move(file, target);
+                log.Info($"Migrated Config file to root: {Path.GetFileName(file)}");
+            }
+
+            Directory.Delete(legacyConfig, recursive: true);
+            log.Info("Deleted legacy Config folder.");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to delete legacy Config folder: {ex.Message}");
+        }
+    }
+
     private static void LogExceptionToEmergencyFile(Exception ex, string context)
     {
         try
         {
-            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "emergency_crash.log");
+            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "emergency_crash.lverror");
             File.AppendAllText(path, $"[{DateTime.Now}] {context}: {ex}\n");
         }
         catch { }

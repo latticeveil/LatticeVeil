@@ -16,7 +16,7 @@ var app = builder.Build();
 app.Logger.LogInformation("GateServer starting. Build: 2026-02-15 05:30. Version: v8.0.6-nuclear");
 
 // 1. HIGH PRIORITY TEST ENDPOINT (No Auth)
-// If this 404s, Render is 100% building the wrong code or branch.
+// If this 404s, the deployed branch/build is not serving current code.
 app.MapGet("/test-friends", () => Results.Ok(new { status = "v8.0.5 is LIVE", routes = "friends mapped" }));
 
 // 2. Features probe
@@ -30,8 +30,7 @@ app.MapGet("/admin/diag", (HttpContext httpContext) => {
         identityRepo = Environment.GetEnvironmentVariable("IDENTITY_REGISTRY_GITHUB_REPO"),
         identityBranch = Environment.GetEnvironmentVariable("IDENTITY_REGISTRY_GITHUB_BRANCH"),
         identityPath = Environment.GetEnvironmentVariable("IDENTITY_REGISTRY_GITHUB_PATH"),
-        hasGithubToken = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("IDENTITY_REGISTRY_GITHUB_TOKEN")),
-        hasDeployHook = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("RENDER_DEPLOY_HOOK_URL"))
+        hasGithubToken = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("IDENTITY_REGISTRY_GITHUB_TOKEN"))
     });
 });
 
@@ -257,17 +256,6 @@ app.MapPost("/webhook/github/identity", async (HttpContext httpContext, Identity
     // Public endpoint for GitHub webhooks. Optional: verify X-Hub-Signature-256.
     var result = await identityProvider.ForceRefreshAsync(ct);
     return Results.Ok(new { ok = result.Ok });
-});
-
-// 6. Render Re-Deploy Trigger
-app.MapPost("/admin/deploy/trigger", async (HttpContext httpContext, IHttpClientFactory httpClientFactory, CancellationToken ct) => {
-    if (!TryAuthorizeAdmin(httpContext, out var failure)) return failure!;
-    var hookUrl = (Environment.GetEnvironmentVariable("RENDER_DEPLOY_HOOK_URL") ?? "").Trim();
-    if (string.IsNullOrWhiteSpace(hookUrl)) return Results.Problem("RENDER_DEPLOY_HOOK_URL not configured.", statusCode: 503);
-    
-    using var client = httpClientFactory.CreateClient();
-    var response = await client.PostAsync(hookUrl, null, ct);
-    return Results.Ok(new { ok = response.IsSuccessStatusCode, status = (int)response.StatusCode });
 });
 
 app.Run();

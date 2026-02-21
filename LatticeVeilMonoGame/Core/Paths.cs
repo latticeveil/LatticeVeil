@@ -1,10 +1,19 @@
 using System;
 using System.IO;
+using System.Linq;
 
 namespace LatticeVeilMonoGame.Core;
 
 public static class Paths
 {
+    public const string ConfigExtension = ".lvc";
+    public const string ListExtension = ".lvlist";
+    public const string LogExtension = ".lvlog";
+    public const string WorldMetaFileName = "world.lvc";
+    public const string LegacyWorldMetaFileName = "world.json";
+    public const string WorldConfigFileName = "world_config.lvc";
+    public const string LegacyWorldConfigFileName = "world_config.json";
+
     public static bool IsDevBuild
     {
 #if DEBUG
@@ -97,39 +106,63 @@ public static class Paths
         Path.Combine(RootDir, "Worlds");
 
     public static string MultiplayerWorldsDir =>
-        Path.Combine(RootDir, "Worlds_Multiplayer");
+        Path.Combine(RootDir, "_OnlineCache");
 
     public static string BackupsDir =>
         Path.Combine(RootDir, "Backups");
 
     public static string ActiveLogPath =>
-        Path.Combine(LogsDir, "current.log");
+        Path.Combine(LogsDir, "current.lvlog");
 
     public static string GamePidPath =>
         Path.Combine(RootDir, "game.pid");
 
     public static string SettingsJsonPath =>
 #if PRIVATE_CLIENT
-        Path.Combine(ConfigDir, "settings.private.json");
+        Path.Combine(RootDir, "options.private.lvc");
 #else
-        Path.Combine(RootDir, "settings.json");
+        Path.Combine(RootDir, "options.lvc");
 #endif
 
+    public static string LegacySettingsLvcPath =>
+        Path.Combine(RootDir, "settings.lvc");
+
+    public static string LegacySettingsJsonPath =>
+        Path.Combine(RootDir, "settings.json");
+
     public static string PlayerProfileJsonPath =>
+        Path.Combine(RootDir, "player_profile.lvc");
+
+    public static string LegacyPlayerProfileJsonPath =>
         Path.Combine(RootDir, "player_profile.json");
 
     public static string ConfigDir =>
-#if PRIVATE_CLIENT
-        Path.Combine(RootDir, "config");
-#else
-        Path.Combine(RootDir, "Config");
-#endif
+        RootDir;
 
     /// <summary>
     /// Local friend labels (nicknames + pinned list). This is client-side only.
     /// </summary>
     public static string FriendLabelsJsonPath =>
-        Path.Combine(ConfigDir, "friend_labels.json");
+        Path.Combine(RootDir, "friend_labels.lvc");
+
+    public static string LegacyFriendLabelsJsonPath =>
+        Path.Combine(RootDir, "friend_labels.json");
+
+    public static string GetWorldMetaPath(string worldPath) =>
+        Path.Combine(worldPath, WorldMetaFileName);
+
+    public static string GetLegacyWorldMetaPath(string worldPath) =>
+        Path.Combine(worldPath, LegacyWorldMetaFileName);
+
+    public static string ResolveWorldMetaPath(string worldPath)
+    {
+        var preferred = GetWorldMetaPath(worldPath);
+        if (File.Exists(preferred))
+            return preferred;
+
+        var legacy = GetLegacyWorldMetaPath(worldPath);
+        return File.Exists(legacy) ? legacy : preferred;
+    }
 
 
 
@@ -187,5 +220,64 @@ public static class Paths
     public static string ResolveAssetPath(string relativePath)
     {
         return Path.Combine(AssetsDir, relativePath);
+    }
+
+    public static bool IsDisallowedAssetRelativePath(string? relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath))
+            return false;
+
+        var normalized = relativePath.Replace('\\', '/').TrimStart('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        var first = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(first))
+            return false;
+
+        var hasNestedPath = normalized.Contains('/');
+        if (!hasNestedPath && normalized.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return first.Equals("packs", StringComparison.OrdinalIgnoreCase)
+            || first.Equals("data", StringComparison.OrdinalIgnoreCase)
+            || first.Equals(".github", StringComparison.OrdinalIgnoreCase)
+            || first.Equals(".git", StringComparison.OrdinalIgnoreCase)
+            || first.Equals(".gitignore", StringComparison.OrdinalIgnoreCase)
+            || first.Equals(".gitattributes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void RemoveDisallowedAssetEntries(Logger log)
+    {
+        try
+        {
+            if (!Directory.Exists(AssetsDir))
+                return;
+
+            foreach (var entry in Directory.GetFileSystemEntries(AssetsDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(entry);
+                if (!IsDisallowedAssetRelativePath(name))
+                    continue;
+
+                try
+                {
+                    if (Directory.Exists(entry))
+                        Directory.Delete(entry, recursive: true);
+                    else if (File.Exists(entry))
+                        File.Delete(entry);
+
+                    log.Info($"Removed disallowed asset entry: {name}");
+                }
+                catch (Exception ex)
+                {
+                    log.Warn($"Failed removing disallowed asset entry '{name}': {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed cleaning disallowed asset entries: {ex.Message}");
+        }
     }
 }

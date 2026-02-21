@@ -105,4 +105,11 @@
     <None Include="..\eos\eos.public.json" Link="eos.public.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\eos\eos.public.json')" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Remove="Defaults/Assets/data/**" />
+    <None Remove="Defaults/Assets/packs/**" />
+    <None Remove="Defaults/Assets/.github/**" />
+    <None Remove="Defaults/Assets/.git*" />
+  </ItemGroup>
+
 </Project>

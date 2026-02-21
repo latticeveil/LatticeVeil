@@ -19,6 +19,7 @@ using DPoint = System.Drawing.Point;
 using DSize = System.Drawing.Size;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -42,6 +43,15 @@ public sealed class LauncherForm : Form
         NotRunning,
         RunningExternal,
         RunningOwned
+    }
+
+    private enum LaunchReadiness
+    {
+        Unknown,
+        Checking,
+        ReadyOnline,
+        ReadyOfflineOnly,
+        Failed
     }
 
     // Win32: make a borderless form draggable.
@@ -163,14 +173,22 @@ public sealed class LauncherForm : Form
     private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
     private static readonly string VeilnetAuthDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "RedactedCraft");
+        "LatticeVeil");
     private static readonly string VeilnetAuthPath = Path.Combine(VeilnetAuthDir, "veilnet_launcher_token.json");
     private bool _onlineFunctional;
     private bool _releaseHashAllowed;
     private bool _officialBuildVerified;
     private bool _onlineServicesReachable;
     private string _onlineStatusDetail = "Checking online services...";
+    private readonly object _onlineValidationSync = new();
+    private bool _onlineValidationInProgress;
+    private LaunchReadiness _launchReadiness = LaunchReadiness.Unknown;
+    private bool _officialHashOk;
+    private bool _veilnetAuthOk;
+    private bool _gateTicketOk;
+    private bool _eosReadyOk;
     private string? _authTicket; // Store authentication ticket for claiming
+    private bool _queuedLinkCodeConsumeInProgress;
 
     private sealed class ReleaseAllowlist
     {
@@ -207,6 +225,7 @@ public sealed class LauncherForm : Form
         _assetInstaller = new AssetPackInstaller(_log);
         _logFilePath = _log.LogFilePath;
         ResetLogSessionDate(_logFilePath);
+        _log.Info($"Auth storage path: {VeilnetAuthPath}");
 
         if (string.IsNullOrWhiteSpace(_profile.OfflineUsername))
         {
@@ -271,6 +290,7 @@ public sealed class LauncherForm : Form
             RefreshGameProcessState();
             _eosClient?.Tick();
             UpdateEpicLoginStatus();
+            _ = TryConsumePendingLinkCodesAsync();
         };
         _pollTimer.Start();
 
@@ -482,16 +502,23 @@ public sealed class LauncherForm : Form
                         return;
                     }
 
-                    if (!_onlineFunctional || !_releaseHashAllowed)
+                    if (_launchReadiness != LaunchReadiness.ReadyOnline || !_onlineFunctional || !_releaseHashAllowed)
                     {
-                        var reason = string.IsNullOrWhiteSpace(_onlineStatusDetail)
-                            ? "Online services are unavailable for this build."
-                            : _onlineStatusDetail;
-                        MessageBox.Show(
-                            reason,
+                        var reason = _onlineValidationInProgress
+                            ? "Validating Veilnet... online launch will unlock when checks finish."
+                            : (string.IsNullOrWhiteSpace(_onlineStatusDetail)
+                                ? "Online services are unavailable for this build."
+                                : _onlineStatusDetail);
+                        var switchResult = MessageBox.Show(
+                            $"{reason}\n\nSwitch to Offline mode?",
                             "Online Unavailable",
-                            MessageBoxButtons.OK,
+                            MessageBoxButtons.YesNo,
                             MessageBoxIcon.Warning);
+                        if (switchResult == DialogResult.Yes)
+                        {
+                            _launchModeBox.SelectedItem = "Offline";
+                            LaunchGameProcess("--offline", requireHashApproval: false);
+                        }
                         return;
                     }
                     StartAssetCheckAndLaunch(BuildOnlineLaunchArgs());
@@ -509,6 +536,13 @@ public sealed class LauncherForm : Form
         _launchModeBox.Font = new DFont(Font.FontFamily, 8.5f, System.Drawing.FontStyle.Bold);
         _launchModeBox.Margin = new Padding(6, 18, 6, 6);
         _toolTip.SetToolTip(_launchModeBox, "Launch mode");
+        _launchModeBox.SelectedIndexChanged += async (_, _) =>
+        {
+            if (IsOnlineModeSelected())
+                await BeginStartupOnlineChecks();
+
+            SetLaunchButtonState(GetGameState());
+        };
 
         ConfigureIconButton(_openLogsBtn, "Logs", 96, 64);
         _toolTip.SetToolTip(_openLogsBtn, "Open logs folder");
@@ -580,12 +614,12 @@ public sealed class LauncherForm : Form
         _hubGoogleBtn.Click += async (_, _) => await OnGoogleLoginClicked();
         _right.Controls.Add(_hubGoogleBtn);
 
-        _hubResetBtn.Text = "SWITCH USER";
+        _hubResetBtn.Text = "RESET VEILNET LOGIN";
         _hubResetBtn.Width = 240;
         _hubResetBtn.Height = 34;
         _hubResetBtn.Enabled = false;
         _hubResetBtn.Visible = false;
-        _hubResetBtn.Click += async (_, _) => await EpicSwitchUserAsync();
+        _hubResetBtn.Click += (_, _) => OnVeilnetResetClicked();
         _right.Controls.Add(_hubResetBtn);
 
         // Hub status label - hidden per user request
@@ -605,17 +639,10 @@ public sealed class LauncherForm : Form
     {
         try
         {
-            var existingToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
-            if (!string.IsNullOrWhiteSpace(existingToken))
-            {
-                TryClearVeilnetAuth();
-                BeginInvoke(new Action(() =>
-                {
-                    RefreshVeilnetLoginVisuals();
-                    UpdateHubStatus("Veilnet: unlinked");
-                }));
-                return;
-            }
+            TryClearVeilnetAuth(
+                "Starting Veilnet login flow; clearing stale local auth.",
+                clearPendingCodes: true,
+                updateStatus: false);
 
             _hubGoogleBtn.Enabled = false;
             UpdateHubStatus("Veilnet: open browser to link...");
@@ -661,12 +688,23 @@ public sealed class LauncherForm : Form
     private async Task<VeilnetClient.ExchangeResponse> LinkVeilnetWithCodeAsync(string code)
     {
         var exchange = await GetVeilnetClient().ExchangeCodeAsync(code).ConfigureAwait(false);
+        var me = await GetVeilnetClient().GetMeAsync(exchange.Token).ConfigureAwait(false);
 
-        Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", exchange.Username);
+        var username = string.IsNullOrWhiteSpace(me.Username) ? exchange.Username : me.Username;
+        var userId = string.IsNullOrWhiteSpace(me.UserId) ? exchange.UserId : me.UserId;
+
+        Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", username);
         Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", exchange.Token);
-        TrySaveVeilnetAuth(exchange.Username, exchange.Token, exchange.UserId);
+        TrySaveVeilnetAuth(username, exchange.Token, userId);
+        ClearVeilnetFriendsProfileCache("Clearing cached Veilnet friends before link sync.");
+        await SyncVeilnetFriendsToProfileAsync("link-code exchange").ConfigureAwait(false);
 
-        BeginInvoke(new Action(() => RefreshVeilnetLoginVisuals(exchange.Username)));
+        _log.Info("Veilnet link exchange verified via launcher-me (200).");
+
+        BeginInvoke(new Action(() => RefreshVeilnetLoginVisuals(username)));
+        _ = BeginStartupOnlineChecks();
+        exchange.Username = username;
+        exchange.UserId = userId;
         return exchange;
     }
 
@@ -675,25 +713,55 @@ public sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(_startupLinkCode))
             return;
 
+        await ConsumeVeilnetLinkCodeAsync(_startupLinkCode, "startup protocol callback").ConfigureAwait(false);
+    }
+
+    private async Task TryConsumePendingLinkCodesAsync()
+    {
+        if (_queuedLinkCodeConsumeInProgress)
+            return;
+
+        var codes = LauncherProtocolLinking.DequeuePendingLinkCodes(_log);
+        if (codes.Length == 0)
+            return;
+
+        _queuedLinkCodeConsumeInProgress = true;
+        try
+        {
+            for (var i = 0; i < codes.Length; i++)
+                await ConsumeVeilnetLinkCodeAsync(codes[i], "queued protocol callback").ConfigureAwait(false);
+        }
+        finally
+        {
+            _queuedLinkCodeConsumeInProgress = false;
+        }
+    }
+
+    private async Task ConsumeVeilnetLinkCodeAsync(string code, string source)
+    {
+        if (string.IsNullOrWhiteSpace(code))
+            return;
+
         try
         {
             BeginInvoke(new Action(() =>
             {
                 _hubGoogleBtn.Enabled = false;
-                UpdateHubStatus("Veilnet: processing launcher link code...");
+                UpdateHubStatus($"Veilnet: processing {source}...");
             }));
 
-            var exchange = await LinkVeilnetWithCodeAsync(_startupLinkCode).ConfigureAwait(false);
+            var exchange = await LinkVeilnetWithCodeAsync(code).ConfigureAwait(false);
             BeginInvoke(new Action(() =>
             {
                 RefreshVeilnetLoginVisuals(exchange.Username);
                 UpdateHubStatus($"Veilnet: linked as {exchange.Username}");
             }));
+            _log.Info($"Veilnet link code consumed from {source}.");
         }
         catch (Exception ex)
         {
-            _log.Warn($"Veilnet deep-link exchange failed: {ex.Message}");
-            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: deep-link failed ({ex.Message})")));
+            _log.Warn($"Veilnet link code consume failed ({source}): {ex.Message}");
+            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: link failed ({ex.Message})")));
         }
         finally
         {
@@ -1017,9 +1085,26 @@ public sealed class LauncherForm : Form
 
     private void TryLoadVeilnetAuth()
     {
+        _log.Info("Loaded session: checking persisted Veilnet auth...");
         var record = TryReadVeilnetAuth();
         if (record == null)
+        {
+            _log.Info("Loaded session: absent.");
+            ClearVeilnetFriendsProfileCache("No Veilnet session found; clearing cached friend usernames.");
+            RefreshVeilnetLoginVisuals();
             return;
+        }
+
+        _log.Info($"Loaded session: present. savedAtUtc={record.SavedAtUtc:o}");
+        if (!TryValidateTokenLifetime(record.Token, out var expiresUtc, out var rejectionReason))
+        {
+            var expText = expiresUtc.HasValue ? expiresUtc.Value.ToString("o") : "n/a";
+            _log.Warn($"Loaded session rejected: reason={rejectionReason}; expUtc={expText}; nowUtc={DateTime.UtcNow:o}");
+            TryClearVeilnetAuth("Saved Veilnet session was invalid/expired.", clearPendingCodes: false, updateStatus: true);
+            return;
+        }
+
+        _log.Info($"Loaded session accepted. expUtc={expiresUtc!.Value:o}; nowUtc={DateTime.UtcNow:o}");
 
         Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", record.Token);
         if (!string.IsNullOrWhiteSpace(record.Username))
@@ -1041,8 +1126,11 @@ public sealed class LauncherForm : Form
         TryAutoLoginVeilnetFromEosPuid();
     }
 
-    private void TryClearVeilnetAuth()
+    private void TryClearVeilnetAuth(string reason, bool clearPendingCodes, bool updateStatus)
     {
+        if (!string.IsNullOrWhiteSpace(reason))
+            _log.Info(reason);
+
         try
         {
             if (File.Exists(VeilnetAuthPath))
@@ -1056,8 +1144,43 @@ public sealed class LauncherForm : Form
         {
             Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", null);
             Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", null);
+            Environment.SetEnvironmentVariable("LV_GATE_TICKET", null);
+            Environment.SetEnvironmentVariable("LV_GATE_TICKET_EXPIRES_UTC", null);
             _veilnetAutoLoginAttempted = false;
+            _veilnetAuthOk = false;
+            _gateTicketOk = false;
+            _eosReadyOk = false;
+            _launchReadiness = LaunchReadiness.ReadyOfflineOnly;
+            ClearVeilnetFriendsProfileCache("Veilnet auth cleared; removing cached friend usernames.");
+
+            if (clearPendingCodes)
+                LauncherProtocolLinking.ClearPendingLinkCodes(_log);
+
+            if (IsHandleCreated)
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    RefreshVeilnetLoginVisuals();
+                    if (updateStatus)
+                        UpdateHubStatus("Veilnet: LOGIN REQUIRED. Click Login with Veilnet.");
+                    SetLaunchButtonState(GetGameState());
+                }));
+            }
+            else if (updateStatus)
+            {
+                _onlineStatusDetail = "Veilnet: LOGIN REQUIRED. Click Login with Veilnet.";
+            }
         }
+    }
+
+    private void TryClearVeilnetAuth()
+    {
+        TryClearVeilnetAuth("Clearing Veilnet auth cache.", clearPendingCodes: false, updateStatus: true);
+    }
+
+    private void OnVeilnetResetClicked()
+    {
+        TryClearVeilnetAuth("Reset Veilnet Login requested by user.", clearPendingCodes: true, updateStatus: true);
     }
 
     private void TryAutoLoginVeilnetFromEosPuid()
@@ -1078,17 +1201,19 @@ public sealed class LauncherForm : Form
                 Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", me.Username);
                 Environment.SetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN", record.Token);
                 TrySaveVeilnetAuth(me.Username, record.Token, me.UserId);
+                await SyncVeilnetFriendsToProfileAsync("auto-login refresh").ConfigureAwait(false);
 
                 BeginInvoke(new Action(() =>
                 {
                     RefreshVeilnetLoginVisuals(me.Username);
                     UpdateHubStatus($"Veilnet: linked as {me.Username}");
                 }));
+                _ = BeginStartupOnlineChecks();
             }
             catch (Exception ex)
             {
                 _log.Warn($"Veilnet token refresh failed: {ex.Message}");
-                TryClearVeilnetAuth();
+                TryClearVeilnetAuth("Saved Veilnet login was rejected by launcher-me.", clearPendingCodes: false, updateStatus: true);
                 BeginInvoke(new Action(() =>
                 {
                     RefreshVeilnetLoginVisuals();
@@ -1098,10 +1223,111 @@ public sealed class LauncherForm : Form
         });
     }
 
+    private async Task SyncVeilnetFriendsToProfileAsync(string trigger)
+    {
+        try
+        {
+            if (!HasValidVeilnetSessionForOnline())
+                return;
+
+            var result = await OnlineGateClient.GetOrCreate().GetFriendsAsync().ConfigureAwait(false);
+            if (!result.Ok)
+            {
+                _log.Warn($"Veilnet friend sync skipped ({trigger}): {result.Message}");
+                return;
+            }
+
+            var merged = new List<PlayerProfile.FriendEntry>();
+            var seenUserIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var friend in result.Friends)
+            {
+                var userId = (friend.ProductUserId ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(userId) || !seenUserIds.Add(userId))
+                    continue;
+
+                var label = NormalizeVeilnetFriendName(friend.Username, friend.DisplayName);
+                if (string.IsNullOrWhiteSpace(label))
+                    continue;
+
+                merged.Add(new PlayerProfile.FriendEntry
+                {
+                    UserId = userId,
+                    Label = label,
+                    LastKnownDisplayName = label,
+                    LastKnownPresence = string.Empty
+                });
+            }
+
+            _profile.Friends = merged;
+            _profile.Save(_log);
+            _log.Info($"Veilnet friend sync ok ({trigger}): cachedUsernames={merged.Count}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Veilnet friend sync failed ({trigger}): {ex.Message}");
+        }
+    }
+
+    private void ClearVeilnetFriendsProfileCache(string reason)
+    {
+        try
+        {
+            if (_profile.Friends.Count == 0)
+                return;
+
+            _profile.Friends.Clear();
+            _profile.Save(_log);
+            _log.Info(reason);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to clear Veilnet friends cache: {ex.Message}");
+        }
+    }
+
+    private static string NormalizeVeilnetFriendName(string? username, string? displayName)
+    {
+        var preferred = (username ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(preferred))
+            return preferred;
+
+        var fallback = (displayName ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(fallback))
+            return fallback;
+
+        return string.Empty;
+    }
+
+    private static bool LooksLikeIdentityToken(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        if (Guid.TryParse(text, out _))
+            return true;
+
+        var compact = text.Replace("-", string.Empty);
+        if (compact.Length >= 16 && compact.All(Uri.IsHexDigit))
+            return true;
+
+        if (text.Contains("...", StringComparison.Ordinal)
+            || text.StartsWith("PLAYER-", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("000", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
     private void RefreshVeilnetLoginVisuals(string? usernameOverride = null)
     {
         var username = (usernameOverride ?? (Environment.GetEnvironmentVariable("LV_VEILNET_USERNAME") ?? string.Empty)).Trim();
+        var token = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+        var hasToken = !string.IsNullOrWhiteSpace(token) && !IsPlaceholderToken(token);
         _hubGoogleBtn.Text = string.IsNullOrWhiteSpace(username) ? "LOGIN WITH VEILNET" : $"LINKED: {username}";
+        _hubResetBtn.Visible = hasToken || !string.IsNullOrWhiteSpace(username);
+        _hubResetBtn.Enabled = _hubResetBtn.Visible;
     }
 
     private static bool IsPlaceholderToken(string token)
@@ -1112,15 +1338,131 @@ public sealed class LauncherForm : Form
             || string.Equals(token, "placeholder", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool HasValidVeilnetSessionForOnline()
+    private bool HasValidVeilnetSessionForOnline(bool logFailures = false)
     {
         var username = (Environment.GetEnvironmentVariable("LV_VEILNET_USERNAME") ?? string.Empty).Trim();
         var token = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
 
         if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(token))
+        {
+            if (logFailures)
+                _log.Warn($"Loaded session rejected: reason=missing_username_or_token; hasUsername={!string.IsNullOrWhiteSpace(username)}; hasToken={!string.IsNullOrWhiteSpace(token)}");
             return false;
+        }
 
-        return !IsPlaceholderToken(token);
+        if (IsPlaceholderToken(token))
+        {
+            if (logFailures)
+                _log.Warn("Loaded session rejected: reason=placeholder_token");
+            return false;
+        }
+
+        if (!TryValidateTokenLifetime(token, out var expiresUtc, out var rejectionReason))
+        {
+            if (logFailures)
+            {
+                var expText = expiresUtc.HasValue ? expiresUtc.Value.ToString("o") : "n/a";
+                _log.Warn($"Loaded session rejected: reason={rejectionReason}; expUtc={expText}; nowUtc={DateTime.UtcNow:o}");
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryValidateTokenLifetime(string token, out DateTime? expiresUtc, out string reason)
+    {
+        expiresUtc = null;
+        reason = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            reason = "missing_token";
+            return false;
+        }
+
+        if (IsPlaceholderToken(token))
+        {
+            reason = "placeholder_token";
+            return false;
+        }
+
+        if (!TryGetJwtExpiryUtc(token, out var expUtc))
+        {
+            reason = "exp_missing_or_invalid";
+            return false;
+        }
+
+        expiresUtc = expUtc;
+        if (expUtc <= DateTime.UtcNow.AddSeconds(60))
+        {
+            reason = "expired_or_near_expiry";
+            return false;
+        }
+
+        reason = "ok";
+        return true;
+    }
+
+    private static bool TryGetJwtExpiryUtc(string token, out DateTime expiresUtc)
+    {
+        expiresUtc = DateTime.MinValue;
+
+        try
+        {
+            var parts = (token ?? string.Empty).Split('.');
+            if (parts.Length < 2)
+                return false;
+
+            var payloadBytes = DecodeBase64Url(parts[1]);
+            using var doc = JsonDocument.Parse(payloadBytes);
+            if (!doc.RootElement.TryGetProperty("exp", out var expProp))
+                return false;
+
+            long expSeconds;
+            if (expProp.ValueKind == JsonValueKind.Number)
+            {
+                if (!expProp.TryGetInt64(out expSeconds))
+                    return false;
+            }
+            else if (expProp.ValueKind == JsonValueKind.String && long.TryParse(expProp.GetString(), out var parsed))
+            {
+                expSeconds = parsed;
+            }
+            else
+            {
+                return false;
+            }
+
+            expiresUtc = DateTimeOffset.FromUnixTimeSeconds(expSeconds).UtcDateTime;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static byte[] DecodeBase64Url(string value)
+    {
+        var s = (value ?? string.Empty).Trim().Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4)
+        {
+            case 2:
+                s += "==";
+                break;
+            case 3:
+                s += "=";
+                break;
+        }
+
+        return Convert.FromBase64String(s);
+    }
+
+    private bool IsOnlineModeSelected()
+    {
+        var mode = (_launchModeBox.SelectedItem as string) ?? "Online";
+        return !string.Equals(mode, "Offline", StringComparison.OrdinalIgnoreCase);
     }
 
     private void BuildTopBar()
@@ -1536,125 +1878,196 @@ public sealed class LauncherForm : Form
 
     private async Task BeginStartupOnlineChecks()
     {
-        await Task.Run(async () =>
+        lock (_onlineValidationSync)
         {
-            var channel = Paths.IsDevBuild ? "dev" : "release";
-            SetProgress(20, "Computing local build hash...");
-
-            if (!TryComputeCurrentExecutableHash(out var executablePath, out var localHash, out var hashError))
-            {
-                SetProgress(100, "Online verification unavailable");
-                ApplyOnlineStartupState(
-                    OnlineStartupState.ComputeFailed,
-                    "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available.",
-                    officialBuildVerified: false,
-                    onlineServicesReachable: false);
-                _log.Warn($"Startup hash compute failed: {hashError}");
+            if (_onlineValidationInProgress)
                 return;
-            }
 
-            SetProgress(45, $"Verifying official {channel} build...");
-            OfficialBuildVerifier.VerifyResult verify;
-            try
-            {
-                verify = await _officialBuildVerifier.VerifyHashAsync(channel, localHash).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"Official hash verification exception: {ex.Message}");
-                SetProgress(100, "Online verification unavailable");
-                ApplyOnlineStartupState(
-                    OnlineStartupState.ServiceUnavailable,
-                    "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available.",
-                    officialBuildVerified: false,
-                    onlineServicesReachable: false);
-                return;
-            }
+            _onlineValidationInProgress = true;
+            _launchReadiness = LaunchReadiness.Checking;
+        }
 
-            if (!verify.Ok)
+        if (IsHandleCreated)
+            BeginInvoke(new Action(() => SetLaunchButtonState(GetGameState())));
+
+        try
+        {
+            await Task.Run(async () =>
             {
-                var startupState = MapVerifierFailureToStartupState(verify.Failure);
-                var detail = startupState switch
+                _officialHashOk = false;
+                _veilnetAuthOk = false;
+                _gateTicketOk = false;
+                _eosReadyOk = false;
+
+                if (!HasValidVeilnetSessionForOnline(logFailures: true))
                 {
-                    OnlineStartupState.HashMismatch => "Unofficial build - online disabled. LAN/offline still available.",
-                    OnlineStartupState.Unauthorized => "Online services unavailable (verification unauthorized). LAN/offline still available.",
-                    OnlineStartupState.BadResponse => "Online services unavailable (invalid verification response). LAN/offline still available.",
-                    _ => "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available."
-                };
-
-                SetProgress(100, startupState == OnlineStartupState.HashMismatch ? "Unofficial build" : "Online verification unavailable");
-                ApplyOnlineStartupState(
-                    startupState,
-                    detail,
-                    officialBuildVerified: false,
-                    onlineServicesReachable: false);
-                _log.Warn($"Official hash verification failed ({verify.Failure}) channel={channel} exe={executablePath}: {verify.Message}");
-                return;
-            }
-
-            _log.Info($"Official hash verified for {channel} channel.");
-            SetProgress(70, "Official build verified. Checking online services...");
-
-            try
-            {
-                var gate = OnlineGateClient.GetOrCreate();
-
-                var gateResult = gate.EnsureTicketWithStatus(_log, TimeSpan.FromSeconds(20), executablePath);
-                if (!gateResult.Ok)
-                {
-                    var startupState = MapTicketStatusToState(gateResult.Status);
-                    var detail = startupState switch
-                    {
-                        OnlineStartupState.HashMismatch => "Official build verified, but gate rejected this hash. Online temporarily unavailable. LAN/offline still available.",
-                        OnlineStartupState.MisconfiguredEndpoint => "Online not configured (endpoint missing/wrong). LAN/offline available.",
-                        OnlineStartupState.Unauthorized => "Online auth failed. Please re-login. LAN/offline available.",
-                        OnlineStartupState.BadResponse => "Official build verified, but online services returned an invalid response. LAN/offline still available.",
-                        _ => "Official build verified, but online services are unavailable right now. Try again later. LAN/offline still available."
-                    };
-
-                    var progressText = startupState == OnlineStartupState.MisconfiguredEndpoint
-                        ? "Online endpoint misconfigured"
-                        : "Online services unavailable";
-                    SetProgress(100, progressText);
+                    TryClearVeilnetAuth(
+                        "Startup online check: Veilnet session missing/expired; forcing signed-out state.",
+                        clearPendingCodes: false,
+                        updateStatus: false);
+                    SetProgress(100, "Online auth required");
                     ApplyOnlineStartupState(
-                        startupState,
-                        detail,
-                        officialBuildVerified: true,
+                        OnlineStartupState.Unauthorized,
+                        "LOGIN REQUIRED: You're not signed in. Online features are unavailable. Switch to Offline mode.",
+                        officialBuildVerified: false,
                         onlineServicesReachable: false);
-                    _log.Warn($"Gate ticket check failed ({gateResult.Status}): {gateResult.Message}");
                     return;
                 }
 
-                string? ticket = null;
-                DateTime ticketExpiresUtc;
-                if (gate.TryGetValidTicketForChildProcess(out ticket, out ticketExpiresUtc) && !string.IsNullOrWhiteSpace(ticket))
+                var authToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+                try
                 {
-                    Environment.SetEnvironmentVariable("LV_GATE_TICKET", ticket);
-                    Environment.SetEnvironmentVariable("LV_GATE_TICKET_EXPIRES_UTC", ticketExpiresUtc.ToString("o"));
+                    var me = await GetVeilnetClient().GetMeAsync(authToken).ConfigureAwait(false);
+                    _veilnetAuthOk = true;
+                    if (!string.IsNullOrWhiteSpace(me.Username))
+                        Environment.SetEnvironmentVariable("LV_VEILNET_USERNAME", me.Username);
+                    await SyncVeilnetFriendsToProfileAsync("startup validation").ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _veilnetAuthOk = false;
+                    _log.Warn($"Veilnet auth validation failed: {ex.Message}");
+                    SetProgress(100, "Online auth failed");
+                    ApplyOnlineStartupState(
+                        OnlineStartupState.Unauthorized,
+                        "Online auth failed. Please re-login. LAN/offline available.",
+                        officialBuildVerified: false,
+                        onlineServicesReachable: false);
+                    return;
                 }
 
-                SetProgress(85, "Preparing EOS config...");
-                if (!EosRemoteConfigBootstrap.TryBootstrap(_log, gate, allowRetry: false, ticket))
-                    _log.Warn("EOS config bootstrap failed; continuing with local EOS config sources.");
+                var channel = Paths.IsDevBuild ? "dev" : "release";
+                SetProgress(20, "Computing local build hash...");
 
-                SetProgress(100, "Official online ready");
-                ApplyOnlineStartupState(
-                    OnlineStartupState.Verified,
-                    "Official build verified. Online services ready.",
-                    officialBuildVerified: true,
-                    onlineServicesReachable: true);
-            }
-            catch (Exception ex)
-            {
-                _log.Error($"Error during startup checks: {ex.Message}");
-                SetProgress(100, "Online services unavailable");
-                ApplyOnlineStartupState(
-                    OnlineStartupState.ServiceUnavailable,
-                    "Official build verified, but online services are unavailable right now. Try again later. LAN/offline still available.",
-                    officialBuildVerified: true,
-                    onlineServicesReachable: false);
-            }
-        });
+                if (!TryComputeCurrentExecutableHash(out var executablePath, out var localHash, out var hashError))
+                {
+                    SetProgress(100, "Online verification unavailable");
+                    ApplyOnlineStartupState(
+                        OnlineStartupState.ComputeFailed,
+                        "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available.",
+                        officialBuildVerified: false,
+                        onlineServicesReachable: false);
+                    _log.Warn($"Startup hash compute failed: {hashError}");
+                    return;
+                }
+
+                SetProgress(45, $"Verifying official {channel} build...");
+                OfficialBuildVerifier.VerifyResult verify;
+                try
+                {
+                    verify = await _officialBuildVerifier.VerifyHashAsync(channel, localHash).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"Official hash verification exception: {ex.Message}");
+                    SetProgress(100, "Online verification unavailable");
+                    ApplyOnlineStartupState(
+                        OnlineStartupState.ServiceUnavailable,
+                        "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available.",
+                        officialBuildVerified: false,
+                        onlineServicesReachable: false);
+                    return;
+                }
+
+                if (!verify.Ok)
+                {
+                    var startupState = MapVerifierFailureToStartupState(verify.Failure);
+                    var detail = startupState switch
+                    {
+                        OnlineStartupState.HashMismatch => "Unofficial build - online disabled. LAN/offline still available.",
+                        OnlineStartupState.Unauthorized => "Online services unavailable (verification unauthorized). LAN/offline still available.",
+                        OnlineStartupState.BadResponse => "Online services unavailable (invalid verification response). LAN/offline still available.",
+                        _ => "Online services unavailable (cannot verify official build). Try again later. LAN/offline still available."
+                    };
+
+                    SetProgress(100, startupState == OnlineStartupState.HashMismatch ? "Unofficial build" : "Online verification unavailable");
+                    ApplyOnlineStartupState(
+                        startupState,
+                        detail,
+                        officialBuildVerified: false,
+                        onlineServicesReachable: false);
+                    _log.Warn($"Official hash verification failed ({verify.Failure}) channel={channel} exe={executablePath}: {verify.Message}");
+                    return;
+                }
+
+                _officialHashOk = true;
+                _log.Info($"Official hash verified for {channel} channel.");
+                SetProgress(70, "Official build verified. Checking online services...");
+
+                try
+                {
+                    var gate = OnlineGateClient.GetOrCreate();
+
+                    var gateResult = gate.EnsureTicketWithStatus(_log, TimeSpan.FromSeconds(20), executablePath);
+                    if (!gateResult.Ok)
+                    {
+                        _gateTicketOk = false;
+                        var startupState = MapTicketStatusToState(gateResult.Status);
+                        var detail = startupState switch
+                        {
+                            OnlineStartupState.HashMismatch => "Official build verified, but gate rejected this hash. Online temporarily unavailable. LAN/offline still available.",
+                            OnlineStartupState.MisconfiguredEndpoint => "Online not configured (endpoint missing/wrong). LAN/offline available.",
+                            OnlineStartupState.Unauthorized => "Online auth failed. Please re-login. LAN/offline available.",
+                            OnlineStartupState.BadResponse => "Official build verified, but online services returned an invalid response. LAN/offline still available.",
+                            _ => "Official build verified, but online services are unavailable right now. Try again later. LAN/offline still available."
+                        };
+
+                        var progressText = startupState == OnlineStartupState.MisconfiguredEndpoint
+                            ? "Online endpoint misconfigured"
+                            : "Online services unavailable";
+                        SetProgress(100, progressText);
+                        ApplyOnlineStartupState(
+                            startupState,
+                            detail,
+                            officialBuildVerified: true,
+                            onlineServicesReachable: false);
+                        _log.Warn($"Gate ticket check failed ({gateResult.Status}): {gateResult.Message}");
+                        return;
+                    }
+
+                    _gateTicketOk = true;
+                    string? ticket = null;
+                    DateTime ticketExpiresUtc;
+                    if (gate.TryGetValidTicketForChildProcess(out ticket, out ticketExpiresUtc) && !string.IsNullOrWhiteSpace(ticket))
+                    {
+                        Environment.SetEnvironmentVariable("LV_GATE_TICKET", ticket);
+                        Environment.SetEnvironmentVariable("LV_GATE_TICKET_EXPIRES_UTC", ticketExpiresUtc.ToString("o"));
+                    }
+
+                    SetProgress(85, "Preparing EOS config...");
+                    _eosReadyOk = EosRemoteConfigBootstrap.TryBootstrap(_log, gate, allowRetry: false, ticket);
+                    if (!_eosReadyOk)
+                        _log.Warn("EOS config bootstrap failed; continuing with local EOS config sources.");
+
+                    SetProgress(100, "Official online ready");
+                    ApplyOnlineStartupState(
+                        OnlineStartupState.Verified,
+                        "Official build verified. Online services ready.",
+                        officialBuildVerified: true,
+                        onlineServicesReachable: true);
+                }
+                catch (Exception ex)
+                {
+                    _log.Error($"Error during startup checks: {ex.Message}");
+                    SetProgress(100, "Online services unavailable");
+                    ApplyOnlineStartupState(
+                        OnlineStartupState.ServiceUnavailable,
+                        "Official build verified, but online services are unavailable right now. Try again later. LAN/offline still available.",
+                        officialBuildVerified: true,
+                        onlineServicesReachable: false);
+                }
+            });
+        }
+        finally
+        {
+            lock (_onlineValidationSync)
+                _onlineValidationInProgress = false;
+
+            if (IsHandleCreated)
+                BeginInvoke(new Action(() => SetLaunchButtonState(GetGameState())));
+            else
+                SetLaunchButtonState(GetGameState());
+        }
     }
 
     private void ApplyOnlineStartupState(
@@ -1667,8 +2080,19 @@ public sealed class LauncherForm : Form
         _onlineServicesReachable = onlineServicesReachable;
         _releaseHashAllowed = officialBuildVerified;
         _onlineFunctional = officialBuildVerified && onlineServicesReachable;
+        _officialHashOk = officialBuildVerified;
+        if (!onlineServicesReachable)
+            _gateTicketOk = false;
+        if (_onlineFunctional)
+            _eosReadyOk = true;
+        _launchReadiness = _onlineFunctional
+            ? LaunchReadiness.ReadyOnline
+            : (state == OnlineStartupState.ComputeFailed ? LaunchReadiness.Failed : LaunchReadiness.ReadyOfflineOnly);
         _onlineStatusDetail = detail;
-        _log.Info($"Online startup state={state}; official={_officialBuildVerified}; services={_onlineServicesReachable}; functional={_onlineFunctional}; detail={_onlineStatusDetail}");
+        _log.Info(
+            $"Online startup state={state}; readiness={_launchReadiness}; official={_officialBuildVerified}; " +
+            $"veilnetAuth={_veilnetAuthOk}; ticket={_gateTicketOk}; eosReady={_eosReadyOk}; " +
+            $"services={_onlineServicesReachable}; functional={_onlineFunctional}; detail={_onlineStatusDetail}");
         ApplyOnlineStatusVisuals();
         BeginInvoke(new Action(() => SetLaunchButtonState(GetGameState())));
     }
@@ -1892,8 +2316,9 @@ public sealed class LauncherForm : Form
         // Update username label based on online status
         UpdateUsernameLabel();
         
-        // Only allow Veilnet login button to appear when online is functional AND build is verified/allowed.
-        _hubGoogleBtn.Visible = _onlineFunctional && _releaseHashAllowed;
+        // Veilnet login button must stay visible so users can recover from stale/expired auth.
+        _hubGoogleBtn.Visible = true;
+        RefreshVeilnetLoginVisuals();
 
         TryAutoLoginVeilnetFromEosPuid();
         
@@ -2294,6 +2719,20 @@ public sealed class LauncherForm : Form
         }
 
         var launchingOffline = args.Contains("--offline", StringComparison.OrdinalIgnoreCase);
+        if (!launchingOffline && _launchReadiness != LaunchReadiness.ReadyOnline)
+        {
+            var reason = string.IsNullOrWhiteSpace(_onlineStatusDetail)
+                ? "Online launch is locked until Veilnet validation succeeds."
+                : _onlineStatusDetail;
+            MessageBox.Show(
+                reason,
+                "Online Unavailable",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            _log.Warn($"Launch blocked: launch readiness={_launchReadiness}; reason={reason}");
+            return;
+        }
+
         if (!launchingOffline && !VerifyOfficialBuildForOnline())
         {
             return;
@@ -2314,6 +2753,8 @@ public sealed class LauncherForm : Form
             
             // Set environment variables for EOS authorization
             startInfo.EnvironmentVariables["LV_PROCESS_KIND"] = "game";
+            startInfo.EnvironmentVariables["LV_LAUNCH_MODE"] = launchingOffline ? "offline" : "online";
+            startInfo.EnvironmentVariables["LV_BUILD_CHANNEL"] = Paths.IsDevBuild ? "dev" : "release";
             var officialVerifiedForRun = !launchingOffline && _officialBuildVerified;
             var servicesReachableForRun = !launchingOffline && _onlineServicesReachable;
             startInfo.EnvironmentVariables["LV_OFFICIAL_BUILD_VERIFIED"] = officialVerifiedForRun ? "1" : "0";
@@ -2340,23 +2781,62 @@ public sealed class LauncherForm : Form
             var veilnetUsername = (Environment.GetEnvironmentVariable("LV_VEILNET_USERNAME") ?? string.Empty).Trim();
             if (!launchingOffline && !string.IsNullOrWhiteSpace(veilnetUsername))
                 startInfo.EnvironmentVariables["LV_VEILNET_USERNAME"] = veilnetUsername;
+            else
+                startInfo.EnvironmentVariables.Remove("LV_VEILNET_USERNAME");
 
             var veilnetToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
             if (!launchingOffline && !string.IsNullOrWhiteSpace(veilnetToken))
                 startInfo.EnvironmentVariables["LV_VEILNET_ACCESS_TOKEN"] = veilnetToken;
+            else
+                startInfo.EnvironmentVariables.Remove("LV_VEILNET_ACCESS_TOKEN");
 
             if (!launchingOffline)
+            {
                 CopyPublicEosEnvironmentToChildProcess(startInfo);
+                startInfo.EnvironmentVariables.Remove("EOS_DISABLED");
+                startInfo.EnvironmentVariables.Remove("EOS_DISABLE");
+            }
+            else
+                startInfo.EnvironmentVariables["EOS_DISABLED"] = "1";
+
+            var hasTicketForRun = false;
+            DateTime gateTicketExpiresUtc = DateTime.MinValue;
+            string gateTicket = string.Empty;
 
             if (!launchingOffline
                 && officialVerifiedForRun
                 && servicesReachableForRun
-                && OnlineGateClient.GetOrCreate().TryGetValidTicketForChildProcess(out var gateTicket, out var gateTicketExpiresUtc)
+                && OnlineGateClient.GetOrCreate().TryGetValidTicketForChildProcess(out gateTicket, out gateTicketExpiresUtc)
                 && !string.IsNullOrWhiteSpace(gateTicket))
             {
+                hasTicketForRun = true;
                 startInfo.EnvironmentVariables["LV_GATE_TICKET"] = gateTicket;
                 startInfo.EnvironmentVariables["LV_GATE_TICKET_EXPIRES_UTC"] = gateTicketExpiresUtc.ToString("o");
             }
+            else
+            {
+                startInfo.EnvironmentVariables.Remove("LV_GATE_TICKET");
+                startInfo.EnvironmentVariables.Remove("LV_GATE_TICKET_EXPIRES_UTC");
+            }
+
+            var hasVeilnetTokenForRun = !launchingOffline && !string.IsNullOrWhiteSpace(veilnetToken);
+            if (!launchingOffline && (!hasVeilnetTokenForRun || !hasTicketForRun))
+            {
+                MessageBox.Show(
+                    "Online auth context is missing. Please link/sign in and launch Online from the launcher.\n\nLAN/offline remains available.",
+                    "Online Unavailable",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                _log.Warn(
+                    $"Online launch blocked due to missing auth context: hasVeilnetToken={hasVeilnetTokenForRun}; " +
+                    $"hasGateTicket={hasTicketForRun}; official={officialVerifiedForRun}; services={servicesReachableForRun}");
+                return;
+            }
+
+            _log.Info(
+                $"Launch env snapshot: mode={(launchingOffline ? "offline" : "online")}; channel={(Paths.IsDevBuild ? "dev" : "release")}; " +
+                $"official={officialVerifiedForRun}; services={servicesReachableForRun}; " +
+                $"hasGateTicket={hasTicketForRun}; hasVeilnetToken={hasVeilnetTokenForRun}; hasUsername={!string.IsNullOrWhiteSpace(veilnetUsername)}");
             
             _gameProcess = Process.Start(startInfo);
 
@@ -2502,10 +2982,25 @@ public sealed class LauncherForm : Form
         {
             case GameState.NotRunning:
                 _launchBtn.Text = "LAUNCH";
-                _launchBtn.Enabled = true;
                 _launchModeBox.Enabled = true;
+                var onlineMode = IsOnlineModeSelected();
+                if (!onlineMode)
+                {
+                    _launchBtn.Enabled = true;
+                    _toolTip.SetToolTip(_launchBtn, "Launch game");
+                }
+                else
+                {
+                    var readyOnline = _launchReadiness == LaunchReadiness.ReadyOnline;
+                    _launchBtn.Enabled = readyOnline;
+                    if (_onlineValidationInProgress || _launchReadiness == LaunchReadiness.Checking)
+                        _toolTip.SetToolTip(_launchBtn, "Validating Veilnet...");
+                    else if (!readyOnline)
+                        _toolTip.SetToolTip(_launchBtn, "Online launch is locked until Veilnet validation succeeds.");
+                    else
+                        _toolTip.SetToolTip(_launchBtn, "Launch game");
+                }
                 if (_rocketIcon != null) { _launchBtn.Image = _rocketIcon; }
-                _toolTip.SetToolTip(_launchBtn, "Launch game");
                 break;
             default:
                 _launchBtn.Text = "KILL";
@@ -2743,12 +3238,12 @@ public sealed class LauncherForm : Form
                 }
 
                 AddDir(Paths.WorldsDir, "Worlds");
-                AddDir(Paths.MultiplayerWorldsDir, "Worlds_Multiplayer");
+                AddDir(Paths.MultiplayerWorldsDir, "_OnlineCache");
                 
                 if (File.Exists(Paths.SettingsJsonPath))
-                    archive.CreateEntryFromFile(Paths.SettingsJsonPath, "settings.json");
+                    archive.CreateEntryFromFile(Paths.SettingsJsonPath, "options.lvc");
                 if (File.Exists(Paths.PlayerProfileJsonPath))
-                    archive.CreateEntryFromFile(Paths.PlayerProfileJsonPath, "player_profile.json");
+                    archive.CreateEntryFromFile(Paths.PlayerProfileJsonPath, "player_profile.lvc");
             }
 
             // Retention: keep last 10

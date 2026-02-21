@@ -89,9 +89,27 @@ public sealed class AssetLoader : IDisposable
         if (_fallbacks.TryGetValue(key, out var fallback))
             return fallback;
 
-        fallback = CreateCheckerFallbackTexture();
+        fallback = CreateFallbackTexture();
         _fallbacks[key] = fallback;
         return fallback;
+    }
+
+    private Texture2D CreateFallbackTexture()
+    {
+        if (AssetResolver.TryResolve("textures/missing.png", out var missingPath))
+        {
+            try
+            {
+                using var fs = File.OpenRead(missingPath);
+                return Texture2D.FromStream(_graphicsDevice, fs);
+            }
+            catch
+            {
+                // Fall through to generated checker fallback.
+            }
+        }
+
+        return CreateCheckerFallbackTexture();
     }
 
     private Texture2D CreateCheckerFallbackTexture()

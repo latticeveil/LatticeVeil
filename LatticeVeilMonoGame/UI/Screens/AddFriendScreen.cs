@@ -40,6 +40,8 @@ public sealed class AddFriendScreen : IScreen
     private string _query = string.Empty;
     private string _status = string.Empty;
     private Color _statusColor = Color.White;
+    private GateIdentityUser? _lastLookupUser;
+    private bool _lastLookupFound;
     private double _now;
     private double _statusUntil;
 
@@ -176,8 +178,25 @@ public sealed class AddFriendScreen : IScreen
 
         sb.Draw(_pixel, _infoRect, new Color(20, 20, 20, 190));
         DrawBorder(sb, _infoRect, new Color(100, 100, 100));
-        var infoText = "Search for players by their username.";
-        _font.DrawString(sb, infoText, new Vector2(_infoRect.X + 8, _infoRect.Y + 8), new Color(180, 180, 180));
+        if (_lastLookupFound && _lastLookupUser != null)
+        {
+            var lookupName = string.IsNullOrWhiteSpace(_lastLookupUser.DisplayName)
+                ? (_lastLookupUser.Username ?? string.Empty)
+                : _lastLookupUser.DisplayName;
+            _font.DrawString(sb, "FOUND USER", new Vector2(_infoRect.X + 8, _infoRect.Y + 8), new Color(130, 230, 160));
+            _font.DrawString(sb, lookupName, new Vector2(_infoRect.X + 8, _infoRect.Y + 8 + _font.LineHeight + 2), Color.White);
+            var id = (_lastLookupUser.ProductUserId ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                var shortId = id.Length > 12 ? id[..12] : id;
+                _font.DrawString(sb, $"ID: {shortId}", new Vector2(_infoRect.X + 8, _infoRect.Y + 8 + ((_font.LineHeight + 2) * 2)), new Color(170, 178, 196));
+            }
+        }
+        else
+        {
+            var infoText = "Search for players by their username.";
+            _font.DrawString(sb, infoText, new Vector2(_infoRect.X + 8, _infoRect.Y + 8), new Color(180, 180, 180));
+        }
 
         _addBtn.Draw(sb, _pixel, _font);
         _backBtn.Draw(sb, _pixel, _font);
@@ -197,35 +216,35 @@ public sealed class AddFriendScreen : IScreen
             return;
 
         var gate = OnlineGateClient.GetOrCreate();
-        if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
-        {
-            SetStatus(gateDenied);
-            return;
-        }
 
         _busy = true;
         SetStatus("Checking username...");
+        _lastLookupFound = false;
+        _lastLookupUser = null;
 
         try
         {
             var username = _query.Trim();
-            var (ok, exists, msg) = await gate.VeilnetUserExistsAsync(username).ConfigureAwait(false);
-            if (!ok)
+            var lookup = await gate.LookupVeilnetUserAsync(username).ConfigureAwait(false);
+            if (!lookup.Ok)
             {
-                SetStatus(string.IsNullOrWhiteSpace(msg) ? "Could not check username." : msg);
+                SetStatus(string.IsNullOrWhiteSpace(lookup.Message) ? "Could not check username." : lookup.Message);
                 return;
             }
 
-            if (!exists)
+            if (!lookup.Found || lookup.User == null)
             {
                 SetStatus("USER DOES NOT EXIST", seconds: 5.0, color: new Color(220, 60, 60));
                 return;
             }
 
+            _lastLookupFound = true;
+            _lastLookupUser = lookup.User;
             SetStatus("Sending request...");
             var result = await gate.AddFriendAsync(username).ConfigureAwait(false);
             if (result.Ok)
             {
+                await SyncLocalFriendsCacheAsync(gate).ConfigureAwait(false);
                 SetStatus("REQUEST SENT", seconds: 5.0, color: new Color(80, 220, 120));
                 _query = string.Empty;
                 return;
@@ -251,10 +270,53 @@ public sealed class AddFriendScreen : IScreen
         _statusUntil = _now + seconds;
     }
 
+    private async Task SyncLocalFriendsCacheAsync(OnlineGateClient gate)
+    {
+        try
+        {
+            var friendsResult = await gate.GetFriendsAsync().ConfigureAwait(false);
+            if (!friendsResult.Ok)
+                return;
+
+            var merged = new System.Collections.Generic.List<PlayerProfile.FriendEntry>();
+            var seen = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var friend in friendsResult.Friends)
+            {
+                var userId = (friend.ProductUserId ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(userId) || !seen.Add(userId))
+                    continue;
+
+                var label = (friend.Username ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(label))
+                    label = (friend.DisplayName ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(label))
+                    continue;
+
+                if (Guid.TryParse(label, out _))
+                    continue;
+
+                merged.Add(new PlayerProfile.FriendEntry
+                {
+                    UserId = userId,
+                    Label = label,
+                    LastKnownDisplayName = label,
+                    LastKnownPresence = string.Empty
+                });
+            }
+
+            _profile.Friends = merged;
+            _profile.Save(_log);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"AddFriendScreen: friend cache sync failed: {ex.Message}");
+        }
+    }
+
     private void HandleTextInput(InputState input, ref string value, int maxLen)
     {
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Back)
             {

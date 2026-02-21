@@ -162,6 +162,7 @@ public sealed class SingleplayerWorldOptionsScreen : IScreen
         if (!EnsureWorldPaths())
             return;
 
+        _log.Info($"HOST_CLICKED world={_worldEntry.Name} mode=singleplayer_options transport=online");
         var gate = OnlineGateClient.GetOrCreate();
         if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
         {

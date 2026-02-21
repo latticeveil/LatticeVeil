@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
+using System.Reflection;
 using LatticeVeilMonoGame.Core;
 
 namespace LatticeVeilMonoGame.Launcher;
@@ -51,6 +52,14 @@ internal sealed class OfficialBuildVerifier
     {
         _log = log;
         _endpoint = (endpoint ?? string.Empty).Trim();
+    }
+
+    private static string GetGameVersion()
+    {
+        var version = Assembly.GetExecutingAssembly()
+            .GetName()
+            .Version?.ToString() ?? "8.0.0";
+        return version.StartsWith("v") ? version : $"v{version}";
     }
 
     public async Task<VerifyResult> VerifyAsync(string channel, string filePath, CancellationToken ct = default)
@@ -135,9 +144,9 @@ internal sealed class OfficialBuildVerifier
             };
         }
 
-        var expectedHash = channel == "dev" ? fetch.Payload.Value.DevHash : fetch.Payload.Value.ReleaseHash;
-        expectedHash = NormalizeHash(expectedHash);
-        if (!IsSha256(expectedHash))
+        var targetHash = channel == "dev" ? fetch.Payload.Value.DevHash : fetch.Payload.Value.ReleaseHash;
+        targetHash = NormalizeHash(targetHash);
+        if (!IsSha256(targetHash))
         {
             return new VerifyResult
             {
@@ -149,7 +158,7 @@ internal sealed class OfficialBuildVerifier
             };
         }
 
-        if (!string.Equals(localHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(localHash, targetHash, StringComparison.OrdinalIgnoreCase))
         {
             return new VerifyResult
             {
@@ -157,7 +166,7 @@ internal sealed class OfficialBuildVerifier
                 Failure = VerifyFailure.HashMismatch,
                 Channel = channel,
                 Message = "This build is not official for online play. Please download the official release.",
-                ExpectedHash = expectedHash,
+                ExpectedHash = targetHash,
                 ActualHash = localHash
             };
         }
@@ -168,7 +177,7 @@ internal sealed class OfficialBuildVerifier
             Failure = VerifyFailure.None,
             Channel = channel,
             Message = "Official hash verified.",
-            ExpectedHash = expectedHash,
+            ExpectedHash = targetHash,
             ActualHash = localHash
         };
     }
@@ -187,7 +196,13 @@ internal sealed class OfficialBuildVerifier
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, _endpoint);
+            // Determine target based on current build configuration
+            var target = Paths.IsDevBuild ? "dev" : "release";
+            var version = GetGameVersion();
+            var endpointWithParams = $"{_endpoint}?target={target}&version={version}";
+            _log?.Info($"Hash lookup: target={target}, version={version}");
+            
+            using var request = new HttpRequestMessage(HttpMethod.Get, endpointWithParams);
             using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -205,8 +220,11 @@ internal sealed class OfficialBuildVerifier
             }
 
             using var doc = JsonDocument.Parse(body);
+            _log?.Info($"Supabase response: {body}");
             var snapshot = ExtractSnapshot(doc.RootElement);
-            if (!IsSha256(snapshot.DevHash) && !IsSha256(snapshot.ReleaseHash))
+            var targetHash = target == "dev" ? snapshot.DevHash : snapshot.ReleaseHash;
+            _log?.Info($"Fetched {target} hash: {targetHash}");
+            if (!IsSha256(targetHash))
             {
                 return (false, VerifyFailure.BadResponse, "Official hash payload is missing dev/release hashes.", null);
             }

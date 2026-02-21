@@ -3,7 +3,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -39,6 +41,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private ILanSession? _lanSession;
     private readonly string _worldPath;
     private readonly string _metaPath;
+    private readonly object _historyFileLock = new();
     private GameSettings _settings = new();
     private DateTime _settingsStamp = DateTime.MinValue;
 
@@ -161,6 +164,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Rectangle[] _hotbarSlots = new Rectangle[Inventory.HotbarSize];
     private readonly Rectangle[] _inventoryGridSlots = new Rectangle[Inventory.GridSize];
     private Rectangle _inventoryRect;
+    private Rectangle _inventoryPanelVisualRect;
+    private Rectangle _inventoryCatalogTabRect;
+    private Rectangle _inventoryStorageTabRect;
     private bool _inventoryOpen;
     private HotbarSlot _inventoryHeld;
     private bool _inventoryHasHeld;
@@ -194,6 +200,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Vector3 _homePosition;
     private bool _homeGuiOpen;
     private string _homeGuiNameInput = "";
+    private bool _homeGuiNameInputFocused;
     private string _homeGuiStatus = "";
     private float _homeGuiStatusTimer;
     private float _homeGuiScroll;
@@ -249,6 +256,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Button _pauseSaveExit;
     private readonly Button _pauseProfileIcon;
     private readonly OnlineGateClient _onlineGate;
+    private readonly InputState _pauseGameplayInput = new();
     private EosClient? _eosClient;
     private bool _debugFaceOverlay;
     private bool _debugHudVisible;
@@ -261,8 +269,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int InventorySlotSize = 48;
     private const int InventorySlotGap = 6;
     private const int InventoryPadding = 18;
-    private const int InventoryTitleHeight = 30;
+    private const int InventoryTitleHeight = 40;
+    private const int InventoryTitleHeightWithTabs = 82;
     private const int InventoryFooterHeight = 50;
+    private const int InventoryTabHeight = 30;
+    private const int InventoryTabWidth = 132;
+    private const float InventoryPanelVisualScale = 1.16f;
 
     private const float ItemPickupRadius = 1.5f * Scale.BlockSize;
     private const float ItemPickupRadiusSq = ItemPickupRadius * ItemPickupRadius;
@@ -319,8 +331,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private float _netSendAccumulator;
     private float _persistenceSendAccumulator;
     private readonly Dictionary<int, LanPlayerPersistenceSnapshot> _latestRemotePersistenceByPlayerId = new();
+    private readonly Dictionary<int, DateTime> _remotePersistenceLastFlushUtc = new();
     private readonly HashSet<int> _knownRemotePlayerIds = new();
     private readonly HashSet<int> _pendingRestorePlayerIds = new();
+    private readonly HashSet<int> _pendingRemoteJoinAnnouncements = new();
+    private readonly HashSet<int> _announcedRemotePlayers = new();
+    private readonly Dictionary<int, DateTime> _remoteJoinAnnouncedUtc = new();
+    private static readonly TimeSpan RemoteLeaveAnnouncementGrace = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan RemotePersistenceFlushInterval = TimeSpan.FromSeconds(5);
     private const float PersistenceSendIntervalSeconds = 0.75f;
 
     private float _selectedNameTimer;
@@ -329,11 +347,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Keys _chatKey = Keys.T;
     private Keys _commandKey = Keys.OemQuestion;
     private Keys _homeGuiKey = Keys.H;
+    private Keys _structureFinderKey = Keys.B;
     private Keys _gamemodeModifierKey = Keys.LeftAlt;
     private Keys _gamemodeWheelKey = Keys.G;
+    private Keys _inviteQuickActionKey = Keys.Y;
     private bool _chatInputActive;
     private string _chatInputText = "";
     private readonly List<ChatLine> _chatLines = new();
+    private int _nextChatLineId = 1;
     private int _chatOverlayScrollLines;
     private readonly List<string> _textInputHistory = new();
     private int _textInputHistoryCursor = -1;
@@ -363,11 +384,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int MaxCommandPredictions = 5;
     private const int ChatHistoryScrollStep = 6;
     private const int CommandInputMaxLength = 96;
-    private const float ChatOverlayWidthRatio = 0.46f;
+    private const float ChatOverlayWidthRatio = 0.52f;
     private const int ChatOverlayMinWidth = 420;
-    private const int ChatOverlayMaxWidth = 780;
+    private const int ChatOverlayMaxWidth = 900;
     private const string OperatorSyncPrefix = "__lv_opsync__:";
     private const string GameModeSyncPrefix = "__lv_gamemode__:";
+    private const string InventoryClearSyncPrefix = "__lv_invclear__:";
+    private const string InventoryClearItemSyncPrefix = "__lv_invclear_item__:";
+    private const string InventoryGiveSyncPrefix = "__lv_invgive__:";
     private const string HostDisconnectedFallbackReason = "Host disconnected. Returning to menu.";
     private bool _hasReceivedInitialPlayerList;
     private bool _multiplayerDisconnectHandled;
@@ -375,6 +399,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const string HostJoinLinkPrefix = "latticeveil://join/";
     private const string JoinApproveActionPrefix = "join-approve:";
     private const string JoinDeclineActionPrefix = "join-decline:";
+    private const string ChatClearConfirmActionToken = "chatclear-confirm";
+    private const string ChatClearCancelActionToken = "chatclear-cancel";
+    private const string InventoryClearConfirmActionPrefix = "invclear-confirm:";
+    private const string InventoryClearCancelActionPrefix = "invclear-cancel:";
+    private const float InviteQuickHoldAcceptSeconds = 0.7f;
+    private bool _inviteQuickHoldActive;
+    private bool _inviteQuickHoldAccepted;
+    private float _inviteQuickHoldElapsed;
+    private string _inviteQuickHoldPeerId = string.Empty;
+    private string _inviteQuickHoldConfirmToken = string.Empty;
+    private string _inviteQuickHoldCancelToken = string.Empty;
+    private string _inviteQuickHoldPromptText = string.Empty;
+    private float _inviteQuickStatusTimer;
+    private string _inviteQuickStatusText = string.Empty;
+    private bool _pendingQuickConfirmActive;
+    private string _pendingQuickConfirmToken = string.Empty;
+    private string _pendingQuickCancelToken = string.Empty;
+    private string _pendingQuickPromptText = string.Empty;
     private static readonly HashSet<string> CheatsDisabledAllowedCommands = new(StringComparer.OrdinalIgnoreCase)
     {
         "help",
@@ -453,7 +495,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _persistenceSendAccumulator = _lanSession != null && !_lanSession.IsHost
             ? PersistenceSendIntervalSeconds
             : 0f;
-        _pendingHostedOnlineShareAnnouncement = _lanSession is EosP2PHostSession;
+        _pendingHostedOnlineShareAnnouncement = false;
         _world = preloadedWorld; // Use preloaded world if available
         _settings = GameSettings.LoadOrCreate(_log);
         _settingsStamp = GetSettingsStamp();
@@ -466,8 +508,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _chatKey = GetKeybind("Chat", Keys.T);
         _commandKey = GetKeybind("Command", Keys.OemQuestion);
         _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
         _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
         _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         EnsureCommandRegistry();
 
@@ -535,10 +579,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private DateTime _nextSessionHeartbeatUtc = DateTime.MinValue;
     private readonly Dictionary<string, string> _usernameCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _pendingJoinLookup = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _pendingJoinOrder = new();
+    private readonly Dictionary<string, string> _pendingJoinDisplayNames = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _whitelist = new(StringComparer.OrdinalIgnoreCase);
     private bool _sessionHeartbeatInFlight;
     private int _sessionHeartbeatTickCount;
-    private string WhitelistPath => Path.Combine(_worldPath, "whitelist.json");
+    private string WhitelistPath => Path.Combine(_worldPath, "Whitelist.lvlist");
+    private string LegacyWhitelistPath => Path.Combine(_worldPath, "whitelist.json");
+    private string ChatHistoryLogPath => Path.Combine(_worldPath, "chat_history.lvlog");
+    private string LegacyChatHistoryLogPath => Path.Combine(_worldPath, "chat_history.log");
+    private string CommandHistoryLogPath => Path.Combine(_worldPath, "command_history.lvlog");
+    private string LegacyCommandHistoryLogPath => Path.Combine(_worldPath, "command_history.log");
 
     public void Update(GameTime gameTime, InputState input)
     {
@@ -557,12 +608,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _log.Info("Host/SP mode: Sync skipped (local world ready).");
             }
 
-            if (_pendingHostedOnlineShareAnnouncement)
-            {
-                AnnounceOnlineHostShare(EnsureEosClient(), tryCopyToClipboard: true);
-                _pendingHostedOnlineShareAnnouncement = false;
-            }
-            
             // Return to allow the loop to proceed cleanly next frame
             return;
         }
@@ -604,6 +649,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_gamemodeToastTimer <= 0f)
                 _gamemodeToastText = string.Empty;
         }
+
+        if (_inviteQuickStatusTimer > 0f)
+        {
+            _inviteQuickStatusTimer = Math.Max(0f, _inviteQuickStatusTimer - rawDt);
+            if (_inviteQuickStatusTimer <= 0f)
+                _inviteQuickStatusText = string.Empty;
+        }
+
+        UpdateInviteQuickAction(input, rawDt);
         _overlayMousePos = input.MousePosition;
         UpdateChatLines(rawDt);
         HandleChatOverlayActions(input);
@@ -688,6 +742,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 CloseInventory();
 
             UpdateInventory(input);
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
@@ -698,7 +753,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (!IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(Keys.Escape))
+        if (!_homeGuiOpen && !_structureFinderOpen && !IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(Keys.Escape))
         {
             TogglePauseMenuFromEscape();
             return;
@@ -707,6 +762,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen)
         {
             UpdatePauseButtons(input);
+        }
+
+        if (_pauseMenuOpen)
+        {
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
@@ -714,6 +774,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_homeGuiOpen)
         {
             UpdateHomeGui(input, rawDt);
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
@@ -721,23 +782,30 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_structureFinderOpen)
         {
             UpdateStructureFinderGui(input, rawDt);
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
 
-        if (!IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_homeGuiKey))
+        if (!_pauseMenuOpen && !IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_homeGuiKey))
         {
             OpenHomeGui();
             return;
         }
 
-        if (!IsTextInputActive && !_gamemodeWheelVisible && IsChatOpenKeyPressed(input))
+        if (!_pauseMenuOpen && !IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_structureFinderKey))
+        {
+            OpenStructureFinderGui(openStructuresTab: false);
+            return;
+        }
+
+        if (!_pauseMenuOpen && !IsTextInputActive && !_gamemodeWheelVisible && IsChatOpenKeyPressed(input))
         {
             BeginChatInput();
             return;
         }
 
-        if (!IsTextInputActive && !_gamemodeWheelVisible && IsCommandOpenKeyPressed(input))
+        if (!_pauseMenuOpen && !IsTextInputActive && !_gamemodeWheelVisible && IsCommandOpenKeyPressed(input))
         {
             BeginChatInput("/");
             return;
@@ -746,6 +814,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_chatInputActive)
         {
             UpdateChatInput(input);
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
@@ -753,12 +822,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_commandInputActive)
         {
             UpdateCommandInput(input);
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
 
         if (HandleGameModeWheelInput(input))
         {
+            UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
         }
@@ -785,6 +856,258 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         QueueDirtyChunks(); // Then enumerate safely
         ProcessMeshBuildQueue();
         WarmBlockIcons();
+    }
+
+    private void UpdateOverlayWorldSimulation(GameTime gameTime, float dt)
+    {
+        var pausedInput = _pauseGameplayInput;
+        UpdatePlayer(gameTime, dt, pausedInput);
+        ApplyPlayerSeparation(dt);
+        UpdateActiveChunks(force: false);
+        ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+        UpdateSelectionTimer(dt);
+        UpdateHandoffTarget(pausedInput);
+        UpdateWorldItems();
+        ProcessStreamingResults(); // Apply completed loads/unloads first (main thread only)
+        QueueDirtyChunks(); // Then enumerate safely
+        ProcessMeshBuildQueue();
+    }
+
+    private void ProcessWorldVisualMaintenance()
+    {
+        ProcessStreamingResults();
+        QueueDirtyChunks();
+        ProcessMeshBuildQueue(Math.Max(1, RuntimeMeshScheduleBudget));
+    }
+
+    private void UpdateInviteQuickAction(InputState input, float dt)
+    {
+        if (_pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _structureFinderOpen || IsTextInputActive)
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (TryGetPendingQuickConfirmation(out var confirmToken, out var cancelToken, out var confirmPrompt))
+        {
+            if (input.IsNewKeyPress(_inviteQuickActionKey))
+            {
+                _inviteQuickHoldActive = true;
+                _inviteQuickHoldAccepted = false;
+                _inviteQuickHoldElapsed = 0f;
+                _inviteQuickHoldPeerId = string.Empty;
+                _inviteQuickHoldConfirmToken = confirmToken;
+                _inviteQuickHoldCancelToken = cancelToken;
+                _inviteQuickHoldPromptText = confirmPrompt;
+            }
+
+            if (!_inviteQuickHoldActive)
+                return;
+
+            var confirmKeyDown = input.IsKeyDown(_inviteQuickActionKey);
+            if (confirmKeyDown)
+            {
+                _inviteQuickHoldElapsed += dt;
+                if (!_inviteQuickHoldAccepted && _inviteQuickHoldElapsed >= InviteQuickHoldAcceptSeconds)
+                {
+                    _inviteQuickHoldAccepted = true;
+                    _inviteQuickHoldActive = false;
+                    _inviteQuickHoldElapsed = InviteQuickHoldAcceptSeconds;
+                    if (!string.IsNullOrWhiteSpace(_inviteQuickHoldConfirmToken))
+                        ExecuteCustomChatAction(_inviteQuickHoldConfirmToken, string.Empty);
+                    SetInviteQuickStatus("Confirmed.", 2.2f);
+                    _inviteQuickHoldConfirmToken = string.Empty;
+                    _inviteQuickHoldCancelToken = string.Empty;
+                    _inviteQuickHoldPromptText = string.Empty;
+                }
+                return;
+            }
+
+            var confirmWasAccepted = _inviteQuickHoldAccepted;
+            _inviteQuickHoldActive = false;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+
+            if (confirmWasAccepted)
+                return;
+
+            if (!string.IsNullOrWhiteSpace(_inviteQuickHoldCancelToken))
+                ExecuteCustomChatAction(_inviteQuickHoldCancelToken, string.Empty);
+            SetInviteQuickStatus("Canceled.", 2.2f);
+            _inviteQuickHoldConfirmToken = string.Empty;
+            _inviteQuickHoldCancelToken = string.Empty;
+            _inviteQuickHoldPromptText = string.Empty;
+            return;
+        }
+
+        if (_lanSession is not EosP2PHostSession)
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (!TryGetNewestPendingJoinRequest(out var peerId, out var displayName))
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (input.IsNewKeyPress(_inviteQuickActionKey))
+        {
+            _inviteQuickHoldActive = true;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+            _inviteQuickHoldPeerId = peerId;
+            _inviteQuickHoldConfirmToken = string.Empty;
+            _inviteQuickHoldCancelToken = string.Empty;
+            _inviteQuickHoldPromptText = string.Empty;
+        }
+
+        if (!_inviteQuickHoldActive)
+            return;
+
+        if (string.IsNullOrWhiteSpace(_inviteQuickHoldPeerId))
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        var keyDown = input.IsKeyDown(_inviteQuickActionKey);
+        if (keyDown)
+        {
+            _inviteQuickHoldElapsed += dt;
+            if (!_inviteQuickHoldAccepted && _inviteQuickHoldElapsed >= InviteQuickHoldAcceptSeconds)
+            {
+                _inviteQuickHoldAccepted = true;
+                _inviteQuickHoldActive = false;
+                _inviteQuickHoldElapsed = InviteQuickHoldAcceptSeconds;
+                var acceptedName = GetPendingJoinDisplayName(_inviteQuickHoldPeerId, displayName);
+                _ = RespondToPendingJoinPeerIdAsync(_inviteQuickHoldPeerId, acceptedName, accept: true);
+                SetInviteQuickStatus($"Accepted {acceptedName}.", 2.2f);
+                _inviteQuickHoldPeerId = string.Empty;
+            }
+            return;
+        }
+
+        var wasAccepted = _inviteQuickHoldAccepted;
+        _inviteQuickHoldActive = false;
+        _inviteQuickHoldAccepted = false;
+        _inviteQuickHoldElapsed = 0f;
+
+        if (wasAccepted)
+            return;
+
+        var declinedName = GetPendingJoinDisplayName(_inviteQuickHoldPeerId, displayName);
+        _ = RespondToPendingJoinPeerIdAsync(_inviteQuickHoldPeerId, declinedName, accept: false);
+        SetInviteQuickStatus($"Declined {declinedName}.", 2.2f);
+        _inviteQuickHoldPeerId = string.Empty;
+    }
+
+    private void ResetInviteQuickHoldState()
+    {
+        _inviteQuickHoldActive = false;
+        _inviteQuickHoldAccepted = false;
+        _inviteQuickHoldElapsed = 0f;
+        _inviteQuickHoldPeerId = string.Empty;
+        _inviteQuickHoldConfirmToken = string.Empty;
+        _inviteQuickHoldCancelToken = string.Empty;
+        _inviteQuickHoldPromptText = string.Empty;
+    }
+
+    private bool TryGetPendingQuickConfirmation(out string confirmToken, out string cancelToken, out string promptText)
+    {
+        confirmToken = string.Empty;
+        cancelToken = string.Empty;
+        promptText = string.Empty;
+
+        if (!_pendingQuickConfirmActive)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(_pendingQuickConfirmToken) || string.IsNullOrWhiteSpace(_pendingQuickCancelToken))
+        {
+            ClearPendingQuickConfirmation();
+            return false;
+        }
+
+        var found = _chatLines.Any(line =>
+            line.TimeRemaining > 0f
+            && string.Equals(line.CustomActionToken, _pendingQuickConfirmToken, StringComparison.Ordinal)
+            && string.Equals(line.CustomActionToken2, _pendingQuickCancelToken, StringComparison.Ordinal));
+
+        if (!found)
+        {
+            ClearPendingQuickConfirmation();
+            return false;
+        }
+
+        confirmToken = _pendingQuickConfirmToken;
+        cancelToken = _pendingQuickCancelToken;
+        promptText = string.IsNullOrWhiteSpace(_pendingQuickPromptText)
+            ? "Confirmation pending."
+            : _pendingQuickPromptText;
+        return true;
+    }
+
+    private void RegisterPendingQuickConfirmation(string promptText, string confirmToken, string cancelToken)
+    {
+        var normalizedConfirm = (confirmToken ?? string.Empty).Trim();
+        var normalizedCancel = (cancelToken ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedConfirm) || string.IsNullOrWhiteSpace(normalizedCancel))
+            return;
+
+        _pendingQuickConfirmActive = true;
+        _pendingQuickConfirmToken = normalizedConfirm;
+        _pendingQuickCancelToken = normalizedCancel;
+        _pendingQuickPromptText = string.IsNullOrWhiteSpace(promptText)
+            ? "Confirmation pending."
+            : promptText.Trim();
+    }
+
+    private void ClearPendingQuickConfirmation()
+    {
+        _pendingQuickConfirmActive = false;
+        _pendingQuickConfirmToken = string.Empty;
+        _pendingQuickCancelToken = string.Empty;
+        _pendingQuickPromptText = string.Empty;
+    }
+
+    private bool TryGetNewestPendingJoinRequest(out string peerId, out string displayName)
+    {
+        peerId = string.Empty;
+        displayName = "PLAYER";
+
+        for (var i = _pendingJoinOrder.Count - 1; i >= 0; i--)
+        {
+            var candidate = (_pendingJoinOrder[i] ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(candidate))
+                continue;
+
+            peerId = candidate;
+            if (_pendingJoinDisplayNames.TryGetValue(candidate, out var resolved) && !string.IsNullOrWhiteSpace(resolved))
+                displayName = resolved;
+            return true;
+        }
+
+        return false;
+    }
+
+    private string GetPendingJoinDisplayName(string peerId, string fallback)
+    {
+        var normalized = (peerId ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(normalized)
+            && _pendingJoinDisplayNames.TryGetValue(normalized, out var display)
+            && !string.IsNullOrWhiteSpace(display))
+        {
+            return display;
+        }
+
+        return string.IsNullOrWhiteSpace(fallback) ? "PLAYER" : fallback.Trim();
+    }
+
+    private void SetInviteQuickStatus(string text, float seconds)
+    {
+        _inviteQuickStatusText = text;
+        _inviteQuickStatusTimer = Math.Max(0f, seconds);
     }
 
     public void OnMouseCaptureGained()
@@ -1013,7 +1336,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, $"WORLD: {name}", new Vector2(_viewport.X + 20, _viewport.Y + 20), Color.White);
         _font.DrawString(sb, $"MODE: {mode.ToString().ToUpperInvariant()}", new Vector2(_viewport.X + 20, _viewport.Y + 20 + _font.LineHeight + 4), Color.White);
         var modeCombo = $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)}";
-        _font.DrawString(sb, $"WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | {modeCombo} MODE WHEEL | ESC PAUSE", new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
+        var finderKey = FormatKeyLabel(_structureFinderKey);
+        _font.DrawString(sb, $"WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | {modeCombo} MODE WHEEL | {finderKey} FINDER | ESC PAUSE", new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
         
         DrawHotbar(sb);
         DrawSelectedBlockName(sb);
@@ -1046,12 +1370,38 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private async Task<string> ResolveUsernameAsync(string puid)
     {
         puid = (puid ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(puid)) return "Unknown";
+        if (string.IsNullOrWhiteSpace(puid)) return string.Empty;
 
         lock (_usernameCache)
         {
             if (_usernameCache.TryGetValue(puid, out var cached))
                 return cached;
+        }
+
+        var localUsername = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(localUsername) && !LooksLikeIdentityToken(localUsername))
+        {
+            var localPuid = (EosClientProvider.Current?.LocalProductUserId ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(localPuid) && string.Equals(localPuid, puid, StringComparison.OrdinalIgnoreCase))
+            {
+                CacheUsername(puid, localUsername);
+                return localUsername;
+            }
+        }
+
+        for (var i = 0; i < _profile.Friends.Count; i++)
+        {
+            var friend = _profile.Friends[i];
+            var friendId = (friend.UserId ?? string.Empty).Trim();
+            if (!string.Equals(friendId, puid, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var label = (friend.Label ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(label) && !LooksLikeIdentityToken(label))
+            {
+                CacheUsername(puid, label);
+                return label;
+            }
         }
 
         try
@@ -1060,8 +1410,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (result.Found && result.User != null && !string.IsNullOrWhiteSpace(result.User.Username))
             {
                 var username = result.User.Username.Trim();
-                lock (_usernameCache) _usernameCache[puid] = username;
-                return username;
+                if (!LooksLikeIdentityToken(username))
+                {
+                    CacheUsername(puid, username);
+                    return username;
+                }
             }
         }
         catch (Exception ex)
@@ -1069,7 +1422,43 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _log.Warn($"Failed to resolve username for {puid}: {ex.Message}");
         }
 
-        return PlayerProfile.ShortId(puid);
+        return string.Empty;
+    }
+
+    private void CacheUsername(string puid, string username)
+    {
+        var key = (puid ?? string.Empty).Trim();
+        var value = (username ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value) || LooksLikeIdentityToken(value))
+            return;
+
+        lock (_usernameCache)
+            _usernameCache[key] = value;
+    }
+
+    private static bool LooksLikeIdentityToken(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        if (string.Equals(text, "UNKNOWN", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "PLAYER", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "HOST", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (Guid.TryParse(text, out _))
+            return true;
+
+        var compact = text.Replace("-", string.Empty);
+        if (compact.Length >= 16 && compact.All(Uri.IsHexDigit))
+            return true;
+
+        if (text.Contains("...", StringComparison.Ordinal)
+            || text.StartsWith("PLAYER-", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
     }
 
     private void TickHostedOnlineLobbyHeartbeat()
@@ -1137,12 +1526,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 worldId: worldId);
 
             _log.Info($"EOS_LOBBY_HEARTBEAT_RESULT tick={tick} ok={ok}");
-            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(ok ? 6 : 10);
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(ok ? 2 : 5);
         }
         catch (Exception ex)
         {
             _log.Warn($"EOS_LOBBY_HEARTBEAT_RESULT tick={tick} ok=false error={ex.Message}");
-            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(10);
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(5);
         }
         finally
         {
@@ -1154,22 +1543,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         try
         {
-            if (File.Exists(WhitelistPath))
-            {
-                var json = File.ReadAllText(WhitelistPath);
-                var list = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json);
-                if (list != null) _whitelist = new HashSet<string>(list, StringComparer.OrdinalIgnoreCase);
-            }
-
-            // Sync saved friends into whitelist automatically
-            var friends = _profile.Friends;
-            var addedAny = false;
-            foreach (var f in friends)
-            {
-                if (!string.IsNullOrWhiteSpace(f.UserId) && _whitelist.Add(f.UserId)) addedAny = true;
-                if (!string.IsNullOrWhiteSpace(f.Label) && _whitelist.Add(f.Label)) addedAny = true;
-            }
-            if (addedAny) SaveWhitelist();
+            MigrateLegacyWorldTextFiles();
+            _whitelist = LoadWhitelistEntries();
+            if (PruneWhitelistIdentityTokens())
+                SaveWhitelist();
         }
         catch (Exception ex)
         {
@@ -1737,8 +2114,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _chatKey = GetKeybind("Chat", Keys.T);
         _commandKey = GetKeybind("Command", Keys.OemQuestion);
         _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
         _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
         _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         UpdateReticleSettings();
 
@@ -2704,6 +3083,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void UpdateHandoffTarget(InputState input)
     {
+        _handoffPromptVisible = false;
+        _handoffTargetId = -1;
+        _handoffTargetName = string.Empty;
+
         if (_pauseMenuOpen || _inventoryOpen || _lanSession == null || _gameMode != GameMode.Veilwalker)
             return;
 
@@ -2739,7 +3122,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             bestDistSq = distSq;
             targetId = id;
-            targetName = _playerNames.TryGetValue(id, out var name) ? name : $"PLAYER {id}";
+            targetName = ResolvePlayerName(id);
         }
 
         if (targetId >= 0)
@@ -3066,13 +3449,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void UpdateInventoryLayout()
     {
+        var tabsVisible = _gameMode == GameMode.Artificer;
+        var headerHeight = tabsVisible ? InventoryTitleHeightWithTabs : InventoryTitleHeight;
         var maxW = _viewport.Width - 40;
         var maxH = _viewport.Height - 40;
         var slotSize = InventorySlotSize;
         var gridW = InventoryCols * slotSize + (InventoryCols - 1) * InventorySlotGap;
         var gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
         var windowW = InventoryPadding * 2 + gridW;
-        var windowH = InventoryPadding * 2 + InventoryTitleHeight + gridH + InventoryFooterHeight;
+        var windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
 
         if (windowW > maxW)
         {
@@ -3083,10 +3468,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (windowH > maxH)
         {
-            var maxSlot = (maxH - InventoryPadding * 2 - InventoryTitleHeight - InventoryFooterHeight - InventorySlotGap * (InventoryRows - 1)) / InventoryRows;
+            var maxSlot = (maxH - InventoryPadding * 2 - headerHeight - InventoryFooterHeight - InventorySlotGap * (InventoryRows - 1)) / InventoryRows;
             slotSize = Math.Clamp(Math.Min(slotSize, maxSlot), 32, InventorySlotSize);
             gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
-            windowH = InventoryPadding * 2 + InventoryTitleHeight + gridH + InventoryFooterHeight;
+            windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
         }
 
         _inventoryRect = new Rectangle(
@@ -3095,8 +3480,28 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             windowW,
             windowH);
 
+        var visualWidth = Math.Min(maxW, (int)MathF.Round(windowW * InventoryPanelVisualScale));
+        var visualHeight = Math.Min(maxH, (int)MathF.Round(windowH * InventoryPanelVisualScale));
+        _inventoryPanelVisualRect = new Rectangle(
+            _inventoryRect.Center.X - visualWidth / 2,
+            _inventoryRect.Center.Y - visualHeight / 2,
+            visualWidth,
+            visualHeight);
+
+        if (tabsVisible)
+        {
+            var tabY = _inventoryRect.Y + InventoryPadding;
+            _inventoryCatalogTabRect = new Rectangle(_inventoryRect.X + InventoryPadding, tabY, InventoryTabWidth, InventoryTabHeight);
+            _inventoryStorageTabRect = new Rectangle(_inventoryCatalogTabRect.Right + 10, tabY, InventoryTabWidth, InventoryTabHeight);
+        }
+        else
+        {
+            _inventoryCatalogTabRect = Rectangle.Empty;
+            _inventoryStorageTabRect = Rectangle.Empty;
+        }
+
         var startX = _inventoryRect.X + InventoryPadding;
-        var startY = _inventoryRect.Y + InventoryPadding + InventoryTitleHeight;
+        var startY = _inventoryRect.Y + InventoryPadding + headerHeight;
 
         for (int row = 0; row < InventoryRows; row++)
         {
@@ -3130,12 +3535,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         // Hover detection
         var p = _inventoryMousePos;
+        var showArtificerTabs = _gameMode == GameMode.Artificer;
+        var isCatalogView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var displayedGrid = isCatalogView ? _inventory.SandboxCatalogSlots : _inventory.Grid;
         var hoveredAny = false;
         for (int i = 0; i < _inventoryGridSlots.Length; i++)
         {
             if (_inventoryGridSlots[i].Contains(p))
             {
-                var slot = _inventory.Grid[i];
+                var slot = displayedGrid[i];
                 if (slot.Id != BlockId.Air && slot.Count > 0)
                 {
                     SetDisplayName(BlockRegistry.Get(slot.Id).Name);
@@ -3162,15 +3570,60 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
+        if (isCatalogView && input.ScrollDelta != 0)
+        {
+            var gridBounds = GetInventoryGridBounds();
+            if (gridBounds.Width > 0 && gridBounds.Height > 0 && gridBounds.Contains(p))
+            {
+                var delta = input.ScrollDelta > 0 ? -1 : 1;
+                if (_inventory.TryAdvanceSandboxCatalogPage(delta))
+                {
+                    _inventoryHeld = default;
+                    _inventoryHasHeld = false;
+                    _heldFrom = InventorySlotGroup.None;
+                    _heldIndex = -1;
+                    SetCommandStatus($"Catalog page {_inventory.SandboxCatalogPage}/{_inventory.SandboxCatalogPageCount}.", 2.2f, echoToChat: false);
+                }
+            }
+        }
+
         if (!input.IsNewLeftClick())
             return;
+
+        if (showArtificerTabs)
+        {
+            if (_inventoryCatalogTabRect.Contains(p))
+            {
+                _artificerInventoryView = ArtificerInventoryView.Catalog;
+                return;
+            }
+
+            if (_inventoryStorageTabRect.Contains(p))
+            {
+                _artificerInventoryView = ArtificerInventoryView.Inventory;
+                return;
+            }
+        }
 
         for (int i = 0; i < _inventoryGridSlots.Length; i++)
         {
             if (_inventoryGridSlots[i].Contains(p))
             {
+                if (isCatalogView)
+                {
+                    var catalogSlot = _inventory.SandboxCatalogSlots[i];
+                    if (catalogSlot.Count > 0 && catalogSlot.Id != BlockId.Air)
+                    {
+                        _inventoryHeld = catalogSlot;
+                        _inventoryHasHeld = true;
+                        _heldFrom = InventorySlotGroup.None;
+                        _heldIndex = -1;
+                    }
+                    return;
+                }
+
                 ref var slot = ref _inventory.Grid[i];
-                HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i);
+                HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
                 return;
             }
         }
@@ -3180,10 +3633,38 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_hotbarSlots[i].Contains(p))
             {
                 ref var slot = ref _inventory.Hotbar[i];
-                HandleInventorySlotClick(ref slot, InventorySlotGroup.Hotbar, i);
+                HandleInventorySlotClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: isCatalogView);
                 return;
             }
         }
+    }
+
+    private Rectangle GetInventoryGridBounds()
+    {
+        if (_inventoryGridSlots.Length == 0)
+            return Rectangle.Empty;
+
+        var left = int.MaxValue;
+        var top = int.MaxValue;
+        var right = int.MinValue;
+        var bottom = int.MinValue;
+
+        for (var i = 0; i < _inventoryGridSlots.Length; i++)
+        {
+            var rect = _inventoryGridSlots[i];
+            if (rect.Width <= 0 || rect.Height <= 0)
+                continue;
+
+            left = Math.Min(left, rect.Left);
+            top = Math.Min(top, rect.Top);
+            right = Math.Max(right, rect.Right);
+            bottom = Math.Max(bottom, rect.Bottom);
+        }
+
+        if (right <= left || bottom <= top)
+            return Rectangle.Empty;
+
+        return new Rectangle(left, top, right - left, bottom - top);
     }
 
     private void WarmBlockIcons()
@@ -3203,7 +3684,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var gridSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
                 ? _inventoryGridSlots[0].Width - pad * 2
                 : InventorySlotSize - pad * 2;
-            WarmIconSlots(_inventory.Grid, gridSize);
+            var displaySlots = (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
+                ? _inventory.SandboxCatalogSlots
+                : _inventory.Grid;
+            WarmIconSlots(displaySlots, gridSize);
         }
 
         if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
@@ -3252,9 +3736,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _inventoryOpen = false;
     }
 
-    private void HandleInventorySlotClick(ref HotbarSlot slot, InventorySlotGroup group, int index)
+    private void HandleInventorySlotClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
     {
-        if (_inventory.Mode != GameMode.Artificer)
+        if (sandboxCatalogMode)
         {
             HandleSandboxInventoryClick(ref slot, group, index);
             return;
@@ -3287,12 +3771,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _heldIndex = -1;
         }
 
-        if (_gameMode == GameMode.Artificer)
-        {
-            ClampSandboxSlot(ref slot);
-            if (_inventoryHasHeld)
-                ClampSandboxSlot(ref _inventoryHeld);
-        }
+        // Non-artificer mode keeps standard move/swap behavior.
     }
 
     private static void ClampSandboxSlot(ref HotbarSlot slot)
@@ -3343,6 +3822,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         Grid,
         Hotbar
     }
+
+    private enum ArtificerInventoryView
+    {
+        Catalog,
+        Inventory
+    }
+
+    private ArtificerInventoryView _artificerInventoryView = ArtificerInventoryView.Catalog;
 
     private void DrawHotbar(SpriteBatch sb)
     {
@@ -3442,11 +3929,35 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
         if (_pausePanel != null)
-            sb.Draw(_pausePanel, _inventoryRect, Color.White);
+            sb.Draw(_pausePanel, _inventoryPanelVisualRect, Color.White);
+        else
+            sb.Draw(_pixel, _inventoryPanelVisualRect, new Color(8, 12, 22, 220));
 
-        _font.DrawString(sb, "INVENTORY", new Vector2(_inventoryRect.X + 20, _inventoryRect.Y + 14), Color.White);
+        var tabsVisible = _gameMode == GameMode.Artificer;
+        var isArtificerCatalog = tabsVisible && _artificerInventoryView == ArtificerInventoryView.Catalog;
 
-        DrawInventorySlots(sb, _inventory.Grid, _inventoryGridSlots);
+        if (tabsVisible)
+        {
+            sb.Draw(_pixel, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
+            sb.Draw(_pixel, _inventoryStorageTabRect, isArtificerCatalog ? new Color(20, 20, 20, 180) : new Color(42, 66, 98, 235));
+            DrawBorder(sb, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(200, 225, 255) : new Color(120, 120, 120));
+            DrawBorder(sb, _inventoryStorageTabRect, isArtificerCatalog ? new Color(120, 120, 120) : new Color(200, 225, 255));
+            _font.DrawString(sb, "CATALOG", new Vector2(_inventoryCatalogTabRect.X + 16, _inventoryCatalogTabRect.Y + 6), Color.White);
+            _font.DrawString(sb, "INVENTORY", new Vector2(_inventoryStorageTabRect.X + 8, _inventoryStorageTabRect.Y + 6), Color.White);
+        }
+
+        var titleY = _inventoryRect.Y + InventoryPadding + (tabsVisible ? InventoryTabHeight + 8 : 6);
+        var title = isArtificerCatalog ? "ARTIFICER CATALOG" : "INVENTORY";
+        _font.DrawString(sb, title, new Vector2(_inventoryRect.X + InventoryPadding + 2, titleY), Color.White);
+        if (isArtificerCatalog)
+        {
+            var pageText = $"PAGE {_inventory.SandboxCatalogPage}/{_inventory.SandboxCatalogPageCount} (WHEEL)";
+            var pageSize = _font.MeasureString(pageText);
+            _font.DrawString(sb, pageText, new Vector2(_inventoryRect.Right - pageSize.X - 20, titleY), new Color(205, 220, 255));
+        }
+
+        var displayedSlots = isArtificerCatalog ? _inventory.SandboxCatalogSlots : _inventory.Grid;
+        DrawInventorySlots(sb, displayedSlots, _inventoryGridSlots);
 
         _inventoryClose.Draw(sb, _pixel, _font);
 
@@ -3726,13 +4237,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         var giveKey = FormatKeyLabel(_giveKey);
-        var modKey = FormatKeyLabel(_stackModifierKey);
-        var label = _handoffFullStack
-            ? $"GIVE FULL STACK ({modKey}+{giveKey})"
-            : $"GIVE ITEM ({giveKey})";
-
-        if (!string.IsNullOrWhiteSpace(_handoffTargetName))
-            label = $"{label} -> {_handoffTargetName.ToUpperInvariant()}";
+        var displayName = string.IsNullOrWhiteSpace(_handoffTargetName)
+            ? "PLAYER"
+            : _handoffTargetName.Trim();
+        var label = $"GIVE ITEM ({giveKey}) {displayName}";
 
         var size = _font.MeasureString(label);
         var pos = new Vector2(center.X - size.X / 2f, center.Y + reticleSize + 10f);
@@ -4242,7 +4750,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void UpdatePauseMenuLayout()
     {
-        var showInvite = CanShareJoinCode();
+        var showInvite = false;
         var canOpenLan = CanOpenLanFromPause();
         var canOpenOnline = CanOpenOnlineFromPause();
         var canOpenHostMenu = canOpenLan || canOpenOnline;
@@ -4541,7 +5049,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         SeedLocalPlayerName();
         ResumeGameplayAfterHosting();
         _pendingHostedOnlineShareAnnouncement = false;
-        AnnounceOnlineHostShare(eos, tryCopyToClipboard: true);
+        SetCommandStatus("Online hosting enabled.", 5f, echoToChat: false);
         UpdatePauseMenuLayout();
     }
 
@@ -4627,6 +5135,37 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private bool TryPasteClipboardIntoText(InputState input, ref string text)
+    {
+        var ctrlDown = input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl);
+        if (!ctrlDown || !input.IsNewKeyPress(Keys.V))
+            return false;
+
+        try
+        {
+            var clip = WinClipboard.GetText() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(clip))
+                return false;
+
+            clip = clip.Replace('\r', ' ').Replace('\n', ' ');
+            var available = Math.Max(0, CommandInputMaxLength - text.Length);
+            if (available <= 0)
+                return false;
+
+            if (clip.Length > available)
+                clip = clip.Substring(0, available);
+
+            text += clip;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Clipboard paste failed: {ex.Message}");
+            SetCommandStatus($"Clipboard paste failed: {ex.Message}", 4f, echoToChat: false);
+            return false;
+        }
+    }
+
     private void OpenShareCode()
     {
         _pauseMenuOpen = false;
@@ -4671,7 +5210,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 var savedRemotePlayers = SaveConnectedRemotePlayerStates();
                 var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
                 var savedMeshes = SaveAllLoadedChunkMeshesToCache();
-                FlushWorldPreviewUpdate(closeState);
+                QueueWorldPreviewUpdate(closeState);
                 _log.Info($"GameWorldScreen: OnClose saved {savedChunks} chunks, {savedMeshes} mesh caches, and {savedRemotePlayers} remote player snapshots.");
             }
         }
@@ -4694,7 +5233,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_lanSession is EosP2PHostSession)
         {
             _log.Info("HOST_STOP requested transport=EOS_LOBBY_P2P");
-            WorldHostBootstrap.TryClearHostingPresence(_log, EnsureEosClient());
+            var eos = EosClientProvider.Current;
+            WorldHostBootstrap.TryClearHostingPresence(_log, eos);
+            if (eos != null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var stopResult = await eos.StopHostedLobbyAsync().ConfigureAwait(false);
+                        _log.Info($"EOS_LOBBY_STOP_ON_CLOSE ok={stopResult}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"EOS_LOBBY_STOP_ON_CLOSE failed: {ex.Message}");
+                    }
+                });
+            }
         }
         _lanSession?.Dispose();
         _blockIconCache?.Dispose();
@@ -5138,6 +5693,26 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         model.Position = new Vector3(state.PosX, state.PosY, state.PosZ);
         model.Yaw = state.Yaw;
         model.IsFlying = state.IsFlying;
+
+        TryFlushRemotePersistenceSnapshot(snapshot.PlayerId, normalized);
+    }
+
+    private void TryFlushRemotePersistenceSnapshot(int playerId, LanPlayerPersistenceSnapshot snapshot, bool force = false)
+    {
+        if (playerId <= 0)
+            return;
+
+        if (!force
+            && _remotePersistenceLastFlushUtc.TryGetValue(playerId, out var lastFlush)
+            && DateTime.UtcNow - lastFlush < RemotePersistenceFlushInterval)
+        {
+            return;
+        }
+
+        if (!TrySaveRemotePlayerStateSnapshot(playerId, snapshot))
+            return;
+
+        _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
     }
 
     private void ProcessPendingPersistenceRestores()
@@ -5233,21 +5808,35 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _multiplayerDisconnectHandled = true;
         var message = string.IsNullOrWhiteSpace(reason) ? HostDisconnectedFallbackReason : reason.Trim();
         _log.Warn($"Multiplayer session closed: {message}");
-
-        try
-        {
-            System.Windows.Forms.MessageBox.Show(
-                message,
-                "Host Disconnected",
-                System.Windows.Forms.MessageBoxButtons.OK,
-                System.Windows.Forms.MessageBoxIcon.Warning);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Host disconnect dialog failed: {ex.Message}");
-        }
-
+        var overlayMessage = BuildDisconnectOverlayMessage(message);
         _menus.Pop();
+        _menus.Push(new MultiplayerDisconnectScreen(_menus, _assets, _font, _pixel, overlayMessage), _viewport);
+    }
+
+    private static string BuildDisconnectOverlayMessage(string reason)
+    {
+        var normalized = (reason ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return "Host Left Left the game";
+
+        if (normalized.StartsWith("Kicked by host", StringComparison.OrdinalIgnoreCase))
+        {
+            var detail = normalized.Contains(':')
+                ? normalized[(normalized.IndexOf(':') + 1)..].Trim()
+                : "No reason provided.";
+            if (string.IsNullOrWhiteSpace(detail))
+                detail = "No reason provided.";
+            return $"Kicked by Host - Reason: {detail}";
+        }
+
+        if (normalized.Contains("host disconnected", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("host left", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("connection to host lost", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Host Left Left the game";
+        }
+
+        return normalized;
     }
 
     private void ApplyNetworkTeleport(LanTeleport teleport)
@@ -5277,13 +5866,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (string.IsNullOrWhiteSpace(peerId))
                 continue;
 
-            var username = await ResolveUsernameAsync(peerId);
+            var fallbackDisplay = (request.DisplayName ?? string.Empty).Trim();
+            var resolvedUsername = await ResolveUsernameAsync(peerId);
+            var resolvedLooksToken = string.IsNullOrWhiteSpace(resolvedUsername)
+                || LooksLikeIdentityToken(resolvedUsername);
+            var fallbackLooksToken = string.IsNullOrWhiteSpace(fallbackDisplay) || LooksLikeIdentityToken(fallbackDisplay);
+            var username = !resolvedLooksToken
+                ? resolvedUsername
+                : (!fallbackLooksToken ? fallbackDisplay : "PLAYER");
+            CacheUsername(peerId, username);
 
-            // DUAL-LAYER GUARD:
-            // 1. If they are whitelisted or already accepted via Gate, hostSession.HandleHello 
-            //    already auto-approved them. They won't even reach TryDequeueJoinRequest.
-            // 2. If for some reason they DO reach here but we know they are approved, skip the prompt.
-            if (_whitelist.Contains(peerId) || _whitelist.Contains(username))
+            // If they are whitelisted by username, skip prompt and approve immediately.
+            if (_whitelist.Contains(username))
             {
                 _log.Info($"P2P: Auto-approving whitelisted peer {username} ({peerId}) in ProcessPendingJoinRequests fallback.");
                 hostSession.PreApprovePuid(peerId);
@@ -5298,8 +5892,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void AddJoinRequestChatPrompt(string peerId, string displayName)
     {
         RememberPendingJoinRequester(peerId, displayName);
+        var hotkeyHint = FormatKeyLabel(_inviteQuickActionKey);
         AddChatLine(
-            $"{displayName} wants to join! Accept?",
+            $"{displayName} wants to join! Accept? (Tap {hotkeyHint}=decline, hold {hotkeyHint}=accept)",
             isSystem: true,
             hoverText: "Allow this player to join your online world.",
             actionLabel: "ACCEPT",
@@ -5308,6 +5903,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             actionLabel2: "REJECT",
             customActionToken2: JoinDeclineActionPrefix + peerId,
             customActionStatus2: $"{displayName} declined.");
+        SetInviteQuickStatus($"Invite received from {displayName}.", 2.4f);
     }
 
     private void RememberPendingJoinRequester(string peerId, string displayName)
@@ -5317,8 +5913,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         _pendingJoinLookup[normalizedPeerId] = normalizedPeerId;
-        if (!string.IsNullOrWhiteSpace(displayName))
-            _pendingJoinLookup[displayName.Trim()] = normalizedPeerId;
+        var normalizedDisplay = (displayName ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(normalizedDisplay))
+        {
+            _pendingJoinLookup[normalizedDisplay] = normalizedPeerId;
+            _pendingJoinDisplayNames[normalizedPeerId] = normalizedDisplay;
+        }
+
+        _pendingJoinOrder.RemoveAll(id => string.Equals(id, normalizedPeerId, StringComparison.OrdinalIgnoreCase));
+        _pendingJoinOrder.Add(normalizedPeerId);
     }
 
     private void ForgetPendingJoinRequester(string peerId)
@@ -5334,6 +5937,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         for (var i = 0; i < keysToRemove.Length; i++)
             _pendingJoinLookup.Remove(keysToRemove[i]);
+
+        _pendingJoinOrder.RemoveAll(id => string.Equals(id, normalizedPeerId, StringComparison.OrdinalIgnoreCase));
+        _pendingJoinDisplayNames.Remove(normalizedPeerId);
+        if (_inviteQuickHoldActive && string.Equals(normalizedPeerId, _inviteQuickHoldPeerId, StringComparison.OrdinalIgnoreCase))
+        {
+            _inviteQuickHoldActive = false;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+            _inviteQuickHoldPeerId = string.Empty;
+        }
     }
 
     private bool TryResolvePendingJoinRequester(string query, out string peerId)
@@ -5349,6 +5962,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void ApplyPlayerList(LanPlayerList list)
     {
         var previousRemoteIds = _knownRemotePlayerIds.ToArray();
+        var localIdKnown = _lanSession != null && _lanSession.LocalPlayerId >= 0;
+        if (_lanSession == null)
+        {
+            _pendingRemoteJoinAnnouncements.Clear();
+            _announcedRemotePlayers.Clear();
+            _remoteJoinAnnouncedUtc.Clear();
+        }
         
         // Preserve old names for the "left the game" message
         var oldNames = new Dictionary<int, string>(_playerNames);
@@ -5362,8 +5982,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var name = string.IsNullOrWhiteSpace(entry.Name) ? $"Player{entry.PlayerId}" : entry.Name;
             _playerNames[entry.PlayerId] = name;
 
-            if (_lanSession == null || entry.PlayerId != _lanSession.LocalPlayerId)
+            if (_lanSession == null)
+            {
                 _knownRemotePlayerIds.Add(entry.PlayerId);
+            }
+            else if (localIdKnown && entry.PlayerId != _lanSession.LocalPlayerId)
+            {
+                _knownRemotePlayerIds.Add(entry.PlayerId);
+            }
         }
 
         if (_lanSession is EosP2PClientSession eosClientSession)
@@ -5394,7 +6020,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     if (_lanSession.IsHost)
                         _pendingRestorePlayerIds.Add(playerId);
 
-                    if (_hasReceivedInitialPlayerList)
+                    _pendingRemoteJoinAnnouncements.Add(playerId);
+                    continue;
+                }
+
+                if (_pendingRemoteJoinAnnouncements.Remove(playerId))
+                {
+                    _announcedRemotePlayers.Add(playerId);
+                    _remoteJoinAnnouncedUtc[playerId] = DateTime.UtcNow;
+                    if (_hasReceivedInitialPlayerList && localIdKnown)
                     {
                         var joinedName = _playerNames.TryGetValue(playerId, out var nameVal) ? nameVal : $"Player{playerId}";
                         AddChatLine($"{joinedName} joined the game", isSystem: true);
@@ -5408,22 +6042,33 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (_knownRemotePlayerIds.Contains(playerId))
                     continue;
 
-                if (_hasReceivedInitialPlayerList)
+                _pendingRemoteJoinAnnouncements.Remove(playerId);
+                var wasAnnounced = _announcedRemotePlayers.Remove(playerId);
+                var hadJoinTimestamp = _remoteJoinAnnouncedUtc.TryGetValue(playerId, out var joinAnnouncedUtc);
+                if (hadJoinTimestamp)
+                    _remoteJoinAnnouncedUtc.Remove(playerId);
+                if (wasAnnounced && _hasReceivedInitialPlayerList && localIdKnown)
                 {
-                    var leftName = oldNames.TryGetValue(playerId, out var oldNameVal) ? oldNameVal : $"Player{playerId}";
-                    AddChatLine($"{leftName} left the game", isSystem: true);
+                    var suppressEarlyLeave = hadJoinTimestamp
+                        && (DateTime.UtcNow - joinAnnouncedUtc) < RemoteLeaveAnnouncementGrace;
+                    if (!suppressEarlyLeave)
+                    {
+                        var leftName = oldNames.TryGetValue(playerId, out var oldNameVal) ? oldNameVal : $"Player{playerId}";
+                        AddChatLine($"{leftName} left the game", isSystem: true);
+                    }
                 }
 
                 if (_lanSession.IsHost)
                 {
                     FlushPersistedRemoteStateForPlayer(playerId);
                     _latestRemotePersistenceByPlayerId.Remove(playerId);
+                    _remotePersistenceLastFlushUtc.Remove(playerId);
                     _pendingRestorePlayerIds.Remove(playerId);
                 }
             }
         }
 
-        _hasReceivedInitialPlayerList = true;
+        _hasReceivedInitialPlayerList = _hasReceivedInitialPlayerList || localIdKnown;
 
         if (_lanSession != null && _lanSession.IsHost && _lanSession.IsConnected)
             BroadcastOperatorSyncState();
@@ -7051,11 +7696,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_latestRemotePersistenceByPlayerId.TryGetValue(playerId, out var snapshot)
             && TrySaveRemotePlayerStateSnapshot(playerId, snapshot))
         {
+            _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
             return;
         }
 
         if (_remotePlayers.TryGetValue(playerId, out var model))
-            TrySaveRemotePlayerModelState(playerId, model);
+        {
+            if (TrySaveRemotePlayerModelState(playerId, model))
+                _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
+        }
     }
 
     private bool TrySaveRemotePlayerStateSnapshot(int playerId, LanPlayerPersistenceSnapshot snapshot)
@@ -7330,6 +7979,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         for (var i = _chatLines.Count - 1; i >= 0; i--)
             _chatLines[i].TimeRemaining = Math.Max(0f, _chatLines[i].TimeRemaining - dt);
+
+        if (_pendingQuickConfirmActive)
+            TryGetPendingQuickConfirmation(out _, out _, out _);
     }
 
     private bool IsChatOpenKeyPressed(InputState input)
@@ -7510,7 +8162,56 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (string.IsNullOrWhiteSpace(token))
             return;
 
-        if (_lanSession is not EosP2PHostSession hostSession)
+        if (token.StartsWith("spoiler-reveal:", StringComparison.Ordinal))
+        {
+            var raw = token.Substring("spoiler-reveal:".Length).Trim();
+            if (int.TryParse(raw, out var lineId))
+            {
+                for (var i = _chatLines.Count - 1; i >= 0; i--)
+                {
+                    if (_chatLines[i].LineId != lineId)
+                        continue;
+                    _chatLines[i].SpoilerRevealed = true;
+                    break;
+                }
+            }
+            return;
+        }
+
+        if (_pendingQuickConfirmActive
+            && (string.Equals(token, _pendingQuickConfirmToken, StringComparison.Ordinal)
+                || string.Equals(token, _pendingQuickCancelToken, StringComparison.Ordinal)))
+        {
+            ClearPendingQuickConfirmation();
+        }
+
+        if (string.Equals(token, ChatClearConfirmActionToken, StringComparison.Ordinal))
+        {
+            ClearChatHistory();
+            return;
+        }
+
+        if (string.Equals(token, ChatClearCancelActionToken, StringComparison.Ordinal))
+        {
+            SetCommandStatus("Chat clear canceled.", 3f, echoToChat: false);
+            return;
+        }
+
+        if (token.StartsWith(InventoryClearConfirmActionPrefix, StringComparison.Ordinal))
+        {
+            var raw = token.Substring(InventoryClearConfirmActionPrefix.Length).Trim();
+            if (int.TryParse(raw, out var targetId))
+                ExecuteConfirmedInventoryClear(targetId);
+            return;
+        }
+
+        if (token.StartsWith(InventoryClearCancelActionPrefix, StringComparison.Ordinal))
+        {
+            SetCommandStatus("Inventory clear canceled.", 3f, echoToChat: false);
+            return;
+        }
+
+        if (_lanSession is not EosP2PHostSession)
         {
             SetCommandStatus("This action is only available to the online host.", 4f, echoToChat: false);
             return;
@@ -7534,6 +8235,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_whitelist.Remove(target))
             {
                 SaveWhitelist();
+                RevokeWhitelistApprovalsForName(target);
                 AddChatLine($"Removed {target} from whitelist.", isSystem: true);
                 SetCommandStatus($"Removed {target} from whitelist.", 4f, echoToChat: false);
             }
@@ -7543,39 +8245,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (token.StartsWith(JoinApproveActionPrefix, StringComparison.Ordinal))
         {
             var peerId = token.Substring(JoinApproveActionPrefix.Length).Trim();
-            hostSession.PreApprovePuid(peerId);
-            if (!hostSession.ApproveJoinRequest(peerId))
-            {
-                SetCommandStatus("Join request is no longer pending.", 4f, echoToChat: false);
-                return;
-            }
-
-            _ = Task.Run(async () =>
-            {
-                var username = await ResolveUsernameAsync(peerId);
-                AddChatLine($"You approved {username}'s join request.", isSystem: true);
-                SetCommandStatus($"Join approved for {username}.", 4f, echoToChat: false);
-            });
-            ForgetPendingJoinRequester(peerId);
+            var nameHint = GetPendingJoinDisplayName(peerId, "PLAYER");
+            _ = RespondToPendingJoinPeerIdAsync(peerId, nameHint, accept: true);
             return;
         }
 
         if (token.StartsWith(JoinDeclineActionPrefix, StringComparison.Ordinal))
         {
             var peerId = token.Substring(JoinDeclineActionPrefix.Length).Trim();
-            if (!hostSession.DeclineJoinRequest(peerId))
-            {
-                SetCommandStatus("Join request is no longer pending.", 4f, echoToChat: false);
-                return;
-            }
-
-            _ = Task.Run(async () =>
-            {
-                var username = await ResolveUsernameAsync(peerId);
-                AddChatLine($"You declined {username}'s join request.", isSystem: true);
-                SetCommandStatus($"Join declined for {username}.", 4f, echoToChat: false);
-            });
-            ForgetPendingJoinRequester(peerId);
+            var nameHint = GetPendingJoinDisplayName(peerId, "PLAYER");
+            _ = RespondToPendingJoinPeerIdAsync(peerId, nameHint, accept: false);
         }
     }
 
@@ -7670,9 +8349,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
         if (commandLikeText && input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _chatInputText, reverseCycle: shift))
             return;
+        if (TryPasteClipboardIntoText(input, ref _chatInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
 
         var changed = false;
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Tab)
                 continue;
@@ -7747,9 +8431,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
         if (input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _commandInputText, reverseCycle: shift))
             return;
+        if (TryPasteClipboardIntoText(input, ref _commandInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
 
         var changed = false;
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Tab)
                 continue;
@@ -7812,7 +8501,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _commandTabCycleCandidates.AddRange(_commandTabBuildBuffer);
             _commandTabContextKey = contextKey;
             _commandTabIndex = reverseCycle ? _commandTabCycleCandidates.Count - 1 : 0;
-            _commandTabAppendSpace = _commandTabCycleCandidates.Count == 1;
+            // Minecraft-like behavior: keep cycling current token until user manually types space.
+            _commandTabAppendSpace = false;
         }
         else
         {
@@ -7903,9 +8593,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (!HasCommandPermission(descriptor.Permission) || !IsCommandAllowedWithCheatsSetting(descriptor))
                     continue;
 
-                AddCandidate(descriptor.Name, descriptor.Description, descriptor.Usage);
+                AddCandidate(descriptor.Name, descriptor.Description, descriptor.Usage, filterByPrefix: true);
                 for (var i = 0; i < descriptor.Aliases.Length; i++)
-                    AddCandidate(descriptor.Aliases[i], $"Alias for /{descriptor.Name}. {descriptor.Description}", descriptor.Usage);
+                    AddCandidate(descriptor.Aliases[i], $"Alias for /{descriptor.Name}. {descriptor.Description}", descriptor.Usage, filterByPrefix: true);
             }
 
             return;
@@ -7920,17 +8610,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         var tokenOptions = GetCommandArgumentCompletionTokens(command, context.TokenIndex, context.Tokens);
+        var exactTokenMatch = !string.IsNullOrWhiteSpace(prefix)
+            && tokenOptions.Any(option => string.Equals(option, prefix, StringComparison.OrdinalIgnoreCase));
+        var filterByPrefix = !exactTokenMatch;
         for (var i = 0; i < tokenOptions.Count; i++)
-            AddCandidate(tokenOptions[i], $"Argument for /{command.Name}.", command.Usage);
-
-        output.Sort((a, b) => string.Compare(a.Value, b.Value, StringComparison.OrdinalIgnoreCase));
+            AddCandidate(tokenOptions[i], $"Argument for /{command.Name}.", command.Usage, filterByPrefix);
         return;
 
-        void AddCandidate(string value, string description, string usage)
+        void AddCandidate(string value, string description, string usage, bool filterByPrefix)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return;
-            if (!value.StartsWith(prefixLower, StringComparison.OrdinalIgnoreCase))
+            if (filterByPrefix && !value.StartsWith(prefixLower, StringComparison.OrdinalIgnoreCase))
                 return;
             if (!seen.Add(value))
                 return;
@@ -7968,23 +8659,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
                 {
                     var sub = tokens[1].ToLowerInvariant();
-                    if (sub == "add" || sub == "remove")
+                    if (sub == "add")
                         AppendFriendNameTokens(values);
+                    else if (sub == "remove")
+                        AppendWhitelistTokens(values);
                 }
                 break;
 
             case "structure":
                 if (tokenIndex == 1)
                 {
-                    values.AddRange(new[] { "gui", "list", "biome" });
-                }
-                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && string.Equals(tokens[1], "biome", StringComparison.OrdinalIgnoreCase))
-                {
-                    values.AddRange(new[] { "desert", "grasslands", "ocean" });
-                }
-                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length && string.Equals(tokens[1], "biome", StringComparison.OrdinalIgnoreCase))
-                {
-                    AppendRadiusPresets(values);
+                    values.AddRange(new[] { "locate", "list" });
                 }
                 break;
 
@@ -8024,14 +8709,72 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     values.Add("confirm");
                 break;
 
+            case "give":
+                if (tokenIndex == 1)
+                {
+                    AppendPlayerNameTokens(values);
+                    values.Add("list");
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    if (TryResolvePlayerTarget(tokens[1], out _, out _))
+                    {
+                        AppendAllGiveItemTokens(values, includeNumericIds: true);
+                    }
+                    else if (TryResolveInventoryItemToken(tokens[1], out _))
+                    {
+                        values.AddRange(new[] { "1", "16", "32", "64" });
+                    }
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
+                {
+                    if (TryResolvePlayerTarget(tokens[1], out _, out _) && TryResolveInventoryItemToken(tokens[2], out _))
+                        values.AddRange(new[] { "1", "16", "32", "64" });
+                }
+                break;
+
+            case "clear":
+                if (tokenIndex == 1)
+                {
+                    AppendPlayerNameTokens(values);
+                    AppendInventoryItemTokens(values, includeNumericIds: true, includeFallbackCatalog: true);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && TryResolvePlayerTarget(tokens[1], out _, out _))
+                {
+                    AppendInventoryItemTokens(values, includeNumericIds: true, includeFallbackCatalog: true);
+                }
+                break;
+
             case "setspawn":
-                AppendCurrentPositionTokens(values);
+                if (tokenIndex is 1 or 2 or 3)
+                    AppendCurrentPositionTokens(values);
                 break;
 
             case "tp":
-                if (tokenIndex is 1 or 2)
+                if (tokenIndex == 1)
+                {
+                    AppendTeleportCoordinateTokens(values, TeleportAxis.X);
                     AppendPlayerNameTokens(values);
-                AppendCurrentPositionTokens(values);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var firstToken = tokens[1];
+                    if (IsTeleportCoordinateToken(firstToken))
+                    {
+                        // /tp <x> <z> and /tp <x> <y> <z> both start here; z default first.
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Z);
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Y);
+                    }
+                    else
+                    {
+                        AppendPlayerNameTokens(values);
+                    }
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
+                {
+                    if (IsTeleportCoordinateToken(tokens[1]) && IsTeleportCoordinateToken(tokens[2]))
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Z);
+                }
                 break;
 
             case "op":
@@ -8071,13 +8814,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (tokenIndex == 1)
                     AppendPlayerNameTokens(values);
                 break;
+
+            case "pos":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
         }
 
-        var ordered = values
-            .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var ordered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < values.Count; i++)
+        {
+            var value = values[i];
+            if (string.IsNullOrWhiteSpace(value))
+                continue;
+            if (!seen.Add(value))
+                continue;
+            ordered.Add(value);
+        }
         return ordered;
     }
 
@@ -8085,6 +8839,42 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         for (var i = 0; i < FinderRadiusOptions.Length; i++)
             output.Add(FinderRadiusOptions[i].ToString());
+    }
+
+    private enum TeleportAxis
+    {
+        X,
+        Y,
+        Z
+    }
+
+    private static bool IsTeleportCoordinateToken(string token)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (token.Length == 0)
+            return false;
+        if (token.StartsWith("~", StringComparison.Ordinal))
+            return true;
+
+        return float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
+    }
+
+    private void AppendTeleportCoordinateTokens(List<string> output, TeleportAxis axis)
+    {
+        var px = (int)MathF.Floor(_player.Position.X);
+        var py = (int)MathF.Floor(_player.Position.Y);
+        var pz = (int)MathF.Floor(_player.Position.Z);
+
+        var axisValue = axis switch
+        {
+            TeleportAxis.X => px,
+            TeleportAxis.Y => py,
+            _ => pz
+        };
+
+        output.Add(axisValue.ToString(CultureInfo.InvariantCulture));
+        output.Add("~");
+        output.Add("~0");
     }
 
     private void AppendCurrentPositionTokens(List<string> output)
@@ -8106,38 +8896,28 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void AppendFriendNameTokens(List<string> output)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        // Prefer remote friends list (authoritative) if available
-        try
-        {
-            var friendsResult = _onlineGate.GetFriendsAsync().GetAwaiter().GetResult();
-            if (friendsResult.Ok)
-            {
-                foreach (var f in friendsResult.Friends)
-                {
-                    if (!string.IsNullOrWhiteSpace(f.DisplayName) && seen.Add(f.DisplayName))
-                        output.Add(f.DisplayName);
-                    if (!string.IsNullOrWhiteSpace(f.Username) && seen.Add(f.Username))
-                        output.Add(f.Username);
-                    if (!string.IsNullOrWhiteSpace(f.ProductUserId) && seen.Add(f.ProductUserId))
-                        output.Add(f.ProductUserId);
-                }
-                return;
-            }
-        }
-        catch
-        {
-            // Fallback to local friends if remote fetch fails
-        }
 
-        // Fallback to local _profile.Friends
+        // Use locally synced cache only to avoid chat-command lag during completion.
         foreach (var f in _profile.Friends)
         {
-            if (!string.IsNullOrWhiteSpace(f.Label) && seen.Add(f.Label))
-                output.Add(f.Label);
-            if (!string.IsNullOrWhiteSpace(f.LastKnownDisplayName) && seen.Add(f.LastKnownDisplayName))
-                output.Add(f.LastKnownDisplayName);
-            if (!string.IsNullOrWhiteSpace(f.UserId) && seen.Add(f.UserId))
-                output.Add(f.UserId);
+            var display = NormalizeFriendDisplayName(
+                (f.Label ?? string.Empty).Trim(),
+                (f.LastKnownDisplayName ?? string.Empty).Trim());
+            if (!string.IsNullOrWhiteSpace(display) && seen.Add(display))
+                output.Add(display);
+        }
+    }
+
+    private void AppendWhitelistTokens(List<string> output)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in _whitelist)
+        {
+            var normalized = NormalizeWhitelistName(entry);
+            if (string.IsNullOrWhiteSpace(normalized) || !seen.Add(normalized))
+                continue;
+
+            output.Add(normalized);
         }
     }
 
@@ -8163,6 +8943,121 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 continue;
             output.Add(names[i]);
         }
+    }
+
+    private static void AppendAllGiveItemTokens(List<string> output, bool includeNumericIds = true)
+    {
+        foreach (var def in BlockRegistry.All.OrderBy(d => d.AtlasIndex))
+        {
+            if (def.Id == BlockId.Air)
+                continue;
+
+            output.Add(def.Id.ToString());
+            output.Add(def.Name.Replace(' ', '_'));
+            if (includeNumericIds)
+                output.Add(((byte)def.Id).ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    private void AppendInventoryItemTokens(List<string> output, bool includeNumericIds = false, bool includeFallbackCatalog = false)
+    {
+        var seenIds = new HashSet<BlockId>();
+        AppendInventoryItemTokensFromSlots(output, _inventory.Hotbar, seenIds, includeNumericIds);
+
+        AppendInventoryItemTokensFromSlots(output, _inventory.Grid, seenIds, includeNumericIds);
+
+        if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
+            AppendItemTokenForId(output, _inventoryHeld.Id, includeNumericIds, seenIds);
+
+        if (!includeFallbackCatalog || seenIds.Count > 0)
+            return;
+
+        // Fallback so /clear remains usable even if inventory currently has no items.
+        AppendAllGiveItemTokens(output, includeNumericIds);
+    }
+
+    private static void AppendInventoryItemTokensFromSlots(List<string> output, HotbarSlot[] slots, HashSet<BlockId> seenIds, bool includeNumericIds)
+    {
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Count <= 0 || slot.Id == BlockId.Air)
+                continue;
+
+            AppendItemTokenForId(output, slot.Id, includeNumericIds, seenIds);
+        }
+    }
+
+    private static void AppendItemTokenForId(List<string> output, BlockId id, bool includeNumericIds, HashSet<BlockId>? seenIds = null)
+    {
+        if (id == BlockId.Air)
+            return;
+        if (seenIds != null && !seenIds.Add(id))
+            return;
+
+        var def = BlockRegistry.Get(id);
+        output.Add(id.ToString());
+        output.Add(def.Name.Replace(' ', '_'));
+        if (includeNumericIds)
+            output.Add(((byte)id).ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static bool TryResolveInventoryItemToken(string token, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+        var raw = (token ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+
+        if (byte.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId)
+            && Enum.IsDefined(typeof(BlockId), (int)byId))
+        {
+            var parsedById = (BlockId)byId;
+            if (parsedById != BlockId.Air)
+            {
+                blockId = parsedById;
+                return true;
+            }
+        }
+
+        if (Enum.TryParse(raw, true, out BlockId parsedEnum) && parsedEnum != BlockId.Air)
+        {
+            blockId = parsedEnum;
+            return true;
+        }
+
+        var normalized = NormalizeItemToken(raw);
+        foreach (var def in BlockRegistry.All)
+        {
+            if (def.Id == BlockId.Air)
+                continue;
+
+            if (string.Equals(NormalizeItemToken(def.Name), normalized, StringComparison.Ordinal))
+            {
+                blockId = def.Id;
+                return true;
+            }
+
+            if (string.Equals(NormalizeItemToken(def.Id.ToString()), normalized, StringComparison.Ordinal))
+            {
+                blockId = def.Id;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string NormalizeItemToken(string value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        if (text.Length == 0)
+            return string.Empty;
+
+        text = text.Replace("_", string.Empty, StringComparison.Ordinal);
+        text = text.Replace("-", string.Empty, StringComparison.Ordinal);
+        text = text.Replace(" ", string.Empty, StringComparison.Ordinal);
+        return text;
     }
 
     private void SubmitLocalChatMessage(string message)
@@ -8191,7 +9086,217 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        AddChatLine($"{username}: {text}", isSystem: false);
+        AddFormattedPlayerChatLine($"{username}: ", text);
+    }
+
+    private void AddFormattedPlayerChatLine(string prefix, string rawMessage)
+    {
+        var parsed = ParseChatMarkup(rawMessage, Color.White);
+        AddChatLine(
+            $"{prefix}{parsed.CleanText}",
+            isSystem: false,
+            richPrefixText: prefix,
+            richMessageText: parsed.CleanText,
+            richMessageSpans: parsed.Spans,
+            hasSpoilerContent: parsed.HasSpoiler);
+    }
+
+    private static ChatMarkupParseResult ParseChatMarkup(string rawText, Color defaultColor)
+    {
+        var source = rawText ?? string.Empty;
+        var spans = new List<ChatStyledSpan>();
+        var currentColor = defaultColor;
+        var bold = false;
+        var italic = false;
+        var spoiler = false;
+        var hasSpoiler = false;
+        var segment = new StringBuilder(source.Length);
+        var clean = new StringBuilder(source.Length);
+
+        void FlushSegment()
+        {
+            if (segment.Length <= 0)
+                return;
+
+            var text = segment.ToString();
+            segment.Clear();
+            clean.Append(text);
+            if (spans.Count > 0
+                && spans[^1].Bold == bold
+                && spans[^1].Italic == italic
+                && spans[^1].Spoiler == spoiler
+                && spans[^1].Color == currentColor)
+            {
+                var merged = spans[^1];
+                spans[^1] = new ChatStyledSpan(
+                    merged.Text + text,
+                    merged.Color,
+                    merged.Bold,
+                    merged.Italic,
+                    merged.Spoiler);
+                return;
+            }
+
+            spans.Add(new ChatStyledSpan(text, currentColor, bold, italic, spoiler));
+        }
+
+        for (var i = 0; i < source.Length; i++)
+        {
+            if (source[i] != '$')
+            {
+                segment.Append(source[i]);
+                continue;
+            }
+
+            if (StartsWithToken(source, i, "$bold%"))
+            {
+                FlushSegment();
+                bold = true;
+                i += "$bold%".Length - 1;
+                continue;
+            }
+
+            if (StartsWithToken(source, i, "$italic&"))
+            {
+                FlushSegment();
+                italic = true;
+                i += "$italic&".Length - 1;
+                continue;
+            }
+
+            var close = source.IndexOf('$', i + 1);
+            if (close <= i + 1)
+            {
+                segment.Append(source[i]);
+                continue;
+            }
+
+            var token = source.Substring(i + 1, close - i - 1).Trim();
+            var nextColor = currentColor;
+            var nextBold = bold;
+            var nextItalic = italic;
+            var nextSpoiler = spoiler;
+            if (TryApplyChatStyleToken(token, defaultColor, ref nextColor, ref nextBold, ref nextItalic, ref nextSpoiler))
+            {
+                // Apply style tokens to following text only.
+                FlushSegment();
+                currentColor = nextColor;
+                bold = nextBold;
+                italic = nextItalic;
+                spoiler = nextSpoiler;
+                i = close;
+                continue;
+            }
+
+            segment.Append(source[i]);
+        }
+
+        FlushSegment();
+
+        if (spans.Count == 0)
+            spans.Add(new ChatStyledSpan(string.Empty, defaultColor, false, false, false));
+
+        for (var i = 0; i < spans.Count; i++)
+        {
+            if (spans[i].Spoiler && !string.IsNullOrWhiteSpace(spans[i].Text))
+            {
+                hasSpoiler = true;
+                break;
+            }
+        }
+
+        return new ChatMarkupParseResult(clean.ToString().Trim(), spans, hasSpoiler);
+    }
+
+    private static bool StartsWithToken(string source, int index, string token)
+    {
+        if (index < 0 || index + token.Length > source.Length)
+            return false;
+
+        for (var i = 0; i < token.Length; i++)
+        {
+            if (char.ToLowerInvariant(source[index + i]) != char.ToLowerInvariant(token[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryApplyChatStyleToken(string token, Color defaultColor, ref Color color, ref bool bold, ref bool italic, ref bool spoiler)
+    {
+        var key = (token ?? string.Empty).Trim().ToLowerInvariant();
+        key = key.TrimEnd('%', '&');
+
+        switch (key)
+        {
+            case "reset":
+            case "plain":
+            case "normal":
+                color = defaultColor;
+                bold = false;
+                italic = false;
+                spoiler = false;
+                return true;
+            case "bold":
+            case "b":
+                bold = true;
+                return true;
+            case "unbold":
+            case "nobold":
+            case "boldoff":
+                bold = false;
+                return true;
+            case "italic":
+            case "i":
+                italic = true;
+                return true;
+            case "unitalic":
+            case "noitalic":
+            case "italicoff":
+                italic = false;
+                return true;
+            case "spoiler":
+                spoiler = true;
+                return true;
+            case "unspoiler":
+            case "nospoiler":
+            case "spoileroff":
+                spoiler = false;
+                return true;
+            case "red":
+                color = new Color(255, 120, 120);
+                return true;
+            case "blue":
+                color = new Color(130, 185, 255);
+                return true;
+            case "green":
+                color = new Color(130, 230, 150);
+                return true;
+            case "yellow":
+                color = new Color(255, 230, 120);
+                return true;
+            case "orange":
+                color = new Color(255, 175, 90);
+                return true;
+            case "purple":
+                color = new Color(200, 140, 255);
+                return true;
+            case "pink":
+                color = new Color(255, 150, 210);
+                return true;
+            case "cyan":
+                color = new Color(120, 240, 245);
+                return true;
+            case "gray":
+            case "grey":
+                color = new Color(180, 180, 180);
+                return true;
+            case "white":
+                color = Color.White;
+                return true;
+            default:
+                return false;
+        }
     }
 
     private void AddChatLine(
@@ -8208,7 +9313,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         string? actionLabel2 = null,
         string? customActionToken2 = null,
         string? customActionStatus2 = null,
-        string? hoverText2 = null)
+        string? hoverText2 = null,
+        Color? textColorOverride = null,
+        string? richPrefixText = null,
+        string? richMessageText = null,
+        List<ChatStyledSpan>? richMessageSpans = null,
+        bool hasSpoilerContent = false,
+        bool trackAsChatHistory = true)
     {
         if (string.IsNullOrWhiteSpace(text))
             return;
@@ -8227,8 +9338,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var hasCustomAction2 = !string.IsNullOrWhiteSpace(normalizedCustomActionToken2);
         var normalizedCustomActionStatus2 = (customActionStatus2 ?? string.Empty).Trim();
         var normalizedActionLabel2 = (actionLabel2 ?? string.Empty).Trim();
+        var isConfirmCancelPair = hasCustomAction
+            && hasCustomAction2
+            && string.Equals(normalizedActionLabel, "CONFIRM", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(normalizedActionLabel2, "CANCEL", StringComparison.OrdinalIgnoreCase);
 
-        if (_chatLines.Count > 0 
+        var shouldDedup = hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2;
+        if (shouldDedup && _chatLines.Count > 0 
             && string.Equals(_chatLines[^1].Text, text, StringComparison.Ordinal)
             && string.Equals(_chatLines[^1].CustomActionToken, normalizedCustomActionToken, StringComparison.Ordinal)
             && string.Equals(_chatLines[^1].CustomActionToken2, normalizedCustomActionToken2, StringComparison.Ordinal))
@@ -8252,9 +9368,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _chatLines[^1].CustomActionStatus2 = normalizedCustomActionStatus2;
             _chatLines[^1].ActionLabel2 = normalizedActionLabel2;
             _chatLines[^1].HoverText2 = hoverText2 ?? string.Empty;
+            _chatLines[^1].HasTextColorOverride = textColorOverride.HasValue;
+            _chatLines[^1].TextColorOverride = textColorOverride ?? Color.White;
+            _chatLines[^1].HasRichText = richMessageSpans != null && richMessageSpans.Count > 0;
+            _chatLines[^1].RichPrefixText = richPrefixText ?? string.Empty;
+            _chatLines[^1].RichMessageText = richMessageText ?? string.Empty;
+            _chatLines[^1].RichMessageSpans = richMessageSpans != null
+                ? new List<ChatStyledSpan>(richMessageSpans)
+                : new List<ChatStyledSpan>();
+            _chatLines[^1].HasSpoilerContent = hasSpoilerContent;
+            _chatLines[^1].SpoilerRevealed = _chatLines[^1].SpoilerRevealed || !hasSpoilerContent;
 
             if (hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2)
                 _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
+
+            if (isConfirmCancelPair)
+                RegisterPendingQuickConfirmation(text, normalizedCustomActionToken, normalizedCustomActionToken2);
             return;
         }
 
@@ -8279,14 +9408,86 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             CustomActionToken2 = normalizedCustomActionToken2,
             CustomActionStatus2 = normalizedCustomActionStatus2,
             ActionLabel2 = normalizedActionLabel2,
-            HoverText2 = hoverText2 ?? string.Empty
+            HoverText2 = hoverText2 ?? string.Empty,
+            HasTextColorOverride = textColorOverride.HasValue,
+            TextColorOverride = textColorOverride ?? Color.White,
+            HasRichText = richMessageSpans != null && richMessageSpans.Count > 0,
+            RichPrefixText = richPrefixText ?? string.Empty,
+            RichMessageText = richMessageText ?? string.Empty,
+            RichMessageSpans = richMessageSpans != null
+                ? new List<ChatStyledSpan>(richMessageSpans)
+                : new List<ChatStyledSpan>(),
+            HasSpoilerContent = hasSpoilerContent,
+            SpoilerRevealed = !hasSpoilerContent,
+            LineId = _nextChatLineId++
         });
+
+        if (trackAsChatHistory)
+            AppendChatHistoryRecord(text);
 
         if (hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2)
             _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
 
+        if (isConfirmCancelPair)
+            RegisterPendingQuickConfirmation(text, normalizedCustomActionToken, normalizedCustomActionToken2);
+
         if (_chatLines.Count > MaxChatLines)
             _chatLines.RemoveRange(0, _chatLines.Count - MaxChatLines);
+    }
+
+    private void AppendChatHistoryRecord(string line)
+        => AppendHistoryRecord(ChatHistoryLogPath, "CHAT", line);
+
+    private void AppendCommandHistoryRecord(string line)
+        => AppendHistoryRecord(CommandHistoryLogPath, "CMD", line);
+
+    private void AppendHistoryRecord(string path, string category, string line)
+    {
+        var text = (line ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        try
+        {
+            var worldName = _meta?.Name;
+            if (string.IsNullOrWhiteSpace(worldName))
+                worldName = Path.GetFileName(_worldPath);
+
+            var stamped = $"[{DateTimeOffset.UtcNow:O}] [{category}] [{worldName}] {text}";
+            lock (_historyFileLock)
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+
+                File.AppendAllText(path, stamped + Environment.NewLine);
+            }
+
+            // Mirror into runtime logs for easier diagnostics.
+            _log.Info(stamped);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to append {category} history: {ex.Message}");
+        }
+    }
+
+    private void TruncateHistoryFile(string path)
+    {
+        try
+        {
+            lock (_historyFileLock)
+            {
+                if (!File.Exists(path))
+                    return;
+
+                File.WriteAllText(path, string.Empty);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to clear history file {path}: {ex.Message}");
+        }
     }
 
     private void EnsureCommandRegistry()
@@ -8299,13 +9500,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         RegisterCommand("biome", Array.Empty<string>(), "/biome [list|here|<desert|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
         RegisterCommand("accept", Array.Empty<string>(), "/accept <username>", "Accept a world join invite.", CommandPermission.Everyone, ExecuteAcceptInviteCommand);
         RegisterCommand("reject", Array.Empty<string>(), "/reject <username>", "Reject a world join invite.", CommandPermission.Everyone, ExecuteRejectInviteCommand);
-        RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list|sync> [username]", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
-        RegisterCommand("structure", new[] { "locate" }, "/structure [gui|list|biome <name> [radius]]", "Open structure finder GUI or run finder tools.", CommandPermission.Everyone, ExecuteStructureCommand);
-        RegisterCommand("tp", new[] { "teleport" }, "/tp <x> <z> | /tp <x> <y> <z> | /tp <player> | /tp <fromPlayer> <toPlayer>", "Teleport players by coords or player target.", CommandPermission.Operator, ExecuteTeleportCommand);
+        RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list> [username]", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
+        RegisterCommand("structure", Array.Empty<string>(), "/structure <locate|list> [name]", "Structure lookup command (no GUI).", CommandPermission.Everyone, ExecuteStructureCommand);
+        RegisterCommand("tp", new[] { "teleport" }, "/tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>", "Teleport players by absolute/relative coords or player target.", CommandPermission.Operator, ExecuteTeleportCommand);
         RegisterCommand("gamemode", new[] { "gm" }, "/gamemode <artificer|veilwalker|veilseer|gui> [player]", "Change gamemode or open selector.", CommandPermission.Operator, ExecuteGameModeCommand);
-        RegisterCommand("artificer", Array.Empty<string>(), "/artificer [player]", "Set ARTIFICER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Artificer, parts));
-        RegisterCommand("veilwalker", Array.Empty<string>(), "/veilwalker [player]", "Set VEILWALKER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilwalker, parts));
-        RegisterCommand("veilseer", Array.Empty<string>(), "/veilseer [player]", "Set VEILSEER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilseer, parts));
+        RegisterCommand("artificer", new[] { "gma", "gmc" }, "/artificer [player]", "Set ARTIFICER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Artificer, parts));
+        RegisterCommand("veilwalker", new[] { "gmvw", "gms" }, "/veilwalker [player]", "Set VEILWALKER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilwalker, parts));
+        RegisterCommand("veilseer", new[] { "gmvs", "gmsp" }, "/veilseer [player]", "Set VEILSEER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilseer, parts));
         RegisterCommand("difficulty", new[] { "diff" }, "/difficulty <peaceful|easy|normal|hard>", "Set difficulty.", CommandPermission.Operator, ExecuteDifficultyCommand);
         RegisterCommand("seed", Array.Empty<string>(), "/seed", "Show current world seed.", CommandPermission.Operator, ExecuteSeedCommand);
         RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <ticks>]", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
@@ -8319,7 +9520,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         RegisterCommand("home", Array.Empty<string>(), "/home [name|list|gui|set|rename|delete|icon]", "Teleport/manage homes.", CommandPermission.Everyone, ExecuteHomeCommand);
         RegisterCommand("me", Array.Empty<string>(), "/me <action>", "Broadcast an action message.", CommandPermission.Everyone, ExecuteMeCommand);
         RegisterCommand("msg", Array.Empty<string>(), "/msg <player> <message>", "Send a private message.", CommandPermission.Everyone, ExecuteMsgCommand);
-        RegisterCommand("chatclear", Array.Empty<string>(), "/chatclear confirm", "Clear chat history after confirmation.", CommandPermission.Everyone, ExecuteChatClearCommand);
+        RegisterCommand("chatclear", new[] { "clearchat", "cc" }, "/chatclear", "Clear chat history (with confirmation).", CommandPermission.Everyone, ExecuteChatClearCommand);
+        RegisterCommand("give", Array.Empty<string>(), "/give [player] <item|id> [amount]", "Give an item/block by token or numeric id.", CommandPermission.Operator, ExecuteGiveCommand);
+        RegisterCommand("clear", Array.Empty<string>(), "/clear [player] [item|id]", "Clear whole inventory (confirmation) or clear a specific item.", CommandPermission.Operator, ExecuteClearInventoryCommand);
+        RegisterCommand("pos", Array.Empty<string>(), "/pos [player]", "Show player's exact coordinates with one-click copy.", CommandPermission.Everyone, ExecutePosCommand);
+        RegisterCommand("broadcast", new[] { "bc" }, "/broadcast <message>", "Send a broadcast message to everyone.", CommandPermission.Everyone, ExecuteBroadcastCommand);
         RegisterCommand("commandclear", Array.Empty<string>(), "/commandclear", "Clear command entries from shared input history.", CommandPermission.Everyone, ExecuteCommandClearCommand);
     }
 
@@ -8386,7 +9591,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var echoed = commandText.StartsWith("/", StringComparison.Ordinal) ? commandText : "/" + commandText;
         var username = _profile.GetDisplayUsername();
-        AddChatLine($"{username}: {echoed}", isSystem: false);
+        AppendCommandHistoryRecord($"{username}: {echoed}");
+        AddChatLine($"{username}: {echoed}", isSystem: false, trackAsChatHistory: false);
 
         if (commandText.StartsWith("/", StringComparison.Ordinal))
             commandText = commandText.Substring(1);
@@ -8460,29 +9666,44 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        await RespondToPendingJoinPeerIdAsync(peerId, username, accept);
+    }
+
+    private async Task RespondToPendingJoinPeerIdAsync(string peerId, string displayNameHint, bool accept)
+    {
+        if (_lanSession is not EosP2PHostSession hostSession)
+            return;
+
+        var normalizedPeerId = (peerId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedPeerId))
+            return;
+
         bool ok;
         if (accept)
         {
-            hostSession.PreApprovePuid(peerId);
-            ok = hostSession.ApproveJoinRequest(peerId);
+            hostSession.PreApprovePuid(normalizedPeerId);
+            ok = hostSession.ApproveJoinRequest(normalizedPeerId);
         }
         else
         {
-            ok = hostSession.DeclineJoinRequest(peerId);
+            ok = hostSession.DeclineJoinRequest(normalizedPeerId);
         }
+
+        var bestName = await ResolveUsernameAsync(normalizedPeerId);
+        if (string.IsNullOrWhiteSpace(bestName))
+            bestName = string.IsNullOrWhiteSpace(displayNameHint) ? "PLAYER" : displayNameHint.Trim();
+
         if (ok)
         {
-            var bestName = await ResolveUsernameAsync(peerId);
             var actionWord = accept ? "accepted" : "rejected";
-
             SetCommandStatus($"Join request from {bestName} {actionWord}.", echoToChat: false);
             AddChatLine($"You {actionWord} {bestName}'s join request.", isSystem: true);
-            ForgetPendingJoinRequester(peerId);
+            ForgetPendingJoinRequester(normalizedPeerId);
         }
         else
         {
             var actionWord = accept ? "accept" : "reject";
-            SetCommandStatus($"Failed to {actionWord} {username}.", echoToChat: false);
+            SetCommandStatus($"Failed to {actionWord} {bestName}.", echoToChat: false);
         }
     }
 
@@ -8490,25 +9711,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (parts.Length < 2)
         {
-            SetCommandStatus("Usage: /whitelist <add|remove|list|sync> [username]");
+            SetCommandStatus("Usage: /whitelist <add|remove|list> [username]");
             return;
         }
 
         var sub = parts[1].ToLowerInvariant();
-        if (sub == "sync")
-        {
-            var friends = _profile.Friends;
-            var addedCount = 0;
-            foreach (var f in friends)
-            {
-                if (!string.IsNullOrWhiteSpace(f.UserId) && _whitelist.Add(f.UserId)) addedCount++;
-                if (!string.IsNullOrWhiteSpace(f.Label) && _whitelist.Add(f.Label)) addedCount++;
-            }
-            if (addedCount > 0) SaveWhitelist();
-            SetCommandStatus($"Synced {addedCount} new identifiers from friends list to whitelist.");
-            return;
-        }
-
         if (sub == "list")
         {
             if (_whitelist.Count == 0 && _profile.Friends.Count == 0)
@@ -8520,7 +9727,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_whitelist.Count > 0)
             {
                 AddChatLine("--- WHITELISTED ---", isSystem: true);
-                foreach (var entry in _whitelist.OrderBy(x => x))
+                foreach (var entry in _whitelist
+                    .Select(NormalizeWhitelistName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 {
                     AddChatLine(entry, isSystem: true,
                         actionLabel: "REMOVE",
@@ -8530,18 +9741,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
 
             var friendsNotWhitelisted = _profile.Friends
-                .Where(f => !_whitelist.Contains(f.Label) && !_whitelist.Contains(f.UserId))
+                .Select(f => NormalizeFriendDisplayName(
+                    (f.Label ?? string.Empty).Trim(),
+                    (f.LastKnownDisplayName ?? string.Empty).Trim()))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(name => !_whitelist.Contains(name))
                 .ToList();
 
             if (friendsNotWhitelisted.Count > 0)
             {
                 AddChatLine("--- FRIENDS (NOT WHITELISTED) ---", isSystem: true);
-                foreach (var f in friendsNotWhitelisted)
+                foreach (var friendName in friendsNotWhitelisted)
                 {
-                    var nameToShow = string.IsNullOrWhiteSpace(f.Label) ? PlayerProfile.ShortId(f.UserId) : f.Label;
-                    AddChatLine(nameToShow, isSystem: true,
+                    AddChatLine(friendName, isSystem: true,
                         actionLabel: "ADD",
-                        customActionToken: "wl-add:" + (string.IsNullOrWhiteSpace(f.Label) ? f.UserId : f.Label),
+                        customActionToken: "wl-add:" + friendName,
                         customActionStatus: "Adding...");
                 }
             }
@@ -8554,7 +9769,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        var name = parts[2].Trim();
+        var name = NormalizeWhitelistName(parts[2]);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            SetCommandStatus("Use a Veilnet username (not raw player/product IDs).");
+            return;
+        }
+
         if (sub == "add")
         {
             if (_whitelist.Add(name))
@@ -8572,6 +9793,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_whitelist.Remove(name))
             {
                 SaveWhitelist();
+                RevokeWhitelistApprovalsForName(name);
                 SetCommandStatus($"Removed {name} from whitelist.");
             }
             else
@@ -8585,13 +9807,199 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         try
         {
-            var json = System.Text.Json.JsonSerializer.Serialize(_whitelist.ToList());
-            File.WriteAllText(WhitelistPath, json);
+            var clean = _whitelist
+                .Select(NormalizeWhitelistName)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var lines = new List<string>(clean.Count + 1) { "# LatticeVeil world whitelist (.lvlist)" };
+            lines.AddRange(clean);
+            File.WriteAllLines(WhitelistPath, lines);
+            _whitelist = new HashSet<string>(clean, StringComparer.OrdinalIgnoreCase);
         }
         catch (Exception ex)
         {
             _log.Warn($"Failed to save whitelist: {ex.Message}");
         }
+    }
+
+    private HashSet<string> LoadWhitelistEntries()
+    {
+        var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var targetPath = File.Exists(WhitelistPath) ? WhitelistPath : LegacyWhitelistPath;
+            if (!File.Exists(targetPath))
+                return results;
+
+            if (targetPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                var json = File.ReadAllText(targetPath);
+                var list = JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+                for (var i = 0; i < list.Count; i++)
+                {
+                    var normalized = NormalizeWhitelistName(list[i]);
+                    if (!string.IsNullOrWhiteSpace(normalized))
+                        results.Add(normalized);
+                }
+                return results;
+            }
+
+            var lines = File.ReadAllLines(targetPath);
+            for (var i = 0; i < lines.Length; i++)
+            {
+                var line = lines[i]?.Trim() ?? string.Empty;
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                    continue;
+
+                var normalized = NormalizeWhitelistName(line);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                    results.Add(normalized);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load whitelist entries: {ex.Message}");
+        }
+
+        return results;
+    }
+
+    private void MigrateLegacyWorldTextFiles()
+    {
+        MigrateLegacyFile(LegacyChatHistoryLogPath, ChatHistoryLogPath);
+        MigrateLegacyFile(LegacyCommandHistoryLogPath, CommandHistoryLogPath);
+
+        if (File.Exists(LegacyWhitelistPath) && !File.Exists(WhitelistPath))
+        {
+            try
+            {
+                var list = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(LegacyWhitelistPath)) ?? new List<string>();
+                var clean = list
+                    .Select(NormalizeWhitelistName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (clean.Count > 0)
+                {
+                    var lines = new List<string>(clean.Count + 1) { "# LatticeVeil world whitelist (.lvlist)" };
+                    lines.AddRange(clean);
+                    File.WriteAllLines(WhitelistPath, lines);
+                }
+                else
+                {
+                    File.WriteAllLines(WhitelistPath, new[] { "# LatticeVeil world whitelist (.lvlist)" });
+                }
+
+                File.Delete(LegacyWhitelistPath);
+                _log.Info("Migrated whitelist.json to Whitelist.lvlist");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to migrate whitelist.json to .lvlist: {ex.Message}");
+            }
+        }
+    }
+
+    private void MigrateLegacyFile(string legacyPath, string targetPath)
+    {
+        try
+        {
+            if (!File.Exists(legacyPath))
+                return;
+
+            if (!File.Exists(targetPath))
+            {
+                File.Move(legacyPath, targetPath);
+                _log.Info($"Migrated legacy world file: {Path.GetFileName(legacyPath)} -> {Path.GetFileName(targetPath)}");
+                return;
+            }
+
+            var legacyContent = File.ReadAllText(legacyPath);
+            if (!string.IsNullOrWhiteSpace(legacyContent))
+                File.AppendAllText(targetPath, Environment.NewLine + legacyContent.Trim());
+
+            File.Delete(legacyPath);
+            _log.Info($"Merged and removed legacy world file: {Path.GetFileName(legacyPath)}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to migrate legacy world file {legacyPath}: {ex.Message}");
+        }
+    }
+
+    private bool PruneWhitelistIdentityTokens()
+    {
+        var before = _whitelist.Count;
+        if (before == 0)
+            return false;
+
+        var clean = _whitelist
+            .Select(NormalizeWhitelistName)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _whitelist = new HashSet<string>(clean, StringComparer.OrdinalIgnoreCase);
+        return _whitelist.Count != before;
+    }
+
+    private static string NormalizeWhitelistName(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text) || LooksLikeIdentityToken(text))
+            return string.Empty;
+
+        return text;
+    }
+
+    private void RevokeWhitelistApprovalsForName(string username)
+    {
+        if (_lanSession is not EosP2PHostSession hostSession)
+            return;
+
+        var target = NormalizeWhitelistName(username);
+        if (string.IsNullOrWhiteSpace(target))
+            return;
+
+        var peerIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_pendingJoinLookup.TryGetValue(target, out var pendingPeer) && !string.IsNullOrWhiteSpace(pendingPeer))
+            peerIds.Add(pendingPeer.Trim());
+
+        lock (_usernameCache)
+        {
+            foreach (var kvp in _usernameCache)
+            {
+                if (!string.Equals((kvp.Value ?? string.Empty).Trim(), target, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var peerId = (kvp.Key ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(peerId))
+                    peerIds.Add(peerId);
+            }
+        }
+
+        foreach (var peerId in peerIds)
+        {
+            if (hostSession.RevokePuidPreApproval(peerId))
+                _log.Info($"Whitelist removal revoked auto-join pre-approval for {target} ({peerId}).");
+        }
+    }
+
+    private static string NormalizeFriendDisplayName(string preferredUsername, string preferredDisplayName)
+    {
+        var username = NormalizeWhitelistName(preferredUsername);
+        if (!string.IsNullOrWhiteSpace(username))
+            return username;
+
+        var displayName = NormalizeWhitelistName(preferredDisplayName);
+        if (!string.IsNullOrWhiteSpace(displayName))
+            return displayName;
+
+        // We intentionally avoid returning raw identities/UUIDs to keep whitelist UX username-only.
+        return string.Empty;
     }
 
     private void ExecuteHelpCommand(string[] _)
@@ -8654,51 +10062,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void ExecuteStructureCommand(string[] commandParts)
     {
-        if (commandParts.Length < 2 || string.Equals(commandParts[1], "gui", StringComparison.OrdinalIgnoreCase))
+        if (commandParts.Length < 2)
         {
-            OpenStructureFinderGui(openStructuresTab: true);
-            SetCommandStatus("Opened structure finder.");
+            SetCommandStatus("Usage: /structure <locate|list> [name]");
             return;
         }
 
-        if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
+        var sub = commandParts[1].ToLowerInvariant();
+        if (sub == "list")
         {
-            SetCommandStatus("Structures: (none configured yet).", 8f);
+            SetCommandStatus("No structures are configured yet.", 8f);
             return;
         }
 
-        var tokenIndex = 1;
-        if (string.Equals(commandParts[1], "biome", StringComparison.OrdinalIgnoreCase))
+        if (sub == "locate")
         {
-            if (commandParts.Length < 3)
-            {
-                SetCommandStatus("Usage: /structure biome <desert|grasslands|ocean> [radius]");
-                return;
-            }
-
-            tokenIndex = 2;
-        }
-
-        if (!TryResolveBiome(commandParts[tokenIndex], out var targetBiomeToken, out var targetBiomeLabel))
-        {
-            SetCommandStatus("No structures are configured yet. Use /structure gui.");
+            if (commandParts.Length >= 3)
+                SetCommandStatus($"Unable to locate '{commandParts[2]}': no structures configured yet.", 8f);
+            else
+                SetCommandStatus("No structures are configured yet.", 8f);
             return;
         }
 
-        var maxRadius = CommandFindBiomeDefaultRadius;
-        if (commandParts.Length > tokenIndex + 1)
-        {
-            if (!int.TryParse(commandParts[tokenIndex + 1], out maxRadius))
-            {
-                SetCommandStatus("Radius must be a number.");
-                return;
-            }
-
-            maxRadius = Math.Clamp(maxRadius, 16, CommandFindBiomeMaxRadius);
-        }
-
-        if (!TryReportBiomeLocation(targetBiomeToken, targetBiomeLabel, maxRadius))
-            return;
+        SetCommandStatus("Usage: /structure <locate|list> [name]");
     }
 
     private bool TryReportBiomeLocation(string targetBiomeToken, string targetBiomeLabel, int maxRadius)
@@ -9085,6 +10471,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void ExecuteTeleportCommand(string[] commandParts)
     {
+        var baseX = (int)MathF.Floor(_player.Position.X);
+        var baseY = (int)MathF.Floor(_player.Position.Y);
+        var baseZ = (int)MathF.Floor(_player.Position.Z);
+
         if (commandParts.Length == 2)
         {
             if (!TryResolvePlayerTarget(commandParts[1], out var targetId, out _))
@@ -9106,7 +10496,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (commandParts.Length == 3)
         {
-            if (int.TryParse(commandParts[1], out var x) && int.TryParse(commandParts[2], out var z))
+            if (TryParseTeleportCoordinateToken(commandParts[1], baseX, out var x)
+                && TryParseTeleportCoordinateToken(commandParts[2], baseZ, out var z))
             {
                 if (!TryTeleportPlayer(x, z, explicitY: null, out var coordResult))
                 {
@@ -9142,11 +10533,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (commandParts.Length == 4)
         {
-            if (!int.TryParse(commandParts[1], out var x) ||
-                !int.TryParse(commandParts[2], out var parsedY) ||
-                !int.TryParse(commandParts[3], out var z))
+            if (!TryParseTeleportCoordinateToken(commandParts[1], baseX, out var x) ||
+                !TryParseTeleportCoordinateToken(commandParts[2], baseY, out var parsedY) ||
+                !TryParseTeleportCoordinateToken(commandParts[3], baseZ, out var z))
             {
-                SetCommandStatus("Usage: /tp <x> <z> | /tp <x> <y> <z> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+                SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
                 return;
             }
 
@@ -9160,7 +10551,39 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        SetCommandStatus("Usage: /tp <x> <z> | /tp <x> <y> <z> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+        SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+    }
+
+    private static bool TryParseTeleportCoordinateToken(string token, int baseValue, out int result)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (token.StartsWith("~", StringComparison.Ordinal))
+        {
+            if (token.Length == 1)
+            {
+                result = baseValue;
+                return true;
+            }
+
+            var offsetToken = token.Substring(1);
+            if (float.TryParse(offsetToken, NumberStyles.Float, CultureInfo.InvariantCulture, out var offset))
+            {
+                result = (int)MathF.Floor(baseValue + offset);
+                return true;
+            }
+
+            result = 0;
+            return false;
+        }
+
+        if (float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var absolute))
+        {
+            result = (int)MathF.Floor(absolute);
+            return true;
+        }
+
+        result = 0;
+        return false;
     }
 
     private bool TryTeleportPlayerToPlayer(int sourcePlayerId, int targetPlayerId, out string result)
@@ -9776,6 +11199,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void OpenHomeGui()
     {
         _homeGuiOpen = true;
+        _homeGuiNameInputFocused = false;
         _homeGuiScroll = 0f;
         if (_selectedHomeIndex < 0 && _homes.Count > 0)
             _selectedHomeIndex = 0;
@@ -9824,8 +11248,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (input.IsNewKeyPress(Keys.Escape))
         {
             _homeGuiOpen = false;
+            _homeGuiNameInputFocused = false;
             return;
         }
+
+        if (input.IsNewKeyPress(_homeGuiKey) && !_homeGuiNameInputFocused)
+        {
+            _homeGuiOpen = false;
+            _homeGuiNameInputFocused = false;
+            return;
+        }
+
+        if (input.IsNewLeftClick())
+            _homeGuiNameInputFocused = _homeGuiInputRect.Contains(input.MousePosition);
 
         var maxScroll = Math.Max(0f, _homes.Count * HomeGuiRowHeight - _homeGuiListRect.Height);
         if (_homeGuiListRect.Contains(input.MousePosition) && input.ScrollDelta != 0)
@@ -9866,20 +11301,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        foreach (var key in input.GetNewKeys())
+        if (_homeGuiNameInputFocused)
         {
-            if (key == Keys.Back)
+            foreach (var key in input.GetTextInputKeys())
             {
-                if (_homeGuiNameInput.Length > 0)
-                    _homeGuiNameInput = _homeGuiNameInput.Substring(0, _homeGuiNameInput.Length - 1);
-                continue;
+                if (key == Keys.Back)
+                {
+                    if (_homeGuiNameInput.Length > 0)
+                        _homeGuiNameInput = _homeGuiNameInput.Substring(0, _homeGuiNameInput.Length - 1);
+                    continue;
+                }
+
+                if (!TryMapCommandInputKey(key, input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift), out var c))
+                    continue;
+
+                if (_homeGuiNameInput.Length < 24)
+                    _homeGuiNameInput += c;
             }
-
-            if (!TryMapCommandInputKey(key, input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift), out var c))
-                continue;
-
-            if (_homeGuiNameInput.Length < 24)
-                _homeGuiNameInput += c;
         }
 
         _homeGuiSetHereBtn.Update(input);
@@ -9902,7 +11340,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, "HOME MANAGER", new Vector2(_homeGuiPanelRect.X + 16, _homeGuiPanelRect.Y + 12), Color.White);
 
         sb.Draw(_pixel, _homeGuiInputRect, new Color(10, 10, 10, 210));
-        DrawBorder(sb, _homeGuiInputRect, new Color(190, 190, 190));
+        DrawBorder(sb, _homeGuiInputRect, _homeGuiNameInputFocused ? new Color(230, 230, 130) : new Color(190, 190, 190));
         var nameInput = string.IsNullOrWhiteSpace(_homeGuiNameInput) ? "(home name)" : _homeGuiNameInput;
         _font.DrawString(sb, nameInput, new Vector2(_homeGuiInputRect.X + 8, _homeGuiInputRect.Y + 8), Color.White);
 
@@ -10128,6 +11566,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        if (input.IsNewKeyPress(_structureFinderKey))
+        {
+            _structureFinderOpen = false;
+            return;
+        }
+
         if (!_structureFinderStructureTab && input.IsNewLeftClick() && _structureFinderListRect.Contains(input.MousePosition))
         {
             for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
@@ -10299,17 +11743,363 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void ExecuteChatClearCommand(string[] commandParts)
     {
-        if (commandParts.Length < 2 || !string.Equals(commandParts[1], "confirm", StringComparison.OrdinalIgnoreCase))
+        if (commandParts.Length >= 2 && string.Equals(commandParts[1], "confirm", StringComparison.OrdinalIgnoreCase))
         {
-            SetCommandStatus("Type /chatclear confirm to clear all chat history.");
+            ClearChatHistory();
             return;
         }
 
+        AddChatLine(
+            "Clear chat history?",
+            isSystem: true,
+            actionLabel: "CONFIRM",
+            customActionToken: ChatClearConfirmActionToken,
+            customActionStatus: "Chat history cleared.",
+            actionLabel2: "CANCEL",
+            customActionToken2: ChatClearCancelActionToken,
+            customActionStatus2: "Chat clear canceled.");
+        SetCommandStatus("Click CONFIRM to clear chat history.", 4f, echoToChat: false);
+    }
+
+    private void ClearChatHistory()
+    {
         _chatLines.Clear();
         _chatActionHitboxes.Clear();
         _hoveredChatActionIndex = -1;
         _chatOverlayScrollLines = 0;
+        TruncateHistoryFile(ChatHistoryLogPath);
+        ClearPendingQuickConfirmation();
+        ResetInviteQuickHoldState();
         SetCommandStatus("Chat history cleared.");
+    }
+
+    private void ExecuteGiveCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /give [player] <item|id> [amount]. Use TAB to browse item ids.");
+            return;
+        }
+
+        if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
+        {
+            var all = BlockRegistry.All
+                .Where(def => def.Id != BlockId.Air)
+                .OrderBy(def => def.AtlasIndex)
+                .Select(def => $"{(byte)def.Id}:{def.Id}")
+                .ToArray();
+            AddChatLine($"Give IDs: {string.Join(", ", all)}", isSystem: true);
+            SetCommandStatus($"Listed {all.Length} item/block ids.", 6f, echoToChat: false);
+            return;
+        }
+
+        var args = commandParts.Skip(1).ToList();
+        var amount = 1;
+
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var targetId = localId;
+        var targetName = ResolvePlayerName(localId);
+        var itemParts = new List<string>(args);
+
+        string itemToken;
+        if (args.Count >= 2 && TryResolvePlayerTarget(args[0], out var candidateId, out var candidateName))
+        {
+            targetId = candidateId;
+            targetName = candidateName;
+            itemParts = args.Skip(1).ToList();
+        }
+
+        if (itemParts.Count > 1
+            && int.TryParse(itemParts[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount))
+        {
+            amount = Math.Max(1, parsedAmount);
+            itemParts.RemoveAt(itemParts.Count - 1);
+        }
+
+        itemToken = string.Join(" ", itemParts);
+        if (!TryResolveInventoryItemToken(itemToken, out var itemId))
+        {
+            SetCommandStatus($"Unknown item/block: {itemToken}");
+            return;
+        }
+
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can give items to another player.");
+            return;
+        }
+
+        if (_lanSession == null || targetId == localId)
+        {
+            var added = GiveLocalInventoryItem(itemId, amount);
+            if (added <= 0)
+            {
+                SetCommandStatus($"No inventory space for {itemId}.");
+                return;
+            }
+
+            SetCommandStatus($"Gave {added}x {itemId} to {targetName}.", 4f, echoToChat: false);
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryGiveSyncPrefix}{targetId}|{(byte)itemId}|{amount}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+        SetCommandStatus($"Requested give: {amount}x {itemId} -> {targetName}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteClearInventoryCommand(string[] commandParts)
+    {
+        var args = commandParts.Skip(1).ToArray();
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var targetId = localId;
+        var targetName = ResolvePlayerName(localId);
+
+        // /clear <item> OR /clear <player> <item>
+        if (args.Length >= 1)
+        {
+            if (args.Length >= 2 && TryResolvePlayerTarget(args[0], out var itemTargetId, out var itemTargetName))
+            {
+                var itemToken = string.Join(" ", args.Skip(1));
+                if (TryResolveInventoryItemToken(itemToken, out var targetItemId))
+                {
+                    ExecuteClearSpecificItem(itemTargetId, itemTargetName, targetItemId);
+                    return;
+                }
+            }
+
+            var selfItemToken = string.Join(" ", args);
+            if (TryResolveInventoryItemToken(selfItemToken, out var selfItemId))
+            {
+                ExecuteClearSpecificItem(localId, targetName, selfItemId);
+                return;
+            }
+
+            if (!TryResolvePlayerTarget(args[0], out targetId, out targetName))
+            {
+                SetCommandStatus($"Player not found or invalid item: {args[0]}");
+                return;
+            }
+        }
+
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        AddChatLine(
+            $"Clear inventory for {targetName}?",
+            isSystem: true,
+            actionLabel: "CONFIRM",
+            customActionToken: $"{InventoryClearConfirmActionPrefix}{targetId}",
+            customActionStatus: $"Cleared inventory for {targetName}.",
+            actionLabel2: "CANCEL",
+            customActionToken2: $"{InventoryClearCancelActionPrefix}{targetId}",
+            customActionStatus2: "Inventory clear canceled.");
+        SetCommandStatus($"Click CONFIRM to clear {targetName}'s inventory.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteClearSpecificItem(int targetId, string targetName, BlockId itemId)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory items.");
+            return;
+        }
+
+        if (_lanSession == null || targetId == localId)
+        {
+            var removed = RemoveLocalInventoryItem(itemId);
+            if (removed <= 0)
+            {
+                SetCommandStatus($"{targetName} has no {itemId} in inventory.", 4f, echoToChat: false);
+                return;
+            }
+
+            SetCommandStatus($"Removed {removed}x {itemId} from {targetName}.", 4f, echoToChat: false);
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryClearItemSyncPrefix}{targetId}|{(byte)itemId}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+        SetCommandStatus($"Requested clear of {itemId} for {targetName}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteConfirmedInventoryClear(int targetId)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        var targetName = ResolvePlayerName(targetId);
+        if (_lanSession == null || targetId == localId)
+        {
+            var removed = ClearLocalInventoryItems();
+            var status = removed > 0
+                ? $"Cleared your inventory ({removed} item{(removed == 1 ? string.Empty : "s")})."
+                : "Your inventory is already empty.";
+            SetCommandStatus(status);
+            return;
+        }
+
+        if (!_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryClearSyncPrefix}{targetId}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+
+        SetCommandStatus($"Requested inventory clear for {targetName}.");
+    }
+
+    private int ClearLocalInventoryItems()
+    {
+        var clearGrid = _inventory.Mode != GameMode.Artificer;
+        var removed = _inventory.ClearAll(clearGrid);
+        _inventoryHeld = default;
+        _inventoryHasHeld = false;
+        _heldFrom = InventorySlotGroup.None;
+        _heldIndex = -1;
+        SavePlayerState();
+        return removed;
+    }
+
+    private int GiveLocalInventoryItem(BlockId itemId, int amount)
+    {
+        var leftover = _inventory.Add(itemId, Math.Max(1, amount));
+        var added = Math.Max(0, amount - leftover);
+        if (added > 0)
+            SavePlayerState();
+        return added;
+    }
+
+    private int RemoveLocalInventoryItem(BlockId itemId)
+    {
+        if (itemId == BlockId.Air)
+            return 0;
+
+        var removed = 0;
+        removed += RemoveItemFromSlots(_inventory.Hotbar, itemId);
+        if (_inventory.Mode != GameMode.Artificer)
+            removed += RemoveItemFromSlots(_inventory.Grid, itemId);
+
+        if (_inventoryHasHeld && _inventoryHeld.Id == itemId && _inventoryHeld.Count > 0)
+        {
+            removed += _inventoryHeld.Count;
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        if (removed > 0)
+            SavePlayerState();
+
+        return removed;
+    }
+
+    private static int RemoveItemFromSlots(HotbarSlot[] slots, BlockId itemId)
+    {
+        var removed = 0;
+        for (var i = 0; i < slots.Length; i++)
+        {
+            if (slots[i].Id != itemId || slots[i].Count <= 0)
+                continue;
+
+            removed += slots[i].Count;
+            slots[i].Id = BlockId.Air;
+            slots[i].Count = 0;
+        }
+
+        return removed;
+    }
+
+    private void ExecutePosCommand(string[] commandParts)
+    {
+        var targetId = _lanSession?.LocalPlayerId ?? 0;
+        if (commandParts.Length >= 2 && !TryResolvePlayerTarget(commandParts[1], out targetId, out _))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        if (!TryGetKnownPlayerPose(targetId, out var position, out _, out _))
+        {
+            SetCommandStatus($"Unable to resolve position for {ResolvePlayerName(targetId)}.");
+            return;
+        }
+
+        var x = (int)MathF.Floor(position.X);
+        var y = (int)MathF.Floor(position.Y);
+        var z = (int)MathF.Floor(position.Z);
+        var targetName = ResolvePlayerName(targetId);
+        var coords = $"{x} {y} {z}";
+        AddChatLine(
+            $"{targetName} position: {coords}",
+            isSystem: true,
+            hoverText: "Click COPY to copy coordinates.",
+            copyText: coords,
+            actionLabel: "COPY");
+        SetCommandStatus($"{targetName} is at {coords}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteBroadcastCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /broadcast <message>");
+            return;
+        }
+
+        var text = string.Join(" ", commandParts.Skip(1)).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            SetCommandStatus("Usage: /broadcast <message>");
+            return;
+        }
+
+        var line = $"[BROADCAST] {text}";
+
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.System,
+                Text = line,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            SetCommandStatus("Broadcast sent.", 3f, echoToChat: false);
+            return;
+        }
+
+        AddChatLine(line, isSystem: true);
+        SetCommandStatus("Broadcast sent.", 3f, echoToChat: false);
     }
 
     private void ExecuteCommandClearCommand(string[] _)
@@ -10318,6 +12108,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _textInputHistoryBrowsing = false;
         _textInputHistoryCursor = _textInputHistory.Count;
         _textInputHistoryDraft = _chatInputActive ? _chatInputText : _commandInputText;
+        TruncateHistoryFile(CommandHistoryLogPath);
         SetCommandStatus(removed > 0
             ? $"Cleared {removed} command history entr{(removed == 1 ? "y" : "ies")}."
             : "No command history entries to clear.");
@@ -10517,11 +12308,106 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return true;
     }
 
+    private bool TryHandleInventoryClearMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryClearSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryClearSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 1 || !int.TryParse(parts[0], out var targetId))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var hostName = parts.Length >= 2 ? parts[1] : ResolvePlayerName(message.FromPlayerId);
+        var removed = ClearLocalInventoryItems();
+        AddChatLine(
+            removed > 0
+                ? $"Inventory cleared by {hostName} ({removed} item{(removed == 1 ? string.Empty : "s")})."
+                : $"Inventory clear requested by {hostName}, but it was already empty.",
+            isSystem: true);
+        return true;
+    }
+
+    private bool TryHandleInventoryClearItemMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryClearItemSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryClearItemSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2 || !int.TryParse(parts[0], out var targetId) || !byte.TryParse(parts[1], out var itemRaw))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var itemId = (BlockId)itemRaw;
+        var hostName = parts.Length >= 3 ? parts[2] : ResolvePlayerName(message.FromPlayerId);
+        var removed = RemoveLocalInventoryItem(itemId);
+        AddChatLine(
+            removed > 0
+                ? $"{hostName} removed {removed}x {itemId} from your inventory."
+                : $"{hostName} tried to remove {itemId}, but you had none.",
+            isSystem: true);
+        return true;
+    }
+
+    private bool TryHandleInventoryGiveMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryGiveSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryGiveSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3
+            || !int.TryParse(parts[0], out var targetId)
+            || !byte.TryParse(parts[1], out var itemRaw)
+            || !int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var itemId = (BlockId)itemRaw;
+        var hostName = parts.Length >= 4 ? parts[3] : ResolvePlayerName(message.FromPlayerId);
+        var added = GiveLocalInventoryItem(itemId, Math.Max(1, amount));
+        AddChatLine(
+            added > 0
+                ? $"{hostName} gave you {added}x {itemId}."
+                : $"{hostName} tried to give {itemId}, but your inventory is full.",
+            isSystem: true);
+        return true;
+    }
+
     private void HandleNetworkChat(LanChatMessage message)
     {
         if (TryHandleOperatorSyncMessage(message))
             return;
         if (TryHandleGameModeSyncMessage(message))
+            return;
+        if (TryHandleInventoryClearMessage(message))
+            return;
+        if (TryHandleInventoryClearItemMessage(message))
+            return;
+        if (TryHandleInventoryGiveMessage(message))
             return;
 
         var localId = _lanSession?.LocalPlayerId ?? -1;
@@ -10529,24 +12415,30 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         switch (message.Kind)
         {
             case LanChatKind.Emote:
-                AddChatLine($"* {fromName} {message.Text}", isSystem: false);
-                return;
+                {
+                    AddFormattedPlayerChatLine($"* {fromName} ", message.Text ?? string.Empty);
+                    return;
+                }
             case LanChatKind.Whisper:
-                if (message.FromPlayerId == localId && message.ToPlayerId >= 0)
                 {
-                    AddChatLine($"[TO {ResolvePlayerName(message.ToPlayerId)}] {message.Text}", isSystem: false);
+                    if (message.FromPlayerId == localId && message.ToPlayerId >= 0)
+                    {
+                        AddFormattedPlayerChatLine($"[TO {ResolvePlayerName(message.ToPlayerId)}] ", message.Text ?? string.Empty);
+                    }
+                    else if (message.ToPlayerId == localId)
+                    {
+                        AddFormattedPlayerChatLine($"[FROM {fromName}] ", message.Text ?? string.Empty);
+                    }
+                    return;
                 }
-                else if (message.ToPlayerId == localId)
-                {
-                    AddChatLine($"[FROM {fromName}] {message.Text}", isSystem: false);
-                }
-                return;
             case LanChatKind.System:
                 AddChatLine(message.Text, isSystem: true);
                 return;
             default:
-                AddChatLine($"{fromName}: {message.Text}", isSystem: false);
-                return;
+                {
+                    AddFormattedPlayerChatLine($"{fromName}: ", message.Text ?? string.Empty);
+                    return;
+                }
         }
     }
 
@@ -10554,6 +12446,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_playerNames.TryGetValue(playerId, out var name) && !string.IsNullOrWhiteSpace(name))
             return name;
+
+        if (_lanSession == null && playerId == 0)
+        {
+            var offlineName = _profile.GetDisplayUsername();
+            if (!string.IsNullOrWhiteSpace(offlineName))
+                return offlineName;
+        }
 
         if (_lanSession != null && playerId == _lanSession.LocalPlayerId)
         {
@@ -10569,6 +12468,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         _gameMode = target;
         _inventory.SetMode(target);
+        _artificerInventoryView = target == GameMode.Artificer
+            ? ArtificerInventoryView.Catalog
+            : ArtificerInventoryView.Inventory;
+        if (_inventoryOpen)
+            UpdateInventoryLayout();
 
         var wasFlying = _player.IsFlying;
         _player.AllowFlying = target == GameMode.Artificer;
@@ -11380,7 +13284,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _hoveredChatActionIndex = -1;
 
         var hasVisibleChatLines = _chatLines.Any(line => line.TimeRemaining > 0f);
-        if (!IsTextInputActive && !hasVisibleChatLines)
+        var hasPendingQuickConfirmation = TryGetPendingQuickConfirmation(out _, out _, out var quickConfirmPrompt);
+        var hasInviteQuickOverlay = _inviteQuickStatusTimer > 0f || _inviteQuickHoldActive || hasPendingQuickConfirmation;
+        if (!IsTextInputActive && !hasVisibleChatLines && !hasInviteQuickOverlay)
             return;
 
         var x = _viewport.X + 20;
@@ -11430,6 +13336,41 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
+        if (hasInviteQuickOverlay)
+        {
+            var hasPendingJoin = TryGetNewestPendingJoinRequest(out var pendingPeerId, out var pendingDisplay);
+            var inviteName = hasPendingJoin ? pendingDisplay : "PLAYER";
+            var keyLabel = FormatKeyLabel(_inviteQuickActionKey);
+            string inviteText;
+            if (_inviteQuickStatusTimer > 0f && !string.IsNullOrWhiteSpace(_inviteQuickStatusText))
+            {
+                inviteText = _inviteQuickStatusText;
+            }
+            else if (hasPendingQuickConfirmation)
+            {
+                inviteText = $"{quickConfirmPrompt} Tap {keyLabel} to CANCEL, hold {keyLabel} to CONFIRM.";
+            }
+            else
+            {
+                inviteText = $"Invite from {inviteName}: tap {keyLabel} to DECLINE, hold {keyLabel} to ACCEPT.";
+            }
+
+            y = DrawCommandLine(sb, x, y, inviteText, new Color(0, 0, 0, 190), new Color(230, 235, 255), fixedWidth: overlayWidth);
+
+            if (_inviteQuickHoldActive && (!string.IsNullOrWhiteSpace(pendingPeerId) || hasPendingQuickConfirmation))
+            {
+                var progress = Math.Clamp(_inviteQuickHoldElapsed / InviteQuickHoldAcceptSeconds, 0f, 1f);
+                var barRect = new Rectangle(x + 10, y - 16, overlayWidth - 20, 10);
+                var fillRect = new Rectangle(barRect.X + 1, barRect.Y + 1, Math.Max(0, (int)((barRect.Width - 2) * progress)), Math.Max(0, barRect.Height - 2));
+                sb.Draw(_pixel, barRect, new Color(20, 20, 20, 220));
+                sb.Draw(_pixel, fillRect, new Color(90, 205, 140, 220));
+                DrawBorder(sb, barRect, new Color(220, 240, 255, 170));
+                y -= 18;
+            }
+
+            y -= 4;
+        }
+
         var startIndex = _chatLines.Count - 1;
         if (startIndex >= 0 && IsTextInputActive)
             startIndex = Math.Clamp(startIndex - _chatOverlayScrollLines, 0, _chatLines.Count - 1);
@@ -11440,7 +13381,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (!IsTextInputActive && line.TimeRemaining <= 0f)
                 continue;
 
-            var fg = line.IsSystem ? new Color(200, 220, 255) : new Color(230, 230, 230);
+            var fg = line.HasTextColorOverride
+                ? line.TextColorOverride
+                : line.IsSystem ? new Color(200, 220, 255) : new Color(230, 230, 230);
             if (line.HasTeleportAction)
             {
                 var action = new ChatActionHitbox
@@ -11511,7 +13454,37 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
             else
             {
-                y = DrawCommandLine(sb, x, y, line.Text, new Color(0, 0, 0, 145), fg, fixedWidth: overlayWidth);
+                if (line.HasRichText)
+                {
+                    var hideSpoiler = line.HasSpoilerContent && !line.SpoilerRevealed;
+                    if (hideSpoiler)
+                    {
+                        var revealAction = new ChatActionHitbox
+                        {
+                            HasCustomAction = true,
+                            CustomActionToken = $"spoiler-reveal:{line.LineId}",
+                            CustomActionStatus = "Spoiler revealed.",
+                            HoverText = "Reveal spoiler text."
+                        };
+                        y = DrawRichCommandLine(
+                            sb,
+                            x,
+                            y,
+                            line,
+                            new Color(0, 0, 0, 145),
+                            fg,
+                            fixedWidth: overlayWidth,
+                            hideSpoilers: true,
+                            actionLabel: "REVEAL",
+                            action: revealAction);
+                    }
+                    else
+                    {
+                        y = DrawRichCommandLine(sb, x, y, line, new Color(0, 0, 0, 145), fg, fixedWidth: overlayWidth);
+                    }
+                }
+                else
+                    y = DrawCommandLine(sb, x, y, line.Text, new Color(0, 0, 0, 145), fg, fixedWidth: overlayWidth);
             }
 
             y -= 2;
@@ -11658,6 +13631,264 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         return rect.Y;
+    }
+
+    private int DrawRichCommandLine(
+        SpriteBatch sb,
+        int x,
+        int bottomY,
+        ChatLine line,
+        Color background,
+        Color fallbackForeground,
+        int? fixedWidth = null,
+        bool hideSpoilers = false,
+        string? actionLabel = null,
+        ChatActionHitbox? action = null)
+    {
+        var actionWidth = 0;
+        if (!string.IsNullOrWhiteSpace(actionLabel))
+            actionWidth = (int)Math.Ceiling(_font.MeasureString(actionLabel).X) + 16;
+
+        var maxWidth = Math.Max(240, _viewport.Width - 40);
+        var requestedWidth = fixedWidth ?? maxWidth;
+        var width = Math.Clamp(requestedWidth, 320, maxWidth);
+        var textWidth = Math.Max(120, width - 18 - actionWidth);
+
+        BuildRichTextBuffers(
+            line,
+            fallbackForeground,
+            out var fullText,
+            out var colors,
+            out var boldFlags,
+            out var italicFlags,
+            out var spoilerFlags);
+
+        var wrappedRanges = WrapOverlayTextRanges(fullText, textWidth);
+        var lineSpacing = 2;
+        var textHeight = wrappedRanges.Count * _font.LineHeight + Math.Max(0, wrappedRanges.Count - 1) * lineSpacing;
+        var height = textHeight + 12;
+        var rect = new Rectangle(x, bottomY - height, width, height);
+        sb.Draw(_pixel, rect, background);
+        DrawBorder(sb, rect, new Color(255, 255, 255, 170));
+
+        var textY = rect.Y + 6;
+        for (var i = 0; i < wrappedRanges.Count; i++)
+        {
+            var range = wrappedRanges[i];
+            DrawRichTextRange(
+                sb,
+                fullText,
+                range.start,
+                range.length,
+                colors,
+                boldFlags,
+                italicFlags,
+                spoilerFlags,
+                rect.X + 8,
+                textY,
+                fallbackForeground,
+                hideSpoilers);
+            textY += _font.LineHeight + lineSpacing;
+        }
+
+        if (action.HasValue && !string.IsNullOrWhiteSpace(actionLabel))
+        {
+            var index = _chatActionHitboxes.Count;
+            var hitbox = action.Value;
+            var targetRect = new Rectangle(rect.Right - actionWidth - 8, rect.Y + 4, actionWidth, rect.Height - 8);
+            hitbox.Bounds = targetRect;
+            _chatActionHitboxes.Add(hitbox);
+
+            var hovered = targetRect.Contains(_overlayMousePos);
+            if (hovered)
+                _hoveredChatActionIndex = index;
+
+            sb.Draw(_pixel, targetRect, hovered ? new Color(45, 90, 145, 230) : new Color(30, 70, 120, 220));
+            DrawBorder(sb, targetRect, hovered ? new Color(190, 230, 255) : new Color(120, 170, 210));
+            _font.DrawString(sb, actionLabel, new Vector2(targetRect.X + 8, targetRect.Y + 3), new Color(235, 245, 255));
+        }
+
+        return rect.Y;
+    }
+
+    private void BuildRichTextBuffers(
+        ChatLine line,
+        Color fallbackForeground,
+        out string fullText,
+        out Color[] colors,
+        out bool[] boldFlags,
+        out bool[] italicFlags,
+        out bool[] spoilerFlags)
+    {
+        var prefix = line.RichPrefixText ?? string.Empty;
+        var message = line.RichMessageText ?? string.Empty;
+        fullText = prefix + message;
+
+        if (fullText.Length == 0)
+            fullText = string.Empty;
+
+        colors = new Color[fullText.Length];
+        boldFlags = new bool[fullText.Length];
+        italicFlags = new bool[fullText.Length];
+        spoilerFlags = new bool[fullText.Length];
+        for (var i = 0; i < fullText.Length; i++)
+            colors[i] = fallbackForeground;
+
+        var prefixLen = prefix.Length;
+        var cursor = Math.Clamp(prefixLen, 0, fullText.Length);
+        if (line.RichMessageSpans == null || line.RichMessageSpans.Count == 0)
+            return;
+
+        for (var spanIndex = 0; spanIndex < line.RichMessageSpans.Count; spanIndex++)
+        {
+            var span = line.RichMessageSpans[spanIndex];
+            var spanText = span.Text ?? string.Empty;
+            for (var i = 0; i < spanText.Length && cursor < fullText.Length; i++, cursor++)
+            {
+                colors[cursor] = span.Color;
+                boldFlags[cursor] = span.Bold;
+                italicFlags[cursor] = span.Italic;
+                spoilerFlags[cursor] = span.Spoiler;
+            }
+        }
+    }
+
+    private void DrawRichTextRange(
+        SpriteBatch sb,
+        string text,
+        int start,
+        int length,
+        Color[] colors,
+        bool[] boldFlags,
+        bool[] italicFlags,
+        bool[] spoilerFlags,
+        int x,
+        int y,
+        Color fallbackForeground,
+        bool hideSpoilers)
+    {
+        if (length <= 0)
+            return;
+
+        var end = Math.Min(text.Length, start + length);
+        float drawX = x;
+        var i = Math.Clamp(start, 0, text.Length);
+        while (i < end)
+        {
+            var color = (i < colors.Length) ? colors[i] : fallbackForeground;
+            var bold = i < boldFlags.Length && boldFlags[i];
+            var italic = i < italicFlags.Length && italicFlags[i];
+            var spoiler = i < spoilerFlags.Length && spoilerFlags[i];
+            var runStart = i;
+            i++;
+            while (i < end)
+            {
+                var sameColor = i < colors.Length && colors[i] == color;
+                var sameBold = i < boldFlags.Length && boldFlags[i] == bold;
+                var sameItalic = i < italicFlags.Length && italicFlags[i] == italic;
+                var sameSpoiler = i < spoilerFlags.Length && spoilerFlags[i] == spoiler;
+                if (!sameColor || !sameBold || !sameItalic || !sameSpoiler)
+                    break;
+                i++;
+            }
+
+            var chunk = text.Substring(runStart, i - runStart);
+            var chunkWidth = _font.MeasureString(chunk).X;
+            if (hideSpoilers && spoiler)
+            {
+                var spoilerRect = new Rectangle((int)drawX, y + 1, Math.Max(4, (int)Math.Ceiling(chunkWidth)), Math.Max(4, _font.LineHeight - 2));
+                sb.Draw(_pixel, spoilerRect, new Color(0, 0, 0, 230));
+                DrawBorder(sb, spoilerRect, new Color(70, 70, 70, 220));
+            }
+            else
+            {
+                DrawStyledChatChunk(sb, chunk, new Vector2(drawX, y), color, bold, italic);
+            }
+
+            drawX += chunkWidth;
+        }
+    }
+
+    private void DrawStyledChatChunk(SpriteBatch sb, string text, Vector2 pos, Color color, bool bold, bool italic)
+    {
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        if (italic)
+            _font.DrawString(sb, text, pos + new Vector2(1f, 0f), new Color(color.R, color.G, color.B, Math.Max(60, color.A - 30)));
+
+        _font.DrawString(sb, text, pos, color);
+
+        if (bold)
+            _font.DrawString(sb, text, pos + new Vector2(1f, 0f), color);
+    }
+
+    private List<(int start, int length)> WrapOverlayTextRanges(string text, int maxTextWidth)
+    {
+        var ranges = new List<(int start, int length)>();
+        if (string.IsNullOrEmpty(text))
+        {
+            ranges.Add((0, 0));
+            return ranges;
+        }
+
+        var paragraphStart = 0;
+        while (paragraphStart <= text.Length)
+        {
+            var newline = text.IndexOf('\n', paragraphStart);
+            var paragraphEnd = newline >= 0 ? newline : text.Length;
+            if (paragraphEnd <= paragraphStart)
+            {
+                ranges.Add((paragraphStart, 0));
+            }
+            else
+            {
+                var cursor = paragraphStart;
+                while (cursor < paragraphEnd)
+                {
+                    var bestLen = 0;
+                    var bestSpaceLen = -1;
+                    for (var len = 1; cursor + len <= paragraphEnd; len++)
+                    {
+                        var sample = text.Substring(cursor, len);
+                        if (_font.MeasureString(sample).X > maxTextWidth)
+                            break;
+                        bestLen = len;
+                        if (char.IsWhiteSpace(text[cursor + len - 1]))
+                            bestSpaceLen = len;
+                    }
+
+                    if (bestLen <= 0)
+                        bestLen = 1;
+
+                    var useLen = bestLen;
+                    if (cursor + bestLen < paragraphEnd && bestSpaceLen > 0)
+                        useLen = bestSpaceLen;
+
+                    while (useLen > 0 && char.IsWhiteSpace(text[cursor + useLen - 1]))
+                        useLen--;
+
+                    if (useLen <= 0)
+                    {
+                        cursor += Math.Max(1, bestLen);
+                        continue;
+                    }
+
+                    ranges.Add((cursor, useLen));
+                    cursor += bestLen;
+                    while (cursor < paragraphEnd && char.IsWhiteSpace(text[cursor]))
+                        cursor++;
+                }
+            }
+
+            if (newline < 0)
+                break;
+            paragraphStart = newline + 1;
+        }
+
+        if (ranges.Count == 0)
+            ranges.Add((0, 0));
+        return ranges;
     }
 
     private List<string> WrapOverlayText(string text, int maxTextWidth)
@@ -11876,6 +14107,38 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public string[] Tokens { get; }
     }
 
+    private readonly struct ChatStyledSpan
+    {
+        public ChatStyledSpan(string text, Color color, bool bold, bool italic, bool spoiler)
+        {
+            Text = text;
+            Color = color;
+            Bold = bold;
+            Italic = italic;
+            Spoiler = spoiler;
+        }
+
+        public string Text { get; init; }
+        public Color Color { get; init; }
+        public bool Bold { get; init; }
+        public bool Italic { get; init; }
+        public bool Spoiler { get; init; }
+    }
+
+    private readonly struct ChatMarkupParseResult
+    {
+        public ChatMarkupParseResult(string cleanText, List<ChatStyledSpan> spans, bool hasSpoiler)
+        {
+            CleanText = cleanText;
+            Spans = spans;
+            HasSpoiler = hasSpoiler;
+        }
+
+        public string CleanText { get; }
+        public List<ChatStyledSpan> Spans { get; }
+        public bool HasSpoiler { get; }
+    }
+
     private sealed class ChatLine
     {
         public string Text = "";
@@ -11898,6 +14161,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public string CustomActionStatus2 = "";
         public string ActionLabel2 = "";
         public string HoverText2 = "";
+        public bool HasTextColorOverride;
+        public Color TextColorOverride = Color.White;
+        public bool HasRichText;
+        public string RichPrefixText = "";
+        public string RichMessageText = "";
+        public List<ChatStyledSpan> RichMessageSpans = new();
+        public bool HasSpoilerContent;
+        public bool SpoilerRevealed;
+        public int LineId;
     }
 
     private struct PlayerHomeEntry

@@ -399,16 +399,8 @@ function Clean-Outputs {
             }
     }
 
-    foreach ($drop in @($script:DevDropDir, $script:ReleaseDropDir)) {
-        if ([string]::IsNullOrWhiteSpace($drop) -or -not (Test-Path -LiteralPath $drop)) {
-            continue
-        }
-
-        Get-ChildItem -LiteralPath $drop -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Write-Log "Cleared drop folder: $drop"
-    }
+    # NOTE: We no longer clear DEV/RELEASE drop folders to preserve final EXEs
+    Write-Log "Clean complete (DEV/RELEASE folders preserved)"
 }
 
 function Get-GameVersion {
@@ -916,15 +908,18 @@ $btnRelease.Add_Click({
         Set-Progress 35
         Invoke-External "dotnet" @("restore", $script:GameProject) $script:RepoRoot
         Set-Progress 60
-        Invoke-External "dotnet" @("publish", $script:GameProject, "--configuration", "Release", "-r", "win-x64", "--self-contained", "true", "-p:PublishSingleFile=true", "-p:BuildNonce=$buildNonce") $script:RepoRoot
+        Invoke-External "dotnet" @("publish", $script:GameProject, "--configuration", "Release", "-r", "win-x64", "--self-contained", "true", "-p:PublishSingleFile=true", "-p:BuildNonce=$buildNonce", "-p:PublishReadyToRun=true") $script:RepoRoot
         Set-Progress 74
         Stage-ReleaseFinalExe | Out-Null
         Set-Progress 82
 
         $publishDir = Get-PublishDirectory
-        if (-not (Test-Path -LiteralPath $publishDir)) {
-            throw "Publish folder not found: $publishDir"
+        $publishedExe = Get-PreferredExeInDirectory -DirectoryPath $publishDir
+        if (-not $publishedExe) {
+            throw "Published EXE not found in: $publishDir"
         }
+        $releaseHash = (Get-FileHash -Path $publishedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Log "Published EXE hash: $releaseHash"
 
         $version = Get-GameVersion
         $zipName = "LatticeVeil-v{0}-win-x64.zip" -f $version
@@ -934,7 +929,7 @@ $btnRelease.Add_Click({
         }
 
         Compress-Archive -Path (Join-Path $publishDir "*") -DestinationPath $zipPath -Force
-        Write-Log "Release package: $zipPath"
+        Write-Log "Release package: $zipPath (contains EXE hash: $releaseHash)"
     }
 })
 $buttonPanel.Controls.Add($btnRelease)
@@ -949,6 +944,8 @@ $btnBuildOnly.Add_Click({
     Run-Task "DEV Publish Only" {
         $buildNonce = New-BuildNonce
         Write-Log "BuildNonce: $buildNonce"
+        Set-Progress 15
+        Clean-Outputs
         Set-Progress 20
         Invoke-External "dotnet" @("restore", $script:GameProject) $script:RepoRoot
         Set-Progress 60

@@ -6,12 +6,27 @@ using LatticeVeilMonoGame.Core;
 
 namespace LatticeVeilMonoGame.Online.Eos;
 
+internal static class EosPublicDefaults
+{
+    public const string SourceName = "HardcodedDefaults";
+    public const string ProductId = "0794da3c598d467c9ac126231f132351";
+    public const string SandboxId = "f9417e71fd2645f4af2d072c6ca5b63d";
+    public const string DeploymentId = "843fd58fa18545eaa1a7c8232eb7522b";
+    public const string ClientId = "xyza7891M5Mc8NNr3Bln7pSpVXN7252e";
+    public const string ProductName = "RedactedCraft";
+    public const string ProductVersion = "1.0";
+}
+
 public sealed class EosConfig
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
+    private static readonly object LoadLogSync = new();
+    private static readonly TimeSpan LoadLogCooldown = TimeSpan.FromSeconds(8);
+    private static string _lastLoadLogSignature = string.Empty;
+    private static DateTime _lastLoadLogUtc = DateTime.MinValue;
 
     private const string AppDataVendorFolder = "RedactedCraft";
     private const string DefaultProductName = "RedactedCraft";
@@ -36,12 +51,18 @@ public sealed class EosConfig
         try
         {
             var config = LoadOrThrow();
-            log.Info($"EOS config loaded. {config.GetSourceSummary()}");
+            if (ShouldLogLoad(config))
+            {
+                if (string.Equals(config.PublicSource, EosPublicDefaults.SourceName, StringComparison.Ordinal))
+                    log.Info("EOS public config source = HardcodedDefaults");
+                log.Info($"EOS public config loaded from: {config.PublicSource}");
+                log.Info($"EOS config loaded. {config.GetSourceSummary()}");
+            }
             return config;
         }
         catch (FileNotFoundException ex)
         {
-            log.Warn($"EOS config not found: {ex.Message}");
+            log.Warn($"EOS public config missing: {ex.Message}");
             return null;
         }
     }
@@ -144,12 +165,17 @@ public sealed class EosConfig
 
     private static PublicEosConfigFile LoadPublicConfigOrThrow(out string source)
     {
-        if (TryBuildPublicConfigFromEnvironment(out var envConfig))
+        var resolved = BuildHardcodedPublicConfig();
+        var hasEnvOverrides = ApplyPublicEnvironmentOverrides(resolved);
+        if (HasRequiredPublicFields(resolved))
         {
-            source = "environment variables EOS_PRODUCT_ID/EOS_SANDBOX_ID/EOS_DEPLOYMENT_ID/EOS_CLIENT_ID";
-            return envConfig;
+            source = hasEnvOverrides
+                ? "environment overrides + HardcodedDefaults"
+                : EosPublicDefaults.SourceName;
+            return resolved;
         }
 
+        // Optional legacy fallback for developer machines.
         var searched = new List<string>();
 
         foreach (var candidate in EnumeratePublicConfigCandidates())
@@ -167,32 +193,66 @@ public sealed class EosConfig
             return parsed;
         }
 
-        throw new FileNotFoundException($"Could not find eos.public.json. Searched: {string.Join(", ", searched)}");
+        throw new FileNotFoundException($"Could not resolve EOS public config (defaults/env/file). Searched files: {string.Join(", ", searched)}");
     }
 
-    private static bool TryBuildPublicConfigFromEnvironment(out PublicEosConfigFile config)
+    private static PublicEosConfigFile BuildHardcodedPublicConfig()
     {
-        config = new PublicEosConfigFile();
+        return new PublicEosConfigFile
+        {
+            ProductId = EosPublicDefaults.ProductId,
+            SandboxId = EosPublicDefaults.SandboxId,
+            DeploymentId = EosPublicDefaults.DeploymentId,
+            ClientId = EosPublicDefaults.ClientId,
+            ProductName = EosPublicDefaults.ProductName,
+            ProductVersion = EosPublicDefaults.ProductVersion
+        };
+    }
 
-        var productId = GetEnv("EOS_PRODUCT_ID");
-        var sandboxId = GetEnv("EOS_SANDBOX_ID");
-        var deploymentId = GetEnv("EOS_DEPLOYMENT_ID");
-        var clientId = GetEnv("EOS_CLIENT_ID");
-
-        if (IsMissingRequiredPublicValue(productId)
-            || IsMissingRequiredPublicValue(sandboxId)
-            || IsMissingRequiredPublicValue(deploymentId)
-            || IsMissingRequiredPublicValue(clientId))
+    private static bool ApplyPublicEnvironmentOverrides(PublicEosConfigFile config)
+    {
+        var allowOverrides = Normalize(GetEnv("EOS_ALLOW_PUBLIC_ENV_OVERRIDES"));
+        if (!string.Equals(allowOverrides, "1", StringComparison.Ordinal)
+            && !string.Equals(allowOverrides, "true", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        config.ProductId = productId;
-        config.SandboxId = sandboxId;
-        config.DeploymentId = deploymentId;
-        config.ClientId = clientId;
-        config.ProductName = Normalize(GetEnv("EOS_PRODUCT_NAME"), DefaultProductName);
-        config.ProductVersion = Normalize(GetEnv("EOS_PRODUCT_VERSION"), DefaultProductVersion);
+        var used = false;
+
+        used |= TryOverrideRequiredPublicField("EOS_PRODUCT_ID", v => config.ProductId = v);
+        used |= TryOverrideRequiredPublicField("EOS_SANDBOX_ID", v => config.SandboxId = v);
+        used |= TryOverrideRequiredPublicField("EOS_DEPLOYMENT_ID", v => config.DeploymentId = v);
+        used |= TryOverrideRequiredPublicField("EOS_CLIENT_ID", v => config.ClientId = v);
+
+        var productName = Normalize(GetEnv("EOS_PRODUCT_NAME"));
+        if (!string.IsNullOrWhiteSpace(productName))
+        {
+            config.ProductName = productName;
+            used = true;
+        }
+
+        var productVersion = Normalize(GetEnv("EOS_PRODUCT_VERSION"));
+        if (!string.IsNullOrWhiteSpace(productVersion))
+        {
+            config.ProductVersion = productVersion;
+            used = true;
+        }
+
+        return used;
+    }
+
+    private static bool TryOverrideRequiredPublicField(string envName, Action<string> apply)
+    {
+        var raw = GetEnv(envName);
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+
+        var value = Normalize(raw);
+        if (IsMissingRequiredPublicValue(value))
+            return false;
+
+        apply(value);
         return true;
     }
 
@@ -407,6 +467,25 @@ public sealed class EosConfig
             return "***";
 
         return trimmed.Substring(0, 3) + "***" + trimmed.Substring(trimmed.Length - 2);
+    }
+
+    private static bool ShouldLogLoad(EosConfig config)
+    {
+        var signature = $"{config.PublicSource}|{config.SecretSource}|{config.HasClientSecret}";
+        var now = DateTime.UtcNow;
+
+        lock (LoadLogSync)
+        {
+            if (string.Equals(signature, _lastLoadLogSignature, StringComparison.Ordinal)
+                && now - _lastLoadLogUtc < LoadLogCooldown)
+            {
+                return false;
+            }
+
+            _lastLoadLogSignature = signature;
+            _lastLoadLogUtc = now;
+            return true;
+        }
     }
 
     private static bool HasRequiredPublicFields(PublicEosConfigFile config)

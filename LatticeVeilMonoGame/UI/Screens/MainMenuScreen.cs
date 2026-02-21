@@ -405,17 +405,21 @@ public sealed class MainMenuScreen : IScreen
                 var servicesOk = IsTruthy(Environment.GetEnvironmentVariable("LV_ONLINE_SERVICES_OK"));
                 var gateTicket = (Environment.GetEnvironmentVariable("LV_GATE_TICKET") ?? string.Empty).Trim();
                 var accessToken = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+                var missing = new System.Collections.Generic.List<string>();
 
                 if (!launcherAuth)
-                    return "Launcher did not authorize online mode for this session.";
+                    missing.Add("LV_LAUNCHER_ONLINE_AUTH");
                 if (!official)
-                    return "Official build verification flag is missing.";
+                    missing.Add("LV_OFFICIAL_BUILD_VERIFIED");
                 if (!servicesOk)
-                    return "Online services flag is missing.";
+                    missing.Add("LV_ONLINE_SERVICES_OK");
                 if (string.IsNullOrWhiteSpace(gateTicket))
-                    return "Gate ticket is missing.";
+                    missing.Add("LV_GATE_TICKET");
                 if (string.IsNullOrWhiteSpace(accessToken))
-                    return "Veilnet access token is missing. Re-link in launcher.";
+                    missing.Add("LV_VEILNET_ACCESS_TOKEN");
+
+                if (missing.Count > 0)
+                    return $"Online auth missing. Please launch Online from launcher.\nMissing: {string.Join(", ", missing)}";
             }
 
             return "EOS client unavailable. Retry initialization from launcher.";

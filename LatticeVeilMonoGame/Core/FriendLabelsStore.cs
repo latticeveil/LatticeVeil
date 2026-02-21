@@ -23,7 +23,13 @@ public sealed class FriendLabelsStore
     {
         try
         {
-            Directory.CreateDirectory(Paths.ConfigDir);
+            Directory.CreateDirectory(Paths.RootDir);
+            if (!File.Exists(Paths.FriendLabelsJsonPath))
+            {
+                if (File.Exists(Paths.LegacyFriendLabelsJsonPath))
+                    TryMigrateLegacyFile(log);
+            }
+
             if (!File.Exists(Paths.FriendLabelsJsonPath))
             {
                 var created = new FriendLabelsStore();
@@ -66,13 +72,29 @@ public sealed class FriendLabelsStore
     {
         try
         {
-            Directory.CreateDirectory(Paths.ConfigDir);
+            Directory.CreateDirectory(Paths.RootDir);
             var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(Paths.FriendLabelsJsonPath, json);
         }
         catch (Exception ex)
         {
             log.Warn($"Failed to save friend labels: {ex.Message}");
+        }
+    }
+
+    private static void TryMigrateLegacyFile(Logger log)
+    {
+        try
+        {
+            if (!File.Exists(Paths.LegacyFriendLabelsJsonPath) || File.Exists(Paths.FriendLabelsJsonPath))
+                return;
+
+            File.Move(Paths.LegacyFriendLabelsJsonPath, Paths.FriendLabelsJsonPath);
+            log.Info($"Migrated friend labels file: {Path.GetFileName(Paths.LegacyFriendLabelsJsonPath)} -> {Path.GetFileName(Paths.FriendLabelsJsonPath)}");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to migrate legacy friend labels file: {ex.Message}");
         }
     }
 

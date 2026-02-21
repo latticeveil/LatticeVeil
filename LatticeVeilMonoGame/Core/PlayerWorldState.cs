@@ -260,15 +260,26 @@ public sealed class PlayerWorldState
             }
 
             state.InventoryGrid = new HotbarSlot[Inventory.GridSize];
-            if (state.Version >= 5 && br.BaseStream.Position < br.BaseStream.Length)
+            if (state.Version >= 5)
             {
-                var gridCount = br.ReadByte();
-                for (int i = 0; i < gridCount; i++)
+                try
                 {
-                    var id = (BlockId)br.ReadByte();
-                    var c = br.ReadInt32();
-                    if (i >= 0 && i < state.InventoryGrid.Length)
-                        state.InventoryGrid[i] = new HotbarSlot { Id = id, Count = c };
+                    var gridCount = br.ReadByte();
+                    for (int i = 0; i < gridCount; i++)
+                    {
+                        var id = (BlockId)br.ReadByte();
+                        var c = br.ReadInt32();
+                        if (i >= 0 && i < state.InventoryGrid.Length)
+                            state.InventoryGrid[i] = new HotbarSlot { Id = id, Count = c };
+                    }
+                }
+                catch (EndOfStreamException)
+                {
+                    // Older/truncated payloads may not include grid data.
+                }
+                catch (IOException)
+                {
+                    // Corrupt payload tail: keep defaults for grid.
                 }
             }
 

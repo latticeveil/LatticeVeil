@@ -219,45 +219,34 @@ public sealed class Game1 : Game
         }
         catch { }
 
-        // 5) FIX FOCUS PAUSE - Don't early-return on !IsActive during preparing
-        bool isPreparing = false;
-        var topScreen = _menus.Peek();
-        if (topScreen is GameWorldScreen gameWorld)
-        {
-            isPreparing = !gameWorld.WorldReady;
-        }
-        
+        // Keep all game systems ticking even while window focus is lost.
+        // Input is suppressed while inactive, but loading/network/refresh continue.
         if (!IsActive)
         {
             ReleaseMouseCapture();
             _input.Reset();
             _wasActive = false;
             _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
-            
-            // 5) Continue ticking streaming/apply and loading UI while inactive (just ignore input)
-            if (isPreparing)
-            {
-                _menus.Update(gameTime, _input); // _input was already reset above
-            }
-            base.Update(gameTime);
-            return;
         }
-
-        if (!_wasActive)
+        else
         {
-            _input.Reset();
-            _wasActive = true;
-            UpdateMouseCapture(computeDelta: false);
-            _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
-            base.Update(gameTime);
-            return;
+            if (!_wasActive)
+            {
+                _input.Reset();
+                _wasActive = true;
+                UpdateMouseCapture(computeDelta: false);
+                _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
+                base.Update(gameTime);
+                return;
+            }
+
+            LogFrameStall(gameTime);
+            _input.Update();
         }
 
-        LogFrameStall(gameTime);
-        _input.Update();
         RefreshSettingsIfChanged();
         UpdateUiLayout();
-        UpdateMouseCapture(computeDelta: true);
+        UpdateMouseCapture(computeDelta: IsActive);
         if (_eosClient == null && _startOptions?.Offline != true)
         {
             var created = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
@@ -294,7 +283,7 @@ public sealed class Game1 : Game
 
         // Global quit (Alt+F4 is handled by OS; Esc handled in screens)
         _menus.Update(gameTime, _input);
-        
+
         HandleSmoke(gameTime);
         // Do not auto-exit when the menu stack is momentarily empty during startup transitions.
         // Exit should be driven by an explicit request (Quit button / OS close).

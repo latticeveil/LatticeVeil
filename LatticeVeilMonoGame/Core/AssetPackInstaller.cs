@@ -52,8 +52,9 @@ public sealed class AssetPackInstaller
 
     public static string DownloadsDir => Path.Combine(Paths.RootDir, "_downloads");
     public static string StagingDir => Path.Combine(Paths.RootDir, "_assets_staging");
-    public static string MarkerPath => Path.Combine(Paths.TexturesDir, ".asset_state.json");
-    private static string LegacyMarkerPath => Path.Combine(Paths.RootDir, "assets_installed.json");
+    public static string MarkerPath => Path.Combine(Paths.TexturesDir, ".asset_manifest.lvc");
+    private static string LegacyMarkerPath => Path.Combine(Paths.TexturesDir, ".asset_state.json");
+    private static string LegacyRootMarkerPath => Path.Combine(Paths.RootDir, "assets_installed.json");
 
     public AssetPackInstaller(Logger log)
     {
@@ -312,6 +313,7 @@ public sealed class AssetPackInstaller
         // If the found root IS ALREADY staging/Assets, we are done.
         if (string.Equals(validRootFull, targetFull, StringComparison.OrdinalIgnoreCase))
         {
+            FilterDisallowedAssetContent(targetDir);
             _log.Info("Assets are already in the correct location.");
             return;
         }
@@ -329,6 +331,7 @@ public sealed class AssetPackInstaller
 
         _log.Info($"Moving content from {validRoot} to {targetDir}");
         MoveChildren(validRoot, targetDir);
+        FilterDisallowedAssetContent(targetDir);
     }
 
     private static string? TryGetSingleRootFolder(string dir)
@@ -462,6 +465,8 @@ public sealed class AssetPackInstaller
             var name = Path.GetFileName(entry);
             if (string.IsNullOrWhiteSpace(name))
                 continue;
+            if (Paths.IsDisallowedAssetRelativePath(name))
+                continue;
 
             var dest = Path.Combine(destDir, name);
 
@@ -594,6 +599,7 @@ public sealed class AssetPackInstaller
             throw new DirectoryNotFoundException("Staging assets root missing (expected Assets folder in staging).");
 
         MigrateLegacyContent(stagingRoot);
+        FilterDisallowedAssetContent(stagingRoot);
         ValidateStagingRoot(stagingRoot);
 
         ClearReadOnlyAttributes(stagingRoot);
@@ -607,6 +613,7 @@ public sealed class AssetPackInstaller
         if (forceCleanInstall)
         {
             InstallStagedAssetsForceClean(stagingDir, assetsDir, stagingRoot, backupDir);
+            Paths.RemoveDisallowedAssetEntries(_log);
             return;
         }
 
@@ -657,6 +664,8 @@ public sealed class AssetPackInstaller
             throw;
         }
 
+        Paths.RemoveDisallowedAssetEntries(_log);
+
     }
 
     private void InstallStagedAssetsForceClean(string stagingDir, string assetsDir, string stagingRoot, string backupDir)
@@ -698,15 +707,19 @@ public sealed class AssetPackInstaller
     {
         try
         {
-            var path = MarkerPath;
-            if (!File.Exists(path))
-            {
-                TryDeleteLegacyMarker();
+            var path = ResolveExistingMarkerPath();
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 return null;
-            }
 
             var json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<InstalledAssetsMarker>(json);
+            var marker = JsonSerializer.Deserialize<InstalledAssetsMarker>(json);
+            if (marker == null)
+                return null;
+
+            if (!string.Equals(path, MarkerPath, StringComparison.OrdinalIgnoreCase))
+                WriteInstalledMarkerFromExisting(marker);
+
+            return marker;
         }
         catch (Exception ex)
         {
@@ -758,7 +771,7 @@ public sealed class AssetPackInstaller
     {
         try
         {
-            if (File.Exists(MarkerPath))
+            if (File.Exists(MarkerPath) || !string.IsNullOrWhiteSpace(ResolveExistingMarkerPath()))
                 return;
 
             if (!CheckLocalAssetsInstalled(out _))
@@ -1239,6 +1252,40 @@ public sealed class AssetPackInstaller
         return false;
     }
 
+    private void FilterDisallowedAssetContent(string root)
+    {
+        try
+        {
+            if (!Directory.Exists(root))
+                return;
+
+            foreach (var entry in Directory.GetFileSystemEntries(root, "*", SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(entry);
+                if (!Paths.IsDisallowedAssetRelativePath(name))
+                    continue;
+
+                try
+                {
+                    if (Directory.Exists(entry))
+                        Directory.Delete(entry, recursive: true);
+                    else if (File.Exists(entry))
+                        File.Delete(entry);
+
+                    _log.Info($"Filtered disallowed asset content from package: {name}");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"Failed filtering disallowed asset content '{name}': {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed scanning disallowed package content: {ex.Message}");
+        }
+    }
+
     private static void RetryIo(Action action, Logger log, string opName, string? normalizePath)
     {
         Exception? last = null;
@@ -1286,6 +1333,8 @@ public sealed class AssetPackInstaller
         foreach (var dir in Directory.GetDirectories(stagingRoot, "*", SearchOption.AllDirectories))
         {
             var rel = Path.GetRelativePath(stagingRoot, dir);
+            if (Paths.IsDisallowedAssetRelativePath(rel))
+                continue;
             var destDir = Path.Combine(assetsDir, rel);
             if (createdDirs.Contains(destDir))
                 continue;
@@ -1304,6 +1353,8 @@ public sealed class AssetPackInstaller
         foreach (var file in Directory.GetFiles(stagingRoot, "*", SearchOption.AllDirectories))
         {
             var rel = Path.GetRelativePath(stagingRoot, file);
+            if (Paths.IsDisallowedAssetRelativePath(rel))
+                continue;
             var dest = Path.Combine(assetsDir, rel);
             var destDir = Path.GetDirectoryName(dest) ?? assetsDir;
             var tmp = dest + ".tmp";
@@ -1419,10 +1470,40 @@ public sealed class AssetPackInstaller
         {
             if (File.Exists(LegacyMarkerPath))
                 File.Delete(LegacyMarkerPath);
+            if (File.Exists(LegacyRootMarkerPath))
+                File.Delete(LegacyRootMarkerPath);
         }
         catch (Exception ex)
         {
             _log.Warn($"Failed to remove legacy marker: {ex.Message}");
+        }
+    }
+
+    private string? ResolveExistingMarkerPath()
+    {
+        if (File.Exists(MarkerPath))
+            return MarkerPath;
+        if (File.Exists(LegacyMarkerPath))
+            return LegacyMarkerPath;
+        if (File.Exists(LegacyRootMarkerPath))
+            return LegacyRootMarkerPath;
+        return null;
+    }
+
+    private void WriteInstalledMarkerFromExisting(InstalledAssetsMarker marker)
+    {
+        try
+        {
+            EnsureWritableDirectory(Paths.AssetsDir, "Documents\\LatticeVeil\\Assets");
+            Paths.EnsureAssetDirectoriesExist(_log);
+            var json = JsonSerializer.Serialize(marker, _jsonOptions);
+            File.WriteAllText(MarkerPath, json);
+            TryHideMarker(MarkerPath);
+            TryDeleteLegacyMarker();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed migrating legacy installed marker: {ex.Message}");
         }
     }
 }

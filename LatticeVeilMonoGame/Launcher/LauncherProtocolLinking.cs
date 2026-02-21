@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using Microsoft.Win32;
 using LatticeVeilMonoGame.Core;
 
@@ -10,6 +11,10 @@ internal static class LauncherProtocolLinking
 {
     private const string Scheme = "latticeveil";
     private const string ClassesRoot = @"Software\Classes";
+    private static readonly string QueueDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "LatticeVeil");
+    private static readonly string QueuePath = Path.Combine(QueueDir, "veilnet_link_queue.txt");
 
     public static void TryEnsureProtocolRegistration(Logger log)
     {
@@ -63,6 +68,70 @@ internal static class LauncherProtocolLinking
         return null;
     }
 
+    public static bool TryQueueLinkCodeForRunningLauncher(string code, Logger log)
+    {
+        try
+        {
+            var normalized = NormalizeCode(code);
+            if (string.IsNullOrWhiteSpace(normalized))
+                return false;
+
+            Directory.CreateDirectory(QueueDir);
+            File.AppendAllText(QueuePath, normalized + Environment.NewLine, Encoding.UTF8);
+            log.Info($"Queued protocol link code for running launcher at {QueuePath}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to queue protocol link code: {ex.Message}");
+            return false;
+        }
+    }
+
+    public static string[] DequeuePendingLinkCodes(Logger log)
+    {
+        try
+        {
+            if (!File.Exists(QueuePath))
+                return Array.Empty<string>();
+
+            var lines = File.ReadAllLines(QueuePath);
+            File.Delete(QueuePath);
+
+            var codes = lines
+                .Select(NormalizeCode)
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (codes.Length > 0)
+                log.Info($"Dequeued {codes.Length} pending protocol link code(s) from {QueuePath}");
+
+            return codes;
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to dequeue protocol link codes: {ex.Message}");
+            return Array.Empty<string>();
+        }
+    }
+
+    public static void ClearPendingLinkCodes(Logger log)
+    {
+        try
+        {
+            if (File.Exists(QueuePath))
+            {
+                File.Delete(QueuePath);
+                log.Info($"Cleared pending protocol link code queue at {QueuePath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to clear protocol link code queue: {ex.Message}");
+        }
+    }
+
     private static string? TryExtractLinkCodeFromUri(string? rawValue)
     {
         var value = (rawValue ?? string.Empty).Trim().Trim('"');
@@ -107,6 +176,16 @@ internal static class LauncherProtocolLinking
         }
 
         return null;
+    }
+
+    private static string NormalizeCode(string? raw)
+    {
+        var value = string.Concat((raw ?? string.Empty).Where(ch => !char.IsWhiteSpace(ch)))
+            .Trim()
+            .ToUpperInvariant();
+        if (value.Length < 4 || value.Length > 24)
+            return string.Empty;
+        return value;
     }
 
     private static string ResolveLauncherExecutablePath()

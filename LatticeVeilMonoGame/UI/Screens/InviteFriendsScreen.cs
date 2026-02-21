@@ -18,6 +18,8 @@ public sealed class InviteFriendsScreen : IScreen
     private const int MaxFriendInputLength = 48;
     private const double CanonicalSyncRetrySeconds = 8.0;
     private const double MissingEndpointRetrySeconds = 45.0;
+    private const double AutoRefreshSeconds = 7.0;
+    private const double AutoRefreshBackoffSeconds = 25.0;
 
     private readonly MenuStack _menus;
     private readonly AssetLoader _assets;
@@ -57,6 +59,8 @@ public sealed class InviteFriendsScreen : IScreen
     private double _now;
     private string _status = string.Empty;
     private double _statusUntil;
+    private DateTime _nextAutoRefreshUtc = DateTime.MinValue;
+    private int _refreshFailureCount;
 
     public InviteFriendsScreen(
         MenuStack menus,
@@ -82,7 +86,7 @@ public sealed class InviteFriendsScreen : IScreen
         if (_eosClient == null)
             _log.Warn("InviteFriendsScreen: EOS client not available.");
 
-        _refreshBtn = new Button("REFRESH", () => _ = RefreshFriendsAsync()) { BoldText = true };
+        _refreshBtn = new Button("REFRESH", () => _ = RefreshFriendsAsync(manualTrigger: true)) { BoldText = true };
         _inviteBtn = new Button("INVITE", () => _ = InviteSelectedAsync()) { BoldText = true };
         _addFriendBtn = new Button("ADD FRIEND", () => _ = AddFriendAsync()) { BoldText = true };
         _backBtn = new Button("BACK", () => _menus.Pop()) { BoldText = true };
@@ -94,7 +98,8 @@ public sealed class InviteFriendsScreen : IScreen
         }
         catch { }
 
-        _ = RefreshFriendsAsync();
+        _nextAutoRefreshUtc = DateTime.UtcNow;
+        _ = RefreshFriendsAsync(manualTrigger: true);
     }
 
     public void OnResize(Rectangle viewport)
@@ -176,6 +181,9 @@ public sealed class InviteFriendsScreen : IScreen
         _backBtn.Update(input);
 
         HandleListSelection(input);
+
+        if (!_busy && DateTime.UtcNow >= _nextAutoRefreshUtc)
+            _ = RefreshFriendsAsync(manualTrigger: false);
     }
 
     public void Draw(SpriteBatch sb, Rectangle viewport)
@@ -317,16 +325,24 @@ public sealed class InviteFriendsScreen : IScreen
         _selectedFriend = index;
     }
 
-    private async Task RefreshFriendsAsync()
+    private async Task RefreshFriendsAsync(bool manualTrigger)
     {
         if (_busy)
             return;
+
+        if (manualTrigger)
+        {
+            _refreshFailureCount = 0;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(AutoRefreshSeconds);
+        }
 
         if (!_gate.CanUseOfficialOnline(_log, out var gateDenied))
         {
             _friends.Clear();
             _selectedFriend = -1;
             SetStatus(gateDenied);
+            _refreshFailureCount++;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(_refreshFailureCount >= 3 ? AutoRefreshBackoffSeconds : AutoRefreshSeconds);
             return;
         }
 
@@ -336,6 +352,8 @@ public sealed class InviteFriendsScreen : IScreen
             _friends.Clear();
             _selectedFriend = -1;
             SetStatus("EOS CLIENT UNAVAILABLE");
+            _refreshFailureCount++;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(_refreshFailureCount >= 3 ? AutoRefreshBackoffSeconds : AutoRefreshSeconds);
             return;
         }
 
@@ -345,8 +363,14 @@ public sealed class InviteFriendsScreen : IScreen
             _friends.Clear();
             _selectedFriend = -1;
             SetStatus(snapshot.StatusText);
+            _refreshFailureCount++;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(_refreshFailureCount >= 3 ? AutoRefreshBackoffSeconds : AutoRefreshSeconds);
             return;
         }
+
+        var selectedFriendId = (_selectedFriend >= 0 && _selectedFriend < _friends.Count)
+            ? (_friends[_selectedFriend].ProductUserId ?? string.Empty).Trim()
+            : string.Empty;
 
         _busy = true;
         try
@@ -414,13 +438,24 @@ public sealed class InviteFriendsScreen : IScreen
             _profile.Save(_log);
             _friends.Clear();
             _friends.AddRange(entries.OrderByDescending(x => x.IsHosting).ThenBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase));
-            _selectedFriend = _friends.Count > 0 ? 0 : -1;
+            if (!string.IsNullOrWhiteSpace(selectedFriendId))
+            {
+                _selectedFriend = _friends.FindIndex(f =>
+                    string.Equals(f.ProductUserId, selectedFriendId, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (_selectedFriend < 0 && _friends.Count > 0)
+                _selectedFriend = 0;
             SetStatus("Friends updated.", 1.5);
+            _refreshFailureCount = 0;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(AutoRefreshSeconds);
         }
         catch (Exception ex)
         {
             _log.Warn($"Friends refresh failed: {ex.Message}");
             SetStatus("Refresh failed.");
+            _refreshFailureCount++;
+            _nextAutoRefreshUtc = DateTime.UtcNow.AddSeconds(_refreshFailureCount >= 3 ? AutoRefreshBackoffSeconds : AutoRefreshSeconds);
         }
         finally
         {
@@ -539,7 +574,7 @@ public sealed class InviteFriendsScreen : IScreen
             _addFriendQuery = string.Empty;
             _addFriendActive = false;
             SetStatus(string.IsNullOrWhiteSpace(add.Message) ? "Friend added." : add.Message, 3);
-            await RefreshFriendsAsync();
+            await RefreshFriendsAsync(manualTrigger: true);
         }
         catch (Exception ex)
         {
@@ -688,7 +723,7 @@ public sealed class InviteFriendsScreen : IScreen
     private void HandleTextInput(InputState input, ref string value, int maxLen)
     {
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Back)
             {

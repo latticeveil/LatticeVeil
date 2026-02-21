@@ -72,6 +72,14 @@ _tmp*/
 temp*/
 supabase/
 
+# Asset content excluded from game/runtime packaging
+LatticeVeilMonoGame/Defaults/Assets/data/
+LatticeVeilMonoGame/Defaults/Assets/packs/
+LatticeVeilMonoGame/Defaults/Assets/.github/
+LatticeVeilMonoGame/Defaults/Assets/.git*
+LatticeVeilMonoGame/Defaults/Assets/assets_manifest.json
+LatticeVeilMonoGame/Defaults/Assets/textures/.asset_state.json
+
 # Archive files
 *.zip
 *.7z

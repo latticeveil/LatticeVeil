@@ -1,8 +1,8 @@
 {
-  "ProductId": "REPLACE_WITH_PRODUCT_ID",
-  "SandboxId": "REPLACE_WITH_SANDBOX_ID",
-  "DeploymentId": "REPLACE_WITH_DEPLOYMENT_ID",
-  "ClientId": "REPLACE_WITH_CLIENT_ID",
+  "ProductId": "0794da3c598d467c9ac126231f132351",
+  "SandboxId": "f9417e71fd2645f4af2d072c6ca5b63d",
+  "DeploymentId": "843fd58fa18545eaa1a7c8232eb7522b",
+  "ClientId": "xyza7891M5Mc8NNr3Bln7pSpVXN7252e",
   "ProductName": "RedactedCraft",
   "ProductVersion": "1.0"
 }

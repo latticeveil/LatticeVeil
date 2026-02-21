@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -36,11 +37,10 @@ public sealed class MultiplayerScreen : IScreen
 	private readonly Button _yourIdBtn;
     private readonly Button _filterLanBtn;
     private readonly Button _filterOnlineBtn;
-    private readonly Button _filterFriendsBtn;
     private readonly Button _backBtn;
 
     private enum SessionType { Lan, Online }
-    private enum BrowserFilter { Lan, Online, Friends }
+    private enum BrowserFilter { Lan, Online }
     private enum JoinRequestStateKind { None, Requested, Approved, Declined }
 
     private sealed class JoinRequestState
@@ -69,7 +69,7 @@ public sealed class MultiplayerScreen : IScreen
     private List<SessionEntry> _sessions = new();
     private List<SessionEntry> _onlineSessions = new();
     private readonly Dictionary<string, JoinRequestState> _joinRequestStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _friendIdsFromDirectory = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _hostDisplayNameCache = new(StringComparer.OrdinalIgnoreCase);
     private int _selectedIndex = -1;
     private int _hoveredIndex = -1;
     private Vector2 _lastMousePos = Vector2.Zero;
@@ -77,6 +77,7 @@ public sealed class MultiplayerScreen : IScreen
 
     private DateTime _nextOnlineRefreshUtc = DateTime.MinValue;
     private DateTime _nextSessionRefreshUtc = DateTime.MinValue;
+    private DateTime _lastUpdateUtc = DateTime.MinValue;
     private bool _onlineRefreshInProgress;
     private bool _isRefreshing = false;
     private int _onlineRefreshFailures;
@@ -86,16 +87,18 @@ public sealed class MultiplayerScreen : IScreen
 
     private bool _joining;
     private string _status = "";
-    private BrowserFilter _activeFilter = BrowserFilter.Friends;
+    private BrowserFilter _activeFilter = BrowserFilter.Online;
 
     private Texture2D? _bg;
     private Texture2D? _panel;
 
     private double _lastLanRefresh;
     private int _lastLoggedLanDiscoveryCount = -1;
-    private const double LanRefreshIntervalSeconds = 2.0;
+    private const double LanRefreshIntervalSeconds = 3.0;
     private const double DefaultListRefreshSeconds = 3.0;
     private const double RefreshBackoffSeconds = 20.0;
+    private const int MaxWorldNameChars = 48;
+    private const int MaxUsernameChars = 24;
 
     private Rectangle _viewport;
     private Rectangle _panelRect;
@@ -119,7 +122,6 @@ public sealed class MultiplayerScreen : IScreen
     private const string OnlineLoadingStatusPrefix = "Online loading:";
     private double _lastClickTime;
     private int _lastClickIndex = -1;
-    private readonly OnlineSocialStateService _socialState;
 
     public MultiplayerScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile,
         global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient)
@@ -146,7 +148,6 @@ public sealed class MultiplayerScreen : IScreen
                 _log.Warn("MultiplayerScreen: EOS client not available.");
         }
         _onlineGate = OnlineGateClient.GetOrCreate();
-        _socialState = OnlineSocialStateService.GetOrCreate(_log);
         _identityStore = EosIdentityStore.LoadOrCreate(_log);
         _reservedUsername = (_identityStore.ReservedUsername ?? string.Empty).Trim();
 
@@ -160,7 +161,6 @@ public sealed class MultiplayerScreen : IScreen
 		_yourIdBtn = new Button("SHARE ID", OnYourIdClicked) { BoldText = true };
         _filterLanBtn = new Button("LAN", () => SetBrowserFilter(BrowserFilter.Lan)) { BoldText = true };
         _filterOnlineBtn = new Button("ONLINE", () => SetBrowserFilter(BrowserFilter.Online)) { BoldText = true };
-        _filterFriendsBtn = new Button("FRIENDS", () => SetBrowserFilter(BrowserFilter.Friends)) { BoldText = true };
         _backBtn = new Button("BACK", () => { Cleanup(); _menus.Pop(); }) { BoldText = true };
 
         try
@@ -233,6 +233,11 @@ public sealed class MultiplayerScreen : IScreen
 
     public void Update(GameTime gameTime, InputState input)
     {
+        var nowUtc = DateTime.UtcNow;
+        if (_lastUpdateUtc != DateTime.MinValue && (nowUtc - _lastUpdateUtc).TotalSeconds >= 1.5)
+            HandleScreenResume();
+        _lastUpdateUtc = nowUtc;
+
         _now = gameTime.TotalGameTime.TotalSeconds;
 
         if (input.IsNewKeyPress(Keys.Escape))
@@ -249,7 +254,6 @@ public sealed class MultiplayerScreen : IScreen
         _joinBtn.Update(input);
         _filterLanBtn.Update(input);
         _filterOnlineBtn.Update(input);
-        _filterFriendsBtn.Update(input);
         _backBtn.Update(input);
 
         // Update mouse position for hover effects
@@ -263,18 +267,25 @@ public sealed class MultiplayerScreen : IScreen
                 _refreshIconRotation -= 360f;
         }
 
-        var nowUtc = DateTime.UtcNow;
         if (_activeFilter != BrowserFilter.Lan && !_onlineRefreshInProgress && nowUtc >= _nextOnlineRefreshUtc)
             _ = RefreshOnlineSessionsAsync();
 
         // Auto-refresh list while screen is active.
-        if (_justReturnedFromHosting || nowUtc >= _nextSessionRefreshUtc)
+        if (_activeFilter == BrowserFilter.Lan && _justReturnedFromHosting)
         {
             _isRefreshing = true;
+            _joinRequestStates.Clear();
             RefreshSessions();
-            var nextSeconds = _sessionRefreshFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds;
-            _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(nextSeconds);
+            _lastLanRefresh = _now;
+            _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(LanRefreshIntervalSeconds);
             _justReturnedFromHosting = false; // Reset flag
+        }
+        else if (_activeFilter != BrowserFilter.Lan && _justReturnedFromHosting)
+        {
+            _joinRequestStates.Clear();
+            _justReturnedFromHosting = false;
+            _nextOnlineRefreshUtc = DateTime.MinValue;
+            _ = RefreshOnlineSessionsAsync();
         }
 
         UpdateLanDiscovery(gameTime);
@@ -283,8 +294,7 @@ public sealed class MultiplayerScreen : IScreen
         if (!_identitySyncBusy && _now - _lastIdentitySyncAttempt >= IdentitySyncIntervalSeconds)
         {
             _lastIdentitySyncAttempt = _now;
-            _identitySyncBusy = true;
-            _ = SyncIdentityStateAsync();
+            _ = SyncIdentityWithGateAsync();
         }
     }
 
@@ -333,6 +343,7 @@ public sealed class MultiplayerScreen : IScreen
         DrawList(sb);
         DrawButtons(sb);
         DrawStatus(sb);
+        DrawRefreshFeedback(sb);
         _backBtn.Draw(sb, _pixel, _font);
 
         sb.End();
@@ -405,11 +416,9 @@ public sealed class MultiplayerScreen : IScreen
     {
         _filterLanBtn.BackgroundColor = _activeFilter == BrowserFilter.Lan ? new Color(80, 100, 150) : null;
         _filterOnlineBtn.BackgroundColor = _activeFilter == BrowserFilter.Online ? new Color(80, 100, 150) : null;
-        _filterFriendsBtn.BackgroundColor = _activeFilter == BrowserFilter.Friends ? new Color(80, 100, 150) : null;
 
         _filterLanBtn.Draw(sb, _pixel, _font);
         _filterOnlineBtn.Draw(sb, _pixel, _font);
-        _filterFriendsBtn.Draw(sb, _pixel, _font);
     }
 
     private void DrawList(SpriteBatch sb)
@@ -425,7 +434,6 @@ public sealed class MultiplayerScreen : IScreen
             {
                 BrowserFilter.Lan => "No LAN hosts found.",
                 BrowserFilter.Online => "No online EOS lobbies found.",
-                BrowserFilter.Friends => "No friend hosts are active.",
                 _ => "No sessions found."
             };
             var size = _font.MeasureString(msg);
@@ -440,32 +448,54 @@ public sealed class MultiplayerScreen : IScreen
         DrawBorder(sb, headerRect, new Color(60, 60, 60));
 
         var pad = 10;
-        var iconColW = (int)(40 * 0.80f);
-        var userColW = (int)(170 * 0.80f);
-        var worldColW = (int)(220 * 0.80f);
-        var cheatsColW = (int)(130 * 0.80f);
-        var modeColW = (int)(130 * 0.80f);
-        var playersColW = (int)(120 * 0.80f);
-        var colsTotal = iconColW + userColW + worldColW + cheatsColW + modeColW + playersColW + pad * 2;
-        // If columns exceed width, shrink world column
-        if (colsTotal > headerRect.Width)
+        var contentWidth = Math.Max(240, headerRect.Width - pad * 2);
+        var iconColW = Math.Clamp((int)(contentWidth * 0.06f), 24, 44);
+        var cheatsColW = Math.Clamp((int)(contentWidth * 0.11f), 70, 118);
+        var modeColW = Math.Clamp((int)(contentWidth * 0.15f), 90, 150);
+        var playersColW = Math.Clamp((int)(contentWidth * 0.18f), 100, 170);
+        var remainingForNames = Math.Max(220, contentWidth - (iconColW + cheatsColW + modeColW + playersColW));
+
+        var maxUserWidth = (int)_font.MeasureString("USERNAME").X;
+        var maxWorldWidth = (int)_font.MeasureString("WORLD").X;
+        for (var i = 0; i < _sessions.Count; i++)
         {
-            var shrink = colsTotal - headerRect.Width;
-            worldColW = Math.Max(80, worldColW - shrink);
+            var userDisplay = LimitDisplayText(_sessions[i].HostName, MaxUsernameChars);
+            var worldDisplay = LimitDisplayText(_sessions[i].WorldName, MaxWorldNameChars);
+            maxUserWidth = Math.Max(maxUserWidth, (int)_font.MeasureString(userDisplay).X);
+            maxWorldWidth = Math.Max(maxWorldWidth, (int)_font.MeasureString(worldDisplay).X);
         }
+
+        var desiredUserWidth = Math.Clamp(maxUserWidth + 26, 105, Math.Max(110, remainingForNames - 120));
+        var desiredWorldWidth = Math.Clamp(maxWorldWidth + 26, 120, Math.Max(120, remainingForNames - 105));
+        var desiredTotal = desiredUserWidth + desiredWorldWidth;
+        if (desiredTotal > remainingForNames)
+        {
+            var scale = (double)remainingForNames / desiredTotal;
+            desiredUserWidth = Math.Max(100, (int)Math.Floor(desiredUserWidth * scale));
+            desiredWorldWidth = Math.Max(120, remainingForNames - desiredUserWidth);
+        }
+        else
+        {
+            var extra = remainingForNames - desiredTotal;
+            desiredWorldWidth += (int)Math.Floor(extra * 0.65);
+            desiredUserWidth = remainingForNames - desiredWorldWidth;
+        }
+
+        var userColW = Math.Max(100, desiredUserWidth);
+        var worldColW = Math.Max(120, remainingForNames - userColW);
 
         var colX = headerRect.X + pad + 8; // Shift headers right by 8px
         _font.DrawString(sb, "", new Vector2(colX, headerRect.Y + 4), Color.White);
         colX += iconColW;
-        _font.DrawString(sb, "USERNAME", new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180)); // Shift USERNAME right
+        _font.DrawString(sb, FitTextToWidth("USERNAME", userColW - 12, out _), new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180));
         colX += userColW;
-        _font.DrawString(sb, "WORLD", new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180)); // Shift WORLD right
+        _font.DrawString(sb, FitTextToWidth("WORLD", worldColW - 12, out _), new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180));
         colX += worldColW;
-        _font.DrawString(sb, "CHEATS", new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180)); // Shift CHEATS right
+        _font.DrawString(sb, FitTextToWidth("CHEATS", cheatsColW - 12, out _), new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180));
         colX += cheatsColW;
-        _font.DrawString(sb, "MODE", new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180)); // Shift MODE right
+        _font.DrawString(sb, FitTextToWidth("MODE", modeColW - 12, out _), new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180));
         colX += modeColW;
-        _font.DrawString(sb, "PLAYERS", new Vector2(colX + 25, headerRect.Y + 4), new Color(180, 180, 180)); // Shift PLAYERS further right
+        _font.DrawString(sb, FitTextToWidth("PLAYERS", playersColW - 12, out _), new Vector2(colX + 8, headerRect.Y + 4), new Color(180, 180, 180));
 
         // Draw vertical lines between columns (shifted right)
         var lineX = headerRect.X + pad + iconColW + 8;
@@ -515,13 +545,13 @@ public sealed class MultiplayerScreen : IScreen
             var textY = rowRect.Y + (rowRect.Height - _font.LineHeight) / 2;
 
             // Username column (shifted right)
-            var user = s.HostName;
+            var user = LimitDisplayText(s.HostName, MaxUsernameChars);
             var userFit = FitTextToWidth(user, Math.Max(24, userColW - 16), out _);
             _font.DrawString(sb, userFit, new Vector2(textX + 8, textY), Color.White);
             textX += userColW;
 
             // World column (shifted right)
-            var world = s.WorldName;
+            var world = LimitDisplayText(s.WorldName, MaxWorldNameChars);
             var worldFit = FitTextToWidth(world, Math.Max(24, worldColW - 16), out var worldWasTrimmed);
             _font.DrawString(sb, worldFit, new Vector2(textX + 8, textY), Color.White);
             if (worldWasTrimmed && (i == _selectedIndex || rowIsHovered))
@@ -558,8 +588,9 @@ public sealed class MultiplayerScreen : IScreen
 
             // Players column (moved further right, include host in count)
             var activePlayers = Math.Max(1, s.PlayerCount); // Always count at least 1 for host
-            var players = (s.MaxPlayers > 0) ? $"{activePlayers} active" : $"{activePlayers} active";
-            _font.DrawString(sb, players, new Vector2(textX + 35, textY), Color.White); // Moved further right to match header
+            var players = $"{activePlayers} ACTIVE";
+            var playersFit = FitTextToWidth(players, Math.Max(24, playersColW - 12), out _);
+            _font.DrawString(sb, playersFit, new Vector2(textX + 8, textY), Color.White);
 
             rowY += rowH + 4;
             if (rowY > _listBodyRect.Bottom - rowH)
@@ -599,18 +630,15 @@ public sealed class MultiplayerScreen : IScreen
 
     private void DrawStatus(SpriteBatch sb)
     {
-        // Draw status text
         if (!string.IsNullOrEmpty(_status))
         {
-            var pos = new Vector2(_panelRect.X + 14, _panelRect.Bottom - _font.LineHeight - 8);
+            var statusText = _status;
+            var statusSize = _font.MeasureString(statusText);
+            var statusCenterX = (_addBtn.Bounds.X + _hostBtn.Bounds.Right) / 2f;
+            var pos = new Vector2(
+                statusCenterX - (statusSize.X / 2f),
+                _buttonRowRect.Y - _font.LineHeight - 8);
             _font.DrawString(sb, _status, pos, Color.White);
-        }
-
-        if (!string.IsNullOrWhiteSpace(_hoveredWorldDetails))
-        {
-            var worldDetails = $"WORLD: {_hoveredWorldDetails}";
-            var detailsPos = new Vector2(_panelRect.X + 14, _panelRect.Bottom - (_font.LineHeight * 2) - 12);
-            _font.DrawString(sb, worldDetails, detailsPos, new Color(220, 220, 220));
         }
     }
 
@@ -621,10 +649,17 @@ public sealed class MultiplayerScreen : IScreen
         _onlineRefreshFailures = 0;
         _nextOnlineRefreshUtc = DateTime.MinValue;
         if (_activeFilter != BrowserFilter.Lan)
+        {
+            _status = "Refreshing online lobbies...";
             _ = RefreshOnlineSessionsAsync();
-        RefreshSessions();
-        _status = "";
-        _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(2);
+        }
+        else
+        {
+            RefreshSessions();
+            _lastLanRefresh = _now;
+            _status = "Refreshing LAN hosts...";
+        }
+        _nextSessionRefreshUtc = DateTime.UtcNow.AddSeconds(LanRefreshIntervalSeconds);
     }
 
     private void OnAddClicked()
@@ -750,18 +785,29 @@ public sealed class MultiplayerScreen : IScreen
 
     private void OpenHostWorlds()
     {
-        var eos = EnsureEosClient();
-        var snapshot = EosRuntimeStatus.Evaluate(eos);
-        var hostOnline = snapshot.Reason == EosRuntimeReason.Ready;
-        
-        if (hostOnline && !_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        var wantsOnlineHost = _activeFilter != BrowserFilter.Lan;
+        if (wantsOnlineHost)
         {
-            _status = gateDenied;
-            return;
+            if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+            {
+                _status = gateDenied;
+                return;
+            }
+
+            var eos = EnsureEosClient();
+            var snapshot = EosRuntimeStatus.Evaluate(eos);
+            if (snapshot.Reason != EosRuntimeReason.Ready)
+            {
+                if (snapshot.Reason == EosRuntimeReason.Connecting)
+                    _status = "EOS connecting... please wait a moment.";
+                else
+                    _status = snapshot.StatusText;
+                return;
+            }
         }
 
         _justReturnedFromHosting = true; // Set flag to refresh immediately on return
-        _menus.Push(new MultiplayerHostScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient, hostOnline), _viewport);
+        _menus.Push(new MultiplayerHostScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _eosClient, wantsOnlineHost), _viewport);
     }
 
     private void LayoutActionButtons()
@@ -855,7 +901,7 @@ public sealed class MultiplayerScreen : IScreen
     private void LayoutFilterButtons()
     {
         var gap = 8;
-        var buttonCount = 3;
+        var buttonCount = 2;
         var buttonW = Math.Max(90, (_filterRowRect.Width - gap * (buttonCount - 1)) / buttonCount);
         var totalW = buttonW * buttonCount + gap * (buttonCount - 1);
         var startX = _filterRowRect.X + Math.Max(0, (_filterRowRect.Width - totalW) / 2);
@@ -863,7 +909,6 @@ public sealed class MultiplayerScreen : IScreen
 
         _filterLanBtn.Bounds = new Rectangle(startX, y, buttonW, _filterRowRect.Height);
         _filterOnlineBtn.Bounds = new Rectangle(_filterLanBtn.Bounds.Right + gap, y, buttonW, _filterRowRect.Height);
-        _filterFriendsBtn.Bounds = new Rectangle(_filterOnlineBtn.Bounds.Right + gap, y, buttonW, _filterRowRect.Height);
     }
 
     private void SetBrowserFilter(BrowserFilter filter)
@@ -888,7 +933,8 @@ public sealed class MultiplayerScreen : IScreen
         var eos = EnsureEosClient();
         if (eos == null) { _status = "EOS not ready."; _joining = false; return; }
 
-        var result = await EosP2PClientSession.ConnectAsync(_log, eos, hostPuid, _profile.GetDisplayUsername(), TimeSpan.FromSeconds(10));
+        var outboundDisplayName = GetOutboundJoinDisplayName();
+        var result = await EosP2PClientSession.ConnectAsync(_log, eos, hostPuid, outboundDisplayName, TimeSpan.FromSeconds(10));
         if (!result.Success || result.Session == null)
         {
             _status = $"P2P Failed: {result.Error}";
@@ -898,7 +944,7 @@ public sealed class MultiplayerScreen : IScreen
 
         var info = result.WorldInfo;
         var worldDir = JoinedWorldCache.PrepareJoinedWorldPath(info, _log);
-        var metaPath = Path.Combine(worldDir, "world.json");
+        var metaPath = Paths.GetWorldMetaPath(worldDir);
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
@@ -912,6 +958,9 @@ public sealed class MultiplayerScreen : IScreen
 
     private async Task JoinOnlineSessionAsync(SessionEntry entry)
     {
+        var joinStateKey = BuildJoinStateKey(entry);
+        ClearJoinRequestState(joinStateKey);
+
         var eos = EnsureEosClient();
         if (eos == null)
         {
@@ -960,7 +1009,7 @@ public sealed class MultiplayerScreen : IScreen
                 _log,
                 eos,
                 entry.JoinTarget,
-                _profile.GetDisplayUsername(),
+                GetOutboundJoinDisplayName(),
                 TimeSpan.FromSeconds(JoinRequestApprovalTimeoutSeconds));
 
             switch (result.Status)
@@ -996,11 +1045,6 @@ public sealed class MultiplayerScreen : IScreen
         {
             _joining = false;
         }
-    }
-
-    private Task SyncIdentityStateAsync()
-    {
-        return Task.CompletedTask;
     }
 
     private void RefreshIdentityStateFromEos(EosClient? eos)
@@ -1094,48 +1138,44 @@ public sealed class MultiplayerScreen : IScreen
             return;
 
         _onlineRefreshInProgress = true;
+        _isRefreshing = true;
         try
         {
             var eos = EnsureEosClient();
             var snapshot = EosRuntimeStatus.Evaluate(eos);
             if (snapshot.Reason != EosRuntimeReason.Ready || eos == null)
             {
-                _onlineSessions = new List<SessionEntry>();
                 _onlineRefreshFailures++;
                 _nextOnlineRefreshUtc = DateTime.UtcNow.AddSeconds(_onlineRefreshFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds);
-                RefreshSessions();
+                if (!_joining && _onlineRefreshFailures >= 3)
+                    _status = snapshot.StatusText;
                 return;
             }
 
-            var friendLabelById = BuildFriendDirectoryMap();
-            _friendIdsFromDirectory.Clear();
-            foreach (var id in friendLabelById.Keys)
-                _friendIdsFromDirectory.Add(id);
-
-            var lobbies = await eos.FindHostedLobbiesAsync().ConfigureAwait(false);
+            var localPuid = (eos.LocalProductUserId ?? string.Empty).Trim();
+            IReadOnlyList<EosHostedLobbyEntry> lobbies = await eos.FindHostedLobbiesAsync().ConfigureAwait(false);
+            _log.Info($"EOS_LOBBY_SEARCH_RAW count={lobbies.Count} filter={_activeFilter}");
             var refreshedOnlineSessions = new List<SessionEntry>(lobbies.Count);
 
             for (var i = 0; i < lobbies.Count; i++)
             {
                 var lobby = lobbies[i];
-                if (!lobby.IsHosting || !lobby.IsInWorld)
-                    continue;
-
                 var hostId = (lobby.HostProductUserId ?? string.Empty).Trim();
                 if (string.IsNullOrWhiteSpace(hostId))
                     continue;
+                if (!string.IsNullOrWhiteSpace(localPuid) && string.Equals(hostId, localPuid, StringComparison.OrdinalIgnoreCase))
+                    continue;
 
-                var hostName = (lobby.HostUsername ?? string.Empty).Trim();
-                if (string.IsNullOrWhiteSpace(hostName) && !friendLabelById.TryGetValue(hostId, out hostName))
-                    hostName = PlayerProfile.ShortId(hostId);
+                var isActive = lobby.IsHosting && lobby.IsInWorld;
+                if (!isActive)
+                    continue;
 
-                var worldName = (lobby.WorldName ?? string.Empty).Trim();
-                if (string.IsNullOrWhiteSpace(worldName))
-                    worldName = $"{hostName}'s World";
+                var hostName = await ResolveHostDisplayNameAsync(hostId, lobby.HostUsername).ConfigureAwait(false);
 
-                var mode = (lobby.GameMode ?? string.Empty).Trim();
-                if (string.IsNullOrWhiteSpace(mode))
-                    mode = "Unknown";
+                var worldName = NormalizeLobbyWorldName(lobby.WorldName, hostName);
+                worldName = LimitDisplayText(worldName, MaxWorldNameChars);
+
+                var mode = NormalizeModeLabel(lobby.GameMode);
 
                 refreshedOnlineSessions.Add(new SessionEntry
                 {
@@ -1151,15 +1191,27 @@ public sealed class MultiplayerScreen : IScreen
                     Cheats = lobby.Cheats,
                     PlayerCount = Math.Max(1, lobby.PlayerCount),
                     MaxPlayers = Math.Max(Math.Max(1, lobby.PlayerCount), lobby.MaxPlayers),
-                    IsFriendHost = friendLabelById.ContainsKey(hostId)
+                    IsFriendHost = false
                 });
             }
 
-            _onlineSessions = refreshedOnlineSessions;
+            var dedupedSessions = refreshedOnlineSessions
+                .GroupBy(s => BuildOnlineHostKey(s), StringComparer.OrdinalIgnoreCase)
+                .Select(g => g
+                    .OrderByDescending(ScoreSessionCompleteness)
+                    .OrderByDescending(s => s.PlayerCount)
+                    .ThenByDescending(s => s.MaxPlayers)
+                    .ThenBy(s => s.LobbyId, StringComparer.OrdinalIgnoreCase)
+                    .First())
+                .ToList();
+
+            _onlineSessions = dedupedSessions;
             _onlineRefreshFailures = 0;
             _nextOnlineRefreshUtc = DateTime.UtcNow.AddSeconds(DefaultListRefreshSeconds);
             _sessionRefreshFailures = 0;
-            _log.Info($"EOS_LOBBY_SEARCH_OK count={refreshedOnlineSessions.Count}");
+            _log.Info($"EOS_LOBBY_SEARCH_OK count={dedupedSessions.Count} raw={refreshedOnlineSessions.Count}");
+            if (!_joining && !string.IsNullOrWhiteSpace(_status) && _status.Contains("Refreshing", StringComparison.OrdinalIgnoreCase))
+                _status = string.Empty;
             RefreshSessions();
         }
         catch (Exception ex)
@@ -1168,10 +1220,13 @@ public sealed class MultiplayerScreen : IScreen
             _sessionRefreshFailures = Math.Max(_sessionRefreshFailures, _onlineRefreshFailures);
             _nextOnlineRefreshUtc = DateTime.UtcNow.AddSeconds(_onlineRefreshFailures >= 3 ? RefreshBackoffSeconds : DefaultListRefreshSeconds);
             _log.Warn($"EOS_LOBBY_SEARCH_FAILED error={ex.Message}");
+            if (!_joining && _onlineRefreshFailures >= 3)
+                _status = "Online refresh failed. Retrying...";
         }
         finally
         {
             _onlineRefreshInProgress = false;
+            _isRefreshing = false;
         }
     }
 
@@ -1191,36 +1246,43 @@ public sealed class MultiplayerScreen : IScreen
                 _lastLoggedLanDiscoveryCount = lan.Count;
                 _log.Info($"LAN_DISCOVERY_FOUND n={lan.Count}");
             }
+            var dedupedLan = new Dictionary<string, SessionEntry>(StringComparer.OrdinalIgnoreCase);
             foreach (var s in lan)
             {
-                newSessions.Add(new SessionEntry
+                var joinTarget = DescribeEndpoint(s);
+                var worldName = (s.ServerName ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(worldName))
+                    worldName = "LAN WORLD";
+                worldName = LimitDisplayText(worldName, MaxWorldNameChars);
+                var mode = NormalizeModeLabel(s.GameMode);
+                var dedupeKey = string.IsNullOrWhiteSpace(joinTarget)
+                    ? $"{(s.Host ?? string.Empty).Trim()}|{worldName}|{mode}"
+                    : joinTarget;
+
+                var lanSession = new SessionEntry
                 {
                     Type = SessionType.Lan,
-                    Title = s.ServerName,
-                    HostName = "Local Network",
+                    Title = worldName,
+                    HostName = "LAN HOST",
                     Status = "Online",
-                    FriendUserId = DescribeEndpoint(s),
-                    JoinTarget = DescribeEndpoint(s),
-                    WorldName = "LAN World",
-                    GameMode = s.GameMode,
+                    FriendUserId = joinTarget,
+                    JoinTarget = joinTarget,
+                    WorldName = worldName,
+                    GameMode = mode,
                     Cheats = false,
-                    PlayerCount = 0,
-                    MaxPlayers = 0
-                });
+                    PlayerCount = 1,
+                    MaxPlayers = 8
+                };
+
+                if (!dedupedLan.TryGetValue(dedupeKey, out var existing) || ScoreSessionCompleteness(lanSession) > ScoreSessionCompleteness(existing))
+                    dedupedLan[dedupeKey] = lanSession;
             }
+
+            newSessions.AddRange(dedupedLan.Values);
         }
         else if (_activeFilter == BrowserFilter.Online)
         {
             newSessions.AddRange(_onlineSessions);
-        }
-        else
-        {
-            for (var i = 0; i < _onlineSessions.Count; i++)
-            {
-                var entry = _onlineSessions[i];
-                if (_friendIdsFromDirectory.Contains(entry.FriendUserId))
-                    newSessions.Add(entry);
-            }
         }
 
         // 3. Servers (Placeholder)
@@ -1245,7 +1307,7 @@ public sealed class MultiplayerScreen : IScreen
         if (_selectedIndex < 0 && _sessions.Count > 0)
             _selectedIndex = 0;
 
-        _isRefreshing = false; // Stop refreshing after update completes
+        _isRefreshing = _activeFilter != BrowserFilter.Lan && _onlineRefreshInProgress;
     }
 
     private void UpdateLanDiscovery(GameTime gameTime)
@@ -1274,7 +1336,7 @@ public sealed class MultiplayerScreen : IScreen
 
         var info = result.WorldInfo;
         var worldDir = JoinedWorldCache.PrepareJoinedWorldPath(info, _log);
-        var metaPath = Path.Combine(worldDir, "world.json");
+        var metaPath = Paths.GetWorldMetaPath(worldDir);
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
@@ -1363,50 +1425,204 @@ public sealed class MultiplayerScreen : IScreen
         return $"{type}|{friendUserId}|{joinTarget}|{worldName}";
     }
 
-    private Dictionary<string, string> BuildFriendDirectoryMap()
+    private static string BuildOnlineHostKey(SessionEntry entry)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var hostId = (entry.FriendUserId ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(hostId))
+            return hostId;
 
-        var socialFriends = _socialState.GetSnapshot().Friends;
-        for (var i = 0; i < socialFriends.Count; i++)
+        var joinTarget = (entry.JoinTarget ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(joinTarget))
+            return joinTarget;
+
+        return BuildSessionKey(entry);
+    }
+
+    private static int ScoreSessionCompleteness(SessionEntry session)
+    {
+        var score = 0;
+        if (!string.IsNullOrWhiteSpace(session.LobbyId))
+            score += 4;
+        if (!string.IsNullOrWhiteSpace(session.WorldName) && !string.Equals(session.WorldName, "HOSTED WORLD", StringComparison.OrdinalIgnoreCase))
+            score += 8;
+        if (!string.IsNullOrWhiteSpace(session.GameMode) && !string.Equals(session.GameMode, "UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            score += 4;
+        if (!string.IsNullOrWhiteSpace(session.HostName) && !LooksLikeIdentityToken(session.HostName))
+            score += 3;
+        if (session.PlayerCount > 0)
+            score += 2;
+        if (session.MaxPlayers > 0)
+            score += 1;
+        return score;
+    }
+
+    private async Task<string> ResolveHostDisplayNameAsync(string hostProductUserId, string? lobbyHostUsername)
+    {
+        var hostId = (hostProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostId))
+            return "PLAYER";
+
+        var fromLobby = (lobbyHostUsername ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(fromLobby))
         {
-            var friend = socialFriends[i];
-            var id = (friend.ProductUserId ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(id))
-                continue;
+            _hostDisplayNameCache[hostId] = fromLobby;
+            return fromLobby;
+        }
 
-            var label = (friend.DisplayName ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(label))
-                label = (friend.Username ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(label))
-                label = PlayerProfile.ShortId(id);
-            map[id] = label;
+        if (_hostDisplayNameCache.TryGetValue(hostId, out var cached) && !LooksLikeIdentityToken(cached))
+            return cached;
+
+        var localPuid = (EosClientProvider.Current?.LocalProductUserId ?? string.Empty).Trim();
+        var localName = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(localName) && string.Equals(localPuid, hostId, StringComparison.OrdinalIgnoreCase))
+        {
+            _hostDisplayNameCache[hostId] = localName;
+            return localName;
         }
 
         for (var i = 0; i < _profile.Friends.Count; i++)
         {
             var friend = _profile.Friends[i];
-            var id = (friend.UserId ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(id))
-                continue;
-            if (map.ContainsKey(id))
+            var friendId = (friend.UserId ?? string.Empty).Trim();
+            if (!string.Equals(friendId, hostId, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var label = (friend.Label ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(label))
-                label = PlayerProfile.ShortId(id);
-            map[id] = label;
+            if (!LooksLikeIdentityToken(label))
+            {
+                _hostDisplayNameCache[hostId] = label;
+                return label;
+            }
+
+            var displayName = (friend.LastKnownDisplayName ?? string.Empty).Trim();
+            if (!LooksLikeIdentityToken(displayName))
+            {
+                _hostDisplayNameCache[hostId] = displayName;
+                return displayName;
+            }
         }
 
-        return map;
+        try
+        {
+            var resolved = await _onlineGate.ResolveIdentityAsync(hostId).ConfigureAwait(false);
+            var username = (resolved.User?.Username ?? string.Empty).Trim();
+            if (resolved.Found && !LooksLikeIdentityToken(username))
+            {
+                _hostDisplayNameCache[hostId] = username;
+                return username;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to resolve lobby host username for {PlayerProfile.ShortId(hostId)}: {ex.Message}");
+        }
+
+        return "PLAYER";
+    }
+
+    private string GetOutboundJoinDisplayName()
+    {
+        var reserved = (_reservedUsername ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(reserved))
+            return reserved;
+
+        var envName = (Environment.GetEnvironmentVariable("LV_VEILNET_USERNAME") ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(envName))
+            return envName;
+
+        var profileName = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+        if (!LooksLikeIdentityToken(profileName))
+            return profileName;
+
+        return "PLAYER";
+    }
+
+    private static string NormalizeModeLabel(string? mode)
+    {
+        var normalized = (mode ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized) || string.Equals(normalized, "Unknown", StringComparison.OrdinalIgnoreCase))
+            return "ARTIFICER";
+        return normalized.ToUpperInvariant();
+    }
+
+    private static string NormalizeLobbyWorldName(string? worldName, string hostName)
+    {
+        var normalized = (worldName ?? string.Empty).Trim();
+        if (LooksLikeIdentityToken(normalized)
+            || string.Equals(normalized, "WORLD", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "HOSTED WORLD", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = string.Empty;
+        }
+
+        if (string.IsNullOrWhiteSpace(normalized) && !LooksLikeIdentityToken(hostName))
+            normalized = $"{hostName}'s World";
+
+        if (string.IsNullOrWhiteSpace(normalized))
+            normalized = "WORLD";
+
+        return normalized;
+    }
+
+    private static bool LooksLikeIdentityToken(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        if (string.Equals(text, "UNKNOWN", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "PLAYER", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "HOST", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (Guid.TryParse(text, out _))
+            return true;
+
+        var compact = text.Replace("-", string.Empty);
+        if (compact.Length >= 16 && compact.All(Uri.IsHexDigit))
+            return true;
+
+        if (text.Contains("...", StringComparison.Ordinal))
+            return true;
+
+        if (text.StartsWith("PLAYER-", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private static string LimitDisplayText(string? value, int maxChars)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text) || maxChars <= 0)
+            return string.Empty;
+        if (text.Length <= maxChars)
+            return text;
+        if (maxChars <= 3)
+            return text.Substring(0, maxChars);
+        return text.Substring(0, maxChars - 3) + "...";
     }
 
     private string BuildJoinStateKey(SessionEntry entry)
     {
         var hostId = (entry.FriendUserId ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(hostId))
+        if (string.IsNullOrWhiteSpace(hostId))
+            hostId = (entry.JoinTarget ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostId))
+            return string.Empty;
+
+        if (entry.Type != SessionType.Online)
             return hostId;
-        return (entry.JoinTarget ?? string.Empty).Trim();
+
+        var lobbyId = (entry.LobbyId ?? string.Empty).Trim();
+        var worldName = (entry.WorldName ?? string.Empty).Trim().ToUpperInvariant();
+        if (!string.IsNullOrWhiteSpace(lobbyId))
+            return $"{hostId}|{lobbyId}";
+
+        if (!string.IsNullOrWhiteSpace(worldName))
+            return $"{hostId}|{worldName}";
+
+        return hostId;
     }
 
     private JoinRequestStateKind GetJoinRequestState(SessionEntry entry)
@@ -1442,6 +1658,14 @@ public sealed class MultiplayerScreen : IScreen
         };
     }
 
+    private void ClearJoinRequestState(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return;
+
+        _joinRequestStates.Remove(key);
+    }
+
     private void CleanupJoinRequestStateForVisibleSessions()
     {
         if (_joinRequestStates.Count == 0)
@@ -1461,6 +1685,25 @@ public sealed class MultiplayerScreen : IScreen
 
         for (var i = 0; i < keysToDrop.Length; i++)
             _joinRequestStates.Remove(keysToDrop[i]);
+    }
+
+    private void HandleScreenResume()
+    {
+        _joinRequestStates.Clear();
+        _sessionRefreshFailures = 0;
+        _onlineRefreshFailures = 0;
+        _nextSessionRefreshUtc = DateTime.MinValue;
+        _nextOnlineRefreshUtc = DateTime.MinValue;
+
+        if (_activeFilter == BrowserFilter.Lan)
+        {
+            RefreshSessions();
+            _status = "Refreshing LAN hosts...";
+            return;
+        }
+
+        _status = "Refreshing online lobbies...";
+        _ = RefreshOnlineSessionsAsync();
     }
 
     private void DrawRefreshIcon(SpriteBatch sb, Rectangle rect, Color color)
@@ -1491,6 +1734,23 @@ public sealed class MultiplayerScreen : IScreen
         
         sb.Draw(_pixel, new Rectangle(arrowX, arrowY, 2, 2), color);
         sb.Draw(_pixel, new Rectangle(arrowTipX, arrowTipY, 3, 3), color);
+    }
+
+    private void DrawRefreshFeedback(SpriteBatch sb)
+    {
+        if (!_isRefreshing || _activeFilter == BrowserFilter.Lan)
+            return;
+
+        var text = "REFRESHING...";
+        var textSize = _font.MeasureString(text);
+        var iconSize = 16;
+        var totalWidth = iconSize + 8 + textSize.X;
+        var x = _listRect.Center.X - (int)(totalWidth / 2f);
+        var y = _listRect.Y + 6;
+
+        var iconRect = new Rectangle(x, y + 2, iconSize, iconSize);
+        DrawRefreshIcon(sb, iconRect, Color.Yellow);
+        _font.DrawString(sb, text, new Vector2(iconRect.Right + 8, y), new Color(240, 240, 180));
     }
 
     private void DrawBorder(SpriteBatch sb, Rectangle r, Color color)

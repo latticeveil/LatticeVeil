@@ -126,8 +126,10 @@ public sealed class GameSettings
         ["Chat"] = Keys.T,
         ["Command"] = Keys.OemQuestion,
         ["HomeGui"] = Keys.H,
+        ["StructureFinder"] = Keys.B,
         ["GamemodeModifier"] = Keys.LeftAlt,
-        ["GamemodeWheel"] = Keys.G
+        ["GamemodeWheel"] = Keys.G,
+        ["InviteQuickAction"] = Keys.Y
     };
 
     // Packs
@@ -138,7 +140,14 @@ public sealed class GameSettings
         try
         {
             Directory.CreateDirectory(Paths.RootDir);
-            Directory.CreateDirectory(Paths.ConfigDir);
+
+            if (!File.Exists(Paths.SettingsJsonPath))
+            {
+                if (File.Exists(Paths.LegacySettingsLvcPath) || File.Exists(Paths.LegacySettingsJsonPath))
+                {
+                    TryMigrateLegacySettingsFile(log);
+                }
+            }
 
             if (!File.Exists(Paths.SettingsJsonPath))
             {
@@ -310,13 +319,38 @@ public sealed class GameSettings
         try
         {
             Directory.CreateDirectory(Paths.RootDir);
-            Directory.CreateDirectory(Paths.ConfigDir);
             var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(Paths.SettingsJsonPath, json);
         }
         catch (Exception ex)
         {
             log.Warn($"Failed to save settings: {ex.Message}");
+        }
+    }
+
+    private static void TryMigrateLegacySettingsFile(Logger log)
+    {
+        try
+        {
+            if (File.Exists(Paths.SettingsJsonPath))
+                return;
+
+            if (File.Exists(Paths.LegacySettingsLvcPath))
+            {
+                File.Move(Paths.LegacySettingsLvcPath, Paths.SettingsJsonPath);
+                log.Info($"Migrated settings file: {Path.GetFileName(Paths.LegacySettingsLvcPath)} -> {Path.GetFileName(Paths.SettingsJsonPath)}");
+                return;
+            }
+
+            if (File.Exists(Paths.LegacySettingsJsonPath))
+            {
+                File.Move(Paths.LegacySettingsJsonPath, Paths.SettingsJsonPath);
+                log.Info($"Migrated settings file: {Path.GetFileName(Paths.LegacySettingsJsonPath)} -> {Path.GetFileName(Paths.SettingsJsonPath)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to migrate legacy settings file: {ex.Message}");
         }
     }
 

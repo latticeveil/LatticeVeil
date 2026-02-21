@@ -67,6 +67,8 @@ public static class AssetInstaller
             foreach (var srcPath in Directory.GetFiles(defaultsAssets, "*", SearchOption.AllDirectories))
             {
                 var rel = Path.GetRelativePath(defaultsAssets, srcPath);
+                if (Paths.IsDisallowedAssetRelativePath(rel))
+                    continue;
                 var dst = Path.Combine(Paths.AssetsDir, rel);
 
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
@@ -120,6 +122,8 @@ public static class AssetInstaller
             foreach (var srcPath in Directory.GetFiles(fallbackAssets, "*", SearchOption.AllDirectories))
             {
                 var rel = Path.GetRelativePath(fallbackAssets, srcPath);
+                if (Paths.IsDisallowedAssetRelativePath(rel))
+                    continue;
                 var dst = Path.Combine(devAssetsPath, rel);
 
                 if (!File.Exists(dst))

@@ -51,7 +51,7 @@ public sealed class WorldConfig
     {
         try
         {
-            var configPath = Path.Combine(worldPath, "world_config.json");
+            var configPath = Path.Combine(worldPath, Paths.WorldConfigFileName);
             var options = new JsonSerializerOptions 
             { 
                 WriteIndented = true,
@@ -74,7 +74,17 @@ public sealed class WorldConfig
     {
         try
         {
-            var configPath = Path.Combine(worldPath, "world_config.json");
+            var configPath = Path.Combine(worldPath, Paths.WorldConfigFileName);
+            if (!File.Exists(configPath))
+            {
+                var legacyPath = Path.Combine(worldPath, Paths.LegacyWorldConfigFileName);
+                if (File.Exists(legacyPath))
+                {
+                    configPath = legacyPath;
+                    TryMigrateLegacyConfigFile(worldPath, legacyPath, log);
+                }
+            }
+
             if (!File.Exists(configPath))
             {
                 log.Warn($"World configuration file not found: {configPath}");
@@ -95,6 +105,23 @@ public sealed class WorldConfig
         {
             log.Warn($"Failed to load world configuration: {ex.Message}");
             return null;
+        }
+    }
+
+    private static void TryMigrateLegacyConfigFile(string worldPath, string legacyPath, Logger log)
+    {
+        try
+        {
+            var targetPath = Path.Combine(worldPath, Paths.WorldConfigFileName);
+            if (File.Exists(targetPath))
+                return;
+
+            File.Move(legacyPath, targetPath);
+            log.Info($"Migrated world config: {Path.GetFileName(legacyPath)} -> {Path.GetFileName(targetPath)}");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to migrate legacy world config file: {ex.Message}");
         }
     }
 

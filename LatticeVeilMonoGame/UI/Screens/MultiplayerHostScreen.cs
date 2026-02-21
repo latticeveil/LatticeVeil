@@ -32,6 +32,8 @@ public sealed class MultiplayerHostScreen : IScreen
     private readonly Button _deleteBtn;
     private readonly Button _hostBtn;
     private readonly Button _backBtn;
+    private readonly Button _confirmDeleteBtn;
+    private readonly Button _cancelDeleteBtn;
 
     private Rectangle _viewport;
     private Rectangle _panelRect;
@@ -47,6 +49,9 @@ public sealed class MultiplayerHostScreen : IScreen
 
     private string? _statusMessage;
     private double _statusUntil;
+    private bool _deleteConfirmOpen;
+    private int _deleteConfirmIndex = -1;
+    private Rectangle _deleteConfirmRect;
 
     private List<WorldListEntry> _worlds = new();
     private readonly Dictionary<string, PreviewTextureCacheEntry> _previewTextures = new(StringComparer.OrdinalIgnoreCase);
@@ -77,6 +82,8 @@ public sealed class MultiplayerHostScreen : IScreen
         _deleteBtn = new Button("DELETE", DeleteSelectedWorld) { BoldText = true };
         _hostBtn = new Button(_hostForFriends ? "HOST ONLINE" : "HOST LAN", HostSelectedWorld) { BoldText = true };
         _backBtn = new Button("BACK", BackToMultiplayer) { BoldText = true };
+        _confirmDeleteBtn = new Button("DELETE", ConfirmDeleteSelectedWorld) { BoldText = true, BackgroundColor = new Color(100, 26, 26) };
+        _cancelDeleteBtn = new Button("CANCEL", CancelDeleteSelectedWorld) { BoldText = true };
 
         try
         {
@@ -126,6 +133,7 @@ public sealed class MultiplayerHostScreen : IScreen
         _backBtn.Bounds = new Rectangle(_hostBtn.Bounds.Right + gap, buttonY, btnW, 48);
 
         ClampScroll();
+        LayoutDeleteConfirmOverlay();
     }
 
     public void Update(GameTime gameTime, InputState input)
@@ -136,7 +144,20 @@ public sealed class MultiplayerHostScreen : IScreen
 
         if (input.IsNewKeyPress(Keys.Escape))
         {
+            if (_deleteConfirmOpen)
+            {
+                CancelDeleteSelectedWorld();
+                return;
+            }
+
             BackToMultiplayer();
+            return;
+        }
+
+        if (_deleteConfirmOpen)
+        {
+            _confirmDeleteBtn.Update(input);
+            _cancelDeleteBtn.Update(input);
             return;
         }
 
@@ -183,6 +204,9 @@ public sealed class MultiplayerHostScreen : IScreen
         _deleteBtn.Draw(sb, _pixel, _font);
         _hostBtn.Draw(sb, _pixel, _font);
         _backBtn.Draw(sb, _pixel, _font);
+
+        if (_deleteConfirmOpen)
+            DrawDeleteConfirmOverlay(sb);
 
         if (!string.IsNullOrWhiteSpace(_statusMessage))
         {
@@ -312,26 +336,41 @@ public sealed class MultiplayerHostScreen : IScreen
         }
 
         var entry = _worlds[_selectedIndex];
-        var result = System.Windows.Forms.MessageBox.Show(
-            $"Delete world?\n\n{entry.Name}",
-            "Confirm Delete",
-            System.Windows.Forms.MessageBoxButtons.YesNo,
-            System.Windows.Forms.MessageBoxIcon.Warning);
+        _deleteConfirmOpen = true;
+        _deleteConfirmIndex = _selectedIndex;
+        _log.Info($"Delete world requested: {entry.Name}");
+    }
 
-        if (result != System.Windows.Forms.DialogResult.Yes)
+    private void ConfirmDeleteSelectedWorld()
+    {
+        if (!_deleteConfirmOpen)
             return;
+
+        var index = _deleteConfirmIndex;
+        CancelDeleteSelectedWorld();
+        if (index < 0 || index >= _worlds.Count)
+            return;
+
+        var entry = _worlds[index];
 
         try
         {
             if (Directory.Exists(entry.WorldPath))
                 Directory.Delete(entry.WorldPath, true);
             RefreshWorlds();
+            ShowStatus("WORLD DELETED");
         }
         catch (Exception ex)
         {
             _log.Warn($"Failed to delete world {entry.Name}: {ex.Message}");
             ShowStatus("DELETE FAILED");
         }
+    }
+
+    private void CancelDeleteSelectedWorld()
+    {
+        _deleteConfirmOpen = false;
+        _deleteConfirmIndex = -1;
     }
 
     private void OnWorldCreated(string worldName)
@@ -363,6 +402,7 @@ public sealed class MultiplayerHostScreen : IScreen
         WorldHostStartResult result;
         if (_hostForFriends)
         {
+            _log.Info($"HOST_CLICKED world={entry.Name} mode=online_screen transport=online");
             var gate = OnlineGateClient.GetOrCreate();
             if (!gate.CanUseOfficialOnline(_log, out var gateDenied))
             {
@@ -543,6 +583,54 @@ public sealed class MultiplayerHostScreen : IScreen
         sb.Draw(_pixel, new Rectangle(rect.X, rect.Bottom - 2, rect.Width, 2), color);
         sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, 2, rect.Height), color);
         sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
+    }
+
+    private void LayoutDeleteConfirmOverlay()
+    {
+        var modalWidth = Math.Clamp(_panelRect.Width - 140, 320, 560);
+        var modalHeight = 172;
+        _deleteConfirmRect = new Rectangle(
+            _panelRect.Center.X - modalWidth / 2,
+            _panelRect.Center.Y - modalHeight / 2,
+            modalWidth,
+            modalHeight);
+
+        var buttonsY = _deleteConfirmRect.Bottom - 22 - 44;
+        var gap = 16;
+        var buttonWidth = Math.Clamp((_deleteConfirmRect.Width - 48 - gap) / 2, 120, 220);
+        var totalWidth = buttonWidth * 2 + gap;
+        var startX = _deleteConfirmRect.Center.X - totalWidth / 2;
+        _confirmDeleteBtn.Bounds = new Rectangle(startX, buttonsY, buttonWidth, 44);
+        _cancelDeleteBtn.Bounds = new Rectangle(startX + buttonWidth + gap, buttonsY, buttonWidth, 44);
+    }
+
+    private void DrawDeleteConfirmOverlay(SpriteBatch sb)
+    {
+        sb.Draw(_pixel, _viewport, new Color(0, 0, 0, 180));
+        sb.Draw(_pixel, _deleteConfirmRect, new Color(18, 18, 18, 235));
+        DrawBorder(sb, _deleteConfirmRect, new Color(230, 230, 230));
+
+        var title = "DELETE WORLD?";
+        var titleSize = _font.MeasureString(title);
+        _font.DrawString(
+            sb,
+            title,
+            new Vector2(_deleteConfirmRect.Center.X - titleSize.X / 2f, _deleteConfirmRect.Y + 16),
+            Color.White);
+
+        var worldName = (_deleteConfirmIndex >= 0 && _deleteConfirmIndex < _worlds.Count)
+            ? _worlds[_deleteConfirmIndex].Name
+            : "UNKNOWN WORLD";
+        var body = TruncateToWidth(worldName, _deleteConfirmRect.Width - 36);
+        var bodySize = _font.MeasureString(body);
+        _font.DrawString(
+            sb,
+            body,
+            new Vector2(_deleteConfirmRect.Center.X - bodySize.X / 2f, _deleteConfirmRect.Y + 16 + _font.LineHeight + 10),
+            new Color(230, 230, 230));
+
+        _confirmDeleteBtn.Draw(sb, _pixel, _font);
+        _cancelDeleteBtn.Draw(sb, _pixel, _font);
     }
 
     private sealed class PreviewTextureCacheEntry

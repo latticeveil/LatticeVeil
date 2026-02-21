@@ -323,7 +323,7 @@ public sealed class JoinByCodeScreen : IScreen
 
             var info = result.WorldInfo;
             var worldDir = JoinedWorldCache.PrepareJoinedWorldPath(info, _log);
-            var metaPath = Path.Combine(worldDir, "world.json");
+            var metaPath = Paths.GetWorldMetaPath(worldDir);
             var meta = WorldMeta.CreateFlat(
                 info.WorldName,
                 info.GameMode,
@@ -532,7 +532,7 @@ public sealed class JoinByCodeScreen : IScreen
     private void HandleTextInput(InputState input, ref string value, int maxLen)
     {
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Back)
             {

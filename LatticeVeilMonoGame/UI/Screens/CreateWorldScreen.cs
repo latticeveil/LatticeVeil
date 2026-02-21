@@ -228,17 +228,20 @@ public sealed class CreateWorldScreen : IScreen
         _veilseerBtn.Bounds = new Rectangle(modeStartX + (modeButtonW + modeButtonGap) * 2, modeY, modeButtonW, modeButtonH);
 
         var checkboxY = _artificerBtn.Bounds.Bottom + 42;
-        
-        // Difficulty and Homes side by side
-        var sideBySideY = checkboxY - 34 + 40;  // Move down 1 inch + 10 pixels from original
-        var buttonW = 200;  // Fixed width for side-by-side
-        var buttonH = 30;
-        var buttonSpacing = 20;
-        var totalWidth = buttonW * 2 + buttonSpacing;
+
+        // Keep the three world toggles centered and side-by-side.
+        var sideBySideY = checkboxY - 34 + 40;
+        const int buttonH = 30;
+        const int buttonSpacing = 20;
+        const int toggleCount = 3;
+        var availableWidth = Math.Max(420, _contentArea.Width - 24);
+        var buttonW = Math.Clamp((availableWidth - (buttonSpacing * (toggleCount - 1))) / toggleCount, 140, 220);
+        var totalWidth = buttonW * toggleCount + buttonSpacing * (toggleCount - 1);
         var startX = _contentArea.Center.X - totalWidth / 2;
-        
+
         _difficultyBtn.Bounds = new Rectangle(startX, sideBySideY, buttonW, buttonH);
         _enableHomesBtn.Bounds = new Rectangle(startX + buttonW + buttonSpacing, sideBySideY, buttonW, buttonH);
+        _enableCheatsBtn.Bounds = new Rectangle(startX + ((buttonW + buttonSpacing) * 2), sideBySideY, buttonW, buttonH);
         
         // More World Options below them
         var moreOptionsY = sideBySideY + 60;  // 60 pixels below moved buttons
@@ -337,6 +340,7 @@ public sealed class CreateWorldScreen : IScreen
         }
 
         _enableHomesBtn.Update(input);
+        _enableCheatsBtn.Update(input);
 
         _difficultyBtn.Update(input);
         _moreWorldOptionsBtn.Update(input);
@@ -405,10 +409,9 @@ public sealed class CreateWorldScreen : IScreen
 
         DrawModeDescriptionBox(sb);
         _difficultyBtn.Draw(sb, _pixel, _font);
-        _moreWorldOptionsBtn.Draw(sb, _pixel, _font);
-
-        // Draw checkboxes
         _enableHomesBtn.Draw(sb, _pixel, _font);
+        _enableCheatsBtn.Draw(sb, _pixel, _font);
+        _moreWorldOptionsBtn.Draw(sb, _pixel, _font);
 
         // Draw buttons
         _createBtn.Draw(sb, _pixel, _font);
@@ -573,7 +576,7 @@ public sealed class CreateWorldScreen : IScreen
 
             SetGenerationProgress(0.08f, "METADATA");
             Directory.CreateDirectory(worldPath);
-            var metaPath = Path.Combine(worldPath, "world.json");
+            var metaPath = Paths.GetWorldMetaPath(worldPath);
             meta.Save(metaPath, _log);
             
             // Create and save consolidated world configuration
@@ -612,7 +615,7 @@ public sealed class CreateWorldScreen : IScreen
     private void HandleTextInput(InputState input, ref string value, int maxLen)
     {
         var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
-        foreach (var key in input.GetNewKeys())
+        foreach (var key in input.GetTextInputKeys())
         {
             if (key == Keys.Back)
             {
@@ -903,9 +906,11 @@ public sealed class CreateWorldScreen : IScreen
             return false;
 
         var insideDifficulty = _difficultyBtn.Bounds.Contains(mousePos);
+        var insideHomes = _enableHomesBtn.Bounds.Contains(mousePos);
+        var insideCheats = _enableCheatsBtn.Bounds.Contains(mousePos);
         var insideMoreOptions = _moreWorldOptionsBtn.Bounds.Contains(mousePos);
         
-        if (insideDifficulty || insideMoreOptions)
+        if (insideDifficulty || insideHomes || insideCheats || insideMoreOptions)
             return false;
 
         _difficultyDropdownOpen = false;

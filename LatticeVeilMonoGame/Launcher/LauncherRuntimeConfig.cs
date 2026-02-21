@@ -14,7 +14,7 @@ internal sealed class LauncherRuntimeConfig
 
     public static readonly string ConfigDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "RedactedCraft");
+        "LatticeVeil");
 
     public static readonly string ConfigPath = Path.Combine(ConfigDirectory, "launcher_config.json");
 

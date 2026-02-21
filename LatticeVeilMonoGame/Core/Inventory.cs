@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 
 namespace LatticeVeilMonoGame.Core;
 
@@ -17,7 +18,10 @@ public sealed class Inventory
     private const int DefaultStackSize = 60;
     private readonly HotbarSlot[] _hotbar = new HotbarSlot[HotbarSize];
     private readonly HotbarSlot[] _grid = new HotbarSlot[GridSize];
+    private readonly HotbarSlot[] _sandboxCatalogSlots = new HotbarSlot[GridSize];
     private bool _sandboxCatalogBuilt;
+    private int _sandboxCatalogPage;
+    private static BlockId[]? _sandboxCatalogEntriesCache;
 
     public GameMode Mode { get; private set; } = GameMode.Artificer;
 
@@ -25,24 +29,49 @@ public sealed class Inventory
 
     public HotbarSlot[] Hotbar => _hotbar;
     public HotbarSlot[] Grid => _grid;
+    public HotbarSlot[] SandboxCatalogSlots => _sandboxCatalogSlots;
 
     public BlockId SelectedId => _hotbar[SelectedIndex].Id;
 
     public int SelectedCount => _hotbar[SelectedIndex].Count;
 
+    public int SandboxCatalogPage => _sandboxCatalogPage + 1;
+
+    public int SandboxCatalogPageCount
+    {
+        get
+        {
+            var total = GetSandboxCatalogEntries().Length;
+            return Math.Max(1, (int)Math.Ceiling(total / (double)GridSize));
+        }
+    }
+
     public void SetMode(GameMode mode)
     {
-        var wasArtificer = Mode == GameMode.Artificer;
         Mode = mode;
         if (Mode == GameMode.Artificer)
-        {
-            ClampSandboxStacks();
             EnsureSandboxCatalog();
-            return;
-        }
+    }
 
-        if (wasArtificer)
-            ExitSandboxCatalog();
+    public bool TryAdvanceSandboxCatalogPage(int delta)
+    {
+        if (Mode != GameMode.Artificer)
+            return false;
+
+        var pageCount = SandboxCatalogPageCount;
+        if (pageCount <= 1)
+            return false;
+
+        var next = (_sandboxCatalogPage + delta) % pageCount;
+        if (next < 0)
+            next += pageCount;
+
+        if (next == _sandboxCatalogPage && _sandboxCatalogBuilt)
+            return false;
+
+        _sandboxCatalogPage = next;
+        RebuildSandboxCatalog();
+        return true;
     }
 
     public void Select(int index)
@@ -217,57 +246,47 @@ public sealed class Inventory
         BlockId.StormreedStaff
     };
 
-    private void ClampSandboxStacks()
-    {
-        for (int i = 0; i < _hotbar.Length; i++)
-        {
-            if (_hotbar[i].Count > 1)
-                _hotbar[i].Count = 1;
-        }
-        for (int i = 0; i < _grid.Length; i++)
-        {
-            if (_grid[i].Count > 1)
-                _grid[i].Count = 1;
-        }
-    }
-
     private void EnsureSandboxCatalog()
     {
         if (_sandboxCatalogBuilt)
             return;
 
-        var index = 0;
-        foreach (var def in BlockRegistry.All)
-        {
-            if (def.Id == BlockId.Air || !def.IsVisibleInInventory)
-                continue;
-            if (index >= _grid.Length)
-                break;
-            _grid[index].Id = def.Id;
-            _grid[index].Count = 1;
-            index++;
-        }
-
-        for (int i = index; i < _grid.Length; i++)
-        {
-            _grid[i].Id = BlockId.Air;
-            _grid[i].Count = 0;
-        }
-
+        RebuildSandboxCatalog();
         _sandboxCatalogBuilt = true;
     }
 
-    private void ExitSandboxCatalog()
+    private void RebuildSandboxCatalog()
     {
-        // Creative catalog occupies the grid; clear it when returning to gameplay modes
-        // so drops can be picked up and stacked normally.
-        for (int i = 0; i < _grid.Length; i++)
+        var all = GetSandboxCatalogEntries();
+        var pageStart = _sandboxCatalogPage * _sandboxCatalogSlots.Length;
+        for (var i = 0; i < _sandboxCatalogSlots.Length; i++)
         {
-            _grid[i].Id = BlockId.Air;
-            _grid[i].Count = 0;
+            var source = pageStart + i;
+            if (source >= 0 && source < all.Length)
+            {
+                _sandboxCatalogSlots[i].Id = all[source];
+                _sandboxCatalogSlots[i].Count = 1;
+            }
+            else
+            {
+                _sandboxCatalogSlots[i].Id = BlockId.Air;
+                _sandboxCatalogSlots[i].Count = 0;
+            }
         }
+    }
 
-        _sandboxCatalogBuilt = false;
+    private static BlockId[] GetSandboxCatalogEntries()
+    {
+        if (_sandboxCatalogEntriesCache is { Length: > 0 })
+            return _sandboxCatalogEntriesCache;
+
+        _sandboxCatalogEntriesCache = BlockRegistry.All
+            .Where(def => def.Id != BlockId.Air)
+            .OrderBy(def => def.AtlasIndex)
+            .Select(def => def.Id)
+            .ToArray();
+
+        return _sandboxCatalogEntriesCache;
     }
 
     /// <summary>
@@ -316,5 +335,29 @@ public sealed class Inventory
         Array.Clear(_grid, 0, _grid.Length);
         var copy = Math.Min(_grid.Length, data.Length);
         Array.Copy(data, _grid, copy);
+    }
+
+    public int ClearAll(bool clearGrid = true)
+    {
+        var removed = 0;
+        for (int i = 0; i < _hotbar.Length; i++)
+        {
+            removed += Math.Max(0, _hotbar[i].Count);
+            _hotbar[i].Id = BlockId.Air;
+            _hotbar[i].Count = 0;
+        }
+
+        if (clearGrid)
+        {
+            for (int i = 0; i < _grid.Length; i++)
+            {
+                removed += Math.Max(0, _grid[i].Count);
+                _grid[i].Id = BlockId.Air;
+                _grid[i].Count = 0;
+            }
+        }
+
+        SelectedIndex = Math.Clamp(SelectedIndex, 0, HotbarSize - 1);
+        return removed;
     }
 }
