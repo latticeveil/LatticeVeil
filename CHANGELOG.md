@@ -1,6 +1,6 @@
 # LatticeVeil Changelog
 
-## v1.3.0 - "Gatekeeper's Fix" - 2026-02-21
+## v9.0.0 - "Gatekeeper's Fix" - 2026-02-21
 
 ### 🚀 Major Online System Overhaul
 - **Fixed EOS Secret Request**: Resolved invalid gate ticket errors by implementing proper JWT validation and database storage
@@ -19,14 +19,14 @@
 - **Error Handling**: Better error reporting and user feedback throughout the application
 - **Configuration Management**: Centralized Supabase configuration with proper environment variable handling
 
-### � Gameplay Improvements
+### 🎮 Gameplay Improvements
 - **Enhanced Command System**: Improved command input handling with better prediction and tab completion
 - **Fixed Control Rebinding**: Controls now properly rebind without conflicts or lost bindings
 - **Pause Menu Fixes**: Resolved floating/movement issues when game is paused
 - **Enhanced Input Handling**: Better key detection and modifier key support
 - **Improved Chat System**: Enhanced chat history and command input processing
 
-### � Asset Updates
+### 🎨 Asset Updates
 - **Added New Texture**: Added `air.png` texture for improved block rendering
 - **New Background Images**: Added 5 new multiplayer background images:
   - `InviteFriends_bg.png` for friend invitation screen
@@ -43,7 +43,7 @@
 - **Network Resilience**: Improved retry logic and connection handling
 - **Build Authentication**: Stronger verification of official builds
 
-### � Release Build
+### 🚀 Release Build
 - **Production Ready**: Release build (`LatticeVeilMonoGame.exe`) included in `bin/Release/net8.0-windows/win-x64/`
 - **Stable Hash**: Release build uses proper release hash validation
 - **Optimized Performance**: Release build optimized for production deployment

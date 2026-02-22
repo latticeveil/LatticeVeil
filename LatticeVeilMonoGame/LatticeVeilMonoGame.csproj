@@ -15,7 +15,7 @@
 
     <RootNamespace>LatticeVeilMonoGame</RootNamespace>
     <AssemblyName>LatticeVeilMonoGame</AssemblyName>
-    <Version>8.0.0</Version>
+    <Version>9.0.0</Version>
     <BuildNonce Condition="'$(BuildNonce)'==''">stable</BuildNonce>
 
     <Authors>LatticeVeil Team</Authors>

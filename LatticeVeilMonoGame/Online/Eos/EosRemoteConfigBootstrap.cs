@@ -363,7 +363,7 @@ public static class EosRemoteConfigBootstrap
         Environment.SetEnvironmentVariable("EOS_DEPLOYMENT_ID", payload.DeploymentId);
         Environment.SetEnvironmentVariable("EOS_CLIENT_ID", payload.ClientId);
         Environment.SetEnvironmentVariable("EOS_PRODUCT_NAME", string.IsNullOrWhiteSpace(payload.ProductName) ? "LatticeVeil" : payload.ProductName);
-        Environment.SetEnvironmentVariable("EOS_PRODUCT_VERSION", string.IsNullOrWhiteSpace(payload.ProductVersion) ? "1.0.0" : payload.ProductVersion);
+        Environment.SetEnvironmentVariable("EOS_PRODUCT_VERSION", string.IsNullOrWhiteSpace(payload.ProductVersion) ? "9.0.0" : payload.ProductVersion);
         Environment.SetEnvironmentVariable("EOS_LOGIN_MODE", string.IsNullOrWhiteSpace(payload.LoginMode) ? "deviceid" : payload.LoginMode);
     }
 
