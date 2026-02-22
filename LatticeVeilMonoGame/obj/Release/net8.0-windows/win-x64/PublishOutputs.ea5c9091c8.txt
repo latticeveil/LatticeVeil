@@ -1,0 +1,2 @@
+C:\Users\Redacted\Documents\LatticeVeil_project\LatticeVeilMonoGame\bin\Release\net8.0-windows\win-x64\publish\LatticeVeilMonoGame.pdb
+C:\Users\Redacted\Documents\LatticeVeil_project\LatticeVeilMonoGame\bin\Release\net8.0-windows\win-x64\publish\LatticeVeilMonoGame.exe

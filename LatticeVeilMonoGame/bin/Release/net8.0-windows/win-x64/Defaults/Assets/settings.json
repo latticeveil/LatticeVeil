@@ -1,0 +1,32 @@
+{
+  "Fullscreen": false,
+  "VSync": true,
+  "ResolutionWidth": 1280,
+  "ResolutionHeight": 720,
+  "GuiScale": 1,
+  "QualityPreset": "MEDIUM",
+  "Brightness": 1,
+  "FieldOfView": 70,
+  "RenderDistanceChunks": 10,
+  "KeepLauncherOpen": true,
+  "DarkMode": true,
+  "MasterVolume": 1,
+  "MusicVolume": 1,
+  "SfxVolume": 1,
+  "AudioInputDeviceId": "",
+  "AudioOutputDeviceId": "",
+  "VoiceOutputDeviceId": "",
+  "GameOutputDeviceId": "",
+  "MultistreamAudio": false,
+  "MouseSensitivity": 0.0035,
+  "Keybinds": {
+    "MoveUp": 87,
+    "MoveDown": 83,
+    "MoveLeft": 65,
+    "MoveRight": 68,
+    "Jump": 32,
+    "Inventory": 69,
+    "Pause": 27
+  },
+  "EnabledPacks": []
+}

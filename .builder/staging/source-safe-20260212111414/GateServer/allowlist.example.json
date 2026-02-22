@@ -1,0 +1,15 @@
+{
+  "proofTokens": [
+    "REDACTED_OFFICIAL_TOKEN"
+  ],
+  "allowedClientExeSha256": [
+    "REDACTED_COMMON_EXE_SHA256"
+  ],
+  "allowedDevExeSha256": [
+    "REDACTED_DEV_EXE_SHA256"
+  ],
+  "allowedReleaseExeSha256": [
+    "REDACTED_RELEASE_EXE_SHA256"
+  ],
+  "minVersion": "0.1.0"
+}

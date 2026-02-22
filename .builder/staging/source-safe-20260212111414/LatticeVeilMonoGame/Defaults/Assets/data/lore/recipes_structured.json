@@ -1,0 +1,1119 @@
+{
+  "stations": [
+    {
+      "id": "station.crafting_table",
+      "block": "CraftingTable",
+      "name": "Crafting Table (vanilla)"
+    },
+    {
+      "id": "station.sigil_loom",
+      "block": "SigilLoom",
+      "name": "Sigil Loom"
+    },
+    {
+      "id": "station.quiet_alembic",
+      "block": "QuietAlembic",
+      "name": "Quiet Alembic"
+    },
+    {
+      "id": "station.runic_anvil",
+      "block": "RunicAnvil",
+      "name": "Runic Anvil"
+    },
+    {
+      "id": "station.artificers_workbench",
+      "block": "ArtificersWorkbench",
+      "name": "Artificer\u2019s Workbench"
+    }
+  ],
+  "recipes": [
+    {
+      "id": "recipe.limiter_sigil.safe",
+      "name": "Limiter Sigil (steady)",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "CopperWiring",
+          "count": 1
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 1
+        },
+        {
+          "block": "StabilizedAsh",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.limiter_sigil.unstable",
+      "name": "Limiter Sigil (hungry)",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "CopperWiring",
+          "count": 1
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 1
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable"
+      ],
+      "consequences": [
+        {
+          "type": "world.anomaly_pressure",
+          "amount": 1
+        },
+        {
+          "type": "player.corruption",
+          "amount": 1,
+          "hint": "You feel watched."
+        }
+      ]
+    },
+    {
+      "id": "recipe.quiet_alembic.safe",
+      "name": "Quiet Alembic",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Glass",
+          "count": 3
+        },
+        {
+          "block": "CopperWiring",
+          "count": 2
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "QuietAlembic",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.quiet_alembic.unstable",
+      "name": "Alembic (ringing)",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Glass",
+          "count": 2
+        },
+        {
+          "block": "CopperWiring",
+          "count": 2
+        },
+        {
+          "block": "Veilglass",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "QuietAlembic",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable"
+      ],
+      "consequences": [
+        {
+          "type": "world.thinness",
+          "amount": 1,
+          "hint": "The air thins around your bench."
+        }
+      ]
+    },
+    {
+      "id": "recipe.sigil_loom.safe",
+      "name": "Sigil Loom",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Plank",
+          "count": 4
+        },
+        {
+          "block": "CopperWiring",
+          "count": 2
+        },
+        {
+          "block": "Runestone",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "SigilLoom",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.sigil_loom.unstable",
+      "name": "Sigil Loom (echo-threaded)",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Plank",
+          "count": 4
+        },
+        {
+          "block": "CopperWiring",
+          "count": 2
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "SigilLoom",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable"
+      ],
+      "consequences": [
+        {
+          "type": "world.echo_presence",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "recipe.runic_anvil.safe",
+      "name": "Runic Anvil",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Iron",
+          "count": 4
+        },
+        {
+          "block": "Runestone",
+          "count": 2
+        },
+        {
+          "block": "Veinstone",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "RunicAnvil",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.cinderbranch_staff.safe",
+      "name": "Cinderbranch Staff",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "Wood",
+          "count": 2
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 2
+        },
+        {
+          "block": "ResonanceCore",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "CinderbranchStaff",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "fire_magic"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.cinderbranch_staff.unstable",
+      "name": "Cinderbranch Staff (wreath-burned)",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "Wood",
+          "count": 2
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 2
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "CinderbranchStaff",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "fire_magic"
+      ],
+      "consequences": [
+        {
+          "type": "player.corruption",
+          "amount": 2
+        },
+        {
+          "type": "world.echo_presence",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "recipe.stormreed_staff.safe",
+      "name": "Stormreed Staff",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "Wood",
+          "count": 2
+        },
+        {
+          "block": "VeinstoneCrystal",
+          "count": 2
+        },
+        {
+          "block": "ResonanceCore",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "StormreedStaff",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "storm_magic"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.stormreed_staff.unstable",
+      "name": "Stormreed Staff (forked)",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "Wood",
+          "count": 2
+        },
+        {
+          "block": "VeinstoneCrystal",
+          "count": 2
+        },
+        {
+          "block": "EchoBloom",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "StormreedStaff",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "storm_magic"
+      ],
+      "consequences": [
+        {
+          "type": "player.corruption",
+          "amount": 1
+        },
+        {
+          "type": "world.thinness",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "recipe.waybound_frame.safe",
+      "name": "Waybound Frame",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "Nullblock",
+          "count": 4
+        },
+        {
+          "block": "Runestone",
+          "count": 4
+        },
+        {
+          "block": "Veinstone",
+          "count": 2
+        },
+        {
+          "block": "AnchoringAlloy",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "WayboundFrame",
+          "count": 4
+        }
+      ],
+      "flags": [
+        "safe",
+        "portal_frame"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.waybound_frame.unstable",
+      "name": "Waybound Frame (hollow)",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "Nullblock",
+          "count": 4
+        },
+        {
+          "block": "Runestone",
+          "count": 4
+        },
+        {
+          "block": "Veinstone",
+          "count": 2
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "WayboundFrame",
+          "count": 4
+        }
+      ],
+      "flags": [
+        "unstable",
+        "portal_frame"
+      ],
+      "consequences": [
+        {
+          "type": "world.anomaly_pressure",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "recipe.attuned_keystone.safe",
+      "name": "Attuned Keystone",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "AttunedKeystoneFragment",
+          "count": 4
+        },
+        {
+          "block": "AlignmentMatrixFragment",
+          "count": 2
+        },
+        {
+          "block": "AxiomFulgrite",
+          "count": 1
+        },
+        {
+          "block": "AnchoringAlloy",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "AttunedKeystone",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "portal_keystone"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.attuned_keystone.unstable",
+      "name": "Attuned Keystone (singing)",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "AttunedKeystoneFragment",
+          "count": 4
+        },
+        {
+          "block": "AlignmentMatrixFragment",
+          "count": 2
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        },
+        {
+          "block": "Veilglass",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "AttunedKeystone",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "portal_keystone"
+      ],
+      "consequences": [
+        {
+          "type": "world.echo_presence",
+          "amount": 2
+        },
+        {
+          "type": "player.corruption",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "recipe.timed_limiter.safe",
+      "name": "Timed Limiter",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        },
+        {
+          "block": "StabilizedAsh",
+          "count": 1
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "TimedLimiter",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.timed_limiter.unstable",
+      "name": "Timed Limiter (brittle)",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "TimedLimiter",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable"
+      ],
+      "consequences": [
+        {
+          "type": "world.thinness",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "recipe.transit_regulator.safe",
+      "name": "Transit Regulator",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "TransitRegulatorPart",
+          "count": 2
+        },
+        {
+          "block": "RegulatorComponent",
+          "count": 2
+        },
+        {
+          "block": "ResonanceCore",
+          "count": 1
+        },
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "TransitRegulator",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "network"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.transit_regulator.unstable",
+      "name": "Transit Regulator (echo-cast)",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "TransitRegulatorPart",
+          "count": 2
+        },
+        {
+          "block": "RegulatorComponent",
+          "count": 2
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 1
+        },
+        {
+          "block": "LimiterSigil",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "TransitRegulator",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "network"
+      ],
+      "consequences": [
+        {
+          "type": "world.echo_presence",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "recipe.waygate_plinth.safe",
+      "name": "Waygate Plinth",
+      "station": "station.runic_anvil",
+      "inputs": [
+        {
+          "block": "WayfinderPlinthPart",
+          "count": 3
+        },
+        {
+          "block": "Veinstone",
+          "count": 2
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "WaygatePlinth",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "network_node"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.waygate_rune.safe",
+      "name": "Waygate Rune",
+      "station": "station.sigil_loom",
+      "inputs": [
+        {
+          "block": "RunestoneDust",
+          "count": 1
+        },
+        {
+          "block": "VeinstoneCrystal",
+          "count": 1
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "WaygateRune",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "network_node"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.evergate_core.safe",
+      "name": "Evergate Core",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "ResonanceCore",
+          "count": 1
+        },
+        {
+          "block": "RegulatorComponent",
+          "count": 2
+        },
+        {
+          "block": "TimedLimiter",
+          "count": 1
+        },
+        {
+          "block": "Veilglass",
+          "count": 2
+        }
+      ],
+      "outputs": [
+        {
+          "block": "EvergateCore",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "stabilizer"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.evergate_core.unstable",
+      "name": "Evergate Core (Unstable)",
+      "station": "station.artificers_workbench",
+      "inputs": [
+        {
+          "block": "ResonanceCore",
+          "count": 1
+        },
+        {
+          "block": "EchoIconShard",
+          "count": 2
+        },
+        {
+          "block": "TimedLimiter",
+          "count": 1
+        },
+        {
+          "block": "Veilglass",
+          "count": 2
+        }
+      ],
+      "outputs": [
+        {
+          "block": "EvergateCoreUnstable",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "stabilizer"
+      ],
+      "consequences": [
+        {
+          "type": "world.echo_presence",
+          "amount": 4
+        },
+        {
+          "type": "world.anomaly_pressure",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "recipe.clean_phial",
+      "name": "Clean Phial",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "Glass",
+          "count": 1
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.fleetstep.safe",
+      "name": "Fleetstep Draught",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        },
+        {
+          "block": "Swiftleaf",
+          "count": 2
+        },
+        {
+          "block": "AnchoringSalt",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "FleetstepDraught",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "potion"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.fleetstep.unstable",
+      "name": "Fleetstep Draught (echo-sweet)",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        },
+        {
+          "block": "Swiftleaf",
+          "count": 2
+        },
+        {
+          "block": "EchoBloom",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "FleetstepDraught",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "unstable",
+        "potion"
+      ],
+      "consequences": [
+        {
+          "type": "player.corruption",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "recipe.skybound.safe",
+      "name": "Skybound Philter",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        },
+        {
+          "block": "Driftcap",
+          "count": 1
+        },
+        {
+          "block": "Veilglass",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "SkyboundPhilter",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "potion"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.pyroskin.safe",
+      "name": "Pyroskin Tonic",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        },
+        {
+          "block": "Embermoss",
+          "count": 2
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "PyroskinTonic",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "potion"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.brineveil.safe",
+      "name": "Brineveil Elixir",
+      "station": "station.quiet_alembic",
+      "inputs": [
+        {
+          "block": "CleanPhial",
+          "count": 1
+        },
+        {
+          "block": "GraveSilt",
+          "count": 1
+        },
+        {
+          "block": "Veilglass",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "BrineveilElixir",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "potion"
+      ],
+      "consequences": []
+    },
+    {
+      "id": "recipe.artificers_workbench",
+      "name": "Artificer\u2019s Workbench",
+      "station": "station.crafting_table",
+      "inputs": [
+        {
+          "block": "Plank",
+          "count": 4
+        },
+        {
+          "block": "Wood",
+          "count": 2
+        },
+        {
+          "block": "RunestoneDust",
+          "count": 1
+        },
+        {
+          "block": "CopperWiring",
+          "count": 1
+        }
+      ],
+      "outputs": [
+        {
+          "block": "ArtificersWorkbench",
+          "count": 1
+        }
+      ],
+      "flags": [
+        "safe",
+        "station"
+      ],
+      "consequences": []
+    }
+  ],
+  "enchantments": [
+    {
+      "id": "enchant.cinder",
+      "name": "Cinderbind",
+      "appliesTo": [
+        "Tool",
+        "Weapon",
+        "Staff"
+      ],
+      "tier": "mid",
+      "safeCatalyst": "AxiomFulgrite",
+      "unstableCatalyst": "EchoIconShard",
+      "effectsSafe": [
+        "+fire_damage",
+        "ignite_on_hit"
+      ],
+      "effectsUnstable": [
+        "+fire_damage",
+        "self_burn_risk",
+        "corruption_tick"
+      ]
+    },
+    {
+      "id": "enchant.surge",
+      "name": "Veinsurge",
+      "appliesTo": [
+        "Armor",
+        "Tool"
+      ],
+      "tier": "mid",
+      "safeCatalyst": "VeinstoneCrystal",
+      "unstableCatalyst": "EchoBloom",
+      "effectsSafe": [
+        "+move_speed",
+        "+jump"
+      ],
+      "effectsUnstable": [
+        "+move_speed",
+        "random_slow",
+        "thinness_wake"
+      ]
+    },
+    {
+      "id": "enchant.anchor",
+      "name": "Anchorweave",
+      "appliesTo": [
+        "Armor"
+      ],
+      "tier": "late",
+      "safeCatalyst": "AnchoringAlloy",
+      "unstableCatalyst": "VeilSealStone",
+      "effectsSafe": [
+        "+knockback_resist",
+        "+fall_resist"
+      ],
+      "effectsUnstable": [
+        "+knockback_resist",
+        "echo_attention"
+      ]
+    }
+  ],
+  "portal_blueprints": [
+    {
+      "id": "portal.world_gate",
+      "name": "World Gate",
+      "purpose": "Travel between dimensions (later).",
+      "frameBlock": "WayboundFrame",
+      "keystoneBlock": "AttunedKeystone",
+      "limiterBlock": "TimedLimiter",
+      "stabilizerBlock": "EvergateCore",
+      "size": "3x5 arch (inner 2x4)",
+      "activation": "Insert Keystone + place Stabilizer behind arch + apply Limiter to each frame corner.",
+      "safeOutcome": "Stable portal stays open until closed.",
+      "unstableOutcome": "Portal opens but leaks Echo Bloom and raises anomaly pressure."
+    },
+    {
+      "id": "portal.waygate",
+      "name": "Waygate",
+      "purpose": "Fast-travel network (later).",
+      "frameBlock": "WaygatePlinth",
+      "glyphBlock": "WaygateRune",
+      "regulatorBlock": "TransitRegulator",
+      "size": "1x1 plinth node",
+      "activation": "Place Plinth + attach Regulator + set 1 Rune as address.",
+      "safeOutcome": "Links only to known nodes.",
+      "unstableOutcome": "Links can drift, occasionally misroute you (but never fully fails)."
+    }
+  ],
+  "notes": "v1.1: Added Artificer\u2019s Workbench station; moved high-tier gatecraft recipes to it; Corestone input upgraded to Nullblock."
+}

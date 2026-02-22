@@ -1,0 +1,48 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EosConfigService", "EosConfigService\EosConfigService.csproj", "{18761E28-590F-E509-FF37-B63084E5F25B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LatticeVeilMonoGame", "LatticeVeilMonoGame\LatticeVeilMonoGame.csproj", "{D9F50541-6674-C13B-BFD1-0E55506F26C4}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tools", "Tools", "{07C2787E-EAC7-C090-1BA3-A61EC2A24D84}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetPackBuilder", "Tools\AssetPackBuilder\AssetPackBuilder.csproj", "{33C85085-14CB-EDC3-0DFF-C5728BA81A21}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BuildRunner", "Tools\BuildRunner\BuildRunner.csproj", "{92BF5205-A70F-4D53-5764-86002A211D3E}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{18761E28-590F-E509-FF37-B63084E5F25B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{18761E28-590F-E509-FF37-B63084E5F25B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{18761E28-590F-E509-FF37-B63084E5F25B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{18761E28-590F-E509-FF37-B63084E5F25B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D9F50541-6674-C13B-BFD1-0E55506F26C4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D9F50541-6674-C13B-BFD1-0E55506F26C4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D9F50541-6674-C13B-BFD1-0E55506F26C4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D9F50541-6674-C13B-BFD1-0E55506F26C4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{33C85085-14CB-EDC3-0DFF-C5728BA81A21}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{33C85085-14CB-EDC3-0DFF-C5728BA81A21}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{33C85085-14CB-EDC3-0DFF-C5728BA81A21}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{33C85085-14CB-EDC3-0DFF-C5728BA81A21}.Release|Any CPU.Build.0 = Release|Any CPU
+		{92BF5205-A70F-4D53-5764-86002A211D3E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{92BF5205-A70F-4D53-5764-86002A211D3E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{92BF5205-A70F-4D53-5764-86002A211D3E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{92BF5205-A70F-4D53-5764-86002A211D3E}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{33C85085-14CB-EDC3-0DFF-C5728BA81A21} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
+		{92BF5205-A70F-4D53-5764-86002A211D3E} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {4260DA90-A5D0-43DF-9044-7CD4A12E0F73}
+	EndGlobalSection
+EndGlobal

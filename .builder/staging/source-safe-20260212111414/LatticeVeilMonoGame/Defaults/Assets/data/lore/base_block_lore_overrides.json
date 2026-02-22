@@ -1,0 +1,120 @@
+{
+  "version": "v1.1",
+  "notes": "Updated for Nullblock as the canonical bottom layer and added Artificer\u2019s Workbench as an in-game station.",
+  "blocks": [
+    {
+      "blockEnum": "Nullblock",
+      "byteId": 15,
+      "displayNameOverride": "Nullrock",
+      "aliases": [
+        "Corestone (legacy save data)"
+      ],
+      "loreLines": [
+        "The world\u2019s final layer\u2014stone that rejects change.",
+        "Nullrock is not a material so much as a rule: 'no further'.",
+        "Old builders wrote Corestone in their ledgers. The Covenant speaks the truer name: Nullblock."
+      ],
+      "tags": [
+        "unbreakable",
+        "boundary",
+        "stability",
+        "null"
+      ]
+    },
+    {
+      "blockEnum": "CraftingTable",
+      "byteId": 13,
+      "displayNameOverride": null,
+      "loreLines": [
+        "A quiet place where the ordinary becomes deliberate.",
+        "The Ancients wrote: measure twice, open once."
+      ],
+      "tags": [
+        "crafting",
+        "civilization"
+      ]
+    },
+    {
+      "blockEnum": "Coal",
+      "byteId": 11,
+      "loreLines": [
+        "Embercoal\u2014fuel for early work and safer heat.",
+        "Continuists preferred it to open flame near thin places."
+      ],
+      "tags": [
+        "ore",
+        "fuel"
+      ]
+    },
+    {
+      "blockEnum": "Iron",
+      "byteId": 12,
+      "loreLines": [
+        "Anchor-iron\u2014heavy, honest, and willing to hold a shape.",
+        "Used in frames and clamps when the Veil pushes back."
+      ],
+      "tags": [
+        "ore",
+        "metal",
+        "frame"
+      ]
+    },
+    {
+      "blockEnum": "Gold",
+      "byteId": 18,
+      "loreLines": [
+        "Sunmetal\u2014too soft for walls, perfect for conductors.",
+        "It carries alignment cleanly when tuned with care."
+      ],
+      "tags": [
+        "ore",
+        "metal",
+        "conductor"
+      ]
+    },
+    {
+      "blockEnum": "Diamond",
+      "byteId": 19,
+      "loreLines": [
+        "Facetstone\u2014hard enough to cut a rule, not just a rock.",
+        "Ancient keystones were etched with diamond dust."
+      ],
+      "tags": [
+        "ore",
+        "keystone"
+      ]
+    },
+    {
+      "blockEnum": "Chest",
+      "byteId": 10,
+      "loreLines": [
+        "A common box, until it keeps something you shouldn\u2019t forget.",
+        "Many fragments survive because someone stored them and walked away."
+      ],
+      "tags": [
+        "storage",
+        "lore"
+      ]
+    },
+    {
+      "blockEnum": "ArtificersWorkbench",
+      "byteId": 13,
+      "displayNameOverride": "Artificer\u2019s Workbench",
+      "aliases": [
+        "Artificer Bench",
+        "Artificer Workbench"
+      ],
+      "loreLines": [
+        "A bench built for rulework: carving, tuning, and sealing the smallest parts that hold the biggest doors.",
+        "Where a Crafting Table joins materials, the Workbench joins intentions\u2014Frame, Conduit, Limiter, all in one place.",
+        "Continuist benches were etched to refuse haste: if the pattern is wrong, the tools simply do not bite."
+      ],
+      "tags": [
+        "crafting",
+        "station",
+        "continuist",
+        "precision"
+      ]
+    }
+  ]
+}

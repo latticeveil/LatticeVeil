@@ -1,0 +1,17 @@
+{
+  "version": "v1.1c",
+  "generated_utc": "2026-01-13T00:32:58.866965Z",
+  "bottom_layer": {
+    "blockIdEnum": "Nullblock",
+    "displayName": "Nullrock",
+    "y": 0,
+    "thickness": 1,
+    "rule": "Force this block at y==0 across the entire world regardless of terrain height.",
+    "notes": "Nullblock is now the canonical enum in-game. Keep an alias/compat mapping for Corestone in loader if older worlds exist.",
+    "unbreakable_survival_requirement": {
+      "required": true,
+      "rule": "Nullblock must not be breakable in Survival mode; only allow in Creative/Dev if supported.",
+      "implementation": "Enforce in block-break logic + explosion immunity; do not rely on client-only checks."
+    }
+  }
+}

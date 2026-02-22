@@ -1,0 +1,83 @@
+# Build artifacts
+**/bin/
+**/obj/
+Builds/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.pdb
+**/eos.local.json
+.aider*
+
+# EOS secure config split
+eos.private.json
+eos.public.json
+eos.config.json
+eos.*.secret.json
+*.secret.json
+EOS-Service*.env
+official_build.sig
+Artifacts/Render/*.env
+Artifacts/Render/*.secret.json
+Artifacts/Render/*.secret.env
+Artifacts/Render/render-gate.env
+LatticeVeil_project/eos.private.json
+LatticeVeil_project/eos.public.json
+LatticeVeil_project/eos.config.json
+
+# Builder directories (safe to ignore)
+.builder/
+.builder/staging/
+.builder/releases/
+.plans/
+
+# Documentation files (never commit)
+*.md
+!README.md
+!CHANGELOG.md
+!RELEASE_TEMPLATE.md
+!OFFICIAL_ONLINE_SERVICE_TERMS.md
+
+# Executable files
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.cache
+*.log
+.env
+.env.*
+*.env
+!*.example.env
+Thumbs.db
+Desktop.ini
+
+# Development folders
+.vscode/
+_temp/
+_tmp*/
+temp*/
+
+# Archive files
+*.zip
+*.7z
+*.rar
+*.tar.gz
+
+# AI helper files (never commit AI HELPER to repo)
+AI HELPER/
+.ai-helper*/
+
+# Experimental files (local development only)
+Experimental/
+!Experimental/README.md
+
+# Local-only planning and scratch assets
+docs/
+*.backup
+Gamemode icons.png

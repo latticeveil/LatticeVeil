@@ -1,0 +1,168 @@
+{
+  "version": "1.0",
+  "lastModified": "2026-01-31T18:00:00Z",
+  "screens": {
+    "MainMenu": {
+      "screenName": "MainMenu",
+      "lastModified": "2026-01-31T18:00:00Z",
+      "elements": [
+        {
+          "elementId": "SingleplayerBtn",
+          "x": 710,
+          "y": 200,
+          "width": 500,
+          "height": 180,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "MultiplayerBtn",
+          "x": 710,
+          "y": 380,
+          "width": 500,
+          "height": 180,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "OptionsBtn",
+          "x": 710,
+          "y": 560,
+          "width": 500,
+          "height": 180,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "EditorBtn",
+          "x": 710,
+          "y": 740,
+          "width": 500,
+          "height": 180,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "QuitBtn",
+          "x": 710,
+          "y": 920,
+          "width": 500,
+          "height": 180,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "ProfileBtn",
+          "x": 20,
+          "y": 980,
+          "width": 80,
+          "height": 80,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "ScreenshotBtn",
+          "x": 1520,
+          "y": 920,
+          "width": 380,
+          "height": 136,
+          "isVisible": true,
+          "elementType": "Button"
+        }
+      ]
+    },
+    "Singleplayer": {
+      "screenName": "Singleplayer",
+      "lastModified": "2026-01-31T18:00:00Z",
+      "elements": [
+        {
+          "elementId": "BackBtn",
+          "x": 20,
+          "y": 980,
+          "width": 160,
+          "height": 45,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "CreateWorldBtn",
+          "x": 800,
+          "y": 700,
+          "width": 260,
+          "height": 73,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "DeleteWorldBtn",
+          "x": 1070,
+          "y": 700,
+          "width": 73,
+          "height": 73,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "WorldList",
+          "x": 400,
+          "y": 200,
+          "width": 1120,
+          "height": 400,
+          "isVisible": true,
+          "elementType": "Panel"
+        }
+      ]
+    },
+    "Multiplayer": {
+      "screenName": "Multiplayer",
+      "lastModified": "2026-01-31T18:00:00Z",
+      "elements": [
+        {
+          "elementId": "BackBtn",
+          "x": 20,
+          "y": 980,
+          "width": 160,
+          "height": 45,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "RefreshBtn",
+          "x": 400,
+          "y": 700,
+          "width": 200,
+          "height": 50,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "HostBtn",
+          "x": 610,
+          "y": 700,
+          "width": 200,
+          "height": 50,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "JoinBtn",
+          "x": 820,
+          "y": 700,
+          "width": 200,
+          "height": 50,
+          "isVisible": true,
+          "elementType": "Button"
+        },
+        {
+          "elementId": "ServerList",
+          "x": 400,
+          "y": 200,
+          "width": 1120,
+          "height": 400,
+          "isVisible": true,
+          "elementType": "Panel"
+        }
+      ]
+    }
+  }
+}

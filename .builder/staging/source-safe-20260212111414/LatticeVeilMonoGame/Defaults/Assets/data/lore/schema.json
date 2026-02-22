@@ -1,0 +1,94 @@
+{
+  "inscription": {
+    "id": "insc_####",
+    "faction": "Continuists|Ascendants|Veilkeepers|Echo Faith|Hearthward Covenant|Unknown",
+    "stage": "early|mid|late",
+    "placement_tags": [
+      "grave",
+      "ruin_wall",
+      "waygate_hub",
+      "portal_site",
+      "brew_lab",
+      "imprint_rig",
+      "hearthhold_sign"
+    ],
+    "weight": 1.0,
+    "text": "string",
+    "dev_notes": "string (optional, not shown to players)"
+  },
+  "recipe_fragment": {
+    "id": "frag_####",
+    "topic": "runestone|limiter_sigil|staff_cinderbranch|staff_stormreed|quiet_alembic|sigil_loom|world_gate|evergate|waygate|network",
+    "tier": "early|mid|late",
+    "fragment_type": "rule|ingredients|assembly|warning|temptation",
+    "text": [
+      "line1",
+      "line2"
+    ],
+    "teaches": [
+      "knowledge_key_1",
+      "knowledge_key_2"
+    ],
+    "unlocks": [
+      "blueprint_key_optional"
+    ]
+  },
+  "loot_table": {
+    "id": "grave|continuist_ruin_chest|...",
+    "tiers": {
+      "early": [
+        {
+          "item": "id",
+          "min": 1,
+          "max": 1,
+          "weight": 10
+        }
+      ],
+      "mid": [],
+      "late": []
+    }
+  },
+  "structure": {
+    "id": "grave_old|ruin_continuist_small|...",
+    "rarity": "common|uncommon|rare|legendary",
+    "biome_tags": [
+      "plains",
+      "forest",
+      "desert",
+      "mountain",
+      "swamp",
+      "cave"
+    ],
+    "nearby_tags": [
+      "river",
+      "cliff",
+      "thin_spot",
+      "ancient_road"
+    ],
+    "spawn_rules": "human readable string",
+    "loot_table": "loot_table_id",
+    "inscription_pool": [
+      "insc_pool_id"
+    ]
+  },
+  "base_block_lore_overrides": {
+    "version": "v1.0",
+    "blocks": [
+      {
+        "blockEnum": "Corestone",
+        "byteId": 15,
+        "displayNameOverride": "Nullrock (optional)",
+        "aliases": [
+          "Corestone (legacy)"
+        ],
+        "loreLines": [
+          "line1",
+          "line2"
+        ],
+        "tags": [
+          "tag"
+        ]
+      }
+    ]
+  }
+}
