@@ -70,6 +70,49 @@ public sealed class VoxelWorld
         if (meta == null)
             return null;
 
+        // Handle Regions/ vs regions/ folder naming for new format worlds
+        if (meta.WorldVersion >= 2) // New format world
+        {
+            var regionsDir = Path.Combine(worldPath, "regions");
+            var regionsDirUpper = Path.Combine(worldPath, "Regions");
+            
+            // If regions/ exists, rename to regions/ (lowercase)
+            if (Directory.Exists(regionsDirUpper))
+            {
+                try
+                {
+                    Directory.Move(regionsDirUpper, regionsDir);
+                    log.Info("Renamed Regions/ to regions/ for consistency");
+                }
+                catch (Exception ex)
+                {
+                    log.Warn($"Failed to rename Regions/ to regions/: {ex.Message}");
+                }
+            }
+            
+            // Delete legacy chunks/ and biome_catalog.bin for new format worlds
+            try
+            {
+                var chunksDir = Path.Combine(worldPath, "chunks");
+                if (Directory.Exists(chunksDir))
+                {
+                    Directory.Delete(chunksDir, true);
+                    log.Info("Deleted legacy chunks/ folder for new format world");
+                }
+                
+                var biomeCatalogPath = Path.Combine(worldPath, "biome_catalog.bin");
+                if (File.Exists(biomeCatalogPath))
+                {
+                    File.Delete(biomeCatalogPath);
+                    log.Info("Deleted legacy biome_catalog.bin for new format world");
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Failed to clean up legacy files: {ex.Message}");
+            }
+        }
+
         var world = new VoxelWorld(meta, worldPath, log);
         world.LoadChunks();
         return world;

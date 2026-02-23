@@ -16,7 +16,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCopyrightAttribute("Copyright © 2026")]
 [assembly: System.Reflection.AssemblyDescriptionAttribute("LatticeVeil MonoGame Client")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("9.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("9.0.0+84ee2b7e2f9260b5578fc0ba0fbebe4ac71b4220")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("9.0.0+319218e6dc3cd3fd280b19628104a9c7ff3a6f3a")]
 [assembly: System.Reflection.AssemblyProductAttribute("LatticeVeil")]
 [assembly: System.Reflection.AssemblyTitleAttribute("LatticeVeilMonoGame")]
 [assembly: System.Reflection.AssemblyVersionAttribute("9.0.0.0")]
