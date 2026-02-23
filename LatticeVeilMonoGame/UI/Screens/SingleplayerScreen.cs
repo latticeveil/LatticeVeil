@@ -659,15 +659,50 @@ public sealed class SingleplayerScreen : IScreen
         var entry = _worlds[_selectedIndex];
         var name = entry.Name;
         var worldPath = entry.WorldPath;
-        var metaPath = Paths.ResolveWorldMetaPath(worldPath);
-        if (!Directory.Exists(worldPath) || !File.Exists(metaPath))
+        
+        // Validate world format before attempting to load
+        var validation = WorldValidator.ValidateWorldFolder(worldPath);
+        
+        switch (validation.Status)
         {
-            _log.Warn($"World data missing for '{name}'.");
-            ShowStatus("WORLD DATA MISSING");
-            return;
+            case WorldValidationStatus.ValidNew:
+                // Proceed with loading - use existing legacy meta path for now
+                var metaPath = Paths.ResolveWorldMetaPath(worldPath);
+                if (!Directory.Exists(worldPath) || !File.Exists(metaPath))
+                {
+                    _log.Warn($"World data missing for '{name}'.");
+                    ShowStatus("WORLD DATA MISSING");
+                    return;
+                }
+                _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldPath, metaPath), _viewport);
+                break;
+                
+            case WorldValidationStatus.LegacyDetected:
+                ShowLegacyWorldPopup(name, validation.Reason);
+                break;
+                
+            case WorldValidationStatus.CorruptedNew:
+                ShowCorruptedWorldPopup(name, validation.Reason);
+                break;
+                
+            case WorldValidationStatus.NotAWorld:
+                ShowStatus("NOT A VALID WORLD");
+                break;
         }
-
-        _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldPath, metaPath), _viewport);
+    }
+    
+    private void ShowLegacyWorldPopup(string worldName, string reason)
+    {
+        // For now, just show status - popup implementation would need UI framework
+        ShowStatus($"LEGACY WORLD: {worldName}");
+        _log.Warn($"Legacy world detected: {worldName} - {reason}");
+    }
+    
+    private void ShowCorruptedWorldPopup(string worldName, string reason)
+    {
+        // For now, just show status - popup implementation would need UI framework
+        ShowStatus($"CORRUPTED WORLD: {worldName}");
+        _log.Error($"Corrupted world detected: {worldName} - {reason}");
     }
 
     private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)

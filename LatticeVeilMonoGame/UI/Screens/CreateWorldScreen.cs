@@ -575,7 +575,14 @@ public sealed class CreateWorldScreen : IScreen
             _log.Info($"Features: Structures={_structuresEnabled}, Caves={_cavesEnabled}, Ores={_oresEnabled}");
 
             SetGenerationProgress(0.08f, "METADATA");
-            Directory.CreateDirectory(worldPath);
+            
+            // Use new world creation format
+            if (!WorldCreator.CreateNewWorld(worldPath, worldName, meta.Seed, _selectedGameMode))
+            {
+                return WorldCreateResult.Failure("FAILED TO CREATE NEW WORLD STRUCTURE");
+            }
+            
+            // Create legacy meta for compatibility with existing systems
             var metaPath = Paths.GetWorldMetaPath(worldPath);
             meta.Save(metaPath, _log);
             
@@ -591,7 +598,12 @@ public sealed class CreateWorldScreen : IScreen
             worldConfig.Save(worldPath, _log);
             
             SetGenerationProgress(0.22f, "BIOME CATALOG");
-            BiomeCatalog.BuildAndSave(meta, worldPath, _log);
+            // Skip biome catalog for new format worlds - will be handled differently
+            var validation = WorldValidator.ValidateWorldFolder(worldPath);
+            if (validation.Status != WorldValidationStatus.ValidNew)
+            {
+                BiomeCatalog.BuildAndSave(meta, worldPath, _log);
+            }
 
             SetGenerationProgress(0.40f, "SPAWN CHUNKS");
             var meshCoords = PregenerateSpawnChunks(meta, worldPath, progress =>

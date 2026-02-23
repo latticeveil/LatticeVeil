@@ -7,7 +7,7 @@
   "targets": {
     ".NETCoreApp,Version=v8.0": {},
     ".NETCoreApp,Version=v8.0/win-x64": {
-      "LatticeVeilMonoGame/8.0.0": {
+      "LatticeVeilMonoGame/9.0.0": {
         "dependencies": {
           "DotnetNoise": "1.0.0",
           "GeonBit.UI": "4.3.0.4",
@@ -1161,7 +1161,7 @@
     }
   },
   "libraries": {
-    "LatticeVeilMonoGame/8.0.0": {
+    "LatticeVeilMonoGame/9.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

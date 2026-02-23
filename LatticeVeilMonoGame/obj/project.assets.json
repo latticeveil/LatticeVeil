@@ -4361,7 +4361,7 @@
     "C:\\Users\\Redacted\\.nuget\\packages\\": {}
   },
   "project": {
-    "version": "8.0.0",
+    "version": "9.0.0",
     "restore": {
       "projectUniqueName": "C:\\Users\\Redacted\\Documents\\LatticeVeil_project\\LatticeVeilMonoGame\\LatticeVeilMonoGame.csproj",
       "projectName": "LatticeVeilMonoGame",
@@ -4496,10 +4496,6 @@
           },
           {
             "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
-            "version": "[8.0.24, 8.0.24]"
-          },
-          {
-            "name": "Microsoft.NETCore.App.Crossgen2.win-x64",
             "version": "[8.0.24, 8.0.24]"
           },
           {

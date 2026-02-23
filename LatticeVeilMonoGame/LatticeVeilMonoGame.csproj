@@ -47,6 +47,23 @@
     <Compile Remove="GUIDesigner\**" />
     <EmbeddedResource Remove="GUIDesigner\**" />
     <None Remove="GUIDesigner\**" />
+    <Content Remove="DEV\**" />
+    <None Remove="DEV\**" />
+    <None Remove="Tools\**" />
+    <None Remove="test\**" />
+    <None Remove="supabase\**" />
+    <None Remove="eos\**" />
+    <None Remove="GateServer\**" />
+    <None Remove="build\**" />
+    <None Remove="ThirdParty\**" />
+    <None Remove="RELEASE\**" />
+    <None Remove="Builds\**" />
+    <None Remove=".builder\**" />
+    <None Remove=".vscode\**" />
+    <None Remove="*.md" />
+    <None Remove="*.ps1" />
+    <None Remove="*.png" />
+    <None Remove="*.json" />
   </ItemGroup>
 
   <PropertyGroup>

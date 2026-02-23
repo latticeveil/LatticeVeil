@@ -10,13 +10,13 @@
 using System;
 using System.Reflection;
 
-[assembly: System.Reflection.AssemblyMetadataAttribute("BuildNonce", "stable")]
+[assembly: System.Reflection.AssemblyMetadataAttribute("BuildNonce", "20260222224412775-ecfca3e74d")]
 [assembly: System.Reflection.AssemblyCompanyAttribute("LatticeVeil")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyCopyrightAttribute("Copyright © 2026")]
 [assembly: System.Reflection.AssemblyDescriptionAttribute("LatticeVeil MonoGame Client")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("9.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("9.0.0+7c002848c25625cec3250cd2f57b844b8f58f2e2")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("9.0.0+407084e1b033f701a15eb49b79d6ddd45f098aec")]
 [assembly: System.Reflection.AssemblyProductAttribute("LatticeVeil")]
 [assembly: System.Reflection.AssemblyTitleAttribute("LatticeVeilMonoGame")]
 [assembly: System.Reflection.AssemblyVersionAttribute("9.0.0.0")]

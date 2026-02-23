@@ -20,6 +20,10 @@ public sealed class VoxelWorld
     private readonly object _chunksLock = new();
     private readonly Logger _log;
     private readonly int _maxChunkY;
+    
+    // Chunk storage backend
+    private readonly IChunkStore _chunkStore;
+    private readonly bool _isNewFormat;
 
     public WorldMeta Meta { get; }
     public string WorldPath { get; }
@@ -43,6 +47,21 @@ public sealed class VoxelWorld
 
         var height = Math.Max(1, Meta.Size.Height);
         _maxChunkY = (height - 1) / VoxelChunkData.ChunkSizeY;
+
+        // Initialize chunk store based on world format
+        var validation = WorldValidator.ValidateWorldFolder(worldPath);
+        _isNewFormat = validation.Status == WorldValidationStatus.ValidNew;
+        
+        if (_isNewFormat)
+        {
+            // Use region-based storage for new worlds
+            _chunkStore = new RegionChunkStore(worldPath);
+        }
+        else
+        {
+            // Use legacy chunk storage for old worlds (blocked from loading anyway)
+            _chunkStore = new LegacyChunkStore(worldPath);
+        }
     }
 
     public static VoxelWorld? Load(string worldPath, string metaPath, Logger log)
@@ -162,6 +181,14 @@ public sealed class VoxelWorld
 
     public void SaveModifiedChunks()
     {
+        // For new format worlds, use chunk store
+        if (_isNewFormat)
+        {
+            SaveModifiedChunksViaStore();
+            return;
+        }
+
+        // Legacy behavior for old worlds
         if (!Directory.Exists(ChunksDir))
             Directory.CreateDirectory(ChunksDir);
 
@@ -205,6 +232,48 @@ public sealed class VoxelWorld
         }
     }
 
+    private void SaveModifiedChunksViaStore()
+    {
+        var chunksToSave = new List<VoxelChunkData>();
+        
+        // Collect chunks that need saving
+        lock (_chunksLock)
+        {
+            foreach (var chunk in _chunks.Values)
+            {
+                if (chunk.NeedsSave)
+                {
+                    chunksToSave.Add(chunk);
+                }
+            }
+        }
+
+        // Limit saves to prevent freezing (max 50 chunks at once)
+        const int maxChunksPerSave = 50;
+        var savedCount = 0;
+        
+        foreach (var chunk in chunksToSave)
+        {
+            if (savedCount >= maxChunksPerSave)
+            {
+                // Mark remaining chunks as still needing save for next time
+                break;
+            }
+            
+            try
+            {
+                _chunkStore.SaveChunk(chunk.Coord, chunk);
+                chunk.NeedsSave = false; // Clear dirty flag after save
+                savedCount++;
+            }
+            catch (Exception ex)
+            {
+                // Log error but continue saving other chunks
+                System.Diagnostics.Debug.WriteLine($"Failed to save chunk {chunk.Coord}: {ex.Message}");
+            }
+        }
+    }
+
     public void SaveChunk(ChunkCoord coord)
     {
         VoxelChunkData? chunk;
@@ -214,6 +283,15 @@ public sealed class VoxelWorld
                 return;
         }
         
+        // For new format worlds, use chunk store
+        if (_isNewFormat)
+        {
+            _chunkStore.SaveChunk(coord, chunk);
+            chunk.NeedsSave = false;
+            return;
+        }
+
+        // Legacy behavior for old worlds
         var path = Path.Combine(ChunksDir, $"chunk_{coord.X}_{coord.Y}_{coord.Z}.bin");
         chunk.Save(path);
     }
@@ -1102,6 +1180,16 @@ public sealed class VoxelWorld
 
     private void LoadChunks()
     {
+        // For new format worlds, load via chunk store
+        if (_isNewFormat)
+        {
+            // For new format worlds, we don't pre-load all chunks
+            // Chunks are loaded on-demand via TryGetChunk
+            _log.Info("New format world: chunks will be loaded on-demand from Regions/");
+            return;
+        }
+
+        // Legacy behavior for old worlds
         if (!Directory.Exists(ChunksDir))
         {
             _log.Warn($"Chunks folder missing: {ChunksDir}");
@@ -1121,16 +1209,10 @@ public sealed class VoxelWorld
             if (chunk == null)
                 continue;
 
-            if (_chunks.ContainsKey(chunk.Coord))
+            lock (_chunksLock)
             {
-                _log.Warn($"Duplicate chunk at {chunk.Coord} in {file}");
-                continue;
+                _chunks[coord ?? new ChunkCoord(0, 0, 0)] = chunk;
             }
-
-            if (!IsChunkYInRange(chunk.Coord.Y) || !IsChunkWithinWorldXZ(chunk.Coord))
-                continue;
-
-            _chunks[chunk.Coord] = chunk;
             ChunkSeamRegistry.Register(chunk.Coord, ChunkSurfaceProfile.FromChunk(chunk));
         }
 
@@ -1143,6 +1225,17 @@ public sealed class VoxelWorld
         if (!IsChunkYInRange(coord.Y) || !IsChunkWithinWorldXZ(coord))
             return null;
 
+        // For new format worlds, try loading via chunk store
+        if (_isNewFormat)
+        {
+            if (_chunkStore.TryLoadChunk(coord, out var data))
+            {
+                return data;
+            }
+            return null;
+        }
+
+        // Legacy behavior for old worlds
         var path = Path.Combine(ChunksDir, $"chunk_{coord.X}_{coord.Y}_{coord.Z}.bin");
         if (!File.Exists(path))
             return null;
