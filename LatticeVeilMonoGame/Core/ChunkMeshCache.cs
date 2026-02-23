@@ -51,13 +51,30 @@ public static class ChunkMeshCache
         if (!File.Exists(meshPath))
             return false;
 
+        // For new format worlds, we need to get source write time differently
         var chunkPath = Path.Combine(chunksDir, $"chunk_{coord.X}_{coord.Y}_{coord.Z}.bin");
+        DateTime? sourceWriteUtc = null;
+        
         if (File.Exists(chunkPath))
         {
-            var chunkWrite = File.GetLastWriteTimeUtc(chunkPath);
+            sourceWriteUtc = File.GetLastWriteTimeUtc(chunkPath);
+        }
+        else
+        {
+            // For new format worlds, try to get region file write time
+            sourceWriteUtc = GetRegionFileWriteTime(worldPath, coord);
+        }
+
+        if (sourceWriteUtc.HasValue)
+        {
             var meshWrite = File.GetLastWriteTimeUtc(meshPath);
-            if (meshWrite < chunkWrite)
+            if (meshWrite < sourceWriteUtc.Value)
                 return false;
+        }
+        else
+        {
+            // No source file found, treat as stale
+            return false;
         }
 
         try
@@ -88,6 +105,28 @@ public static class ChunkMeshCache
         {
             return false;
         }
+    }
+
+    private static DateTime? GetRegionFileWriteTime(string worldPath, ChunkCoord coord)
+    {
+        // Calculate region coordinates (32x32 chunks per region)
+        var regionX = FloorDiv(coord.X, 32);
+        var regionZ = FloorDiv(coord.Z, 32);
+        var regionPath = Path.Combine(worldPath, "Regions", $"r.{regionX}.{regionZ}.lvregion");
+        
+        if (File.Exists(regionPath))
+            return File.GetLastWriteTimeUtc(regionPath);
+        
+        return null;
+    }
+
+    private static int FloorDiv(int value, int divisor)
+    {
+        var q = value / divisor;
+        var r = value % divisor;
+        if (r != 0 && ((r > 0) != (divisor > 0)))
+            q--;
+        return q;
     }
 
     private static void WriteVertices(BinaryWriter writer, VertexPositionTexture[] vertices)

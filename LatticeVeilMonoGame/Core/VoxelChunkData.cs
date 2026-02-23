@@ -136,7 +136,9 @@ namespace LatticeVeilMonoGame.Core
                                 }
                             }
                         }
-                        MarkDirty();
+                        // Loaded data should be clean
+                        NeedsSave = false;
+                        IsDirty = false;
                     }
                     finally
                     {
@@ -173,7 +175,9 @@ namespace LatticeVeilMonoGame.Core
                         }
                     }
                 }
-                MarkDirty();
+                // Loaded data should be clean
+                NeedsSave = false;
+                IsDirty = false;
             }
             finally
             {

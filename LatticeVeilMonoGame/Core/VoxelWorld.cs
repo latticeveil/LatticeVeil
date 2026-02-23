@@ -105,7 +105,29 @@ public sealed class VoxelWorld
     public bool TryGetChunk(ChunkCoord coord, out VoxelChunkData? chunk) 
     { 
         lock (_chunksLock) 
-            return _chunks.TryGetValue(coord, out chunk); 
+        {
+            if (_chunks.TryGetValue(coord, out chunk))
+                return true;
+        }
+
+        // For new format worlds, try on-demand loading
+        if (_isNewFormat)
+        {
+            if (_chunkStore.TryLoadChunk(coord, out var loaded))
+            {
+                lock (_chunksLock)
+                {
+                    _chunks[coord] = loaded;
+                }
+                ChunkSeamRegistry.Register(coord, ChunkSurfaceProfile.FromChunk(loaded));
+                chunk = loaded;
+                return true;
+            }
+        }
+
+        // Legacy behavior: return false if not in memory
+        chunk = null;
+        return false;
     }
 
     public void AddChunkDirect(ChunkCoord coord, VoxelChunkData chunk)
