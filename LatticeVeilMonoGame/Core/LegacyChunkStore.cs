@@ -100,13 +100,15 @@ public sealed class LegacyChunkStore : IChunkStore
                 return false;
             }
 
-            data = VoxelChunkData.Load(path);
+            var chunk = new VoxelChunkData(coord);
+            chunk.Load(path);
             
             lock (_chunksLock)
             {
-                _chunks[coord] = data;
+                _chunks[coord] = chunk;
             }
             
+            data = chunk;
             return true;
         }
         catch (Exception)
