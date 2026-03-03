@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -17,9 +18,6 @@ public sealed class CreateWorldScreen : IScreen
     private const int PanelMaxHeight = 700;
     private const int ControlShrinkPixels = 60; // ~2 inches at 30 px/in
     private const int ContentDownShiftPixels = 30; // ~1 inch at 30 px/in
-    private const int SpawnChunkPregenerationRadius = 8;
-    private const int SpawnMeshPregenerationRadius = 4;
-    private const int SpawnVerticalPregenerationChunkTop = 5;
 
     private readonly MenuStack _menus;
     private readonly AssetLoader _assets;
@@ -54,6 +52,8 @@ public sealed class CreateWorldScreen : IScreen
     private readonly Button _enableCheatsBtn;
     private readonly Button _difficultyBtn;
     private readonly Button _enableHomesBtn;
+    private readonly Button _resumeGenerationBtn;
+    private readonly Button _abortGenerationBtn;
     private readonly List<Rectangle> _difficultyOptionRects = new();
     private bool _moreWorldOptionsOpen;
 
@@ -64,6 +64,8 @@ public sealed class CreateWorldScreen : IScreen
     private bool _structuresEnabled = true;
     private bool _cavesEnabled = true;
     private bool _oresEnabled = true;
+    private bool _treesEnabled = true;
+    private string _worldType = "terrain";
     private bool _cheatsEnabled = true;
     private bool _multipleHomesEnabled = true;
     private int _maxHomesPerPlayer = 2;
@@ -79,17 +81,24 @@ public sealed class CreateWorldScreen : IScreen
     private float _generationProgress;
     private string _generationStage = string.Empty;
     private Task<WorldCreateResult>? _createTask;
-    private bool _meshPrebakeInProgress;
-    private string _pendingWorldName = string.Empty;
-    private string _pendingWorldPath = string.Empty;
-    private WorldMeta? _pendingWorldMeta;
-    private List<ChunkCoord> _pendingMeshCoords = new();
-    private int _pendingMeshIndex;
-    private int _cachedMeshCount;
-    private VoxelWorld? _meshPrebakeWorld;
-    private CubeNetAtlas? _meshPrebakeAtlas;
+    private CancellationTokenSource? _generationCts;
+    private DateTime _lastHeartbeatUtc = DateTime.UtcNow;
+    private DateTime _lastProgressMovementUtc = DateTime.UtcNow;
+    private float _lastWatchdogProgress = -1f;
+    private string _lastWatchdogStage = string.Empty;
+    private bool _generationPausePromptOpen;
+    private string _generationPauseReason = string.Empty;
+    private Rectangle _generationPausePromptRect;
+    private string _activeWorldName = string.Empty;
+    private string _activeWorldPath = string.Empty;
+    private WorldMeta? _activeWorldMeta;
+    private bool _discardCreateResult;
+    private volatile bool _generationStateActive;
+    private bool _resumeBootstrapPending;
+    private readonly string? _resumeWorldPath;
+    private readonly object _generationLock = new();
 
-    public CreateWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, Action<string> onWorldCreated)
+    public CreateWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, Action<string> onWorldCreated, string? resumeWorldPath = null)
     {
         _menus = menus;
         _assets = assets;
@@ -110,6 +119,10 @@ public sealed class CreateWorldScreen : IScreen
         _difficultyBtn = new Button(string.Empty, ToggleDifficultyDropdown);
         _enableHomesBtn = new Button(string.Empty, ToggleEnableHomes);
         _moreWorldOptionsBtn = new Button("MORE WORLD OPTIONS", OpenMoreWorldOptions);
+        _resumeGenerationBtn = new Button("RESUME GENERATION", ResumeGeneration) { BoldText = true };
+        _abortGenerationBtn = new Button("ABORT + DELETE WORLD", AbortAndDeleteGeneration) { BoldText = true, BackgroundColor = new Color(100, 26, 26) };
+        _resumeWorldPath = string.IsNullOrWhiteSpace(resumeWorldPath) ? null : resumeWorldPath;
+        _resumeBootstrapPending = !string.IsNullOrWhiteSpace(_resumeWorldPath);
 
         var settings = GameSettings.LoadOrCreate(_log);
         _maxHomesCap = Math.Clamp(settings.CreateWorldHomesCap, 1, 64);
@@ -120,19 +133,31 @@ public sealed class CreateWorldScreen : IScreen
 
         LoadAssets();
         RefreshGameModeButtonTextures();
+
+        if (_resumeBootstrapPending && !string.IsNullOrWhiteSpace(_resumeWorldPath))
+        {
+            _worldNameActive = false;
+            _worldName = Path.GetFileName(_resumeWorldPath) ?? "RECOVERING WORLD";
+            _statusMessage = "RESUMING INCOMPLETE GENERATION...";
+            _statusUntil = 0d;
+        }
     }
 
     private void OpenMoreWorldOptions()
     {
         var moreOptionsScreen = new MoreWorldOptionsScreen(
             _menus, _assets, _font, _pixel, _log,
-            _oresEnabled, _cavesEnabled, _structuresEnabled, false,
+            _oresEnabled, _cavesEnabled, _structuresEnabled, _treesEnabled, _worldType,
             _multipleHomesEnabled, _maxHomesPerPlayer, _maxHomesCap,
-            (generateOres, generateCaves, generateStructures, flat, enableHomes, homeSlots) =>
+            (generateOres, generateCaves, generateStructures, generateTrees, worldType, enableHomes, homeSlots) =>
             {
                 _oresEnabled = generateOres;
                 _cavesEnabled = generateCaves;
                 _structuresEnabled = generateStructures;
+                _worldType = WorldMeta.CanonicalWorldType(worldType);
+                _treesEnabled = string.Equals(_worldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+                    ? generateTrees
+                    : true;
                 _multipleHomesEnabled = enableHomes;
                 _maxHomesPerPlayer = homeSlots == -1 ? _maxHomesCap : Math.Clamp(homeSlots, 1, _maxHomesCap);
                 _unlimitedHomes = homeSlots == -1;
@@ -274,6 +299,19 @@ public sealed class CreateWorldScreen : IScreen
             viewport.Bottom - backBtnMargin - backBtnH,
             backBtnW,
             backBtnH);
+
+        var modalW = Math.Clamp(_panelRect.Width - 160, 360, 640);
+        var modalH = 200;
+        _generationPausePromptRect = new Rectangle(
+            _panelRect.Center.X - modalW / 2,
+            _panelRect.Center.Y - modalH / 2,
+            modalW,
+            modalH);
+        var buttonW2 = Math.Clamp((modalW - 48) / 2, 140, 280);
+        var buttonH2 = 44;
+        var buttonsY = _generationPausePromptRect.Bottom - buttonH2 - 20;
+        _resumeGenerationBtn.Bounds = new Rectangle(_generationPausePromptRect.X + 16, buttonsY, buttonW2, buttonH2);
+        _abortGenerationBtn.Bounds = new Rectangle(_generationPausePromptRect.Right - 16 - buttonW2, buttonsY, buttonW2, buttonH2);
     }
 
     public void Update(GameTime gameTime, InputState input)
@@ -282,12 +320,25 @@ public sealed class CreateWorldScreen : IScreen
         if (_statusUntil > 0 && _now >= _statusUntil)
             _statusMessage = string.Empty;
 
+        if (_resumeBootstrapPending)
+        {
+            _resumeBootstrapPending = false;
+            BeginResumeGeneration();
+        }
+
+        if (_createTask != null && _createTask.IsCompleted)
+            CompleteCreateTask();
+
+        if (_generationPausePromptOpen)
+        {
+            _resumeGenerationBtn.Update(input);
+            _abortGenerationBtn.Update(input);
+            return;
+        }
+
         if (_isGeneratingWorld)
         {
-            if (_createTask != null && _createTask.IsCompleted)
-                CompleteCreateTask();
-            if (_meshPrebakeInProgress)
-                ProcessMeshPrebakeStep();
+            UpdateGenerationWatchdog();
             return;
         }
 
@@ -433,6 +484,11 @@ public sealed class CreateWorldScreen : IScreen
             DrawGeneratingOverlay(sb);
         }
 
+        if (_generationPausePromptOpen)
+        {
+            DrawGenerationPausePrompt(sb);
+        }
+
         sb.End();
     }
 
@@ -543,14 +599,19 @@ public sealed class CreateWorldScreen : IScreen
         var worldPath = Path.Combine(Paths.WorldsDir, worldName);
         if (Directory.Exists(worldPath))
         {
-            _log.Warn($"World directory already exists: {worldPath}");
-            SetStatus("WORLD NAME ALREADY EXISTS");
-            return;
+            // If this folder was created by a failed pre-bootstrap heartbeat and has no world manifest,
+            // treat it as transient state and clear it so the user can create the world normally.
+            if (!TryDeleteGhostPreGenerationFolder(worldPath))
+            {
+                _log.Warn($"World directory already exists: {worldPath}");
+                SetStatus("WORLD NAME ALREADY EXISTS");
+                return;
+            }
         }
 
         var (width, height, depth) = GetWorldDimensions();
         var seed = Environment.TickCount;
-        var meta = WorldMeta.CreateFlat(worldName, _selectedGameMode, width, height, depth, seed);
+        var meta = WorldMeta.CreateTerrain(worldName, _selectedGameMode, width, height, depth, seed);
         meta.CreatedAt = DateTimeOffset.UtcNow.ToString("O");
         meta.PlayerCollision = true;
         meta.EnableMultipleHomes = _multipleHomesEnabled;
@@ -558,56 +619,407 @@ public sealed class CreateWorldScreen : IScreen
         meta.EnableCheats = _cheatsEnabled;
         meta.DifficultyLevel = Math.Clamp(_difficulty, 0, 3);
 
-        _isGeneratingWorld = true;
-        _generationProgress = 0f;
-        _generationStage = "PREPARING";
-        _statusMessage = string.Empty;
-        _statusUntil = 0d;
-        _createTask = Task.Run(() => CreateWorldTask(worldName, worldPath, meta));
+        // World generation selections
+        meta.WorldGeneration.GenerateStructures = _structuresEnabled;
+        meta.WorldGeneration.GenerateCaves = _cavesEnabled;
+        meta.WorldGeneration.GenerateOres = _oresEnabled;
+        meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(_worldType);
+        meta.WorldGeneration.GenerateTrees = string.Equals(meta.WorldGeneration.WorldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+            ? _treesEnabled
+            : true;
+        meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);
+
+        StartWorldGeneration(worldName, worldPath, meta, allowExistingWorld: false, resumeState: null);
     }
 
-    private WorldCreateResult CreateWorldTask(string worldName, string worldPath, WorldMeta meta)
+    private void BeginResumeGeneration()
     {
+        var resumePath = !string.IsNullOrWhiteSpace(_activeWorldPath) ? _activeWorldPath : _resumeWorldPath;
+        if (string.IsNullOrWhiteSpace(resumePath))
+        {
+            SetStatus("NO WORLD TO RESUME");
+            return;
+        }
+
+        if (!Directory.Exists(resumePath))
+        {
+            SetStatus("PARTIAL WORLD MISSING");
+            return;
+        }
+
+        var worldManifestPath = FileConventions.GetWorldManifestPath(resumePath);
+        if (!File.Exists(worldManifestPath))
+        {
+            if (TryDeleteGhostPreGenerationFolder(resumePath))
+                SetStatus("REMOVED STALE PARTIAL WORLD");
+            else
+                SetStatus("NO RESUMABLE GENERATION FOUND");
+            return;
+        }
+
+        var metaPath = Paths.ResolveWorldMetaPath(resumePath);
+        if (!File.Exists(metaPath))
+        {
+            SetStatus("PARTIAL WORLD METADATA MISSING");
+            return;
+        }
+
+        var meta = WorldMeta.Load(metaPath, _log);
+        if (meta == null)
+        {
+            SetStatus("FAILED TO LOAD WORLD METADATA");
+            return;
+        }
+
+        _structuresEnabled = meta.WorldGeneration?.GenerateStructures ?? true;
+        _cavesEnabled = meta.WorldGeneration?.GenerateCaves ?? true;
+        _oresEnabled = meta.WorldGeneration?.GenerateOres ?? true;
+        _worldType = WorldMeta.CanonicalWorldType(meta.WorldGeneration?.WorldType);
+        _treesEnabled = string.Equals(_worldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+            ? (meta.WorldGeneration?.GenerateTrees ?? true)
+            : true;
+        _cheatsEnabled = meta.Gameplay?.EnableCheats ?? meta.EnableCheats;
+        _multipleHomesEnabled = meta.Gameplay?.EnableMultipleHomes ?? meta.EnableMultipleHomes;
+        _maxHomesPerPlayer = meta.Gameplay?.MaxHomesPerPlayer ?? meta.MaxHomesPerPlayer;
+
+        WorldGenerationStateStore.TryLoadRecoverableState(resumePath, TimeSpan.FromSeconds(90), out var resumeState, _log);
+        StartWorldGeneration(meta.Name, resumePath, meta, allowExistingWorld: true, resumeState: resumeState);
+    }
+
+    private void StartWorldGeneration(string worldName, string worldPath, WorldMeta meta, bool allowExistingWorld, WorldGenerationState? resumeState)
+    {
+        if (_isGeneratingWorld || (_createTask != null && !_createTask.IsCompleted))
+            return;
+
+        _activeWorldName = worldName;
+        _activeWorldPath = worldPath;
+        _activeWorldMeta = meta;
+
+        _isGeneratingWorld = true;
+        _generationPausePromptOpen = false;
+        _generationPauseReason = string.Empty;
+        SetGenerationProgress(0f, "PREPARING");
+        _statusMessage = string.Empty;
+        _statusUntil = 0d;
+        _lastHeartbeatUtc = DateTime.UtcNow;
+        _lastProgressMovementUtc = DateTime.UtcNow;
+        _lastWatchdogProgress = -1f;
+        _lastWatchdogStage = string.Empty;
+        _generationCts?.Dispose();
+        _generationCts = new CancellationTokenSource();
+        _discardCreateResult = false;
+        _generationStateActive = allowExistingWorld && File.Exists(FileConventions.GetWorldManifestPath(worldPath));
+
+        var worldGeneration = meta.WorldGeneration ?? new WorldGenerationSettings();
+        meta.WorldGeneration = worldGeneration;
+        var worldType = WorldMeta.CanonicalWorldType(worldGeneration.WorldType);
+        var treesEnabled = string.Equals(worldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+            ? worldGeneration.GenerateTrees
+            : true;
+        _treesEnabled = treesEnabled;
+        _worldType = worldType;
+        worldGeneration.WorldType = worldType;
+        worldGeneration.GenerateTrees = treesEnabled;
+        meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(worldType);
+
+        _createTask = Task.Run(() => CreateWorldTask(worldName, worldPath, meta, allowExistingWorld, resumeState, _generationCts.Token));
+    }
+
+    private void UpdateGenerationWatchdog()
+    {
+        const int stallSeconds = 45;
+
+        float progress;
+        string stage;
+        DateTime heartbeatUtc;
+        lock (_generationLock)
+        {
+            progress = _generationProgress;
+            stage = _generationStage;
+            heartbeatUtc = _lastHeartbeatUtc;
+        }
+
+        if (Math.Abs(progress - _lastWatchdogProgress) > 0.0001f
+            || !string.Equals(stage, _lastWatchdogStage, StringComparison.Ordinal))
+        {
+            _lastWatchdogProgress = progress;
+            _lastWatchdogStage = stage;
+            _lastProgressMovementUtc = DateTime.UtcNow;
+        }
+
+        var now = DateTime.UtcNow;
+        var staleByHeartbeat = now - heartbeatUtc > TimeSpan.FromSeconds(stallSeconds);
+        var staleByProgress = now - _lastProgressMovementUtc > TimeSpan.FromSeconds(stallSeconds);
+        if (staleByHeartbeat && staleByProgress)
+        {
+            PauseGeneration("Generation stalled. Resume or abort this partial world.");
+        }
+    }
+
+    private void PauseGeneration(string reason)
+    {
+        if (_generationPausePromptOpen)
+            return;
+
+        _generationCts?.Cancel();
+        _isGeneratingWorld = false;
+        _generationPausePromptOpen = true;
+        _generationPauseReason = reason;
+        PersistGenerationState(WorldGenerationState.StatusPaused, _generationStage, _generationProgress, reason);
+    }
+
+    private void ResumeGeneration()
+    {
+        if (!_generationPausePromptOpen)
+            return;
+
+        if (_createTask != null && !_createTask.IsCompleted)
+        {
+            _generationPauseReason = "Waiting for active generation task to pause...";
+            return;
+        }
+
+        _generationPausePromptOpen = false;
+        _generationPauseReason = string.Empty;
+        BeginResumeGeneration();
+    }
+
+    private void AbortAndDeleteGeneration()
+    {
+        _generationCts?.Cancel();
+        _isGeneratingWorld = false;
+        _generationPausePromptOpen = false;
+        _discardCreateResult = true;
+        _generationStateActive = false;
+
+        if (string.IsNullOrWhiteSpace(_activeWorldPath) || !Directory.Exists(_activeWorldPath))
+        {
+            SetStatus("PARTIAL WORLD NOT FOUND");
+            return;
+        }
+
         try
         {
-            _log.Info($"Creating new world: {worldName}");
-            _log.Info($"Settings: GameMode={_selectedGameMode}, Difficulty={_difficulty}");
-            _log.Info($"Features: Structures={_structuresEnabled}, Caves={_cavesEnabled}, Ores={_oresEnabled}");
+            ClearReadOnlyAttributes(_activeWorldPath);
+            Directory.Delete(_activeWorldPath, true);
+            _activeWorldPath = string.Empty;
+            _activeWorldName = string.Empty;
+            _activeWorldMeta = null;
+            _onWorldCreated?.Invoke(string.Empty);
+            _menus.Pop();
+            SetStatus("PARTIAL WORLD DELETED");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to delete partial world {_activeWorldPath}: {ex.Message}");
+            SetStatus("FAILED TO DELETE PARTIAL WORLD");
+        }
+    }
 
-            SetGenerationProgress(0.08f, "METADATA");
-            Directory.CreateDirectory(worldPath);
+    private WorldCreateResult CreateWorldTask(
+        string worldName,
+        string worldPath,
+        WorldMeta meta,
+        bool allowExistingWorld,
+        WorldGenerationState? resumeState,
+        CancellationToken cancellationToken)
+    {
+        DateTime lastHeartbeatWriteUtc = DateTime.MinValue;
+        float lastPersistedProgress = -1f;
+        string lastPersistedStage = string.Empty;
+
+        void Report(float progress, string stage, bool forcePersist = false)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            SetGenerationProgress(progress, stage);
+
+            var now = DateTime.UtcNow;
+            var stageChanged = !string.Equals(stage, lastPersistedStage, StringComparison.Ordinal);
+            var progressJump = Math.Abs(progress - lastPersistedProgress) >= 0.02f;
+            if (!forcePersist && !stageChanged && !progressJump && now - lastHeartbeatWriteUtc < TimeSpan.FromSeconds(2))
+                return;
+
+            if (_generationStateActive)
+                PersistGenerationState(WorldGenerationState.StatusInProgress, stage, progress, string.Empty);
+            lastHeartbeatWriteUtc = now;
+            lastPersistedProgress = progress;
+            lastPersistedStage = stage;
+        }
+
+        try
+        {
+            if (!allowExistingWorld && Directory.Exists(worldPath))
+                return WorldCreateResult.Failure("WORLD NAME ALREADY EXISTS");
+
+            meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(meta.WorldGeneration.WorldType);
+            meta.WorldGeneration.GenerateTrees = string.Equals(meta.WorldGeneration.WorldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+                ? meta.WorldGeneration.GenerateTrees
+                : true;
+            meta.CanonicalizeWorldGenerationContract();
+
+            _log.Info($"Creating world transaction: {worldName} seed={meta.Seed} type={meta.WorldGeneration.WorldType} generator={meta.Generator}");
+
+            BiomeIndexStore? biomeIndex = null;
+            if (resumeState != null && resumeState.Progress >= 0.30f)
+            {
+                biomeIndex = BiomeIndexStore.Load(worldPath, _log);
+                if (biomeIndex != null && !biomeIndex.IsCompatible(meta))
+                    biomeIndex = null;
+            }
+
+            Report(0.06f, "BIOME INDEX", forcePersist: true);
+            biomeIndex ??= BiomeLocateService.BuildCoverageIndexWithReseed(meta, _log, maxAttempts: 64, stride: 64);
+            cancellationToken.ThrowIfCancellationRequested();
+            meta.CanonicalizeWorldGenerationContract();
+
+            Report(0.12f, "METADATA", forcePersist: true);
+            if (!WorldCreator.CreateNewWorld(worldPath, worldName, meta.Seed, meta.CurrentWorldGameMode))
+                return WorldCreateResult.Failure("FAILED TO CREATE NEW WORLD STRUCTURE");
+
             var metaPath = Paths.GetWorldMetaPath(worldPath);
             meta.Save(metaPath, _log);
-            
-            // Create and save consolidated world configuration
-            SetGenerationProgress(0.12f, "CONFIGURATION");
+            _generationStateActive = true;
+
+            Report(0.20f, "CONFIGURATION", forcePersist: true);
             var worldConfig = WorldConfig.FromWorldMeta(meta);
             worldConfig.WorldGeneration.GenerateStructures = _structuresEnabled;
             worldConfig.WorldGeneration.GenerateCaves = _cavesEnabled;
             worldConfig.WorldGeneration.GenerateOres = _oresEnabled;
+            worldConfig.WorldGeneration.GenerateTrees = string.Equals(meta.WorldGeneration.WorldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+                ? _treesEnabled
+                : true;
+            worldConfig.WorldGeneration.WorldType = meta.WorldGeneration.WorldType;
             worldConfig.Gameplay.EnableCheats = _cheatsEnabled;
             worldConfig.Gameplay.EnableMultipleHomes = _multipleHomesEnabled;
             worldConfig.Gameplay.MaxHomesPerPlayer = _unlimitedHomes ? -1 : _maxHomesPerPlayer;
-            worldConfig.Save(worldPath, _log);
-            
-            SetGenerationProgress(0.22f, "BIOME CATALOG");
-            BiomeCatalog.BuildAndSave(meta, worldPath, _log);
+            meta.WorldGeneration = worldConfig.WorldGeneration;
+            meta.Gameplay = worldConfig.Gameplay;
+            meta.Player = worldConfig.Player;
+            meta.Performance = worldConfig.Performance;
+            meta.Save(metaPath, _log);
 
-            SetGenerationProgress(0.40f, "SPAWN CHUNKS");
-            var meshCoords = PregenerateSpawnChunks(meta, worldPath, progress =>
+            Report(0.30f, "INDEX SAVE", forcePersist: true);
+            biomeIndex.Save(worldPath, _log);
+            Directory.CreateDirectory(worldPath);
+            Directory.CreateDirectory(Path.Combine(worldPath, "regions"));
+
+            Report(0.42f, "PREWARM", forcePersist: true);
+            var spawn = GetSpawnPoint(meta);
+            VoxelWorld.WorldToChunk((int)spawn.X, 64, (int)spawn.Y, out var spawnChunkX, out _, out var spawnChunkZ);
+            var spawnRegionX = (int)Math.Floor(spawnChunkX / 32.0);
+            var spawnRegionZ = (int)Math.Floor(spawnChunkZ / 32.0);
+            RegionChunkStore.EnsureRegionExists(worldPath, spawnRegionX, spawnRegionZ);
+
+            var bakedChunks = new HashSet<ChunkCoord>();
+            var gateChunks = new List<ChunkCoord>();
+            var biomeAnchorChunks = new HashSet<ChunkCoord>();
+
+            const int bakeRadius = 6;
+            const int gateRadius = 3;
+            using (var world = VoxelWorld.Load(worldPath, metaPath, _log))
             {
-                var stageProgress = 0.40f + progress * 0.35f;
-                SetGenerationProgress(stageProgress, "SPAWN CHUNKS");
-            });
+                if (world == null)
+                    return WorldCreateResult.Failure("FAILED TO PREWARM WORLD");
 
-            SetGenerationProgress(0.78f, "MESH CACHE");
-            _log.Info($"World generation base stages complete: {worldName} (mesh candidates: {meshCoords.Count})");
-            return WorldCreateResult.Success(worldName, worldPath, meta, meshCoords);
+                var maxCy = Math.Min(world.MaxChunkY, 5);
+                if (maxCy < 0)
+                    maxCy = 0;
+
+                void BakeColumn(int cx, int cz, bool includeInGate)
+                {
+                    for (var cy = 0; cy <= maxCy; cy++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var coord = new ChunkCoord(cx, cy, cz);
+                        if (bakedChunks.Add(coord))
+                        {
+                            var chunk = world.GetOrCreateChunkData(cx, cy, cz);
+                            chunk.NeedsSave = true;
+                            world.SaveChunk(coord);
+                            chunk.NeedsSave = false;
+                        }
+
+                        if (includeInGate)
+                            gateChunks.Add(coord);
+                    }
+                }
+
+                var totalColumns = (bakeRadius * 2 + 1) * (bakeRadius * 2 + 1);
+                var bakedColumnCount = 0;
+                for (int dz = -bakeRadius; dz <= bakeRadius; dz++)
+                {
+                    for (int dx = -bakeRadius; dx <= bakeRadius; dx++)
+                    {
+                        var cx = spawnChunkX + dx;
+                        var cz = spawnChunkZ + dz;
+                        var includeInGate = Math.Abs(dx) <= gateRadius && Math.Abs(dz) <= gateRadius;
+                        BakeColumn(cx, cz, includeInGate);
+                        bakedColumnCount++;
+                    }
+
+                    var bakeProgress = 0.42f + 0.18f * (bakedColumnCount / (float)Math.Max(1, totalColumns));
+                    Report(bakeProgress, "PREWARM");
+                }
+
+                foreach (var biome in new[] { BiomeId.Grasslands, BiomeId.Forest, BiomeId.Hills, BiomeId.Desert, BiomeId.Ocean })
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!BiomeLocateService.TryGetAnchor(biomeIndex, biome, out var anchor))
+                        continue;
+
+                    VoxelWorld.WorldToChunk(anchor.X, 64, anchor.Z, out var anchorChunkX, out _, out var anchorChunkZ);
+                    var anchorSurface = new ChunkCoord(anchorChunkX, Math.Min(maxCy, 4), anchorChunkZ);
+                    biomeAnchorChunks.Add(anchorSurface);
+                    var outOfSpawnBake = Math.Abs(anchorChunkX - spawnChunkX) > bakeRadius
+                        || Math.Abs(anchorChunkZ - spawnChunkZ) > bakeRadius;
+                    if (outOfSpawnBake)
+                        BakeColumn(anchorChunkX, anchorChunkZ, includeInGate: false);
+                }
+
+                world.SaveAllLoadedChunks();
+            }
+
+            var manifest = new SpawnPrewarmManifest
+            {
+                SpawnChunkX = spawnChunkX,
+                SpawnChunkZ = spawnChunkZ,
+                BakeRadius = bakeRadius,
+                GateRadius = gateRadius,
+                BakedChunks = new List<ChunkCoord>(bakedChunks),
+                GateChunks = gateChunks,
+                BiomeAnchorChunks = new List<ChunkCoord>(biomeAnchorChunks)
+            };
+            SpawnPrewarmStore.Save(worldPath, manifest, _log);
+
+            Report(0.86f, "WORLD PREVIEW", forcePersist: true);
+            if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(worldPath, out var storageBudget))
+            {
+                _log.Warn($"World preview skipped due to storage-conserve mode. size={storageBudget.SizeBytes} bytes");
+            }
+            else
+            {
+                WorldPreviewGenerator.GenerateAndSave(meta, worldPath, _log);
+            }
+
+            Report(1.0f, "FINALIZING", forcePersist: true);
+            PersistGenerationState(WorldGenerationState.StatusCompleted, "DONE", 1f, string.Empty);
+            _log.Info($"World generation complete: {worldName}.");
+            return WorldCreateResult.Success(worldName, worldPath, meta);
+        }
+        catch (OperationCanceledException)
+        {
+            if (_generationStateActive)
+            {
+                PersistGenerationState(WorldGenerationState.StatusPaused, _generationStage, _generationProgress, "Generation paused.");
+                return WorldCreateResult.Paused();
+            }
+            return WorldCreateResult.Failure("GENERATION CANCELED");
         }
         catch (Exception ex)
         {
             _log.Error($"Failed to create world: {ex.Message}");
             _log.Error($"Stack trace: {ex.StackTrace}");
+            PersistGenerationState(WorldGenerationState.StatusFailed, _generationStage, _generationProgress, ex.Message);
             return WorldCreateResult.Failure("FAILED TO CREATE WORLD");
         }
     }
@@ -688,6 +1100,26 @@ public sealed class CreateWorldScreen : IScreen
         return new string(chars).Trim();
     }
 
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        try
+        {
+            var dirInfo = new DirectoryInfo(path);
+            if (!dirInfo.Exists)
+                return;
+
+            dirInfo.Attributes &= ~FileAttributes.ReadOnly;
+            foreach (var file in dirInfo.GetFiles("*", SearchOption.AllDirectories))
+                file.Attributes &= ~FileAttributes.ReadOnly;
+            foreach (var dir in dirInfo.GetDirectories("*", SearchOption.AllDirectories))
+                dir.Attributes &= ~FileAttributes.ReadOnly;
+        }
+        catch
+        {
+            // Best effort only.
+        }
+    }
+
     private void SetStatus(string message, double seconds = 2.5)
     {
         _statusMessage = message;
@@ -696,8 +1128,30 @@ public sealed class CreateWorldScreen : IScreen
 
     private void SetGenerationProgress(float progress, string stage)
     {
-        _generationProgress = Math.Clamp(progress, 0f, 1f);
-        _generationStage = stage ?? string.Empty;
+        lock (_generationLock)
+        {
+            _generationProgress = Math.Clamp(progress, 0f, 1f);
+            _generationStage = stage ?? string.Empty;
+            _lastHeartbeatUtc = DateTime.UtcNow;
+        }
+    }
+
+    private void PersistGenerationState(string status, string stage, float progress, string errorReason)
+    {
+        if (!_generationStateActive || string.IsNullOrWhiteSpace(_activeWorldPath) || _activeWorldMeta == null)
+            return;
+
+        WorldGenerationStateStore.UpdateHeartbeat(
+            _activeWorldPath,
+            status,
+            stage,
+            progress,
+            _activeWorldMeta.Seed,
+            _activeWorldMeta.WorldGeneration.WorldType,
+            _activeWorldMeta.Generator,
+            errorReason,
+            _activeWorldMeta.Name,
+            _log);
     }
 
     private void CompleteCreateTask()
@@ -717,130 +1171,114 @@ public sealed class CreateWorldScreen : IScreen
         }
 
         _createTask = null;
+        _generationCts?.Dispose();
+        _generationCts = null;
+
+        if (_discardCreateResult)
+        {
+            _discardCreateResult = false;
+            _generationStateActive = false;
+            return;
+        }
+
+        if (result.IsPaused)
+        {
+            _isGeneratingWorld = false;
+            _generationPausePromptOpen = true;
+            if (string.IsNullOrWhiteSpace(_generationPauseReason))
+                _generationPauseReason = "Generation paused.";
+            return;
+        }
 
         if (result.IsSuccess)
         {
-            BeginMeshPrebake(result);
+            _isGeneratingWorld = false;
+            _generationPausePromptOpen = false;
+            _generationPauseReason = string.Empty;
+            WorldGenerationStateStore.Delete(result.WorldPath, _log);
+            _generationStateActive = false;
+            _log.Info($"World created successfully: {result.WorldName}.");
+            _onWorldCreated?.Invoke(result.WorldName);
+            var metaPath = Paths.ResolveWorldMetaPath(result.WorldPath);
+            _menus.Pop();
+            _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, result.WorldPath, metaPath), _viewport);
             return;
         }
 
         _isGeneratingWorld = false;
+        _generationPausePromptOpen = false;
+        _generationPauseReason = string.Empty;
+        _generationStateActive = false;
         SetStatus(result.ErrorMessage ?? "FAILED TO CREATE WORLD");
     }
 
-    private void BeginMeshPrebake(WorldCreateResult result)
+    private bool TryDeleteGhostPreGenerationFolder(string worldPath)
     {
-        _pendingWorldName = result.WorldName;
-        _pendingWorldPath = result.WorldPath;
-        _pendingWorldMeta = result.Meta;
-        _pendingMeshCoords = result.MeshCoords ?? new List<ChunkCoord>();
-        _pendingMeshIndex = 0;
-        _cachedMeshCount = 0;
+        if (string.IsNullOrWhiteSpace(worldPath) || !Directory.Exists(worldPath))
+            return false;
 
-        if (_pendingWorldMeta == null || string.IsNullOrWhiteSpace(_pendingWorldPath))
-        {
-            FailGeneration("FAILED TO PREPARE MESH CACHE");
-            return;
-        }
+        var worldManifestPath = FileConventions.GetWorldManifestPath(worldPath);
+        if (File.Exists(worldManifestPath))
+            return false;
 
+        var statePath = WorldGenerationStateStore.GetPath(worldPath);
+        var tempStatePath = statePath + ".tmp";
+        string[] entries;
         try
         {
-            _meshPrebakeWorld = new VoxelWorld(_pendingWorldMeta, _pendingWorldPath, _log);
-            var settings = GameSettings.LoadOrCreate(_log);
-            _meshPrebakeAtlas = CubeNetAtlas.Build(_assets, _log, settings.QualityPreset);
-            _meshPrebakeInProgress = true;
-            SetGenerationProgress(0.78f, "MESH CACHE");
+            entries = Directory.GetFileSystemEntries(worldPath, "*", SearchOption.TopDirectoryOnly);
         }
         catch (Exception ex)
         {
-            _log.Warn($"Mesh cache bootstrap failed: {ex.Message}");
-            _meshPrebakeInProgress = false;
-            FinalizeWorldCreation();
+            _log.Warn($"Failed to inspect world folder {worldPath}: {ex.Message}");
+            return false;
         }
-    }
 
-    private void ProcessMeshPrebakeStep()
-    {
-        if (!_meshPrebakeInProgress || _meshPrebakeWorld == null || _meshPrebakeAtlas == null)
+        var deletable = entries.Length == 0;
+        if (!deletable)
         {
-            _meshPrebakeInProgress = false;
-            FinalizeWorldCreation();
-            return;
+            deletable = true;
+            for (var i = 0; i < entries.Length; i++)
+            {
+                var entry = entries[i];
+                if (string.Equals(entry, statePath, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(entry, tempStatePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                deletable = false;
+                break;
+            }
         }
 
-        var total = Math.Max(1, _pendingMeshCoords.Count);
-        const int chunksPerFrame = 2;
-        var processed = 0;
-        while (_pendingMeshIndex < _pendingMeshCoords.Count && processed < chunksPerFrame)
-        {
-            var coord = _pendingMeshCoords[_pendingMeshIndex];
-            var chunk = _meshPrebakeWorld.GetOrCreateChunk(coord);
-            var mesh = VoxelMesherGreedy.BuildChunkMeshFast(_meshPrebakeWorld, chunk, _meshPrebakeAtlas, _log);
-            ChunkMeshCache.Save(_pendingWorldPath, mesh);
-            _cachedMeshCount++;
-            _pendingMeshIndex++;
-            processed++;
-        }
+        if (!deletable)
+            return false;
 
-        var progress = 0.78f + ((_pendingMeshIndex / (float)total) * 0.12f);
-        SetGenerationProgress(progress, "MESH CACHE");
-
-        if (_pendingMeshIndex >= _pendingMeshCoords.Count)
-        {
-            _meshPrebakeInProgress = false;
-            FinalizeWorldCreation();
-        }
-    }
-
-    private void FinalizeWorldCreation()
-    {
         try
         {
-            SetGenerationProgress(0.90f, "WORLD PREVIEW");
-            if (_pendingWorldMeta != null && !string.IsNullOrWhiteSpace(_pendingWorldPath))
-                WorldPreviewGenerator.GenerateAndSave(_pendingWorldMeta, _pendingWorldPath, _log);
-
-            SetGenerationProgress(1.0f, "FINALIZING");
-            _log.Info($"World created successfully: {_pendingWorldName} (cachedMeshes={_cachedMeshCount}).");
-            _isGeneratingWorld = false;
-            _onWorldCreated?.Invoke(_pendingWorldName);
-            _menus.Pop();
+            ClearReadOnlyAttributes(worldPath);
+            Directory.Delete(worldPath, true);
+            _log.Info($"Removed stale pre-generation world folder: {worldPath}");
+            return true;
         }
         catch (Exception ex)
         {
-            _log.Error($"Finalization failed: {ex.Message}");
-            FailGeneration("FAILED TO FINALIZE WORLD");
+            _log.Warn($"Failed to remove stale pre-generation world folder {worldPath}: {ex.Message}");
+            return false;
         }
-        finally
-        {
-            DisposeMeshPrebakeResources();
-        }
-    }
-
-    private void DisposeMeshPrebakeResources()
-    {
-        if (_meshPrebakeAtlas != null)
-        {
-            _meshPrebakeAtlas.Texture.Dispose();
-            _meshPrebakeAtlas = null;
-        }
-
-        _meshPrebakeWorld = null;
-        _pendingMeshCoords.Clear();
-        _pendingMeshIndex = 0;
-        _cachedMeshCount = 0;
-    }
-
-    private void FailGeneration(string message)
-    {
-        _isGeneratingWorld = false;
-        _meshPrebakeInProgress = false;
-        DisposeMeshPrebakeResources();
-        SetStatus(message);
     }
 
     private void DrawGeneratingOverlay(SpriteBatch sb)
     {
+        float progress;
+        string stageValue;
+        lock (_generationLock)
+        {
+            progress = _generationProgress;
+            stageValue = _generationStage;
+        }
+
         var overlay = new Rectangle(_panelRect.X + 40, _panelRect.Center.Y - 72, _panelRect.Width - 80, 144);
         sb.Draw(_pixel, overlay, new Color(0, 0, 0, 200));
         DrawBorder(sb, overlay, new Color(190, 190, 190));
@@ -849,7 +1287,7 @@ public sealed class CreateWorldScreen : IScreen
         var titleSize = _font.MeasureString(title);
         _font.DrawString(sb, title, new Vector2(overlay.Center.X - titleSize.X / 2f, overlay.Y + 18), Color.White);
 
-        var stage = string.IsNullOrWhiteSpace(_generationStage) ? "PREPARING" : _generationStage.ToUpperInvariant();
+        var stage = string.IsNullOrWhiteSpace(stageValue) ? "PREPARING" : stageValue.ToUpperInvariant();
         var stageText = $"STAGE: {stage}";
         var stageSize = _font.MeasureString(stageText);
         _font.DrawString(sb, stageText, new Vector2(overlay.Center.X - stageSize.X / 2f, overlay.Y + 18 + _font.LineHeight + 8), new Color(220, 220, 220));
@@ -857,8 +1295,30 @@ public sealed class CreateWorldScreen : IScreen
         var barRect = new Rectangle(overlay.X + 24, overlay.Bottom - 34, overlay.Width - 48, 14);
         sb.Draw(_pixel, barRect, new Color(22, 22, 22, 220));
         DrawBorder(sb, barRect, new Color(170, 170, 170));
-        var fill = new Rectangle(barRect.X + 2, barRect.Y + 2, Math.Max(0, (int)MathF.Round((barRect.Width - 4) * _generationProgress)), Math.Max(1, barRect.Height - 4));
+        var fill = new Rectangle(barRect.X + 2, barRect.Y + 2, Math.Max(0, (int)MathF.Round((barRect.Width - 4) * progress)), Math.Max(1, barRect.Height - 4));
         sb.Draw(_pixel, fill, new Color(84, 174, 255, 220));
+    }
+
+    private void DrawGenerationPausePrompt(SpriteBatch sb)
+    {
+        sb.Draw(_pixel, _viewport, new Color(0, 0, 0, 180));
+        sb.Draw(_pixel, _generationPausePromptRect, new Color(20, 20, 20, 240));
+        DrawBorder(sb, _generationPausePromptRect, new Color(230, 230, 230));
+
+        var title = "WORLD GENERATION PAUSED";
+        var titleSize = _font.MeasureString(title);
+        _font.DrawString(sb, title, new Vector2(_generationPausePromptRect.Center.X - titleSize.X / 2f, _generationPausePromptRect.Y + 14), Color.White);
+
+        var reason = string.IsNullOrWhiteSpace(_generationPauseReason) ? "Generation paused." : _generationPauseReason;
+        var reasonSize = _font.MeasureString(reason);
+        _font.DrawString(
+            sb,
+            reason,
+            new Vector2(_generationPausePromptRect.Center.X - reasonSize.X / 2f, _generationPausePromptRect.Y + 14 + _font.LineHeight + 10),
+            new Color(220, 220, 220));
+
+        _resumeGenerationBtn.Draw(sb, _pixel, _font);
+        _abortGenerationBtn.Draw(sb, _pixel, _font);
     }
 
     private void LayoutCenteredToggle(Checkbox checkbox, int y)
@@ -1003,59 +1463,6 @@ public sealed class CreateWorldScreen : IScreen
         sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
     }
 
-    private List<ChunkCoord> PregenerateSpawnChunks(WorldMeta meta, string worldPath, Action<float>? onProgress = null)
-    {
-        try
-        {
-            var world = new VoxelWorld(meta, worldPath, _log);
-            Directory.CreateDirectory(world.ChunksDir);
-
-            var spawn = GetSpawnPoint(meta);
-            var spawnChunk = VoxelWorld.WorldToChunk((int)spawn.X, 0, (int)spawn.Y, out _, out _, out _);
-            var chunkRadius = Math.Max(0, SpawnChunkPregenerationRadius);
-            var chunkRadiusSq = chunkRadius * chunkRadius;
-            var maxCy = Math.Min(Math.Max(0, world.MaxChunkY), SpawnVerticalPregenerationChunkTop);
-            var generatedCoords = new List<ChunkCoord>();
-            var meshCoords = new List<ChunkCoord>();
-
-            for (var dz = -chunkRadius; dz <= chunkRadius; dz++)
-            {
-                for (var dx = -chunkRadius; dx <= chunkRadius; dx++)
-                {
-                    var distSq = dx * dx + dz * dz;
-                    if (distSq > chunkRadiusSq)
-                        continue;
-
-                    for (var cy = 0; cy <= maxCy; cy++)
-                    {
-                        var coord = new ChunkCoord(spawnChunk.X + dx, cy, spawnChunk.Z + dz);
-                        world.GetOrCreateChunk(coord);
-                        generatedCoords.Add(coord);
-
-                        if (distSq <= SpawnMeshPregenerationRadius * SpawnMeshPregenerationRadius)
-                            meshCoords.Add(coord);
-                    }
-                }
-            }
-
-            // Save all pregenerated chunks now (do not use batched SaveModifiedChunks limit).
-            for (int i = 0; i < generatedCoords.Count; i++)
-            {
-                var coord = generatedCoords[i];
-                world.SaveChunk(coord);
-                onProgress?.Invoke((i + 1f) / Math.Max(1, generatedCoords.Count));
-            }
-
-            _log.Info($"Spawn pregeneration complete: chunks={generatedCoords.Count}, meshCandidates={meshCoords.Count}, center={spawnChunk}, maxCy={maxCy}.");
-            return meshCoords;
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Spawn pregeneration failed: {ex.Message}");
-            return new List<ChunkCoord>();
-        }
-    }
-
     private static Vector2 GetSpawnPoint(WorldMeta meta)
     {
         var spawnX = meta.Size.Width * 0.25f;
@@ -1067,26 +1474,28 @@ public sealed class CreateWorldScreen : IScreen
 
     private readonly struct WorldCreateResult
     {
-        private WorldCreateResult(bool success, string worldName, string worldPath, WorldMeta? meta, List<ChunkCoord>? meshCoords, string? errorMessage)
+        private WorldCreateResult(bool success, bool paused, string worldName, string worldPath, WorldMeta? meta, string? errorMessage)
         {
             IsSuccess = success;
+            IsPaused = paused;
             WorldName = worldName;
             WorldPath = worldPath;
             Meta = meta;
-            MeshCoords = meshCoords;
             ErrorMessage = errorMessage;
         }
 
         public bool IsSuccess { get; }
+        public bool IsPaused { get; }
         public string WorldName { get; }
         public string WorldPath { get; }
         public WorldMeta? Meta { get; }
-        public List<ChunkCoord>? MeshCoords { get; }
         public string? ErrorMessage { get; }
 
-        public static WorldCreateResult Success(string worldName, string worldPath, WorldMeta meta, List<ChunkCoord> meshCoords)
-            => new(true, worldName, worldPath, meta, meshCoords, null);
+        public static WorldCreateResult Success(string worldName, string worldPath, WorldMeta meta)
+            => new(true, false, worldName, worldPath, meta, null);
+        public static WorldCreateResult Paused()
+            => new(false, true, string.Empty, string.Empty, null, null);
         public static WorldCreateResult Failure(string errorMessage)
-            => new(false, string.Empty, string.Empty, null, null, errorMessage);
+            => new(false, false, string.Empty, string.Empty, null, errorMessage);
     }
 }

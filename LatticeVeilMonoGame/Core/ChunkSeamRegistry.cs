@@ -117,7 +117,7 @@ namespace LatticeVeilMonoGame.Core
                     for (int y = VoxelChunkData.ChunkSizeY - 1; y >= 0; y--)
                     {
                         var block = chunk.GetBlock(x, y, z);
-                        if (block != BlockIds.Air && block != BlockIds.Nullblock)
+                        if (block != BlockIds.Air && block != BlockIds.Nullrock)
                         {
                             surfaceHeights[x, z] = (int)worldOrigin.Y + y;
                             break;

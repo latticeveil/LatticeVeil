@@ -352,18 +352,71 @@ public sealed class MultiplayerHostScreen : IScreen
             return;
 
         var entry = _worlds[index];
+        var name = entry.Name;
+        var path = entry.WorldPath;
 
         try
         {
-            if (Directory.Exists(entry.WorldPath))
-                Directory.Delete(entry.WorldPath, true);
+            if (Directory.Exists(path))
+            {
+                // Clear read-only attributes recursively before deletion
+                ClearReadOnlyAttributes(path);
+                
+                // Try to delete both possible region folders (case sensitivity issues)
+                var regionsPath = Path.Combine(path, "regions");
+                var regionsPathUpper = Path.Combine(path, "Regions");
+                
+                if (Directory.Exists(regionsPath))
+                {
+                    ClearReadOnlyAttributes(regionsPath);
+                    Directory.Delete(regionsPath, true);
+                }
+                
+                if (Directory.Exists(regionsPathUpper) && regionsPathUpper != regionsPath)
+                {
+                    ClearReadOnlyAttributes(regionsPathUpper);
+                    Directory.Delete(regionsPathUpper, true);
+                }
+                
+                // Finally delete the world folder
+                Directory.Delete(path, true);
+            }
+            
+            _log.Info($"Deleted world: {name} at {path}");
             RefreshWorlds();
             ShowStatus("WORLD DELETED");
         }
         catch (Exception ex)
         {
-            _log.Warn($"Failed to delete world {entry.Name}: {ex.Message}");
+            _log.Warn($"Failed to delete world {name} at {path}: {ex.Message}");
             ShowStatus("DELETE FAILED");
+        }
+    }
+
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        try
+        {
+            var dirInfo = new DirectoryInfo(path);
+            if (dirInfo.Exists)
+            {
+                dirInfo.Attributes &= ~FileAttributes.ReadOnly;
+                
+                foreach (var file in dirInfo.GetFiles("*", SearchOption.AllDirectories))
+                {
+                    file.Attributes &= ~FileAttributes.ReadOnly;
+                }
+                
+                foreach (var dir in dirInfo.GetDirectories("*", SearchOption.AllDirectories))
+                {
+                    dir.Attributes &= ~FileAttributes.ReadOnly;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Non-critical - just log and continue
+            Console.WriteLine($"Warning: Failed to clear read-only attributes for {path}: {ex.Message}");
         }
     }
 

@@ -15,7 +15,7 @@
 
     <RootNamespace>LatticeVeilMonoGame</RootNamespace>
     <AssemblyName>LatticeVeilMonoGame</AssemblyName>
-    <Version>8.0.0</Version>
+    <Version>10.0.0</Version>
     <BuildNonce Condition="'$(BuildNonce)'==''">stable</BuildNonce>
 
     <Authors>LatticeVeil Team</Authors>
@@ -47,6 +47,23 @@
     <Compile Remove="GUIDesigner\**" />
     <EmbeddedResource Remove="GUIDesigner\**" />
     <None Remove="GUIDesigner\**" />
+    <Content Remove="DEV\**" />
+    <None Remove="DEV\**" />
+    <None Remove="Tools\**" />
+    <None Remove="test\**" />
+    <None Remove="supabase\**" />
+    <None Remove="eos\**" />
+    <None Remove="GateServer\**" />
+    <None Remove="build\**" />
+    <None Remove="ThirdParty\**" />
+    <None Remove="RELEASE\**" />
+    <None Remove="Builds\**" />
+    <None Remove=".builder\**" />
+    <None Remove=".vscode\**" />
+    <None Remove="*.md" />
+    <None Remove="*.ps1" />
+    <None Remove="*.png" />
+    <None Remove="*.json" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -70,9 +87,7 @@
   <!-- MonoGame DesktopGL framework - OpenGL based rendering without Vulkan dependency -->
   <ItemGroup>
     <PackageReference Include="GeonBit.UI" Version="4.3.0.4" />
-    <PackageReference Include="LibNoise" Version="0.2.0" />
     <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
-    <PackageReference Include="SharpNoise" Version="0.12.1.1" />
     <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="System.Drawing.Common" Version="10.0.2" />
     <PackageReference Include="System.Memory" Version="4.5.5" />
@@ -85,8 +100,6 @@
     <PackageReference Include="NVorbis" Version="0.10.4" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="System.Threading.Tasks.Dataflow" Version="10.0.2" />
-    <!-- FastNoise C# for high-performance noise generation -->
-    <PackageReference Include="DotnetNoise" Version="1.0.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -23,4 +23,10 @@ public static class Scale
     // First-person overlay scales (in blocks).
     public const float HandScale = 0.25f;
     public const float HeldBlockScale = 0.4f;
+    public const float FirstPersonHandForwardOffset = 0.62f;
+    public const float FirstPersonHandRightOffset = 0.47f;
+    public const float FirstPersonHandDownOffset = 0.42f;
+    public const float FirstPersonHeldForwardOffset = 0.73f;
+    public const float FirstPersonHeldRightOffset = 0.18f;
+    public const float FirstPersonHeldDownOffset = 0.26f;
 }

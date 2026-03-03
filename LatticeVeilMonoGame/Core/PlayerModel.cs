@@ -13,6 +13,7 @@ public sealed class PlayerModel
 
     public Vector3 Position { get; set; }
     public float Yaw { get; set; }
+    public float Pitch { get; set; }
     public Color Color { get; set; } = new(200, 200, 200);
     public bool IsFlying { get; set; }
 
@@ -34,6 +35,7 @@ public sealed class PlayerModel
         _effect.View = view;
         _effect.Projection = projection;
         var world = Matrix.CreateRotationY(Yaw);
+        world *= Matrix.CreateRotationX(Pitch);
         if (IsFlying)
             world *= Matrix.CreateRotationX(-0.5f); // Tilt forward
         world *= Matrix.CreateTranslation(Position);

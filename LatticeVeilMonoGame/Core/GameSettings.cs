@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using Microsoft.Xna.Framework.Audio;
 using Microsoft.Xna.Framework.Input;
 
@@ -85,6 +84,11 @@ public sealed class GameSettings
     public bool EnableInviteLinks { get; set; } = false;
     public string SocialNotifications { get; set; } = nameof(SocialNotificationMode.On);
 
+    // Performance / Derived-data cache
+    // Default OFF: meshes are derived and can always be rebuilt; keeping this off avoids stale cache + slow exits.
+    public bool PersistMeshCache { get; set; } = false;
+
+
     // Launcher
     public bool KeepLauncherOpen { get; set; } = true;
     public bool DarkMode { get; set; } = true;
@@ -129,6 +133,7 @@ public sealed class GameSettings
         ["StructureFinder"] = Keys.B,
         ["GamemodeModifier"] = Keys.LeftAlt,
         ["GamemodeWheel"] = Keys.G,
+        ["VeilseerXrayToggle"] = Keys.X,
         ["InviteQuickAction"] = Keys.Y
     };
 
@@ -143,10 +148,8 @@ public sealed class GameSettings
 
             if (!File.Exists(Paths.SettingsJsonPath))
             {
-                if (File.Exists(Paths.LegacySettingsLvcPath) || File.Exists(Paths.LegacySettingsJsonPath))
-                {
-                    TryMigrateLegacySettingsFile(log);
-                }
+                if (File.Exists(Paths.LegacySettingsLvcPath) || File.Exists(Paths.LegacySettingsJsonPath) || LvcSerializer.IsJsonFormat(Paths.SettingsJsonPath))
+                    throw new LvcSerializer.LegacyFormatException($"Legacy settings format detected. Delete/replace: {Paths.ToUiPath(Paths.SettingsJsonPath)}");
             }
 
             if (!File.Exists(Paths.SettingsJsonPath))
@@ -156,11 +159,12 @@ public sealed class GameSettings
                 return s;
             }
 
-            var json = File.ReadAllText(Paths.SettingsJsonPath);
-            var loaded = JsonSerializer.Deserialize<GameSettings>(json) ?? new GameSettings();
+            var data = LvcSerializer.Read(Paths.SettingsJsonPath);
+            var loaded = new GameSettings();
+            LvcSerializer.ApplyObject(loaded, data);
             Sanitize(loaded);
             return loaded;
-        }
+}
         catch (Exception ex)
         {
             log.Warn($"Failed to load settings: {ex.Message}");
@@ -319,9 +323,9 @@ public sealed class GameSettings
         try
         {
             Directory.CreateDirectory(Paths.RootDir);
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(Paths.SettingsJsonPath, json);
-        }
+            var data = LvcSerializer.SerializeObject(this);
+            LvcSerializer.Write(Paths.SettingsJsonPath, data);
+}
         catch (Exception ex)
         {
             log.Warn($"Failed to save settings: {ex.Message}");
@@ -330,28 +334,7 @@ public sealed class GameSettings
 
     private static void TryMigrateLegacySettingsFile(Logger log)
     {
-        try
-        {
-            if (File.Exists(Paths.SettingsJsonPath))
-                return;
-
-            if (File.Exists(Paths.LegacySettingsLvcPath))
-            {
-                File.Move(Paths.LegacySettingsLvcPath, Paths.SettingsJsonPath);
-                log.Info($"Migrated settings file: {Path.GetFileName(Paths.LegacySettingsLvcPath)} -> {Path.GetFileName(Paths.SettingsJsonPath)}");
-                return;
-            }
-
-            if (File.Exists(Paths.LegacySettingsJsonPath))
-            {
-                File.Move(Paths.LegacySettingsJsonPath, Paths.SettingsJsonPath);
-                log.Info($"Migrated settings file: {Path.GetFileName(Paths.LegacySettingsJsonPath)} -> {Path.GetFileName(Paths.SettingsJsonPath)}");
-            }
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"Failed to migrate legacy settings file: {ex.Message}");
-        }
+        throw new LvcSerializer.LegacyFormatException("Legacy settings format detected (migration disabled).");
     }
 
     public void ApplyGraphics(global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics)

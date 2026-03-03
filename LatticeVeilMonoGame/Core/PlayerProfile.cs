@@ -2,19 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace LatticeVeilMonoGame.Core;
 
 public sealed class PlayerProfile
 {
-    [JsonIgnore]
     public string PlayerId { get; set; } = "";
     /// <summary>
     /// Online (account) username (legacy). For EOS builds this is usually empty and Epic display name is used instead.
     /// </summary>
-    [JsonIgnore]
     public string Username { get; set; } = "";
 
     /// <summary>
@@ -29,12 +25,10 @@ public sealed class PlayerProfile
     /// <summary>
     /// Incoming friend requests (Product User IDs).
     /// </summary>
-    [JsonIgnore]
     public List<string> ReceivedRequests { get; set; } = new();
     /// <summary>
     /// Outgoing friend requests (Product User IDs).
     /// </summary>
-    [JsonIgnore]
     public List<string> SentRequests { get; set; } = new();
 
     public sealed class FriendEntry
@@ -80,8 +74,10 @@ public sealed class PlayerProfile
                 return p;
             }
 
-            var json = File.ReadAllText(Paths.PlayerProfileJsonPath);
-            var profile = JsonSerializer.Deserialize<PlayerProfile>(json) ?? new PlayerProfile();
+            var data = LvcSerializer.Read(Paths.PlayerProfileJsonPath);
+            var profile = new PlayerProfile();
+            LvcSerializer.ApplyObject(profile, data);
+            profile.ApplyFriends(data);
             profile.EnsureDefaults();
             return profile;
         }
@@ -97,8 +93,10 @@ public sealed class PlayerProfile
         try
         {
             Directory.CreateDirectory(Paths.RootDir);
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(Paths.PlayerProfileJsonPath, json);
+            var data = LvcSerializer.SerializeObject(this);
+            // Friends list is serialized manually (non-trivial)
+            this.SerializeFriends(data);
+            LvcSerializer.Write(Paths.PlayerProfileJsonPath, data);
         }
         catch (Exception ex)
         {
@@ -106,20 +104,52 @@ public sealed class PlayerProfile
         }
     }
 
+    private void SerializeFriends(Dictionary<string, string> data)
+    {
+        Friends ??= new List<FriendEntry>();
+        data["FriendsCount"] = Friends.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        for (var i = 0; i < Friends.Count; i++)
+        {
+            var f = Friends[i];
+            if (f == null) continue;
+            data[$"Friend.{i}.UserId"] = f.UserId ?? "";
+            data[$"Friend.{i}.Label"] = f.Label ?? "";
+            data[$"Friend.{i}.LastKnownDisplayName"] = f.LastKnownDisplayName ?? "";
+            data[$"Friend.{i}.LastKnownPresence"] = f.LastKnownPresence ?? "";
+        }
+    }
+
+    private void ApplyFriends(Dictionary<string, string> data)
+    {
+        Friends ??= new List<FriendEntry>();
+        Friends.Clear();
+
+        if (!data.TryGetValue("FriendsCount", out var raw) || !int.TryParse(raw, out var count) || count < 0 || count > 5000)
+            count = 0;
+
+        for (var i = 0; i < count; i++)
+        {
+            data.TryGetValue($"Friend.{i}.UserId", out var userId);
+            if (string.IsNullOrWhiteSpace(userId)) continue;
+
+            data.TryGetValue($"Friend.{i}.Label", out var label);
+            data.TryGetValue($"Friend.{i}.LastKnownDisplayName", out var display);
+            data.TryGetValue($"Friend.{i}.LastKnownPresence", out var presence);
+
+            Friends.Add(new FriendEntry
+            {
+                UserId = (userId ?? "").Trim(),
+                Label = (label ?? "").Trim(),
+                LastKnownDisplayName = (display ?? "").Trim(),
+                LastKnownPresence = (presence ?? "").Trim()
+            });
+        }
+    }
+
+
     private static void TryMigrateLegacyProfileFile(Logger log)
     {
-        try
-        {
-            if (!File.Exists(Paths.LegacyPlayerProfileJsonPath) || File.Exists(Paths.PlayerProfileJsonPath))
-                return;
-
-            File.Move(Paths.LegacyPlayerProfileJsonPath, Paths.PlayerProfileJsonPath);
-            log.Info($"Migrated player profile file: {Path.GetFileName(Paths.LegacyPlayerProfileJsonPath)} -> {Path.GetFileName(Paths.PlayerProfileJsonPath)}");
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"Failed to migrate legacy player profile file: {ex.Message}");
-        }
+        throw new LvcSerializer.LegacyFormatException("Legacy player profile format detected (migration disabled). ");
     }
 
     private void EnsureDefaults()

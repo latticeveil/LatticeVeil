@@ -47,6 +47,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private WorldMeta? _meta;
     private GameMode _gameMode = GameMode.Artificer;
+    private string _gamemodeToastText = "";
+    private float _gamemodeToastTimer = 0f;
+    private string _flySpeedToastText = "";
+    private float _flySpeedToastTimer = 0f;
+    private float _flySpeedToastPercent = 0f;
+    private bool _gamemodeWheelVisible = false;
+    private int _gamemodeWheelHoverMode = -1;
+    private bool _veilseerXrayEnabled;
+    private int _veilseerSpectateTargetPlayerId = -1;
+    private int _veilseerSpectateSlot = -1;
     private VoxelWorld? _world;
     // ALL WORLD GENERATION DELETED
     // ALL WORLD GENERATION DELETED
@@ -77,6 +87,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int PrewarmChunkBudgetPerFrame = 6;
     private const int PrewarmMeshBudgetPerFrame = 4;
     private const double PrewarmTimeoutSeconds = 12.0;
+    private const bool ENABLE_SPAWN_PREWARM = false; // disabled: join/leave should be instant; spawn area is pregenerated on world creation // Gate visibility until spawn-area is generated + meshed
     private static readonly int RuntimeChunkRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
     private static readonly int RuntimeMeshRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
     private static readonly int RuntimeChunkScheduleBudget = Math.Clamp((Environment.ProcessorCount / 3) + 1, 2, 6);
@@ -93,6 +104,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     // Stub services to fix compilation (will be replaced with new world generation)
     private StubStreamingService? _streamingService;
     private StubPregenerationService? _pregenerationService;
+    private bool _pregenerationStarted;
     
     // Result application tracking
     private int _completedLoadsAppliedThisFrame;
@@ -131,6 +143,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _loggedInvalidHandMesh;
 
     private BasicEffect? _effect;
+    private AlphaTestEffect? _cutoutEffect;
     private Effect? _waterEffect;
     private bool _waterEffectLoadAttempted;
     private BasicEffect? _lineEffect;
@@ -167,6 +180,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Rectangle _inventoryPanelVisualRect;
     private Rectangle _inventoryCatalogTabRect;
     private Rectangle _inventoryStorageTabRect;
+    private Rectangle _inventoryCatalogHeaderRect;
+    private Rectangle _inventoryCatalogSearchRect;
+    private Rectangle _inventoryCatalogSearchClearRect;
+    private Rectangle _inventoryCatalogFavoritesRect;
+    private Rectangle _inventoryCatalogListRect;
     private bool _inventoryOpen;
     private HotbarSlot _inventoryHeld;
     private bool _inventoryHasHeld;
@@ -175,9 +193,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Keys _giveKey = Keys.F;
     private Keys _stackModifierKey = Keys.LeftShift;
     private readonly Button _inventoryClose;
+    private readonly Button _inventoryClear;
     private Point _inventoryMousePos;
     private InventorySlotGroup _heldFrom = InventorySlotGroup.None;
     private int _heldIndex = -1;
+    private bool _inventoryCatalogSearchFocused;
+    private int _inventoryCatalogSearchCaret;
+    private float _inventoryCatalogScrollOffsetPx;
+    private float _inventoryCatalogScrollVelocityPxPerSec;
+    private bool _inventoryClearConfirmPending;
+    private float _inventoryClearConfirmTimer;
+    private bool _catalogLoreLoaded;
+    private readonly Dictionary<BlockId, CatalogLoreEntry> _catalogLoreByBlock = new();
     private FirstPersonHandRenderer? _handRenderer;
     private PlayerModel? _playerModel;
     private readonly Dictionary<int, PlayerModel> _remotePlayers = new();
@@ -225,7 +252,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Texture2D? _structureFinderPanelTexture;
     private Rectangle _structureFinderPanelRect;
     private Rectangle _structureFinderListRect;
-    private readonly Rectangle[] _structureFinderBiomeRects = new Rectangle[3];
+    private Rectangle[] _structureFinderBiomeRects = new Rectangle[FinderBiomeLabels.Length];
     private readonly Button _structureFinderBiomeTabBtn;
     private readonly Button _structureFinderStructureTabBtn;
     private readonly Button _structureFinderRadiusBtn;
@@ -266,15 +293,25 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private const int InventoryCols = Inventory.GridCols;
     private const int InventoryRows = Inventory.GridRows;
-    private const int InventorySlotSize = 48;
-    private const int InventorySlotGap = 6;
-    private const int InventoryPadding = 18;
-    private const int InventoryTitleHeight = 40;
-    private const int InventoryTitleHeightWithTabs = 82;
-    private const int InventoryFooterHeight = 50;
-    private const int InventoryTabHeight = 30;
-    private const int InventoryTabWidth = 132;
-    private const float InventoryPanelVisualScale = 1.16f;
+    private const int InventorySlotSize = 56;
+    private const int InventorySlotGap = 8;
+    private const int InventoryPadding = 24;
+    private const int InventoryTitleHeight = 48;
+    private const int InventoryTitleHeightWithTabs = 98;
+    private const int InventoryFooterHeight = 60;
+    private const int InventoryTabHeight = 36;
+    private const int InventoryTabWidth = 156;
+    private const float InventoryPanelVisualScale = 1.24f;
+    private const int CatalogSearchMaxLength = 64;
+    private const int CatalogHeaderHeight = 52;
+    private const int CatalogSearchHeight = 36;
+    private const int CatalogRowHeight = 50;
+    private const int CatalogRowOverscan = 2;
+    private const int CatalogTooltipMaxWidth = 420;
+    private const string CatalogLoreAssetPath = "data/lore/base_block_lore_overrides.json";
+    private const float CatalogScrollWheelImpulse = 520f;
+    private const float CatalogScrollDamping = 12f;
+    private const float InventoryClearConfirmSeconds = 4f;
 
     private const float ItemPickupRadius = 1.5f * Scale.BlockSize;
     private const float ItemPickupRadiusSq = ItemPickupRadius * ItemPickupRadius;
@@ -302,12 +339,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private float _fps;
     private int _frameCount;
     private float _playerSaveTimer; // Timer for periodic player state saving
+    private float _chunkSaveTimer; // Timer for periodic chunk saving
     private int _autoSaveInFlight;
+    private bool _playerStateDirty; // Flag to track when player state needs saving
     private readonly object _previewQueueLock = new();
     private Task? _previewUpdateWorker;
     private bool _previewUpdatePending;
     private int _previewPendingCenterX;
     private int _previewPendingCenterZ;
+    private readonly CancellationTokenSource _backgroundWorkCts = new();
     private bool _isClosing;
     private bool _saveAndExitInProgress;
     private bool _skipOnCloseFullSave;
@@ -350,6 +390,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Keys _structureFinderKey = Keys.B;
     private Keys _gamemodeModifierKey = Keys.LeftAlt;
     private Keys _gamemodeWheelKey = Keys.G;
+    private Keys _veilseerXrayToggleKey = Keys.X;
     private Keys _inviteQuickActionKey = Keys.Y;
     private bool _chatInputActive;
     private string _chatInputText = "";
@@ -440,8 +481,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _hasQueuedLocateOrigin;
     private int _queuedLocateOriginX;
     private int _queuedLocateOriginZ;
-    private static readonly string[] FinderBiomeTokens = { "grasslands", "desert", "ocean" };
-    private static readonly string[] FinderBiomeLabels = { "Grasslands", "Desert", "Ocean" };
+    private BiomeIndexStore? _biomeIndex;
+    private SpawnPrewarmManifest? _spawnPrewarmManifest;
+    private static readonly string[] FinderBiomeTokens = { "grasslands", "forest", "hills", "desert", "ocean" };
+    private static readonly string[] FinderBiomeLabels = { "Grasslands", "Forest", "Hills", "Desert", "Ocean" };
     private static readonly int[] FinderRadiusOptions = { 512, 1024, 2048, 4096, 8192 };
     private static readonly GameMode[] GameModeWheelModes =
     {
@@ -452,14 +495,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private float _chatOverlayActionUnlockUntil;
     private int _timeOfDayTicks = 1000;
     private string _weatherState = "clear";
-    private bool _gamemodeWheelVisible;
     private bool _gamemodeWheelHoldToOpen;
     private bool _gamemodeWheelWaitForRelease;
-    private GameMode _gamemodeWheelHoverMode = GameMode.Artificer;
-    private string _gamemodeToastText = "";
-    private float _gamemodeToastTimer;
     private readonly BlockBreakParticleSystem _blockBreakParticles = new();
-    private BiomeCatalog? _biomeCatalog;
     private const string DefaultHomeName = "home";
     private const int HomeGuiRowHeight = 42;
 
@@ -511,6 +549,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
         _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
         _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
         _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         EnsureCommandRegistry();
@@ -536,6 +575,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _pauseSaveExit = new Button("SAVE & EXIT", SaveAndExit);
         _pauseProfileIcon = new Button("", OpenProfileFromPause) { BoldText = true };
         _inventoryClose = new Button("CLOSE", CloseInventory);
+        _inventoryClear = new Button("CLEAR INVENTORY", ClearArtificerInventoryFromUi);
         _homeGuiSetHereBtn = new Button("SET HERE", SetHomeAtCurrentPositionFromGui);
         _homeGuiRenameBtn = new Button("RENAME", RenameSelectedHomeFromGui);
         _homeGuiDeleteBtn = new Button("DELETE", DeleteSelectedHomeFromGui);
@@ -650,6 +690,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _gamemodeToastText = string.Empty;
         }
 
+        if (_flySpeedToastTimer > 0f)
+        {
+            _flySpeedToastTimer = Math.Max(0f, _flySpeedToastTimer - rawDt);
+            if (_flySpeedToastTimer <= 0f)
+                _flySpeedToastText = string.Empty;
+        }
+
         if (_inviteQuickStatusTimer > 0f)
         {
             _inviteQuickStatusTimer = Math.Max(0f, _inviteQuickStatusTimer - rawDt);
@@ -687,6 +734,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             QueuePlayerStateSaveAsync();
             _playerSaveTimer = 0f;
+        }
+
+        // PERIODIC CHUNK SAVING - Save dirty chunks periodically during gameplay
+        if (!IsJoinedClientSession && !_isClosing && _world != null)
+        {
+            _chunkSaveTimer += rawDt;
+            if (_chunkSaveTimer >= 60.0f) // Save chunks every 60 seconds
+            {
+                _world.SaveModifiedChunks();
+                _chunkSaveTimer = 0f;
+            }
         }
 
         // Always update network layer, even if world sync is in progress
@@ -736,12 +794,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return; // Block gameplay controls until prewarm gate is visually ready.
         }
 
+        // Start background pregeneration once the gate is ready.
+        if (ENABLE_SPAWN_PREWARM && !_pregenerationStarted && !IsJoinedClientSession && _pregenerationService != null)
+        {
+            var radius = AdvancedPerformanceOptimizer.GetOptimalRenderDistance();
+            _log.Info($"Starting background world pregeneration (radius={radius}) after prewarm gate.");
+            _pregenerationService.StartPregeneration(radius);
+            _pregenerationStarted = true;
+        }
+
         if (_inventoryOpen)
         {
-            if (input.IsNewKeyPress(_inventoryKey) || input.IsNewKeyPress(Keys.Escape))
-                CloseInventory();
-
-            UpdateInventory(input);
+            UpdateInventory(input, dt);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -750,6 +814,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!_pauseMenuOpen && !IsTextInputActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_inventoryKey))
         {
             _inventoryOpen = true;
+            _inventoryCatalogSearchFocused = false;
+            _inventoryCatalogSearchCaret = 0;
             return;
         }
 
@@ -759,12 +825,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        // If the pause menu was open at any point this frame, consume mouse clicks for this frame.
+        // This prevents a menu click (e.g., RESUME / SETTINGS / SAVE & EXIT) from also breaking/placing blocks
+        // in the world on the same frame the menu closes.
+        var pauseMenuWasOpenThisFrame = _pauseMenuOpen;
+
         if (_pauseMenuOpen)
         {
             UpdatePauseButtons(input);
         }
 
-        if (_pauseMenuOpen)
+        if (pauseMenuWasOpenThisFrame || _pauseMenuOpen)
         {
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
@@ -832,6 +903,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
+        }
+
+        if (_gameMode == GameMode.Veilseer && input.IsNewKeyPress(_veilseerXrayToggleKey))
+        {
+            _veilseerXrayEnabled = !_veilseerXrayEnabled;
+            SetCommandStatus(_veilseerXrayEnabled ? "VeilSeer Xray enabled." : "VeilSeer Xray disabled.", 3f);
         }
 
 #if DEBUG
@@ -1136,9 +1213,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         if (needsLoading)
         {
-            // Draw simple centered loading
-            sb.Begin();
-            var center = new Vector2(_viewport.Width / 2f, _viewport.Height / 2f);
+            // Always clear first so it never looks "frozen".
+	            // NOTE: use a distinct name so we never collide with the main-world draw path.
+	            var gd = sb.GraphicsDevice;
+	            gd.Clear(Color.Black);
+	            gd.DepthStencilState = DepthStencilState.None;
+	            gd.RasterizerState = RasterizerState.CullNone;
+	            gd.BlendState = BlendState.AlphaBlend;
+
+            sb.Begin(blendState: BlendState.AlphaBlend);
+            // Always center relative to the *actual* current graphics viewport.
+            // The Rectangle parameter passed into Draw() can be stale depending on the caller.
+            var vp = gd.Viewport;
+            var center = new Vector2(vp.Width / 2f, vp.Height / 2f);
+
+            // Lightweight "3D-ish" portal animation (no extra assets): layered rotating quads.
+            // Uses _worldTimeSeconds which is updated every frame in Update().
+            var t = _worldTimeSeconds;
+            var baseSize = 56f;
+            for (int i = 0; i < 3; i++)
+            {
+                var size = baseSize * (1f + i * 0.35f);
+                var rot = t * (0.9f + i * 0.55f) * (i % 2 == 0 ? 1f : -1f);
+                var alpha = 0.18f + i * 0.10f;
+                sb.Draw(
+                    _pixel,
+                    center + new Vector2(0f, 70f),
+                    sourceRectangle: null,
+                    color: Color.White * alpha,
+                    rotation: rot,
+                    origin: new Vector2(0.5f, 0.5f),
+                    scale: new Vector2(size, size),
+                    effects: SpriteEffects.None,
+                    layerDepth: 0f);
+            }
             
             var title = !_hasLoadedWorld ? "WORLD MATERIALIZING..." : 
                        _worldSyncInProgress ? "DIMENSIONAL SYNC..." : 
@@ -1151,12 +1259,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 var progress = $"PREWARM {_prewarmReadyCount}/{_prewarmTargetCount}";
                 var progressSize = _font.MeasureString(progress);
                 _font.DrawString(sb, progress, new Vector2(center.X - progressSize.X / 2f, center.Y + 10 + _font.LineHeight + 6), Color.White);
+
+                // Progress bar (accurate to the tier-0 mesh gate).
+                var pct = Math.Clamp(_prewarmReadyCount / (float)Math.Max(1, _prewarmTargetCount), 0f, 1f);
+                var barW = 260;
+                var barH = 10;
+                var barX = (int)center.X - barW / 2;
+                var barY = (int)center.Y + 10 + _font.LineHeight * 2 + 14;
+                sb.Draw(_pixel, new Rectangle(barX, barY, barW, barH), Color.White * 0.18f);
+                sb.Draw(_pixel, new Rectangle(barX, barY, (int)(barW * pct), barH), Color.White * 0.65f);
             }
             
-            // Simple centered indicator
-            var indicatorSize = 12;
-            var indicatorRect = new Rectangle((int)center.X - indicatorSize/2, (int)center.Y + 10, indicatorSize, indicatorSize);
-            sb.Draw(_pixel, indicatorRect, Color.White);
+            // Spinner glyph so it feels alive even before prewarm starts.
+            char[] spinner = new[] { '|', '/', '-', '\\', '|', '/', '-', '\\' };
+            var spin = spinner[_spinnerFrame % spinner.Length].ToString();
+            _font.DrawString(sb, spin, new Vector2(center.X - 4, center.Y + 6), Color.White);
             
             sb.End();
             return;
@@ -1188,10 +1305,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 #endif
 
         EnsureEffect(device);
-        if (_effect == null || _atlas == null)
+        EnsureCutoutEffect(device);
+        if (_effect == null || _cutoutEffect == null || _atlas == null)
             return;
 
         var view = GetViewMatrix();
+        var cameraPosition = _player.Position + _player.HeadOffset;
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observedCamera))
+        {
+            cameraPosition = observedCamera.Position + _player.HeadOffset;
+        }
+        var xrayMode = _gameMode == GameMode.Veilseer && _veilseerXrayEnabled;
         var aspect = device.Viewport.AspectRatio;
         var chunkWorld = VoxelChunkData.ChunkSizeX * Scale.BlockSize;
         var farPlane = MathF.Max(500f, (_activeRadiusChunks + 4) * chunkWorld);
@@ -1199,7 +1325,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         _effect.TextureEnabled = true;
         _effect.Texture = _atlas.Texture;
-        _effect.FogEnabled = true;
+        _effect.FogEnabled = !xrayMode;
         _effect.FogColor = clearColor.ToVector3();
         
         // 5) DISTANCE FOG - Tied to render distance to prevent seeing sharp void edges
@@ -1212,14 +1338,28 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _effect.Projection = proj;
         _effect.World = Matrix.Identity;
         _effect.DiffuseColor = Vector3.One;
-        _effect.Alpha = 1f;
+        _effect.Alpha = xrayMode ? 0.34f : 1f;
+
+        _cutoutEffect.Texture = _atlas.Texture;
+        _cutoutEffect.World = Matrix.Identity;
+        _cutoutEffect.View = view;
+        _cutoutEffect.Projection = proj;
+        _cutoutEffect.FogEnabled = !xrayMode;
+        _cutoutEffect.FogColor = clearColor.ToVector3();
+        _cutoutEffect.FogStart = fogStartRadius;
+        _cutoutEffect.FogEnd = fogEndRadius;
+        _cutoutEffect.Alpha = xrayMode ? 0.34f : 1f;
+        _cutoutEffect.AlphaFunction = CompareFunction.Greater;
+        _cutoutEffect.ReferenceAlpha = 128;
 
         var frustum = new BoundingFrustum(view * proj);
 
 #if DEBUG
         _debugWorldAtlasBound = _effect.Texture != null;
 #endif
-        // OPTIMIZED RENDERING - Improved mesh validation and error handling
+        // Opaque pass
+        device.BlendState = xrayMode ? BlendState.AlphaBlend : BlendState.Opaque;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.Default;
         foreach (var coord in _chunkOrder)
         {
             if (!_chunkMeshes.TryGetValue(coord, out var mesh))
@@ -1255,6 +1395,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
+        // Cutout pass (leaves and similar alpha-cut materials)
+        device.BlendState = xrayMode ? BlendState.AlphaBlend : BlendState.Opaque;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.Default;
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.CutoutVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+            if (verts.Length % 3 != 0)
+            {
+                _log.Warn($"Invalid cutout vertex count for chunk {coord}: {verts.Length} (must be multiple of 3)");
+                continue;
+            }
+
+            try
+            {
+                foreach (var pass in _cutoutEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Cutout rendering error for chunk {coord}: {ex.Message}");
+                _chunkMeshes.Remove(coord, out _);
+            }
+        }
+
 #if DEBUG
         if (_debugDrawPlayerModel)
         {
@@ -1267,10 +1441,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         DrawRemotePlayers(device, view, proj);
         device.SamplerStates[0] = sampler;
 
-        device.BlendState = BlendState.AlphaBlend;
-        device.DepthStencilState = DepthStencilState.DepthRead;
-        
-        // OPTIMIZED TRANSPARENT RENDERING - Improved mesh validation and error handling
+        device.BlendState = BlendState.NonPremultiplied;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.DepthRead;
+
+        // Blended transparency pass (sorted far-to-near)
+        var transparentOrder = new List<(ChunkCoord Coord, float DistSq)>();
         foreach (var coord in _chunkOrder)
         {
             if (!_chunkMeshes.TryGetValue(coord, out var mesh))
@@ -1282,10 +1457,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (verts == null || verts.Length == 0)
                 continue;
 
+            var center = mesh.Bounds.Min + (mesh.Bounds.Max - mesh.Bounds.Min) * 0.5f;
+            transparentOrder.Add((coord, Vector3.DistanceSquared(center, cameraPosition)));
+        }
+        transparentOrder.Sort((a, b) => b.DistSq.CompareTo(a.DistSq));
+
+        foreach (var pair in transparentOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(pair.Coord, out var mesh))
+                continue;
+            var verts = mesh.TransparentVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+
             // Validate vertex data before rendering
             if (verts.Length % 3 != 0)
             {
-                _log.Warn($"Invalid transparent vertex count for chunk {coord}: {verts.Length} (must be multiple of 3)");
+                _log.Warn($"Invalid transparent vertex count for chunk {pair.Coord}: {verts.Length} (must be multiple of 3)");
                 continue;
             }
 
@@ -1300,9 +1488,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
             catch (Exception ex)
             {
-                _log.Error($"Transparent rendering error for chunk {coord}: {ex.Message}");
+                _log.Error($"Transparent rendering error for chunk {pair.Coord}: {ex.Message}");
                 // Remove problematic mesh to prevent repeated errors
-                _chunkMeshes.Remove(coord, out _);
+                _chunkMeshes.Remove(pair.Coord, out _);
             }
         }
 
@@ -1316,7 +1504,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             sb.End();
         }
 
-        var drawHands = !_pauseMenuOpen;
+        var drawHands = !_pauseMenuOpen && _gameMode != GameMode.Veilseer;
 #if DEBUG
         drawHands = drawHands && !_debugDisableHands;
         _debugOverlayAtlasBound = drawHands && _atlas?.Texture != null;
@@ -1324,7 +1512,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (drawHands)
             DrawFirstPersonHands(device, view, proj);
 
-        if (!_pauseMenuOpen)
+        if (!_pauseMenuOpen && _gameMode != GameMode.Veilseer)
             DrawBlockHighlight(device, view, proj);
         else
             _highlightActive = false;
@@ -1337,13 +1525,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, $"MODE: {mode.ToString().ToUpperInvariant()}", new Vector2(_viewport.X + 20, _viewport.Y + 20 + _font.LineHeight + 4), Color.White);
         var modeCombo = $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)}";
         var finderKey = FormatKeyLabel(_structureFinderKey);
-        _font.DrawString(sb, $"WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | {modeCombo} MODE WHEEL | {finderKey} FINDER | ESC PAUSE", new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
+        var controlsHint = _gameMode == GameMode.Veilseer
+            ? $"VEILSEER: 1-9 SPECTATE PLAYER | 0 FREECAM | {FormatKeyLabel(_veilseerXrayToggleKey)} XRAY | WHEEL FLY SPEED | {modeCombo} MODE/CYCLE | ESC PAUSE"
+            : $"WASD MOVE | SPACE JUMP | CTRL DOWN | DOUBLE TAP SPACE: FLY | WHEEL HOTBAR | {FormatKeyLabel(_gamemodeModifierKey)}+WHEEL(FLY)=SPEED | {modeCombo} MODE/CYCLE | {finderKey} FINDER | ESC PAUSE";
+        _font.DrawString(sb, controlsHint, new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
         
-        DrawHotbar(sb);
+        if (_gameMode != GameMode.Veilseer)
+            DrawHotbar(sb);
         DrawSelectedBlockName(sb);
         DrawPlayerList(sb);
         DrawCommandOverlay(sb);
         DrawGamemodeToast(sb);
+        DrawFlySpeedToast(sb);
+        DrawVeilseerStatus(sb);
         DrawGamemodeWheel(sb);
         if (_homeGuiOpen)
             DrawHomeGui(sb);
@@ -1574,7 +1768,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _playerCollisionEnabled = _meta.PlayerCollision;
         _difficultyLevel = Math.Clamp(_meta.DifficultyLevel, 0, 3);
         LoadOperatorsFromMeta();
-        EnsureBiomeCatalog();
+        _biomeIndex = BiomeIndexStore.Load(_worldPath, _log);
+        if (_biomeIndex == null || !_biomeIndex.IsCompatible(_meta))
+        {
+            _biomeIndex = BiomeLocateService.BuildCoverageIndex(_meta, stride: 64);
+            _biomeIndex.Save(_worldPath, _log);
+        }
+        SpawnPrewarmManifest? prewarmManifest = null;
+        if (SpawnPrewarmStore.TryLoad(_worldPath, _log, out var loadedPrewarmManifest))
+            prewarmManifest = loadedPrewarmManifest;
+        _spawnPrewarmManifest = prewarmManifest;
 
         // 1) FIX INIT ORDER: Build atlas FIRST, then create streaming service
         sw.Restart();
@@ -1596,10 +1799,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         InitBlockModel();
         
-        _player.AllowFlying = _gameMode == GameMode.Artificer;
+        _player.AllowFlying = _gameMode == GameMode.Artificer || _gameMode == GameMode.Veilseer;
+        _player.NoClipEnabled = _gameMode == GameMode.Veilseer;
         _inventory.SetMode(_gameMode);
         if (_gameMode == GameMode.Veilwalker)
             _player.SetFlying(false);
+        else if (_gameMode == GameMode.Veilseer)
+            _player.SetFlying(true);
 
         // Initialize performance optimizer for maximum GPU/CPU/RAM utilization
         AdvancedPerformanceOptimizer.Initialize();
@@ -1610,6 +1816,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         // RESTORE PLAYER POSITION FIRST - This determines where chunks need to be loaded
         RestoreOrCenterCamera();
+
+        // Prime the player's current chunk immediately so joining feels instant even without spawn prewarm.
+        PrimeSpawnChunkImmediate();
 
         if (IsJoinedClientSession)
         {
@@ -1634,27 +1843,26 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         // PreloadChunksAroundPlayer();
         // PreloadChunksAroundPlayer();
         
-        // Start automatic world pregeneration with OPTIMIZED area (non-blocking)
-        if (_pregenerationService != null)
-        {
-            var optimalRadius = AdvancedPerformanceOptimizer.GetOptimalRenderDistance();
-            _log.Info($"Starting OPTIMIZED world pregeneration for best experience...");
-            _pregenerationService.StartPregeneration(optimalRadius); // Use hardware-optimal radius
-            
-            _log.Info($"World pregeneration started in background - {optimalRadius} chunk radius optimized for hardware");
-        }
+        // Pregeneration starts AFTER the spawn prewarm gate completes.
+        // This prevents background pregeneration from starving the prewarm pipeline.
+        _pregenerationStarted = false;
         
-        // TEST: Run our new world generation system test
-        try
+        // WorldGenerationTest is DEV-only; never run it automatically during join.
+#if DEBUG
+        if (Environment.GetEnvironmentVariable("LV_RUN_WORLDGEN_TESTS") == "1")
         {
-            _log.Info("=== Testing New World Generation System ===");
-            WorldGenerationTest.RunTest(_log);
-            _log.Info("=== New World Generation System Test Complete ===");
+            try
+            {
+                _log.Info("=== Testing New World Generation System ===");
+                WorldGenerationTest.RunTest(_log);
+                _log.Info("=== New World Generation System Test Complete ===");
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"World generation test failed: {ex.Message}");
+            }
         }
-        catch (Exception ex)
-        {
-            _log.Error($"World generation test failed: {ex.Message}");
-        }
+#endif
         sw.Stop();
         _log.Info($"World load: player position chunk pre-load {sw.ElapsedMilliseconds}ms");
 
@@ -1737,10 +1945,32 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_world == null)
             return;
 
+        if (!ENABLE_SPAWN_PREWARM)
+        {
+            _prewarmRequiredChunks.Clear();
+            _tier0Chunks.Clear();
+            _prewarmTargetCount = 0;
+            _prewarmReadyCount = 0;
+
+            _spawnPrewarmComplete = true;
+            _visibilitySafe = true;
+
+            _log.Info("Spawn prewarm DISABLED: entering world immediately; chunks/meshes will stream in the background.");
+            return;
+        }
+
+        var focusPosition = _player.Position;
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
+        {
+            focusPosition = observed.Position;
+        }
+
         var playerChunk = VoxelWorld.WorldToChunk(
-            (int)MathF.Floor(_player.Position.X),
-            (int)MathF.Floor(_player.Position.Y),
-            (int)MathF.Floor(_player.Position.Z),
+            (int)MathF.Floor(focusPosition.X),
+            (int)MathF.Floor(focusPosition.Y),
+            (int)MathF.Floor(focusPosition.Z),
             out _, out _, out _);
 
         var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
@@ -1801,31 +2031,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void PrimeTier0FromMeshCache()
     {
-        if (_world == null)
-            return;
-
-        var loaded = 0;
-        foreach (var coord in _tier0Chunks)
-        {
-            if (_chunkMeshes.ContainsKey(coord))
-            {
-                loaded++;
-                continue;
-            }
-
-            if (!ChunkMeshCache.TryLoadFresh(_worldPath, _world.ChunksDir, coord, out var mesh))
-                continue;
-            if (!ValidateMesh(mesh))
-                continue;
-
-            _chunkMeshes[coord] = mesh;
-            if (!_chunkOrder.Contains(coord))
-                _chunkOrder.Add(coord);
-            loaded++;
-        }
-
-        if (loaded > 0)
-            _log.Info($"Loaded {loaded} prewarmed chunk meshes from disk cache.");
+        // Disabled: mesh cache is not persisted on disk.
     }
 
     private void QueueChunkGeneration(ChunkCoord coord)
@@ -1861,21 +2067,141 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
 
             var world = _world;
+            var cancellationToken = _backgroundWorkCts.Token;
             _ = Task.Run(() =>
             {
                 try
                 {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
                     world.GetOrCreateChunk(coord);
+                }
+                catch (OperationCanceledException)
+                {
+                    // ignored
+                }
+                catch (Exception ex)
+                {
+                    _log.Debug($"Chunk generation skipped for {coord}: {ex.Message}");
                 }
                 finally
                 {
                     _chunkGenerationInFlight.TryRemove(coord, out _);
                     _chunkGenerationSemaphore.Release();
                 }
-            });
+            }, cancellationToken);
 
             scheduled++;
         }
+    }
+
+
+
+    private void PrimeSpawnChunkImmediate()
+    {
+        try
+        {
+            if (_world == null || _atlas == null) return;
+            var pos = _player.Position;
+
+            VoxelWorld.WorldToChunkCoords(
+                (int)pos.X,
+                (int)pos.Y,
+                (int)pos.Z,
+                out var chunkX,
+                out var chunkY,
+                out var chunkZ);
+
+            var gateCoords = BuildSpawnPrimeCoords(chunkX, chunkY, chunkZ);
+            var builtFallback = 0;
+            const int fallbackBuildLimit = 48;
+
+            for (var i = 0; i < gateCoords.Count; i++)
+            {
+                var coord = gateCoords[i];
+                if (!IsChunkWithinWorldBounds(coord))
+                    continue;
+
+                _world.GetOrCreateChunk(coord);
+
+                if (_chunkMeshes.ContainsKey(coord))
+                    continue;
+
+                if (builtFallback >= fallbackBuildLimit)
+                {
+                    QueuePriorityMeshBuild(coord);
+                    continue;
+                }
+
+                if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                    continue;
+
+                var mesh = VoxelMesherGreedy.BuildChunkMeshPriority(_world, chunk, _atlas, _log);
+                if (!ValidateMesh(mesh))
+                    continue;
+
+                _chunkMeshes[coord] = mesh;
+                if (!_chunkOrder.Contains(coord))
+                    _chunkOrder.Add(coord);
+                builtFallback++;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn($"PrimeSpawnChunkImmediate failed: {ex.Message}");
+        }
+    }
+
+    private List<ChunkCoord> BuildSpawnPrimeCoords(int fallbackChunkX, int fallbackChunkY, int fallbackChunkZ)
+    {
+        var coords = new List<ChunkCoord>();
+        var seen = new HashSet<ChunkCoord>();
+        var worldMaxCy = _world?.MaxChunkY ?? Math.Max(0, fallbackChunkY);
+        var verticalTop = Math.Min(
+            worldMaxCy,
+            Math.Max(PrewarmVerticalChunkTop, Math.Min(fallbackChunkY, PrewarmVerticalChunkTop + 2)));
+
+        void AddCoord(ChunkCoord coord)
+        {
+            if (seen.Add(coord))
+                coords.Add(coord);
+        }
+
+        // Always prime around the player's current chunk first so rejoin never opens into a distant spawn gate.
+        for (var ring = 0; ring <= 1; ring++)
+        {
+            for (var dz = -ring; dz <= ring; dz++)
+            {
+                for (var dx = -ring; dx <= ring; dx++)
+                {
+                    if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != ring)
+                        continue;
+
+                    var cx = fallbackChunkX + dx;
+                    var cz = fallbackChunkZ + dz;
+                    for (var cy = 0; cy <= verticalTop; cy++)
+                        AddCoord(new ChunkCoord(cx, cy, cz));
+
+                    // If the player is high above terrain, also include their current vertical band.
+                    if (fallbackChunkY > verticalTop)
+                        AddCoord(new ChunkCoord(cx, Math.Min(worldMaxCy, fallbackChunkY), cz));
+                }
+            }
+        }
+
+        // Include nearby prewarm coords only if they overlap the current player area.
+        if (_spawnPrewarmManifest?.GateChunks != null)
+        {
+            for (var i = 0; i < _spawnPrewarmManifest.GateChunks.Count; i++)
+            {
+                var coord = _spawnPrewarmManifest.GateChunks[i];
+                if (Math.Abs(coord.X - fallbackChunkX) > 2 || Math.Abs(coord.Z - fallbackChunkZ) > 2)
+                    continue;
+                AddCoord(coord);
+            }
+        }
+
+        return coords;
     }
 
     private void ProcessPrewarmStep()
@@ -2117,6 +2443,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
         _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
         _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
         _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         UpdateReticleSettings();
@@ -2165,7 +2492,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _log.Info($"Render distance raised: {oldRadius} -> {newRadius}, expanding gradually");
             }
             
-            UpdateActiveChunks(force: true);
+            UpdateActiveChunks(force: false);
             _log.Info($"Render distance changed: {_activeRadiusChunks} chunks");
         }
     }
@@ -2633,10 +2960,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var coordForBuild = coord;
             var chunkForBuild = chunk;
             var versionForBuild = chunk.Version;
+            var cancellationToken = _backgroundWorkCts.Token;
             void BuildPriorityMesh()
             {
                 try
                 {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
                     var mesh = VoxelMesherGreedy.BuildChunkMeshPriority(world, chunkForBuild, atlas, log);
                     if (!ValidateMesh(mesh))
                     {
@@ -2659,7 +2989,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 }
             }
 
-            _ = Task.Run(BuildPriorityMesh);
+            _ = Task.Run(BuildPriorityMesh, cancellationToken);
 
             scheduleBudget--;
             priorityBudget--;
@@ -2690,10 +3020,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var coordForBuild = coord;
             var chunkForBuild = chunk;
             var versionForBuild = chunk.Version;
+            var cancellationToken = _backgroundWorkCts.Token;
             _ = Task.Run(() =>
             {
                 try
                 {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
                     var mesh = fast
                         ? VoxelMesherGreedy.BuildChunkMeshFast(world, chunkForBuild, atlas, log)
                         : VoxelMesherGreedy.BuildChunkMesh(world, chunkForBuild, atlas, log);
@@ -2715,7 +3048,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     _meshBuildInFlight.TryRemove(coordForBuild, out _);
                     _meshBuildSemaphore.Release();
                 }
-            });
+            }, cancellationToken);
 
             scheduleBudget--;
         }
@@ -2782,10 +3115,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private static bool ValidateMesh(ChunkMesh mesh)
     {
-        if (mesh.OpaqueVertices.Length % 3 != 0 || mesh.TransparentVertices.Length % 3 != 0 || mesh.WaterVertices.Length % 3 != 0)
+        if (mesh.OpaqueVertices.Length % 3 != 0
+            || mesh.CutoutVertices.Length % 3 != 0
+            || mesh.TransparentVertices.Length % 3 != 0
+            || mesh.WaterVertices.Length % 3 != 0)
             return false;
 
         return VerticesFinite(mesh.OpaqueVertices)
+            && VerticesFinite(mesh.CutoutVertices)
             && VerticesFinite(mesh.TransparentVertices)
             && VerticesFinite(mesh.WaterVertices);
     }
@@ -2855,6 +3192,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_world == null)
             return;
+        if (_gameMode == GameMode.Veilseer && !_player.IsFlying)
+            _player.SetFlying(true);
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.ContainsKey(_veilseerSpectateTargetPlayerId))
+        {
+            return;
+        }
 
         _player.Update(dt, gameTime.TotalGameTime.TotalSeconds, input, _world.GetBlock);
         ClampPlayerToWorldBounds();
@@ -2878,6 +3223,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void ApplyPlayerSeparation(float dt)
     {
+        if (_gameMode == GameMode.Veilseer || _player.NoClipEnabled)
+            return;
+
         if (!_playerCollisionEnabled || _remotePlayers.Count == 0)
             return;
 
@@ -2937,6 +3285,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_world == null)
             return;
+        if (_gameMode == GameMode.Veilseer)
+            return;
 
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         if (_interactCooldown > 0f)
@@ -2969,7 +3319,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (_gameMode == GameMode.Veilwalker)
                     SpawnBlockDrop(hit.X, hit.Y, hit.Z, (BlockId)id);
                 else
+                {
                     _inventory.Add((BlockId)id, 1);
+                    MarkPlayerStateDirty(); // Mark dirty after inventory change
+                }
                 _interactCooldown = InteractCooldownSeconds;
             }
         }
@@ -3025,8 +3378,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (input.ScrollDelta != 0)
         {
-            var step = input.ScrollDelta > 0 ? -1 : 1;
-            _inventory.Scroll(step);
+            if (_gameMode == GameMode.Veilseer)
+            {
+                var speedStep = input.ScrollDelta > 0 ? 1 : -1;
+                if (_player.AdjustFlySpeedMultiplier(speedStep))
+                    ShowFlySpeedToast();
+            }
+            else if (_player.IsFlying && input.IsKeyDown(_gamemodeModifierKey))
+            {
+                var speedStep = input.ScrollDelta > 0 ? 1 : -1;
+                if (_player.AdjustFlySpeedMultiplier(speedStep))
+                    ShowFlySpeedToast();
+            }
+            else
+            {
+                var step = input.ScrollDelta > 0 ? -1 : 1;
+                _inventory.Scroll(step);
+            }
+        }
+
+        if (_gameMode == GameMode.Veilseer)
+        {
+            TryHandleVeilseerSpectateNumberInput(input);
+            return;
         }
 
         if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1)) _inventory.Select(0);
@@ -3050,6 +3424,50 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 }
             }
         }
+    }
+
+    private void ShowFlySpeedToast()
+    {
+        _flySpeedToastText = $"FLY SPEED {(_player.FlySpeedMultiplier * 100f):0}%";
+        _flySpeedToastPercent = Math.Clamp(_player.FlySpeedNormalized, 0f, 1f);
+        _flySpeedToastTimer = 1.8f;
+    }
+
+    private bool TryHandleVeilseerSpectateNumberInput(InputState input)
+    {
+        var slot = -1;
+        if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1)) slot = 0;
+        else if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2)) slot = 1;
+        else if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3)) slot = 2;
+        else if (input.IsNewKeyPress(Keys.D4) || input.IsNewKeyPress(Keys.NumPad4)) slot = 3;
+        else if (input.IsNewKeyPress(Keys.D5) || input.IsNewKeyPress(Keys.NumPad5)) slot = 4;
+        else if (input.IsNewKeyPress(Keys.D6) || input.IsNewKeyPress(Keys.NumPad6)) slot = 5;
+        else if (input.IsNewKeyPress(Keys.D7) || input.IsNewKeyPress(Keys.NumPad7)) slot = 6;
+        else if (input.IsNewKeyPress(Keys.D8) || input.IsNewKeyPress(Keys.NumPad8)) slot = 7;
+        else if (input.IsNewKeyPress(Keys.D9) || input.IsNewKeyPress(Keys.NumPad9)) slot = 8;
+        else if (input.IsNewKeyPress(Keys.D0) || input.IsNewKeyPress(Keys.NumPad0))
+        {
+            _veilseerSpectateTargetPlayerId = -1;
+            _veilseerSpectateSlot = -1;
+            SetCommandStatus("VeilSeer free camera restored.", 2.5f);
+            return true;
+        }
+
+        if (slot < 0)
+            return false;
+
+        var available = _remotePlayers.Keys.OrderBy(id => id).ToArray();
+        if (slot >= available.Length)
+        {
+            SetCommandStatus($"No player in VeilSeer slot {slot + 1}.", 2.5f);
+            return false;
+        }
+
+        _veilseerSpectateTargetPlayerId = available[slot];
+        _veilseerSpectateSlot = slot;
+        var targetName = ResolvePlayerName(_veilseerSpectateTargetPlayerId);
+        SetCommandStatus($"VeilSeer spectating {targetName} (slot {slot + 1}).", 2.5f);
+        return true;
     }
 
     private bool WouldBlockIntersectAnyPlayer(int x, int y, int z)
@@ -3391,6 +3809,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (leftover <= 0)
             {
                 _worldItemRemove.Add(item.ItemId);
+                MarkPlayerStateDirty(); // Mark dirty after inventory change
                 SendItemPickup(item.ItemId);
             }
         }
@@ -3513,10 +3932,49 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _inventoryGridSlots[idx] = new Rectangle(x, y, slotSize, slotSize);
             }
         }
-        _inventoryClose.Bounds = new Rectangle(_inventoryRect.Right - 140, _inventoryRect.Bottom - 44, 120, 32);
+        _inventoryClose.Bounds = new Rectangle(_inventoryRect.Right - 164, _inventoryRect.Bottom - 50, 140, 38);
+        _inventoryClear.Bounds = new Rectangle(_inventoryRect.X + 16, _inventoryRect.Bottom - 50, 220, 38);
+
+        var gridBounds = GetInventoryGridBounds();
+        _inventoryCatalogHeaderRect = gridBounds.Width > 0
+            ? new Rectangle(gridBounds.X, gridBounds.Y, gridBounds.Width, CatalogHeaderHeight)
+            : Rectangle.Empty;
+
+        if (_inventoryCatalogHeaderRect.Width > 0)
+        {
+            var favoritesWidth = 130;
+            var searchWidth = Math.Max(120, _inventoryCatalogHeaderRect.Width - favoritesWidth - 12);
+            _inventoryCatalogSearchRect = new Rectangle(
+                _inventoryCatalogHeaderRect.X,
+                _inventoryCatalogHeaderRect.Y + 6,
+                searchWidth,
+                CatalogSearchHeight);
+            _inventoryCatalogSearchClearRect = new Rectangle(
+                _inventoryCatalogSearchRect.Right - 30,
+                _inventoryCatalogSearchRect.Y + 2,
+                26,
+                _inventoryCatalogSearchRect.Height - 4);
+            _inventoryCatalogFavoritesRect = new Rectangle(
+                _inventoryCatalogSearchRect.Right + 12,
+                _inventoryCatalogSearchRect.Y,
+                favoritesWidth - 12,
+                CatalogSearchHeight);
+            _inventoryCatalogListRect = new Rectangle(
+                gridBounds.X,
+                _inventoryCatalogHeaderRect.Bottom + 4,
+                gridBounds.Width,
+                Math.Max(0, gridBounds.Height - _inventoryCatalogHeaderRect.Height - 4));
+        }
+        else
+        {
+            _inventoryCatalogSearchRect = Rectangle.Empty;
+            _inventoryCatalogSearchClearRect = Rectangle.Empty;
+            _inventoryCatalogFavoritesRect = Rectangle.Empty;
+            _inventoryCatalogListRect = Rectangle.Empty;
+        }
     }
 
-    private void UpdateInventory(InputState input)
+    private void UpdateInventory(InputState input, float dt)
     {
         if (!_inventoryOpen)
             return;
@@ -3529,27 +3987,126 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         _inventoryMousePos = input.MousePosition;
+        var p = _inventoryMousePos;
+        var showArtificerTabs = _gameMode == GameMode.Artificer;
+        var isCatalogView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var searchFocusLocked = isCatalogView && _inventoryCatalogSearchFocused;
+
+        if (_inventoryClearConfirmPending)
+        {
+            _inventoryClearConfirmTimer = Math.Max(0f, _inventoryClearConfirmTimer - Math.Max(0f, dt));
+            if (_inventoryClearConfirmTimer <= 0f)
+                _inventoryClearConfirmPending = false;
+        }
+
+        _inventoryClear.Visible = _gameMode == GameMode.Artificer;
+        _inventoryClear.Enabled = _gameMode == GameMode.Artificer;
+        _inventoryClear.Label = _inventoryClearConfirmPending ? "CONFIRM CLEAR" : "CLEAR INVENTORY";
+
+        if (searchFocusLocked)
+        {
+            if (input.IsNewKeyPress(Keys.Escape))
+            {
+                _inventoryCatalogSearchFocused = false;
+                return;
+            }
+
+            if (input.IsNewLeftClick())
+            {
+                var clickInsideSearchUi = _inventoryCatalogSearchRect.Contains(p)
+                    || _inventoryCatalogSearchClearRect.Contains(p);
+                if (!clickInsideSearchUi)
+                {
+                    _inventoryCatalogSearchFocused = false;
+                    return;
+                }
+
+                if (_inventoryCatalogSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_inventory.SandboxCatalogSearchQuery))
+                {
+                    _inventory.ClearSandboxCatalogSearchQuery();
+                    _inventoryCatalogSearchCaret = 0;
+                    ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                    return;
+                }
+            }
+
+            // While focused, only search-text editing keys are accepted.
+            UpdateInventoryCatalogSearchInput(input);
+            return;
+        }
+
+        if (input.IsNewKeyPress(_inventoryKey))
+        {
+            CloseInventory();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            CloseInventory();
+            return;
+        }
+
+        if (isCatalogView)
+        {
+            if (_inventoryCatalogListRect.Contains(p) && input.ScrollDelta != 0)
+            {
+                var wheelSteps = input.ScrollDelta / 120f;
+                if (Math.Abs(wheelSteps) < 0.01f)
+                    wheelSteps = Math.Sign(input.ScrollDelta);
+                _inventoryCatalogScrollVelocityPxPerSec -= wheelSteps * CatalogScrollWheelImpulse;
+            }
+
+            var scrollDecay = MathF.Exp(-CatalogScrollDamping * Math.Max(0f, dt));
+            _inventoryCatalogScrollVelocityPxPerSec *= scrollDecay;
+            if (MathF.Abs(_inventoryCatalogScrollVelocityPxPerSec) < 1f)
+                _inventoryCatalogScrollVelocityPxPerSec = 0f;
+
+            _inventoryCatalogScrollOffsetPx += _inventoryCatalogScrollVelocityPxPerSec * Math.Max(0f, dt);
+            ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+
+            UpdateInventoryCatalogSearchInput(input);
+        }
+        else
+        {
+            _inventoryCatalogSearchFocused = false;
+            _inventoryCatalogScrollVelocityPxPerSec = 0f;
+            ClampInventoryCatalogScroll(resetVelocityWhenClamped: false);
+        }
+
         _inventoryClose.Update(input);
+        _inventoryClear.Update(input);
         if (!_inventoryOpen)
             return;
 
         // Hover detection
-        var p = _inventoryMousePos;
-        var showArtificerTabs = _gameMode == GameMode.Artificer;
-        var isCatalogView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
-        var displayedGrid = isCatalogView ? _inventory.SandboxCatalogSlots : _inventory.Grid;
         var hoveredAny = false;
-        for (int i = 0; i < _inventoryGridSlots.Length; i++)
+        if (isCatalogView)
         {
-            if (_inventoryGridSlots[i].Contains(p))
+            if (TryGetInventoryCatalogRowAtPoint(p, out var hoveredIndex, out _, out _) && hoveredIndex >= 0)
             {
-                var slot = displayedGrid[i];
+                var slot = _inventory.GetSandboxCatalogFilteredEntryAt(hoveredIndex);
                 if (slot.Id != BlockId.Air && slot.Count > 0)
                 {
                     SetDisplayName(BlockRegistry.Get(slot.Id).Name);
                     hoveredAny = true;
                 }
-                break;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _inventoryGridSlots.Length; i++)
+            {
+                if (_inventoryGridSlots[i].Contains(p))
+                {
+                    var slot = _inventory.Grid[i];
+                    if (slot.Id != BlockId.Air && slot.Count > 0)
+                    {
+                        SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                        hoveredAny = true;
+                    }
+                    break;
+                }
             }
         }
 
@@ -3570,23 +4127,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
-        if (isCatalogView && input.ScrollDelta != 0)
-        {
-            var gridBounds = GetInventoryGridBounds();
-            if (gridBounds.Width > 0 && gridBounds.Height > 0 && gridBounds.Contains(p))
-            {
-                var delta = input.ScrollDelta > 0 ? -1 : 1;
-                if (_inventory.TryAdvanceSandboxCatalogPage(delta))
-                {
-                    _inventoryHeld = default;
-                    _inventoryHasHeld = false;
-                    _heldFrom = InventorySlotGroup.None;
-                    _heldIndex = -1;
-                    SetCommandStatus($"Catalog page {_inventory.SandboxCatalogPage}/{_inventory.SandboxCatalogPageCount}.", 2.2f, echoToChat: false);
-                }
-            }
-        }
-
         if (!input.IsNewLeftClick())
             return;
 
@@ -3595,36 +4135,76 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_inventoryCatalogTabRect.Contains(p))
             {
                 _artificerInventoryView = ArtificerInventoryView.Catalog;
+                _inventoryCatalogSearchFocused = false;
                 return;
             }
 
             if (_inventoryStorageTabRect.Contains(p))
             {
                 _artificerInventoryView = ArtificerInventoryView.Inventory;
+                _inventoryCatalogSearchFocused = false;
                 return;
             }
         }
 
-        for (int i = 0; i < _inventoryGridSlots.Length; i++)
+        if (isCatalogView)
         {
-            if (_inventoryGridSlots[i].Contains(p))
+            if (_inventoryCatalogSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_inventory.SandboxCatalogSearchQuery))
             {
-                if (isCatalogView)
+                _inventory.ClearSandboxCatalogSearchQuery();
+                _inventoryCatalogSearchCaret = 0;
+                ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                return;
+            }
+
+            if (_inventoryCatalogSearchRect.Contains(p))
+            {
+                _inventoryCatalogSearchFocused = true;
+                _inventoryCatalogSearchCaret = _inventory.SandboxCatalogSearchQuery.Length;
+                return;
+            }
+
+            if (_inventoryCatalogFavoritesRect.Contains(p))
+            {
+                _inventory.SetSandboxCatalogFavoritesOnly(!_inventory.SandboxCatalogFavoritesOnly);
+                ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                return;
+            }
+
+            _inventoryCatalogSearchFocused = false;
+
+            if (TryGetInventoryCatalogRowAtPoint(p, out var selectedIndex, out _, out var favoriteRect))
+            {
+                var catalogSlot = _inventory.GetSandboxCatalogFilteredEntryAt(selectedIndex);
+                if (catalogSlot.Count <= 0 || catalogSlot.Id == BlockId.Air)
+                    return;
+
+                if (favoriteRect.Contains(p))
                 {
-                    var catalogSlot = _inventory.SandboxCatalogSlots[i];
-                    if (catalogSlot.Count > 0 && catalogSlot.Id != BlockId.Air)
-                    {
-                        _inventoryHeld = catalogSlot;
-                        _inventoryHasHeld = true;
-                        _heldFrom = InventorySlotGroup.None;
-                        _heldIndex = -1;
-                    }
+                    if (_inventory.ToggleSandboxCatalogFavorite((int)catalogSlot.Id))
+                        MarkPlayerStateDirty();
+                    ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
                     return;
                 }
 
-                ref var slot = ref _inventory.Grid[i];
-                HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                _inventoryHeld = catalogSlot;
+                _inventoryHasHeld = true;
+                _heldFrom = InventorySlotGroup.None;
+                _heldIndex = -1;
                 return;
+            }
+        }
+        else
+        {
+            _inventoryCatalogSearchFocused = false;
+            for (int i = 0; i < _inventoryGridSlots.Length; i++)
+            {
+                if (_inventoryGridSlots[i].Contains(p))
+                {
+                    ref var slot = ref _inventory.Grid[i];
+                    HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                    return;
+                }
             }
         }
 
@@ -3667,6 +4247,533 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return new Rectangle(left, top, right - left, bottom - top);
     }
 
+    private void ClampInventoryCatalogScroll(bool resetVelocityWhenClamped)
+    {
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+        {
+            _inventoryCatalogScrollOffsetPx = 0f;
+            if (resetVelocityWhenClamped)
+                _inventoryCatalogScrollVelocityPxPerSec = 0f;
+            return;
+        }
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        var maxScroll = Math.Max(0f, totalRows * CatalogRowHeight - _inventoryCatalogListRect.Height);
+        var clamped = Math.Clamp(_inventoryCatalogScrollOffsetPx, 0f, maxScroll);
+        if (Math.Abs(clamped - _inventoryCatalogScrollOffsetPx) > 0.001f && resetVelocityWhenClamped)
+            _inventoryCatalogScrollVelocityPxPerSec = 0f;
+
+        _inventoryCatalogScrollOffsetPx = clamped;
+    }
+
+    private bool TryGetInventoryCatalogRowAtPoint(Point point, out int filteredIndex, out Rectangle rowRect, out Rectangle favoriteRect)
+    {
+        filteredIndex = -1;
+        rowRect = Rectangle.Empty;
+        favoriteRect = Rectangle.Empty;
+
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+            return false;
+        if (!_inventoryCatalogListRect.Contains(point))
+            return false;
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalRows <= 0)
+            return false;
+
+        var contentY = (point.Y - _inventoryCatalogListRect.Y) + _inventoryCatalogScrollOffsetPx;
+        filteredIndex = (int)MathF.Floor(contentY / CatalogRowHeight);
+        if (filteredIndex < 0 || filteredIndex >= totalRows)
+            return false;
+
+        var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(filteredIndex * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
+        rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
+        if (!rowRect.Contains(point))
+            return false;
+
+        favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+        return true;
+    }
+
+    private void UpdateInventoryCatalogSearchInput(InputState input)
+    {
+        if (!_inventoryCatalogSearchFocused)
+            return;
+
+        var query = _inventory.SandboxCatalogSearchQuery;
+        _inventoryCatalogSearchCaret = Math.Clamp(_inventoryCatalogSearchCaret, 0, query.Length);
+
+        if (input.IsNewKeyPress(Keys.Left))
+            _inventoryCatalogSearchCaret = Math.Max(0, _inventoryCatalogSearchCaret - 1);
+        if (input.IsNewKeyPress(Keys.Right))
+            _inventoryCatalogSearchCaret = Math.Min(query.Length, _inventoryCatalogSearchCaret + 1);
+        if (input.IsNewKeyPress(Keys.Home))
+            _inventoryCatalogSearchCaret = 0;
+        if (input.IsNewKeyPress(Keys.End))
+            _inventoryCatalogSearchCaret = query.Length;
+
+        var changed = false;
+
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        foreach (var key in input.GetTextInputKeys())
+        {
+            if (key is Keys.Tab or Keys.Enter or Keys.Left or Keys.Right or Keys.Home or Keys.End)
+                continue;
+
+            if (key == Keys.Back)
+            {
+                if (_inventoryCatalogSearchCaret > 0)
+                {
+                    query = query.Remove(_inventoryCatalogSearchCaret - 1, 1);
+                    _inventoryCatalogSearchCaret--;
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (key == Keys.Delete)
+            {
+                if (_inventoryCatalogSearchCaret < query.Length)
+                {
+                    query = query.Remove(_inventoryCatalogSearchCaret, 1);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (!TryMapCommandInputKey(key, shift, out var c))
+                continue;
+
+            if (query.Length >= CatalogSearchMaxLength)
+                continue;
+
+            query = query.Insert(_inventoryCatalogSearchCaret, c.ToString());
+            _inventoryCatalogSearchCaret++;
+            changed = true;
+        }
+
+        if (TryPasteClipboardIntoText(input, ref query))
+        {
+            if (query.Length > CatalogSearchMaxLength)
+                query = query.Substring(0, CatalogSearchMaxLength);
+            _inventoryCatalogSearchCaret = query.Length;
+            changed = true;
+        }
+
+        if (!changed)
+            return;
+
+        if (query.Length > CatalogSearchMaxLength)
+            query = query.Substring(0, CatalogSearchMaxLength);
+
+        _inventory.SetSandboxCatalogSearchQuery(query);
+        _inventoryCatalogSearchCaret = Math.Clamp(_inventoryCatalogSearchCaret, 0, _inventory.SandboxCatalogSearchQuery.Length);
+        _inventoryCatalogScrollOffsetPx = 0f;
+        _inventoryCatalogScrollVelocityPxPerSec = 0f;
+        ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+    }
+
+    private void DrawInventoryCatalogPanel(SpriteBatch sb)
+    {
+        if (_inventoryCatalogHeaderRect.Width <= 0 || _inventoryCatalogListRect.Width <= 0)
+            return;
+
+        EnsureCatalogLoreLoaded();
+
+        sb.Draw(_pixel, _inventoryCatalogHeaderRect, new Color(14, 18, 24, 210));
+        DrawBorder(sb, _inventoryCatalogHeaderRect, new Color(100, 120, 140));
+
+        sb.Draw(_pixel, _inventoryCatalogSearchRect, new Color(10, 10, 14, 235));
+        DrawBorder(sb, _inventoryCatalogSearchRect, _inventoryCatalogSearchFocused ? new Color(230, 230, 140) : new Color(170, 170, 170));
+        var query = _inventory.SandboxCatalogSearchQuery;
+        var queryDisplay = string.IsNullOrEmpty(query) ? "Search blocks..." : query;
+        var queryColor = string.IsNullOrEmpty(query) ? new Color(150, 150, 150) : Color.White;
+        _font.DrawString(sb, queryDisplay, new Vector2(_inventoryCatalogSearchRect.X + 8, _inventoryCatalogSearchRect.Y + 8), queryColor);
+
+        if (!string.IsNullOrEmpty(query))
+        {
+            sb.Draw(_pixel, _inventoryCatalogSearchClearRect, new Color(26, 30, 36, 240));
+            DrawBorder(sb, _inventoryCatalogSearchClearRect, new Color(205, 205, 205));
+            var clearText = "X";
+            var clearSize = _font.MeasureString(clearText);
+            _font.DrawString(
+                sb,
+                clearText,
+                new Vector2(_inventoryCatalogSearchClearRect.Center.X - clearSize.X / 2f, _inventoryCatalogSearchClearRect.Center.Y - clearSize.Y / 2f),
+                Color.White);
+        }
+
+        if (_inventoryCatalogSearchFocused && ((int)(_worldTimeSeconds * 2f) % 2 == 0))
+        {
+            var caret = Math.Clamp(_inventoryCatalogSearchCaret, 0, query.Length);
+            var caretPrefix = caret <= 0 ? string.Empty : query.Substring(0, caret);
+            var caretOffsetX = _font.MeasureString(caretPrefix).X;
+            var caretX = _inventoryCatalogSearchRect.X + 8 + (int)MathF.Round(caretOffsetX);
+            var caretRect = new Rectangle(caretX, _inventoryCatalogSearchRect.Y + 6, 2, _inventoryCatalogSearchRect.Height - 12);
+            sb.Draw(_pixel, caretRect, new Color(245, 245, 245));
+        }
+
+        var favoritesOnly = _inventory.SandboxCatalogFavoritesOnly;
+        sb.Draw(_pixel, _inventoryCatalogFavoritesRect, favoritesOnly ? new Color(48, 86, 132, 235) : new Color(18, 20, 24, 235));
+        DrawBorder(sb, _inventoryCatalogFavoritesRect, favoritesOnly ? new Color(220, 235, 255) : new Color(160, 160, 160));
+        _font.DrawString(
+            sb,
+            favoritesOnly ? "FAVORITES ON" : "FAVORITES",
+            new Vector2(_inventoryCatalogFavoritesRect.X + 10, _inventoryCatalogFavoritesRect.Y + 8),
+            Color.White);
+
+        sb.Draw(_pixel, _inventoryCatalogListRect, new Color(9, 10, 12, 220));
+        DrawBorder(sb, _inventoryCatalogListRect, new Color(170, 170, 170));
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalRows <= 0)
+        {
+            _font.DrawString(sb, "No blocks match search.", new Vector2(_inventoryCatalogListRect.X + 12, _inventoryCatalogListRect.Y + 12), new Color(220, 220, 220));
+            return;
+        }
+
+        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
+        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
+        var last = Math.Min(totalRows - 1, first + visible - 1);
+        var hoveredBlockId = BlockId.Air;
+        var hoveredRowRect = Rectangle.Empty;
+        for (var index = first; index <= last; index++)
+        {
+            var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(index * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
+            var rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
+            if (rowRect.Bottom <= _inventoryCatalogListRect.Top || rowRect.Top >= _inventoryCatalogListRect.Bottom)
+                continue;
+
+            var hovered = rowRect.Contains(_inventoryMousePos);
+            sb.Draw(_pixel, rowRect, hovered ? new Color(34, 44, 58, 220) : new Color(20, 24, 30, 210));
+            DrawBorder(sb, rowRect, hovered ? new Color(188, 214, 252) : new Color(88, 96, 110));
+
+            var slot = _inventory.GetSandboxCatalogFilteredEntryAt(index);
+            var iconRect = new Rectangle(rowRect.X + 8, rowRect.Y + 4, 32, 32);
+            var icon = GetBlockIcon(slot.Id, iconRect.Width);
+            if (icon != null)
+                sb.Draw(icon, iconRect, Color.White);
+            else if (_atlas != null)
+                sb.Draw(_atlas.Texture, iconRect, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+
+            var def = BlockRegistry.Get(slot.Id);
+            var name = def.Name.ToUpperInvariant();
+            var rarity = ResolveCatalogRarity(slot.Id, def);
+            var nameColor = GetCatalogRarityColor(rarity);
+            var nameY = rowRect.Y + (rowRect.Height - _font.LineHeight) / 2f;
+
+            var favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+            var favorite = _inventory.IsSandboxCatalogFavorite((int)slot.Id);
+            sb.Draw(_pixel, favoriteRect, favorite ? new Color(64, 112, 84, 245) : new Color(34, 34, 34, 245));
+            DrawBorder(sb, favoriteRect, favorite ? new Color(210, 245, 220) : new Color(150, 150, 150));
+            _font.DrawString(sb, favorite ? "*" : "+", new Vector2(favoriteRect.X + 7, favoriteRect.Y + 3), Color.White);
+            var nameMaxWidth = Math.Max(40, favoriteRect.Left - (iconRect.Right + 8) - 10);
+            var displayName = TruncateCatalogLabel(name, nameMaxWidth);
+            _font.DrawString(sb, displayName, new Vector2(iconRect.Right + 8, nameY), nameColor);
+
+            if (hovered)
+            {
+                hoveredBlockId = slot.Id;
+                hoveredRowRect = rowRect;
+            }
+        }
+
+        if (hoveredRowRect != Rectangle.Empty)
+            DrawCatalogHoverTooltip(sb, hoveredBlockId, hoveredRowRect);
+    }
+
+    private void EnsureCatalogLoreLoaded()
+    {
+        if (_catalogLoreLoaded)
+            return;
+
+        _catalogLoreLoaded = true;
+        _catalogLoreByBlock.Clear();
+
+        try
+        {
+            if (!_assets.TryLoadAssetBytes(CatalogLoreAssetPath, out var bytes) || bytes.Length == 0)
+                return;
+
+            var json = Encoding.UTF8.GetString(bytes);
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var payload = JsonSerializer.Deserialize<CatalogLoreFile>(json, options);
+            if (payload?.Blocks == null || payload.Blocks.Count == 0)
+                return;
+
+            for (var i = 0; i < payload.Blocks.Count; i++)
+            {
+                var source = payload.Blocks[i];
+                if (source == null || !TryResolveCatalogLoreBlockId(source, out var blockId))
+                    continue;
+
+                var def = BlockRegistry.Get(blockId);
+                if (def.Id != blockId || blockId == BlockId.Air || !def.IsVisibleInInventory)
+                    continue;
+
+                var description = BuildCatalogLoreDescription(source, def);
+                if (string.IsNullOrWhiteSpace(description))
+                    description = BuildDefaultCatalogDescription(def);
+
+                var displayName = string.IsNullOrWhiteSpace(source.DisplayNameOverride)
+                    ? def.Name
+                    : source.DisplayNameOverride.Trim();
+                var tags = NormalizeCatalogLoreTags(source.Tags);
+                var rarity = ResolveCatalogRarity(blockId, def, tags);
+                _catalogLoreByBlock[blockId] = new CatalogLoreEntry(displayName, description, tags, rarity);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Catalog lore load failed: {ex.Message}");
+        }
+    }
+
+    private static bool TryResolveCatalogLoreBlockId(CatalogLoreBlockDto source, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+
+        if (source.ByteId > 0 && source.ByteId <= byte.MaxValue)
+        {
+            var byteBlock = (BlockId)source.ByteId;
+            if (BlockRegistry.Get(byteBlock).Id == byteBlock)
+            {
+                blockId = byteBlock;
+                return true;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(source.BlockEnum))
+            return false;
+
+        if (!Enum.TryParse<BlockId>(source.BlockEnum.Trim(), ignoreCase: true, out var parsed))
+            return false;
+
+        if (BlockRegistry.Get(parsed).Id != parsed)
+            return false;
+
+        blockId = parsed;
+        return true;
+    }
+
+    private static string[] NormalizeCatalogLoreTags(string[]? tags)
+    {
+        if (tags == null || tags.Length == 0)
+            return Array.Empty<string>();
+
+        var output = new List<string>(tags.Length);
+        for (var i = 0; i < tags.Length; i++)
+        {
+            var normalized = (tags[i] ?? string.Empty).Trim().ToLowerInvariant();
+            if (normalized.Length > 0)
+                output.Add(normalized);
+        }
+
+        if (output.Count == 0)
+            return Array.Empty<string>();
+
+        return output.Distinct(StringComparer.Ordinal).ToArray();
+    }
+
+    private static string BuildCatalogLoreDescription(CatalogLoreBlockDto source, BlockDef def)
+    {
+        if (source.LoreLines != null)
+        {
+            for (var i = 0; i < source.LoreLines.Length; i++)
+            {
+                var line = NormalizeCatalogLoreLine(source.LoreLines[i]);
+                if (!string.IsNullOrWhiteSpace(line))
+                    return line;
+            }
+        }
+
+        return BuildDefaultCatalogDescription(def);
+    }
+
+    private static string NormalizeCatalogLoreLine(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        var trimmed = raw.Trim();
+        return string.Join(' ', trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static string BuildDefaultCatalogDescription(BlockDef def)
+    {
+        var token = def.Id.ToString().ToLowerInvariant();
+        if (def.Id == BlockId.Water)
+            return "A flowing liquid block used to shape waterways and terrain basins.";
+        if (token.Contains("leaf", StringComparison.Ordinal))
+            return "Foliage block for shaping canopies and natural-looking tree crowns.";
+        if (token.Contains("glass", StringComparison.Ordinal))
+            return "Transparent construction block for clear windows and observation views.";
+        if (token.Contains("ore", StringComparison.Ordinal) || token is "coal" or "iron" or "gold" or "diamond")
+            return "Resource-bearing block used for progression materials and crafted tools.";
+        if (token.Contains("bench", StringComparison.Ordinal) || token.Contains("table", StringComparison.Ordinal))
+            return "Workstation block used for crafting and advanced build workflows.";
+        if (!def.IsSolid)
+            return "Light crafted component used in advanced recipes and utility builds.";
+        if (def.Hardness < 0f)
+            return "A foundational boundary block that anchors the world where it stands.";
+        return "Reliable structural block for building, landscaping, and terrain shaping.";
+    }
+
+    private CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def)
+    {
+        if (_catalogLoreByBlock.TryGetValue(blockId, out var lore))
+            return lore.Rarity;
+
+        return ResolveCatalogRarity(blockId, def, Array.Empty<string>());
+    }
+
+    private static CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def, IReadOnlyList<string> tags)
+    {
+        var token = blockId.ToString().ToLowerInvariant();
+
+        if (def.Hardness < 0f
+            || token.Contains("evergatecore", StringComparison.Ordinal)
+            || tags.Contains("null"))
+            return CatalogRarity.Legendary;
+
+        if (token.Contains("evergate", StringComparison.Ordinal)
+            || token.Contains("keystone", StringComparison.Ordinal)
+            || token.Contains("axiom", StringComparison.Ordinal)
+            || token.Contains("resonancecore", StringComparison.Ordinal)
+            || token.Contains("runicanvil", StringComparison.Ordinal)
+            || tags.Contains("keystone")
+            || tags.Contains("continuist"))
+            return CatalogRarity.Rare;
+
+        if (token.Contains("ore", StringComparison.Ordinal)
+            || token.Contains("glass", StringComparison.Ordinal)
+            || token.Contains("runestone", StringComparison.Ordinal)
+            || token.Contains("veinstone", StringComparison.Ordinal)
+            || token.Contains("staff", StringComparison.Ordinal)
+            || token.Contains("regulator", StringComparison.Ordinal)
+            || token.Contains("plinth", StringComparison.Ordinal)
+            || token.Contains("sigil", StringComparison.Ordinal)
+            || token.Contains("philter", StringComparison.Ordinal)
+            || token.Contains("elixir", StringComparison.Ordinal)
+            || token.Contains("draught", StringComparison.Ordinal)
+            || tags.Contains("ore")
+            || tags.Contains("metal")
+            || tags.Contains("crafting")
+            || tags.Contains("station")
+            || tags.Contains("precision"))
+            return CatalogRarity.Uncommon;
+
+        return CatalogRarity.Common;
+    }
+
+    private static Color GetCatalogRarityColor(CatalogRarity rarity)
+    {
+        return rarity switch
+        {
+            CatalogRarity.Common => new Color(236, 236, 236),
+            CatalogRarity.Uncommon => new Color(132, 232, 148),
+            CatalogRarity.Rare => new Color(132, 186, 255),
+            CatalogRarity.Legendary => new Color(255, 214, 118),
+            _ => Color.White
+        };
+    }
+
+    private void DrawCatalogHoverTooltip(SpriteBatch sb, BlockId blockId, Rectangle hoveredRowRect)
+    {
+        var def = BlockRegistry.Get(blockId);
+        var lore = _catalogLoreByBlock.TryGetValue(blockId, out var entry)
+            ? entry
+            : new CatalogLoreEntry(def.Name, BuildDefaultCatalogDescription(def), Array.Empty<string>(), ResolveCatalogRarity(blockId, def));
+        var rarity = lore.Rarity;
+        var rarityColor = GetCatalogRarityColor(rarity);
+        var rarityLabel = rarity switch
+        {
+            CatalogRarity.Common => "COMMON",
+            CatalogRarity.Uncommon => "UNCOMMON",
+            CatalogRarity.Rare => "RARE",
+            CatalogRarity.Legendary => "LEGENDARY",
+            _ => "COMMON"
+        };
+
+        var title = lore.DisplayName.ToUpperInvariant();
+        var description = string.IsNullOrWhiteSpace(lore.Description)
+            ? BuildDefaultCatalogDescription(def)
+            : lore.Description;
+        var wrapped = WrapOverlayText(description, CatalogTooltipMaxWidth - 30);
+        var maxTextWidth = _font.MeasureString(title).X + 14 + _font.MeasureString(rarityLabel).X;
+        for (var i = 0; i < wrapped.Count; i++)
+            maxTextWidth = Math.Max(maxTextWidth, _font.MeasureString(wrapped[i]).X);
+
+        var panelWidth = (int)Math.Ceiling(Math.Clamp(maxTextWidth + 20f, 240f, CatalogTooltipMaxWidth));
+        var panelHeight = 12 + _font.LineHeight + 8 + (wrapped.Count * (_font.LineHeight + 2)) + 10;
+
+        var x = _inventoryMousePos.X + 18;
+        var y = _inventoryMousePos.Y + 18;
+        var minX = _viewport.X + 8;
+        var minY = _viewport.Y + 8;
+        var maxX = _viewport.Right - panelWidth - 8;
+        var maxY = _viewport.Bottom - panelHeight - 8;
+        if (maxX < minX)
+            x = minX;
+        else
+            x = Math.Clamp(x, minX, maxX);
+
+        if (maxY < minY)
+            y = minY;
+        else
+            y = Math.Clamp(y, minY, maxY);
+
+        if (y + panelHeight > _inventoryCatalogListRect.Bottom && hoveredRowRect.Top - panelHeight - 8 >= _viewport.Y + 8)
+            y = hoveredRowRect.Top - panelHeight - 8;
+
+        var panel = new Rectangle(x, y, panelWidth, panelHeight);
+        sb.Draw(_pixel, panel, new Color(8, 10, 14, 244));
+        DrawBorder(sb, panel, new Color(208, 218, 234, 220));
+
+        var divider = new Rectangle(panel.X + 10, panel.Y + 12 + _font.LineHeight + 2, panel.Width - 20, 1);
+        sb.Draw(_pixel, divider, new Color(76, 90, 112, 210));
+
+        var titlePos = new Vector2(panel.X + 10, panel.Y + 10);
+        var titleShadow = titlePos + new Vector2(1f, 1f);
+        _font.DrawString(sb, title, titleShadow, new Color(0, 0, 0, 210));
+        _font.DrawString(sb, title, titlePos, rarityColor);
+
+        var raritySize = _font.MeasureString(rarityLabel);
+        var rarityPos = new Vector2(panel.Right - raritySize.X - 10, panel.Y + 10);
+        _font.DrawString(sb, rarityLabel, rarityPos + new Vector2(1f, 1f), new Color(0, 0, 0, 210));
+        _font.DrawString(sb, rarityLabel, rarityPos, rarityColor);
+
+        var textY = divider.Bottom + 6;
+        for (var i = 0; i < wrapped.Count; i++)
+        {
+            var linePos = new Vector2(panel.X + 10, textY + i * (_font.LineHeight + 2));
+            _font.DrawString(sb, wrapped[i], linePos + new Vector2(1f, 1f), new Color(0, 0, 0, 200));
+            _font.DrawString(sb, wrapped[i], linePos, new Color(236, 242, 255));
+        }
+    }
+
+    private string TruncateCatalogLabel(string text, int maxWidth)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0)
+            return string.Empty;
+
+        if (_font.MeasureString(text).X <= maxWidth)
+            return text;
+
+        const string ellipsis = "...";
+        if (_font.MeasureString(ellipsis).X > maxWidth)
+            return string.Empty;
+
+        for (var length = text.Length - 1; length > 0; length--)
+        {
+            var candidate = text.Substring(0, length) + ellipsis;
+            if (_font.MeasureString(candidate).X <= maxWidth)
+                return candidate;
+        }
+
+        return ellipsis;
+    }
+
     private void WarmBlockIcons()
     {
         if (_blockIconCache == null)
@@ -3684,10 +4791,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var gridSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
                 ? _inventoryGridSlots[0].Width - pad * 2
                 : InventorySlotSize - pad * 2;
-            var displaySlots = (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
-                ? _inventory.SandboxCatalogSlots
-                : _inventory.Grid;
-            WarmIconSlots(displaySlots, gridSize);
+            if (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
+                WarmVisibleCatalogIcons(gridSize);
+            else
+                WarmIconSlots(_inventory.Grid, gridSize);
         }
 
         if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
@@ -3711,6 +4818,28 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void WarmVisibleCatalogIcons(int size)
+    {
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+            return;
+
+        var total = _inventory.GetSandboxCatalogFilteredCount();
+        if (total <= 0)
+            return;
+
+        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
+        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
+        var last = Math.Min(total - 1, first + visible - 1);
+        for (var i = first; i <= last; i++)
+        {
+            var slot = _inventory.GetSandboxCatalogFilteredEntryAt(i);
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            _blockIconCache?.Warm(slot.Id, size, BlockModelContext.Gui);
+        }
+    }
+
     private Texture2D? GetBlockIcon(BlockId id, int size)
     {
         return _blockIconCache?.GetOrCreate(id, size, BlockModelContext.Gui);
@@ -3725,6 +4854,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 var leftover = _inventory.Add(_inventoryHeld.Id, _inventoryHeld.Count);
                 if (leftover > 0)
                     SpawnDroppedItem(_inventoryHeld.Id, leftover);
+                MarkPlayerStateDirty(); // Mark dirty after inventory change
             }
 
             _inventoryHeld = default;
@@ -3733,6 +4863,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _heldIndex = -1;
         }
 
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
         _inventoryOpen = false;
     }
 
@@ -3951,14 +5083,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, title, new Vector2(_inventoryRect.X + InventoryPadding + 2, titleY), Color.White);
         if (isArtificerCatalog)
         {
-            var pageText = $"PAGE {_inventory.SandboxCatalogPage}/{_inventory.SandboxCatalogPageCount} (WHEEL)";
-            var pageSize = _font.MeasureString(pageText);
-            _font.DrawString(sb, pageText, new Vector2(_inventoryRect.Right - pageSize.X - 20, titleY), new Color(205, 220, 255));
+            var shownText = $"Showing {_inventory.GetSandboxCatalogFilteredCount()} of {_inventory.GetSandboxCatalogTotalCount()}";
+            var shownSize = _font.MeasureString(shownText);
+            _font.DrawString(sb, shownText, new Vector2(_inventoryRect.Right - shownSize.X - 20, titleY), new Color(205, 220, 255));
+            DrawInventoryCatalogPanel(sb);
+        }
+        else
+        {
+            DrawInventorySlots(sb, _inventory.Grid, _inventoryGridSlots);
         }
 
-        var displayedSlots = isArtificerCatalog ? _inventory.SandboxCatalogSlots : _inventory.Grid;
-        DrawInventorySlots(sb, displayedSlots, _inventoryGridSlots);
-
+        if (_inventoryClear.Visible)
+            _inventoryClear.Draw(sb, _pixel, _font);
         _inventoryClose.Draw(sb, _pixel, _font);
 
         if (_inventoryHasHeld && _atlas != null)
@@ -4328,7 +5464,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Matrix GetViewMatrix()
     {
         var eye = _player.Position + _player.HeadOffset;
-        var target = eye + _player.Forward;
+        var forward = _player.Forward;
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
+        {
+            eye = observed.Position + _player.HeadOffset;
+            forward = PlayerController.GetForwardVector(observed.Yaw, observed.Pitch);
+        }
+
+        var target = eye + forward;
         return Matrix.CreateLookAt(eye, target, Vector3.Up);
     }
 
@@ -4343,6 +5488,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             LightingEnabled = false,
             VertexColorEnabled = false,
             World = Matrix.Identity
+        };
+    }
+
+    private void EnsureCutoutEffect(GraphicsDevice device)
+    {
+        if (_cutoutEffect != null)
+            return;
+
+        _cutoutEffect = new AlphaTestEffect(device)
+        {
+            VertexColorEnabled = false
         };
     }
 
@@ -4426,6 +5582,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         _playerModel.Position = _player.Position;
         _playerModel.Yaw = _player.Yaw;
+        _playerModel.Pitch = _player.Pitch;
         _playerModel.Render(view, proj);
 
         device.RasterizerState = prevRaster;
@@ -4441,8 +5598,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         device.DepthStencilState = DepthStencilState.Default;
         device.BlendState = BlendState.Opaque;
 
-        foreach (var model in _remotePlayers.Values)
-            model.Render(view, proj);
+        foreach (var pair in _remotePlayers)
+        {
+            if (_gameMode == GameMode.Veilseer
+                && _veilseerSpectateTargetPlayerId >= 0
+                && pair.Key == _veilseerSpectateTargetPlayerId)
+            {
+                continue;
+            }
+
+            pair.Value.Render(view, proj);
+        }
 
         device.RasterizerState = prevRaster;
     }
@@ -4609,7 +5775,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         device.DepthStencilState = transparent ? DepthStencilState.DepthRead : DepthStencilState.Default;
-        device.BlendState = transparent ? BlendState.AlphaBlend : BlendState.Opaque;
+        device.BlendState = transparent ? BlendState.NonPremultiplied : BlendState.Opaque;
 
         foreach (var pair in _worldItems)
         {
@@ -5197,6 +6363,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         _log.Info("GameWorldScreen: Closing world screen.");
         _isClosing = true;
+        CancelBackgroundWork(waitForPreviewWorker: true);
         if (!_skipOnCloseFullSave)
         {
             if (IsJoinedClientSession)
@@ -5209,8 +6376,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 SavePlayerState(closeState);
                 var savedRemotePlayers = SaveConnectedRemotePlayerStates();
                 var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
-                var savedMeshes = SaveAllLoadedChunkMeshesToCache();
-                QueueWorldPreviewUpdate(closeState);
+                
+                var savedMeshes = 0;
+                if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out var budgetState))
+                {
+                    _log.Info($"GameWorldScreen: OnClose skipped non-critical writes due to storage budget state={budgetState.State} size={budgetState.SizeBytes}.");
+                }
+
+                if (budgetState.IsConserve || budgetState.IsOverTarget)
+                    RegionCompactor.CompactIfNeeded(_worldPath, WorldStorageBudgetService.DefaultThresholds, _log);
+
                 _log.Info($"GameWorldScreen: OnClose saved {savedChunks} chunks, {savedMeshes} mesh caches, and {savedRemotePlayers} remote player snapshots.");
             }
         }
@@ -5262,8 +6437,43 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _samplerHigh = null;
         _samplerUltra?.Dispose();
         _samplerUltra = null;
+        _cutoutEffect?.Dispose();
+        _cutoutEffect = null;
+        _effect?.Dispose();
+        _effect = null;
+        _lineEffect?.Dispose();
+        _lineEffect = null;
+        _itemEffect?.Dispose();
+        _itemEffect = null;
         _waterEffect?.Dispose();
         _waterEffect = null;
+        _handRenderer?.Dispose();
+        _handRenderer = null;
+
+        // Always dispose the world here to release region file handles immediately.
+        // Without this, Windows keeps r.*.lvregion locked until GC runs, which causes
+        // "every other join" behavior (first join loads fallback/generated chunks) and prevents deletion.
+        try
+        {
+            if (_world != null)
+            {
+                if (IsJoinedClientSession)
+                {
+                    _world.Dispose(saveDirtyChunks: false);
+                }
+                else
+                {
+                    // If Save & Exit already completed successfully, avoid a second full save pass.
+                    _world.Dispose(saveDirtyChunks: !_skipOnCloseFullSave);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"GameWorldScreen: Error disposing world: {ex.Message}");
+        }
+        _world = null;
+
     }
 
     private void SaveAndExit()
@@ -5280,6 +6490,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void BeginSaveAndExit()
     {
         _isClosing = true;
+        CancelBackgroundWork(waitForPreviewWorker: false);
         _saveAndExitError = null;
         _saveAndExitInProgress = true;
         _saveAndExitStartedUtc = DateTime.UtcNow;
@@ -5335,15 +6546,26 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
 
             var state = CapturePlayerState();
-            state.Save(_worldPath, _log);
+            var playerId = _profile.PlayerId;
+            if (string.IsNullOrWhiteSpace(playerId))
+                playerId = _profile.GetDisplayUsername();
+            state.Username = _profile.GetDisplayUsername();
+            state.Save(_worldPath, playerId, _log);
             var savedRemotePlayers = SaveConnectedRemotePlayerStates();
             if (_meta != null)
                 _meta.Save(_metaPath, _log);
 
-            var ensuredGateMeshes = EnsureResumeGateMeshes(state);
+            var ensuredGateMeshes = 0;
             var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
-            var savedMeshes = SaveAllLoadedChunkMeshesToCache();
-            FlushWorldPreviewUpdate(state);
+            var savedMeshes = 0;
+            var budgetState = WorldStorageBudgetService.GetBudgetState(_worldPath);
+            if (budgetState.IsConserve || budgetState.IsOverTarget)
+                RegionCompactor.CompactIfNeeded(_worldPath, WorldStorageBudgetService.DefaultThresholds, _log);
+
+            if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out budgetState))
+            {
+                _log.Info($"Save & Exit: skipped non-critical writes due to storage budget state={budgetState.State} size={budgetState.SizeBytes}.");
+            }
 
             sw.Stop();
             _log.Info($"Save & Exit detail: ensured gate meshes={ensuredGateMeshes}, cached meshes={savedMeshes}, remote players saved={savedRemotePlayers}");
@@ -5413,27 +6635,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return built;
     }
 
-    private int SaveAllLoadedChunkMeshesToCache()
+    private int SaveTier0MeshesToCache()
     {
-        var saved = 0;
-        foreach (var pair in _chunkMeshes)
-        {
-            var mesh = pair.Value;
-            if (mesh == null || !ValidateMesh(mesh))
-                continue;
-
-            try
-            {
-                ChunkMeshCache.Save(_worldPath, mesh);
-                saved++;
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"Failed to save mesh cache for {mesh.Coord}: {ex.Message}");
-            }
-        }
-
-        return saved;
+        // Disabled: no persistent mesh cache.
+        return 0;
     }
 
     private EosClient? EnsureEosClient()
@@ -5553,6 +6758,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             model.Position = state.Position;
             model.Yaw = state.Yaw;
+            model.Pitch = state.Pitch;
             model.IsFlying = (state.Status & 1) != 0;
         }
 
@@ -5692,6 +6898,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         model.Position = new Vector3(state.PosX, state.PosY, state.PosZ);
         model.Yaw = state.Yaw;
+        model.Pitch = state.Pitch;
         model.IsFlying = state.IsFlying;
 
         TryFlushRemotePersistenceSnapshot(snapshot.PlayerId, normalized);
@@ -6090,6 +7297,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         for (var i = 0; i < toRemove.Count; i++)
             _remotePlayers.Remove(toRemove[i]);
+
+        if (_veilseerSpectateTargetPlayerId >= 0 && !_remotePlayers.ContainsKey(_veilseerSpectateTargetPlayerId))
+        {
+            _veilseerSpectateTargetPlayerId = -1;
+            _veilseerSpectateSlot = -1;
+            SetCommandStatus("VeilSeer target disconnected. Returned to free camera.", 3f);
+        }
     }
 
     private void RestoreOrCenterCamera()
@@ -6106,9 +7320,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        var username = _profile.GetDisplayUsername();
-        var state = PlayerWorldState.LoadOrDefault(_worldPath, username, BuildDefaultPlayerState, _log);
+        // Use PlayerId for stable per-world saves instead of username
+        var playerId = _profile.PlayerId;
+        if (string.IsNullOrWhiteSpace(playerId))
+        {
+            _log.Warn("PlayerId is empty, using username fallback");
+            playerId = _profile.GetDisplayUsername();
+        }
+        
+        var state = PlayerWorldState.LoadOrDefault(_worldPath, playerId, BuildDefaultPlayerState, _log);
         ApplyPlayerState(state);
+        
+        // If this was a first-time join (no save file), save the defaults immediately
+        var playerDataPath = Path.Combine(_worldPath, "playerdata", $"{playerId}{FileConventions.PlayerExtension}");
+        if (!File.Exists(playerDataPath))
+        {
+            _log.Info($"First-time join for player {playerId}, creating initial save");
+            state.Save(_worldPath, playerId, _log);
+        }
     }
 
     private PlayerWorldState BuildDefaultPlayerState()
@@ -6179,25 +7408,46 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return new Vector2(spawnX, spawnZ);
     }
 
-    private float FindSafeSpawnHeight(float x, float z)
-    {
-        if (_world == null)
-            return 64f; // Default fallback height
+    
+private float FindSafeSpawnHeight(float x, float z)
+{
+    // Ensure the spawn chunk is generated before we probe blocks.
+    // If we query unloaded space we may see Nullblock and choose an invalid spawn Y.
+    if (_world == null)
+        return 70f;
 
-        // Scan from top to bottom to find first solid ground
-        var maxY = _meta?.Size.Height ?? 128;
-        for (int y = (int)maxY - 1; y >= 0; y--)
-        {
-            var blockId = _world.GetBlock((int)x, y, (int)z);
-            if (blockId != BlockIds.Air && blockId != BlockIds.Nullblock)
-            {
-                return y + 1f; // Spawn 1 block above solid ground
-            }
-        }
-        
-        // If no ground found, return reasonable default
-        return 64f;
+    int wx = (int)Math.Floor(x);
+    int wz = (int)Math.Floor(z);
+
+    try
+    {
+        var spawnCoord = VoxelWorld.WorldToChunk(wx, 0, wz, out _, out _, out _);
+        _world.GetOrCreateChunkData(spawnCoord, _log);
     }
+    catch (Exception ex)
+    {
+        _log?.Warn($"FindSafeSpawnHeight: failed to ensure spawn chunk generated: {ex.Message}");
+    }
+
+    int top = Math.Max(0, _world.WorldHeight - 3);
+    for (int y = top; y >= 1; y--)
+    {
+        int id = _world.GetBlockIdAtWorld(wx, y, wz);
+        if (id == BlockIds.Air || id == BlockIds.Nullblock || id == BlockIds.NullRock)
+            continue;
+
+        int above1 = _world.GetBlockIdAtWorld(wx, y + 1, wz);
+        int above2 = _world.GetBlockIdAtWorld(wx, y + 2, wz);
+
+        bool air1 = (above1 == BlockIds.Air || above1 == BlockIds.Nullblock);
+        bool air2 = (above2 == BlockIds.Air || above2 == BlockIds.Nullblock);
+
+        if (air1 && air2)
+            return y + 1;
+    }
+
+    return 70f;
+}
 
     /// <summary>
     /// AGGRESSIVE FIX: Generate solid ground immediately at player position
@@ -6925,7 +8175,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         // IMMEDIATELY GENERATE SPAWN CHUNK (highest priority)
         var surfaceChunk = new ChunkCoord(spawnChunk.X, spawnChunk.Y, spawnChunk.Z);
-        if (!_world.TryGetChunk(surfaceChunk, out _))
+        if (_world.TryGetChunk(surfaceChunk) == null)
         {
             _streamingService.EnqueueLoadJob(surfaceChunk, -100); // Highest priority
         }
@@ -6937,7 +8187,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             {
                 var coord = new ChunkCoord(spawnChunk.X + dx, spawnChunk.Y, spawnChunk.Z + dz);
                 
-                if (!_world.TryGetChunk(coord, out _))
+                if (_world.TryGetChunk(coord) == null)
                 {
                     _streamingService.EnqueueLoadJob(coord, -50); // High priority
                 }
@@ -6960,7 +8210,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var surfaceChunk = new ChunkCoord(spawnChunk.X, spawnChunk.Y, spawnChunk.Z);
         
         // GENERATE CHUNK IF IT DOESN'T EXIST
-        if (!_world.TryGetChunk(surfaceChunk, out var chunk) || chunk == null)
+        var chunk = _world.TryGetChunk(surfaceChunk);
+        if (chunk == null)
         {
             if (_streamingService != null)
             {
@@ -7009,13 +8260,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     // NEW: Prevent loading screen after player has spawned
     private bool ShouldShowLoadingScreen()
     {
+        // Show loading until the world is loaded AND (if enabled) the spawn prewarm gate is ready.
         if (!_hasLoadedWorld)
             return true;
 
         if (_worldSyncInProgress)
             return true;
 
-        return !_spawnPrewarmComplete;
+        if (ENABLE_SPAWN_PREWARM && !_spawnPrewarmComplete)
+            return true;
+
+        return false;
     }
 
     // CPU RAM OPTIMIZATION - Memory pool helper methods
@@ -7138,10 +8393,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         foreach (var coord in _tier0Chunks)
         {
-            if (_world.TryGetChunk(coord, out var chunk) && chunk != null)
+            var chunk = _world.TryGetChunk(coord);
+            if (chunk != null)
             {
                 if (!_chunkMeshes.TryGetValue(coord, out var mesh) || mesh == null || 
-                    (mesh.OpaqueVertices.Length == 0 && mesh.TransparentVertices.Length == 0 && mesh.WaterVertices.Length == 0))
+                    (mesh.OpaqueVertices.Length == 0 && mesh.CutoutVertices.Length == 0 && mesh.TransparentVertices.Length == 0 && mesh.WaterVertices.Length == 0))
                 {
                     _log.Warn($"Building Tier-0 fallback mesh for {coord}");
                     var fallbackMesh = BuildFallbackMesh(coord, chunk);
@@ -7159,8 +8415,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private ChunkMesh BuildFallbackMesh(ChunkCoord coord, VoxelChunkData chunk)
     {
-        // B) FAST FALLBACK MESH - Simple cube faces, no greedy meshing, no neighbor dependency
+        // Fallback mesh is intentionally simple but still respects per-face visibility.
+        if (_atlas == null)
+            return ChunkMesh.Empty;
+
         var opaque = new List<VertexPositionTexture>();
+        var cutout = new List<VertexPositionTexture>();
         var transparent = new List<VertexPositionTexture>();
         var water = new List<VertexPositionTexture>();
 
@@ -7169,7 +8429,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var originY = coord.Y * VoxelChunkData.ChunkSizeY;
         var originZ = coord.Z * VoxelChunkData.ChunkSizeZ;
 
-        // Simple per-block meshing - no optimization
         for (int x = 0; x < VoxelChunkData.ChunkSizeX; x++)
         {
             for (int y = 0; y < VoxelChunkData.ChunkSizeY; y++)
@@ -7180,61 +8439,115 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     if (blockId == BlockIds.Air || blockId == BlockIds.Nullblock)
                         continue;
 
-                    // Simple cube mesh for each solid block
-                    var worldX = originX + x * bs;
-                    var worldY = originY + y * bs;
-                    var worldZ = originZ + z * bs;
+                    var def = BlockRegistry.Get(blockId);
+                    if (def.HasCustomModel)
+                        continue;
 
-                    // Add all 6 faces for simplicity
-                    if (blockId == BlockIds.Water)
-                        AddFallbackCubeFace(water, worldX, worldY, worldZ, bs, blockId);
-                    else if (BlockRegistry.IsTransparent(blockId))
-                        AddFallbackCubeFace(transparent, worldX, worldY, worldZ, bs, blockId);
-                    else
-                        AddFallbackCubeFace(opaque, worldX, worldY, worldZ, bs, blockId);
+                    var target = def.RenderLayer switch
+                    {
+                        BlockRenderLayer.Water => water,
+                        BlockRenderLayer.Cutout => cutout,
+                        BlockRenderLayer.Blended => transparent,
+                        _ => opaque
+                    };
+
+                    var worldX = originX + x;
+                    var worldY = originY + y;
+                    var worldZ = originZ + z;
+
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x + 1, y, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosX);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x - 1, y, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegX);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y + 1, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosY);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y - 1, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegY);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z + 1, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosZ);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z - 1, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegZ);
                 }
             }
         }
 
-        return new ChunkMesh(coord, opaque.ToArray(), transparent.ToArray(), water.ToArray(), 
-            new BoundingBox(new Vector3(originX, originY, originZ), 
-                           new Vector3(originX + VoxelChunkData.ChunkSizeX * bs, 
-                                       originY + VoxelChunkData.ChunkSizeY * bs, 
-                                       originZ + VoxelChunkData.ChunkSizeZ * bs)));
+        return new ChunkMesh(coord, opaque.ToArray(), cutout.ToArray(), transparent.ToArray(), water.ToArray(),
+            new BoundingBox(new Vector3(originX * bs, originY * bs, originZ * bs), 
+                           new Vector3((originX + VoxelChunkData.ChunkSizeX) * bs, 
+                                       (originY + VoxelChunkData.ChunkSizeY) * bs, 
+                                       (originZ + VoxelChunkData.ChunkSizeZ) * bs)));
     }
 
-    private void AddFallbackCubeFace(List<VertexPositionTexture> vertices, float x, float y, float z, float bs, byte blockId)
+    private bool ShouldRenderFallbackFace(byte currentId, int x, int y, int z, int nx, int ny, int nz, VoxelChunkData chunk)
     {
-        // Simple UV coordinates - all faces use same texture
-        var uv00 = Vector2.Zero;
-        var uv10 = Vector2.UnitX;
-        var uv11 = Vector2.One;
-        var uv01 = Vector2.UnitY;
-
-        // Add 6 faces of a cube (simplified - no face culling)
-        var faces = new[]
+        if (nx < 0 || ny < 0 || nz < 0
+            || nx >= VoxelChunkData.ChunkSizeX
+            || ny >= VoxelChunkData.ChunkSizeY
+            || nz >= VoxelChunkData.ChunkSizeZ)
         {
-            // Front face
-            new Vector3(x, y, z + bs), new Vector3(x + bs, y, z + bs), new Vector3(x + bs, y + bs, z + bs), new Vector3(x, y + bs, z + bs),
-            // Back face  
-            new Vector3(x + bs, y, z), new Vector3(x, y, z), new Vector3(x, y + bs, z), new Vector3(x + bs, y + bs, z),
-            // Right face
-            new Vector3(x + bs, y, z), new Vector3(x + bs, y, z + bs), new Vector3(x + bs, y + bs, z + bs), new Vector3(x + bs, y + bs, z),
-            // Left face
-            new Vector3(x, y, z + bs), new Vector3(x, y, z), new Vector3(x, y + bs, z), new Vector3(x, y + bs, z + bs),
-            // Top face
-            new Vector3(x, y + bs, z + bs), new Vector3(x + bs, y + bs, z + bs), new Vector3(x + bs, y + bs, z), new Vector3(x, y + bs, z),
-            // Bottom face
-            new Vector3(x, y, z), new Vector3(x + bs, y, z), new Vector3(x + bs, y, z + bs), new Vector3(x, y, z + bs)
-        };
+            return true;
+        }
 
-        // Add quads for each face
-        for (int i = 0; i < faces.Length; i += 4)
+        var neighborId = chunk.GetLocal(nx, ny, nz);
+        if (neighborId == BlockIds.Air || neighborId == BlockIds.Nullblock)
+            return true;
+        if (neighborId == currentId)
+            return false;
+
+        var currentLayer = BlockRegistry.GetRenderLayer(currentId);
+        var neighborLayer = BlockRegistry.GetRenderLayer(neighborId);
+        var currentOpaque = currentLayer == BlockRenderLayer.Opaque;
+        var neighborOpaque = neighborLayer == BlockRenderLayer.Opaque;
+
+        if (currentOpaque && neighborOpaque)
+            return false;
+        if (currentOpaque && !neighborOpaque)
+            return true;
+        if (!currentOpaque && neighborOpaque)
+            return false;
+
+        if (currentLayer == neighborLayer)
+            return currentId <= neighborId;
+
+        return GetFallbackLayerPriority(currentLayer) >= GetFallbackLayerPriority(neighborLayer);
+    }
+
+    private static int GetFallbackLayerPriority(BlockRenderLayer layer) => layer switch
+    {
+        BlockRenderLayer.Cutout => 3,
+        BlockRenderLayer.Blended => 2,
+        BlockRenderLayer.Water => 1,
+        _ => 0
+    };
+
+    private void AddFallbackFace(List<VertexPositionTexture> vertices, int x, int y, int z, float bs, byte blockId, FaceDirection face)
+    {
+        if (_atlas == null)
+            return;
+
+        var min = new Vector3(x * bs, y * bs, z * bs);
+        var max = min + new Vector3(bs, bs, bs);
+
+        switch (face)
         {
-            vertices.Add(new VertexPositionTexture(faces[i], uv00));
-            vertices.Add(new VertexPositionTexture(faces[i + 1], uv10));
-            vertices.Add(new VertexPositionTexture(faces[i + 2], uv11));
-            vertices.Add(new VertexPositionTexture(faces[i + 3], uv01));
+            case FaceDirection.PosX:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegX:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.PosY:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, max.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z), new Vector3(min.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegY:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, min.Z), new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(min.X, min.Y, max.Z));
+                break;
+            case FaceDirection.PosZ:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.NegZ:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
         }
     }
 
@@ -7261,7 +8574,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             
             // Re-enqueue tier0 chunks with high priority
             _tier0Chunks.Clear();
-            var playerChunk = VoxelWorld.WorldToChunk((int)_player.Position.X, (int)_player.Position.Y, (int)_player.Position.Z, out _, out _, out _);
+            VoxelWorld.WorldToChunk((int)_player.Position.X, (int)_player.Position.Y, (int)_player.Position.Z, out var playerChunkX, out var playerChunkY, out var playerChunkZ);
             var maxCy = _world.MaxChunkY;
             
             for (var ring = 0; ring <= 1; ring++)
@@ -7276,7 +8589,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
                         for (var cy = 0; cy <= maxCy; cy++)
                         {
-                            var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                            var coord = new ChunkCoord(playerChunkX + dx, cy, playerChunkZ + dz);
                             _tier0Chunks.Add(coord);
                             _streamingService.EnqueueLoadJob(coord, -10); // Highest priority
                         }
@@ -7299,7 +8612,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         var playerPos = _player.Position;
-        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
         
         // Check for solid block under player
         var groundY = (int)MathF.Floor(playerPos.Y - 0.1f);
@@ -7332,7 +8645,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         foreach (var coord in _tier0Chunks)
         {
-            if (_world.TryGetChunk(coord, out var chunk) && chunk != null)
+            var chunk = _world.TryGetChunk(coord);
+            if (chunk != null)
             {
                 // Mark as dirty for normal remesh with full quality
                 chunk.IsDirty = true;
@@ -7401,6 +8715,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _inventory.SetGridData(state.InventoryGrid);
             _log.Info($"Restored inventory grid with {state.InventoryGrid.Count(x => x.Id != BlockIds.Air)} items");
         }
+
+        _inventory.SetSandboxCatalogFavorites(state.ArtificerFavoriteBlockIds ?? Array.Empty<int>());
+        _inventory.ClearSandboxCatalogSearchQuery();
+        _inventory.SetSandboxCatalogFavoritesOnly(false);
+        _inventoryCatalogScrollOffsetPx = 0f;
+        _inventoryCatalogScrollVelocityPxPerSec = 0f;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
         
         // Restore selected slot
         if (state.SelectedIndex >= 0 && state.SelectedIndex < Inventory.HotbarSize)
@@ -7408,6 +8730,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _inventory.SelectedIndex = state.SelectedIndex;
             _log.Info($"Restored selected hotbar slot: {state.SelectedIndex}");
         }
+        
+        // Mark player state as clean after successful load
+        _playerStateDirty = false;
+    }
+    
+    /// <summary>
+    /// Mark player state as dirty (needs saving)
+    /// </summary>
+    private void MarkPlayerStateDirty()
+    {
+        _playerStateDirty = true;
     }
 
     private PlayerWorldState CapturePlayerState()
@@ -7429,7 +8762,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             Homes = BuildPlayerHomeStateList(),
             SelectedIndex = _inventory.SelectedIndex,
             Hotbar = _inventory.GetHotbarData(),
-            InventoryGrid = _inventory.GetGridData()
+            InventoryGrid = _inventory.GetGridData(),
+            ArtificerFavoriteBlockIds = _inventory.GetSandboxCatalogFavoriteBlockIds()
         };
     }
 
@@ -7618,13 +8952,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (Interlocked.CompareExchange(ref _autoSaveInFlight, 1, 0) != 0)
             return;
 
+        // Only save if dirty
+        if (!_playerStateDirty)
+        {
+            Interlocked.Exchange(ref _autoSaveInFlight, 0);
+            return;
+        }
+
         var snapshot = CapturePlayerState();
         _ = Task.Run(() =>
         {
             try
             {
-                snapshot.Save(_worldPath, _log);
-                QueueWorldPreviewUpdate(snapshot);
+                SavePlayerState(snapshot);
             }
             catch (Exception ex)
             {
@@ -7639,14 +8979,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void SavePlayerState(PlayerWorldState? state = null)
     {
-        if (IsJoinedClientSession)
-            return;
-
         try
         {
+            // Use PlayerId for stable per-world saves instead of username
+            var playerId = _profile.PlayerId;
+            if (string.IsNullOrWhiteSpace(playerId))
+            {
+                _log.Warn("PlayerId is empty, using username fallback for save");
+                playerId = _profile.GetDisplayUsername();
+            }
+
             state ??= CapturePlayerState();
-            state.Save(_worldPath, _log);
-            QueueWorldPreviewUpdate(state);
+            // Keep the display name inside the file, but use PlayerId for the filename
+            state.Username = _profile.GetDisplayUsername();
+            state.Save(_worldPath, playerId, _log);
+            _playerStateDirty = false;
         }
         catch (Exception ex)
         {
@@ -7750,6 +9097,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             state.PosY = model.Position.Y;
             state.PosZ = model.Position.Z;
             state.Yaw = model.Yaw;
+            state.Pitch = model.Pitch;
             state.IsFlying = model.IsFlying;
             state.Save(_worldPath, _log);
             return true;
@@ -7758,6 +9106,37 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             _log.Warn($"Failed to save remote player state for '{username}': {ex.Message}");
             return false;
+        }
+    }
+
+    private void CancelBackgroundWork(bool waitForPreviewWorker)
+    {
+        try
+        {
+            _backgroundWorkCts.Cancel();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        Task? previewWorker;
+        lock (_previewQueueLock)
+        {
+            _previewUpdatePending = false;
+            previewWorker = _previewUpdateWorker;
+        }
+
+        if (!waitForPreviewWorker || previewWorker == null)
+            return;
+
+        try
+        {
+            previewWorker.Wait(800);
+        }
+        catch
+        {
+            // ignored
         }
     }
 
@@ -7772,6 +9151,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
             return;
+        if (_isClosing || _backgroundWorkCts.IsCancellationRequested)
+            return;
+        if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out _))
+            return;
 
         lock (_previewQueueLock)
         {
@@ -7779,13 +9162,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _previewPendingCenterZ = centerZ;
             _previewUpdatePending = true;
             if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
-                _previewUpdateWorker = Task.Run(ProcessPreviewUpdateQueue);
+                _previewUpdateWorker = Task.Run(
+                    () => ProcessPreviewUpdateQueue(_backgroundWorkCts.Token),
+                    _backgroundWorkCts.Token);
         }
     }
 
     private void FlushWorldPreviewUpdate(PlayerWorldState state)
     {
         if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+        if (_isClosing || _backgroundWorkCts.IsCancellationRequested)
+            return;
+        if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out _))
             return;
 
         Task? worker;
@@ -7795,7 +9184,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _previewPendingCenterZ = (int)MathF.Floor(state.PosZ);
             _previewUpdatePending = true;
             if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
-                _previewUpdateWorker = Task.Run(ProcessPreviewUpdateQueue);
+                _previewUpdateWorker = Task.Run(
+                    () => ProcessPreviewUpdateQueue(_backgroundWorkCts.Token),
+                    _backgroundWorkCts.Token);
             worker = _previewUpdateWorker;
         }
 
@@ -7809,10 +9200,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
-    private void ProcessPreviewUpdateQueue()
+    private void ProcessPreviewUpdateQueue(CancellationToken cancellationToken)
     {
         while (true)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                lock (_previewQueueLock)
+                    _previewUpdateWorker = null;
+                return;
+            }
+
             int centerX;
             int centerZ;
             WorldMeta? meta;
@@ -7835,7 +9233,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             try
             {
-                WorldPreviewGenerator.GenerateAndSave(meta, _worldPath, centerX, centerZ, _log);
+                WorldPreviewGenerator.GenerateAndSave(
+                    meta,
+                    _worldPath,
+                    centerX,
+                    centerZ,
+                    _log,
+                    cancellationToken: cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_previewQueueLock)
+                    _previewUpdateWorker = null;
+                return;
             }
             catch (Exception ex)
             {
@@ -7905,7 +9315,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             {
                 for (int x = minX; x <= maxX; x++)
                 {
-                    if (BlockRegistry.IsSolid(_world.GetBlock(x, y, z)))
+                    if (BlockRegistry.IsSolid((byte)_world.GetBlock(x, y, z)))
                         return true;
                 }
             }
@@ -7926,7 +9336,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         for (int y = maxY; y >= 0; y--)
         {
-            if (BlockRegistry.IsSolid(_world!.GetBlock((int)centerX, y, (int)centerZ)))
+            if (BlockRegistry.IsSolid((byte)_world!.GetBlock((int)centerX, y, (int)centerZ)))
             {
                 groundY = y;
                 break;
@@ -7953,6 +9363,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_inventory.SelectedIndex != _lastSelectedIndex)
         {
             _lastSelectedIndex = _inventory.SelectedIndex;
+            MarkPlayerStateDirty(); // Mark dirty when hotbar selection changes
             var id = _inventory.SelectedId;
             if (id != BlockId.Air)
             {
@@ -8274,7 +9685,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _player.Position = new Vector3(clampedX + 0.5f, y, clampedZ + 0.5f);
         _player.Velocity = Vector3.Zero;
         EnsurePlayerNotInsideSolid(forceLog: false);
-        UpdateActiveChunks(force: true);
+        UpdateActiveChunks(force: false);
         _queuedLocateOriginX = clampedX;
         _queuedLocateOriginZ = clampedZ;
         _hasQueuedLocateOrigin = true;
@@ -8713,6 +10124,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (tokenIndex == 1)
                 {
                     AppendPlayerNameTokens(values);
+                    AppendAllGiveItemTokens(values, includeNumericIds: true);
                     values.Add("list");
                 }
                 else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
@@ -8724,6 +10136,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     else if (TryResolveInventoryItemToken(tokens[1], out _))
                     {
                         values.AddRange(new[] { "1", "16", "32", "64" });
+                    }
+                    else
+                    {
+                        // Keep /give discoverable even when the first argument is an unknown player token.
+                        AppendAllGiveItemTokens(values, includeNumericIds: true);
                     }
                 }
                 else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
@@ -8947,15 +10364,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private static void AppendAllGiveItemTokens(List<string> output, bool includeNumericIds = true)
     {
+        var seenTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var def in BlockRegistry.All.OrderBy(d => d.AtlasIndex))
         {
             if (def.Id == BlockId.Air)
                 continue;
 
-            output.Add(def.Id.ToString());
-            output.Add(def.Name.Replace(' ', '_'));
-            if (includeNumericIds)
-                output.Add(((byte)def.Id).ToString(CultureInfo.InvariantCulture));
+            AppendItemTokenForId(output, def.Id, includeNumericIds, seenTokens: seenTokens);
         }
     }
 
@@ -8988,18 +10403,35 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
-    private static void AppendItemTokenForId(List<string> output, BlockId id, bool includeNumericIds, HashSet<BlockId>? seenIds = null)
+    private static void AppendItemTokenForId(
+        List<string> output,
+        BlockId id,
+        bool includeNumericIds,
+        HashSet<BlockId>? seenIds = null,
+        HashSet<string>? seenTokens = null)
     {
         if (id == BlockId.Air)
             return;
         if (seenIds != null && !seenIds.Add(id))
             return;
 
-        var def = BlockRegistry.Get(id);
-        output.Add(id.ToString());
-        output.Add(def.Name.Replace(' ', '_'));
+        var aliases = BlockRegistry.GetCommandTokens(id);
+        for (var i = 0; i < aliases.Count; i++)
+        {
+            var alias = aliases[i];
+            if (string.IsNullOrWhiteSpace(alias))
+                continue;
+            if (seenTokens != null && !seenTokens.Add(alias))
+                continue;
+            output.Add(alias);
+        }
+
         if (includeNumericIds)
-            output.Add(((byte)id).ToString(CultureInfo.InvariantCulture));
+        {
+            var numeric = ((byte)id).ToString(CultureInfo.InvariantCulture);
+            if (seenTokens == null || seenTokens.Add(numeric))
+                output.Add(numeric);
+        }
     }
 
     private static bool TryResolveInventoryItemToken(string token, out BlockId blockId)
@@ -9009,55 +10441,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (string.IsNullOrWhiteSpace(raw))
             return false;
 
-        if (byte.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId)
-            && Enum.IsDefined(typeof(BlockId), (int)byId))
+        if (byte.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId))
         {
             var parsedById = (BlockId)byId;
-            if (parsedById != BlockId.Air)
+            if (parsedById != BlockId.Air && BlockRegistry.Get(parsedById).Id == parsedById)
             {
                 blockId = parsedById;
                 return true;
             }
         }
 
-        if (Enum.TryParse(raw, true, out BlockId parsedEnum) && parsedEnum != BlockId.Air)
+        if (BlockRegistry.TryResolveToken(raw, out var resolvedByToken) && resolvedByToken != BlockId.Air)
+        {
+            blockId = resolvedByToken;
+            return true;
+        }
+
+        if (Enum.TryParse(raw, true, out BlockId parsedEnum) && parsedEnum != BlockId.Air && BlockRegistry.Get(parsedEnum).Id == parsedEnum)
         {
             blockId = parsedEnum;
             return true;
         }
 
-        var normalized = NormalizeItemToken(raw);
-        foreach (var def in BlockRegistry.All)
-        {
-            if (def.Id == BlockId.Air)
-                continue;
-
-            if (string.Equals(NormalizeItemToken(def.Name), normalized, StringComparison.Ordinal))
-            {
-                blockId = def.Id;
-                return true;
-            }
-
-            if (string.Equals(NormalizeItemToken(def.Id.ToString()), normalized, StringComparison.Ordinal))
-            {
-                blockId = def.Id;
-                return true;
-            }
-        }
-
         return false;
-    }
-
-    private static string NormalizeItemToken(string value)
-    {
-        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
-        if (text.Length == 0)
-            return string.Empty;
-
-        text = text.Replace("_", string.Empty, StringComparison.Ordinal);
-        text = text.Replace("-", string.Empty, StringComparison.Ordinal);
-        text = text.Replace(" ", string.Empty, StringComparison.Ordinal);
-        return text;
     }
 
     private void SubmitLocalChatMessage(string message)
@@ -9497,7 +10903,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         _commandsInitialized = true;
         RegisterCommand("help", new[] { "?" }, "/help", "Show command help.", CommandPermission.Everyone, ExecuteHelpCommand);
-        RegisterCommand("biome", Array.Empty<string>(), "/biome [list|here|<desert|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
+        RegisterCommand("biome", new[] { "biomes" }, "/biome [list|here|<desert|forest|hills|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
         RegisterCommand("accept", Array.Empty<string>(), "/accept <username>", "Accept a world join invite.", CommandPermission.Everyone, ExecuteAcceptInviteCommand);
         RegisterCommand("reject", Array.Empty<string>(), "/reject <username>", "Reject a world join invite.", CommandPermission.Everyone, ExecuteRejectInviteCommand);
         RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list> [username]", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
@@ -10034,13 +11440,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
         {
-            SetCommandStatus("Biomes: Grasslands, Desert, Ocean", 8f);
+            SetCommandStatus("Biomes: Grasslands, Forest, Hills, Desert, Ocean", 8f);
             return;
         }
 
         if (!TryResolveBiome(commandParts[1], out var targetBiomeToken, out var targetBiomeLabel))
         {
-            SetCommandStatus("Biome must be one of: desert, grasslands, ocean. Use /biome list.");
+            SetCommandStatus("Biome must be one of: desert, forest, hills, grasslands, ocean. Use /biome list.");
             return;
         }
 
@@ -10132,206 +11538,66 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_world == null || _meta == null)
             return false;
 
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+            return false;
+
         originX = Math.Clamp(originX, 0, Math.Max(0, _meta.Size.Width - 1));
         originZ = Math.Clamp(originZ, 0, Math.Max(0, _meta.Size.Depth - 1));
 
-        if (IsBiomeCoordinateValid(targetBiomeToken, originX, originZ))
+        if (BiomeService.GetSampleAt(_meta, originX, originZ).BiomeId == targetBiomeId)
         {
             foundX = originX;
             foundZ = originZ;
             return true;
         }
 
-        EnsureBiomeCatalog();
-        if (TryFindValidatedBiomeFromCatalog(targetBiomeToken, originX, originZ, maxRadius, out var catalogX, out var catalogZ)
-            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, catalogX, catalogZ, out foundX, out foundZ))
-            return true;
-
-        var worldRadius = GetBiomeSearchWorldRadius();
-        var boundedRadius = Math.Clamp(maxRadius, 16, Math.Max(16, worldRadius));
-        var ringRadius = Math.Min(boundedRadius, BiomeLocateMaxRingRadius);
-
-        if (TryFindBiomeOnRingScan(targetBiomeToken, originX, originZ, ringRadius, BiomeLocateRingStep, out var ringX, out var ringZ)
-            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, ringX, ringZ, out foundX, out foundZ))
-            return true;
-
-        if (TryFindBiomeByGlobalStrideScan(targetBiomeToken, originX, originZ, BiomeLocateGlobalStride, out var globalX, out var globalZ)
-            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, globalX, globalZ, out foundX, out foundZ))
-            return true;
-
-        if (TryFindBiomeByGlobalStrideScan(targetBiomeToken, originX, originZ, BiomeLocateGlobalFallbackStride, out var fallbackX, out var fallbackZ)
-            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, fallbackX, fallbackZ, out foundX, out foundZ))
-            return true;
-
-        if (TryFindBestBiomeClimateCandidate(targetBiomeToken, originX, originZ, out var climateX, out var climateZ)
-            && TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, climateX, climateZ, Math.Max(12, BiomeSearchRefineWindow * 4), out var refinedX, out var refinedZ)
-            && TryFinalizeBiomeLocateCandidate(targetBiomeToken, originX, originZ, refinedX, refinedZ, out foundX, out foundZ))
-        {
-            return true;
-        }
-
-        return false;
+        return BiomeLocateService.TryLocateNearest(
+            _meta,
+            _biomeIndex,
+            targetBiomeId,
+            originX,
+            originZ,
+            Math.Max(16, maxRadius),
+            out foundX,
+            out foundZ);
     }
 
-    private bool TryFindValidatedBiomeFromCatalog(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ)
+    private bool TryFindBiomeOnRingScan(string targetBiomeToken, int originX, int originZ, int radius, int step, out int foundX, out int foundZ)
     {
         foundX = originX;
         foundZ = originZ;
-        if (_biomeCatalog == null || !BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+        
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
             return false;
-
-        var points = _biomeCatalog.GetPoints(targetBiomeId);
-        if (points.Count == 0)
-            return false;
-
-        var radiusSq = (long)Math.Max(16, maxRadius) * Math.Max(16, maxRadius);
-        var bestAnyDistSq = long.MaxValue;
-        var bestAnyX = originX;
-        var bestAnyZ = originZ;
-        var bestInRadiusDistSq = long.MaxValue;
-        var bestInRadiusX = originX;
-        var bestInRadiusZ = originZ;
-        var hasInRadius = false;
-
-        for (var i = 0; i < points.Count; i++)
+            
+        // Ring scan pattern - check positions at increasing distances from origin
+        for (int r = step; r <= radius; r += step)
         {
-            var point = points[i];
-            if (!IsWithinBiomeSearchBounds(point.X, point.Z))
-                continue;
-
-            var dx = point.X - originX;
-            var dz = point.Z - originZ;
-            var distSq = (long)dx * dx + (long)dz * dz;
-
-            if (distSq < bestAnyDistSq)
+            // Check 8 directions on each ring
+            int[][] directions = new int[][]
             {
-                bestAnyDistSq = distSq;
-                bestAnyX = point.X;
-                bestAnyZ = point.Z;
-            }
-
-            if (distSq <= radiusSq && distSq < bestInRadiusDistSq)
+                new[] { r, 0 }, new[] { -r, 0 }, new[] { 0, r }, new[] { 0, -r },
+                new[] { r, r }, new[] { -r, r }, new[] { r, -r }, new[] { -r, -r }
+            };
+            
+            foreach (var dir in directions)
             {
-                bestInRadiusDistSq = distSq;
-                bestInRadiusX = point.X;
-                bestInRadiusZ = point.Z;
-                hasInRadius = true;
+                int checkX = originX + dir[0];
+                int checkZ = originZ + dir[1];
+                
+                if (!IsWithinBiomeSearchBounds(checkX, checkZ))
+                    continue;
+                    
+                if (BiomeService.GetBiomeIdAtWorldXZ(_meta, checkX, checkZ) == targetBiomeId)
+                {
+                    foundX = checkX;
+                    foundZ = checkZ;
+                    return true;
+                }
             }
         }
-
-        if (hasInRadius
-            && TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestInRadiusX, bestInRadiusZ, Math.Max(8, BiomeSearchRefineWindow * 2), out foundX, out foundZ))
-        {
-            return true;
-        }
-
-        if (TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestAnyX, bestAnyZ, Math.Max(8, BiomeSearchRefineWindow * 2), out foundX, out foundZ))
-            return true;
-
+        
         return false;
-    }
-
-    private bool TryFindBiomeOnRingScan(string targetBiomeToken, int originX, int originZ, int maxRadius, int step, out int foundX, out int foundZ)
-    {
-        foundX = originX;
-        foundZ = originZ;
-        if (maxRadius <= 0)
-            return false;
-
-        step = Math.Max(1, step);
-        var bestDistSq = long.MaxValue;
-        var found = false;
-        var bestX = originX;
-        var bestZ = originZ;
-
-        void EvaluateCandidate(int wx, int wz)
-        {
-            if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
-                return;
-
-            var dx = wx - originX;
-            var dz = wz - originZ;
-            var distSq = (long)dx * dx + (long)dz * dz;
-            if (distSq >= bestDistSq)
-                return;
-
-            bestDistSq = distSq;
-            bestX = wx;
-            bestZ = wz;
-            found = true;
-        }
-
-        for (var radius = step; radius <= maxRadius; radius += step)
-        {
-            for (var dx = -radius; dx <= radius; dx += step)
-            {
-                EvaluateCandidate(originX + dx, originZ - radius);
-                EvaluateCandidate(originX + dx, originZ + radius);
-            }
-
-            for (var dz = -radius + step; dz <= radius - step; dz += step)
-            {
-                EvaluateCandidate(originX - radius, originZ + dz);
-                EvaluateCandidate(originX + radius, originZ + dz);
-            }
-
-            if (found)
-            {
-                foundX = bestX;
-                foundZ = bestZ;
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private bool TryFindBiomeByGlobalStrideScan(string targetBiomeToken, int originX, int originZ, int stride, out int foundX, out int foundZ)
-    {
-        foundX = originX;
-        foundZ = originZ;
-        if (_meta == null || stride <= 0)
-            return false;
-
-        var bestDistSq = long.MaxValue;
-        var found = false;
-        var bestX = originX;
-        var bestZ = originZ;
-        var maxX = Math.Max(0, _meta.Size.Width - 1);
-        var maxZ = Math.Max(0, _meta.Size.Depth - 1);
-
-        void Evaluate(int wx, int wz)
-        {
-            if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
-                return;
-
-            var dx = wx - originX;
-            var dz = wz - originZ;
-            var distSq = (long)dx * dx + (long)dz * dz;
-            if (distSq >= bestDistSq)
-                return;
-
-            bestDistSq = distSq;
-            bestX = wx;
-            bestZ = wz;
-            found = true;
-        }
-
-        for (var wz = 0; wz <= maxZ; wz += stride)
-        {
-            for (var wx = 0; wx <= maxX; wx += stride)
-                Evaluate(wx, wz);
-            Evaluate(maxX, wz);
-        }
-
-        for (var wx = 0; wx <= maxX; wx += stride)
-            Evaluate(wx, maxZ);
-        Evaluate(maxX, maxZ);
-
-        if (!found)
-            return false;
-
-        return TryRefineBiomeCandidate(targetBiomeToken, originX, originZ, bestX, bestZ, Math.Max(8, stride), out foundX, out foundZ);
     }
 
     private bool TryRefineBiomeCandidate(string targetBiomeToken, int originX, int originZ, int centerX, int centerZ, int radius, out int foundX, out int foundZ)
@@ -10434,27 +11700,31 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private float GetBiomeLocateStrength(string targetBiomeToken, int x, int z)
     {
-        if (_world == null)
+        if (_meta == null)
             return 0f;
 
-        var oceanWeight = Math.Clamp(_world.GetOceanWeightAt(x, z), 0f, 1f);
-        var desertWeight = Math.Clamp(_world.GetDesertWeightAt(x, z), 0f, 1f);
-        var effectiveDesert = Math.Clamp(desertWeight * (1f - oceanWeight * 0.9f), 0f, 1f);
+        var sample = BiomeService.GetSampleAt(_meta, x, z);
+        var oceanWeight = sample.OceanWeight;
+        var effectiveDesert = sample.EffectiveDesertWeight;
+        var hillsWeight = sample.HillsWeight;
         return targetBiomeToken switch
         {
             "ocean" => Math.Clamp((oceanWeight - 0.67f) / 0.33f, 0f, 1f),
             "desert" => Math.Clamp((effectiveDesert - 0.44f) / 0.56f, 0f, 1f),
+            "hills" => Math.Clamp((hillsWeight - 0.40f) / 0.60f, 0f, 1f),
             _ => Math.Clamp(1f - MathF.Max(oceanWeight, effectiveDesert), 0f, 1f)
         };
     }
 
     private bool IsBiomeCoordinateValid(string targetBiomeToken, int x, int z)
     {
-        if (_world == null)
+        if (_meta == null)
             return false;
         if (!IsWithinBiomeSearchBounds(x, z))
             return false;
-        return IsBiomeMatch(_world.GetBiomeNameAt(x, z), targetBiomeToken);
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var target))
+            return false;
+        return BiomeService.GetSampleAt(_meta, x, z).BiomeId == target;
     }
 
     private void ReportCurrentBiome(int wx, int wz)
@@ -10633,6 +11903,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             sourceModel.Position = destination;
             sourceModel.Yaw = destYaw;
+            sourceModel.Pitch = destPitch;
             sourceModel.IsFlying = false;
         }
 
@@ -10670,7 +11941,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             position = remote.Position;
             yaw = remote.Yaw;
-            pitch = 0f;
+            pitch = remote.Pitch;
             return true;
         }
 
@@ -10871,6 +12142,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var token = commandParts[1].ToLowerInvariant();
         if (token is "clear" or "rain" or "storm")
         {
+            // Check if rain is allowed at current position (for desert biomes)
+            if (token is "rain" or "storm")
+            {
+                var playerX = (int)_player.Position.X;
+                var playerZ = (int)_player.Position.Z;
+                if (!BiomeService.IsRainAllowedAt(_meta, playerX, playerZ))
+                {
+                    SetCommandStatus("Cannot make it rain in desert biome.");
+                    return;
+                }
+            }
+            
             _weatherState = token;
             SetCommandStatus($"Weather set to {_weatherState.ToUpperInvariant()}.");
             return;
@@ -11513,6 +12796,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void LayoutStructureFinderGui()
     {
+        if (_structureFinderBiomeRects.Length != FinderBiomeLabels.Length)
+            _structureFinderBiomeRects = new Rectangle[FinderBiomeLabels.Length];
+
         var panelW = Math.Clamp((int)MathF.Round(_viewport.Width * 0.56f), 520, 860);
         var panelH = Math.Clamp((int)MathF.Round(_viewport.Height * 0.60f), 360, 620);
         _structureFinderPanelRect = new Rectangle(
@@ -11777,7 +13063,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /give [player] <item|id> [amount]. Use TAB to browse item ids.");
+            SetCommandStatus("Usage: /give [player] <item_name|id> [amount]. Use TAB for autocomplete.");
             return;
         }
 
@@ -11786,10 +13072,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var all = BlockRegistry.All
                 .Where(def => def.Id != BlockId.Air)
                 .OrderBy(def => def.AtlasIndex)
-                .Select(def => $"{(byte)def.Id}:{def.Id}")
+                .Select(def => $"{(byte)def.Id}:{def.Id} ({def.Name})")
                 .ToArray();
             AddChatLine($"Give IDs: {string.Join(", ", all)}", isSystem: true);
-            SetCommandStatus($"Listed {all.Length} item/block ids.", 6f, echoToChat: false);
+            SetCommandStatus($"Listed {all.Length} items/blocks. Use snake_case names (example: coal_ore).", 6f, echoToChat: false);
             return;
         }
 
@@ -11978,14 +13264,35 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private int ClearLocalInventoryItems()
     {
-        var clearGrid = _inventory.Mode != GameMode.Artificer;
-        var removed = _inventory.ClearAll(clearGrid);
+        var removed = _inventory.ClearAll(clearGrid: true);
         _inventoryHeld = default;
         _inventoryHasHeld = false;
         _heldFrom = InventorySlotGroup.None;
         _heldIndex = -1;
         SavePlayerState();
         return removed;
+    }
+
+    private void ClearArtificerInventoryFromUi()
+    {
+        if (_gameMode != GameMode.Artificer)
+            return;
+
+        if (!_inventoryClearConfirmPending)
+        {
+            _inventoryClearConfirmPending = true;
+            _inventoryClearConfirmTimer = InventoryClearConfirmSeconds;
+            SetCommandStatus("Click CLEAR INVENTORY again to confirm.", 3f, echoToChat: false);
+            return;
+        }
+
+        _inventoryClearConfirmPending = false;
+        _inventoryClearConfirmTimer = 0f;
+        var removed = ClearLocalInventoryItems();
+        var status = removed > 0
+            ? $"Inventory cleared ({removed} item{(removed == 1 ? string.Empty : "s")})."
+            : "Inventory is already empty.";
+        SetCommandStatus(status, 3f, echoToChat: false);
     }
 
     private int GiveLocalInventoryItem(BlockId itemId, int amount)
@@ -12118,13 +13425,43 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         playerId = -1;
         name = string.Empty;
-        if (string.IsNullOrWhiteSpace(token))
+        token = (token ?? string.Empty).Trim();
+        if (token.Length == 0)
             return false;
 
-        if (int.TryParse(token, out var byId) && _playerNames.TryGetValue(byId, out var byIdName))
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var localName = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+
+        if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId))
         {
-            playerId = byId;
-            name = byIdName;
+            if (_playerNames.TryGetValue(byId, out var byIdName))
+            {
+                playerId = byId;
+                name = byIdName;
+                return true;
+            }
+
+            if (byId == localId)
+            {
+                playerId = localId;
+                name = !string.IsNullOrWhiteSpace(localName) ? localName : ResolvePlayerName(localId);
+                return true;
+            }
+        }
+
+        if (string.Equals(token, "@s", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "self", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "me", StringComparison.OrdinalIgnoreCase))
+        {
+            playerId = localId;
+            name = !string.IsNullOrWhiteSpace(localName) ? localName : ResolvePlayerName(localId);
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(localName) && string.Equals(localName, token, StringComparison.OrdinalIgnoreCase))
+        {
+            playerId = localId;
+            name = localName;
             return true;
         }
 
@@ -12466,6 +13803,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void ApplyGameModeChange(GameMode target, GameModeChangeSource source, bool persistImmediately, bool emitFeedback)
     {
+        var modeChanged = _gameMode != target;
         _gameMode = target;
         _inventory.SetMode(target);
         _artificerInventoryView = target == GameMode.Artificer
@@ -12475,7 +13813,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             UpdateInventoryLayout();
 
         var wasFlying = _player.IsFlying;
-        _player.AllowFlying = target == GameMode.Artificer;
+        _player.AllowFlying = target == GameMode.Artificer || target == GameMode.Veilseer;
+        _player.NoClipEnabled = target == GameMode.Veilseer;
+        if (target == GameMode.Veilseer)
+            _player.SetFlying(true);
         if (!_player.AllowFlying && wasFlying)
         {
             _player.SetFlying(false);
@@ -12485,6 +13826,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 vel.Y = MathF.Min(vel.Y, -1f);
                 _player.Velocity = vel;
             }
+        }
+
+        if (target != GameMode.Veilseer)
+        {
+            _veilseerXrayEnabled = false;
+            _veilseerSpectateTargetPlayerId = -1;
+            _veilseerSpectateSlot = -1;
         }
 
         if (_meta != null)
@@ -12498,7 +13846,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (persistImmediately)
             SavePlayerState();
 
-        if (!emitFeedback)
+        if (!emitFeedback || !modeChanged)
             return;
 
         var username = _profile.GetDisplayUsername();
@@ -12520,7 +13868,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return false;
 
         var modifierDown = input.IsKeyDown(_gamemodeModifierKey);
-        if (!_gamemodeWheelVisible && modifierDown && input.IsNewKeyPress(_gamemodeWheelKey))
+        var wheelKeyPressed = input.IsNewKeyPress(_gamemodeWheelKey);
+        if (modifierDown && wheelKeyPressed && !IsGamemodeWheelAllowedWithCheats())
+        {
+            _gamemodeWheelVisible = false;
+            ShowGamemodeWheelCheatsDisabledStatus();
+            return true;
+        }
+
+        if (!_gamemodeWheelVisible && modifierDown && wheelKeyPressed)
         {
             OpenGamemodeWheel(holdToOpen: true);
             return true;
@@ -12529,13 +13885,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!_gamemodeWheelVisible)
             return false;
 
+        if (modifierDown && wheelKeyPressed)
+        {
+            var nextMode = GetNextGamemodeWheelMode(_gameMode);
+            _gamemodeWheelHoverMode = GetGamemodeWheelIndex(nextMode);
+            _gamemodeWheelWaitForRelease = true;
+            ApplyGameModeChange(nextMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+            return true;
+        }
+
         UpdateGamemodeWheelSelection(input.MousePosition);
         if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1))
-            _gamemodeWheelHoverMode = GameMode.Artificer;
+            _gamemodeWheelHoverMode = 0;
         else if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2))
-            _gamemodeWheelHoverMode = GameMode.Veilwalker;
+            _gamemodeWheelHoverMode = 1;
         else if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3))
-            _gamemodeWheelHoverMode = GameMode.Veilseer;
+            _gamemodeWheelHoverMode = 2;
 
         if (input.IsNewKeyPress(Keys.Escape))
         {
@@ -12548,12 +13913,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (!modifierDown)
             {
                 if (!_gamemodeWheelWaitForRelease)
-                    ApplyGameModeChange(_gamemodeWheelHoverMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+                    ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
                 _gamemodeWheelVisible = false;
             }
             else if (input.IsNewLeftClick())
             {
-                ApplyGameModeChange(_gamemodeWheelHoverMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+                ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
                 _gamemodeWheelVisible = false;
             }
 
@@ -12562,7 +13927,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (input.IsNewLeftClick() || input.IsNewKeyPress(Keys.Enter))
         {
-            ApplyGameModeChange(_gamemodeWheelHoverMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+            ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
             _gamemodeWheelVisible = false;
             return true;
         }
@@ -12570,12 +13935,39 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return true;
     }
 
+    private bool IsGamemodeWheelAllowedWithCheats()
+        => _meta?.EnableCheats ?? true;
+
+    private void ShowGamemodeWheelCheatsDisabledStatus()
+    {
+        const string text = "Cheats are disabled in this world.";
+        var shouldEcho = !string.Equals(_commandStatusText, text, StringComparison.Ordinal) || _commandStatusTimer <= 0f;
+        SetCommandStatus(text, 4f, echoToChat: shouldEcho);
+    }
+
+    private static int GetGamemodeWheelIndex(GameMode mode)
+    {
+        for (var i = 0; i < GameModeWheelModes.Length; i++)
+        {
+            if (GameModeWheelModes[i] == mode)
+                return i;
+        }
+
+        return 0;
+    }
+
+    private static GameMode GetNextGamemodeWheelMode(GameMode currentMode)
+    {
+        var index = GetGamemodeWheelIndex(currentMode);
+        return GameModeWheelModes[(index + 1) % GameModeWheelModes.Length];
+    }
+
     private void OpenGamemodeWheel(bool holdToOpen)
     {
         _gamemodeWheelVisible = true;
         _gamemodeWheelHoldToOpen = holdToOpen;
         _gamemodeWheelWaitForRelease = false;
-        _gamemodeWheelHoverMode = _gameMode;
+        _gamemodeWheelHoverMode = (int)_gameMode;
     }
 
     private void UpdateGamemodeWheelSelection(Point mousePoint)
@@ -12591,7 +13983,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (!rect.Contains(mousePoint))
                 continue;
 
-            _gamemodeWheelHoverMode = GameModeWheelModes[i];
+            _gamemodeWheelHoverMode = i;
             return;
         }
     }
@@ -12610,6 +14002,42 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, _gamemodeToastText, new Vector2(rect.X + 12, rect.Y + 7), new Color(235, 235, 235));
     }
 
+    private void DrawFlySpeedToast(SpriteBatch sb)
+    {
+        if (_flySpeedToastTimer <= 0f || string.IsNullOrWhiteSpace(_flySpeedToastText))
+            return;
+
+        var size = _font.MeasureString(_flySpeedToastText);
+        var width = (int)Math.Ceiling(Math.Max(size.X + 24, 220f));
+        var height = _font.LineHeight + 28;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 136, width, height);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 180));
+        DrawBorder(sb, rect, new Color(255, 255, 255, 170));
+        _font.DrawString(sb, _flySpeedToastText, new Vector2(rect.X + 12, rect.Y + 6), new Color(230, 230, 230));
+
+        var barRect = new Rectangle(rect.X + 12, rect.Bottom - 12, rect.Width - 24, 6);
+        sb.Draw(_pixel, barRect, new Color(255, 255, 255, 50));
+        var fillWidth = (int)Math.Round(barRect.Width * Math.Clamp(_flySpeedToastPercent, 0f, 1f));
+        if (fillWidth > 0)
+            sb.Draw(_pixel, new Rectangle(barRect.X, barRect.Y, fillWidth, barRect.Height), new Color(120, 220, 255));
+    }
+
+    private void DrawVeilseerStatus(SpriteBatch sb)
+    {
+        if (_gameMode != GameMode.Veilseer)
+            return;
+
+        var status = _veilseerXrayEnabled ? "XRAY ON" : "XRAY OFF";
+        if (_veilseerSpectateTargetPlayerId >= 0)
+            status += $" | VIEWING {ResolvePlayerName(_veilseerSpectateTargetPlayerId).ToUpperInvariant()}";
+
+        var size = _font.MeasureString(status);
+        var rect = new Rectangle(_viewport.Right - (int)Math.Ceiling(size.X) - 36, _viewport.Y + 20, (int)Math.Ceiling(size.X) + 16, _font.LineHeight + 10);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 160));
+        DrawBorder(sb, rect, new Color(180, 220, 255, 180));
+        _font.DrawString(sb, status, new Vector2(rect.X + 8, rect.Y + 5), new Color(220, 240, 255));
+    }
+
     private void DrawGamemodeWheel(SpriteBatch sb)
     {
         if (!_gamemodeWheelVisible)
@@ -12624,7 +14052,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             var mode = GameModeWheelModes[i];
             var rect = GetGamemodeWheelButtonRect(center, ringRadius, buttonWidth, buttonHeight, i);
-            var hovered = mode == _gamemodeWheelHoverMode;
+            var hovered = i == _gamemodeWheelHoverMode;
             sb.Draw(_pixel, rect, hovered ? new Color(42, 82, 116, 230) : new Color(0, 0, 0, 190));
             DrawBorder(sb, rect, hovered ? new Color(225, 241, 255) : new Color(176, 176, 176));
 
@@ -12638,7 +14066,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         var help = _gamemodeWheelHoldToOpen
-            ? $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)} HOLD: release to apply | 1/2/3 quick select"
+            ? $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)} HOLD: release to apply | HOLD {FormatKeyLabel(_gamemodeModifierKey)} + TAP {FormatKeyLabel(_gamemodeWheelKey)}: cycle"
             : "Click or Enter to apply | Esc to cancel";
         var helpSize = _font.MeasureString(help);
         _font.DrawString(sb, help, new Vector2(center.X - helpSize.X / 2f, center.Y - _font.LineHeight / 2f), new Color(235, 235, 235));
@@ -12778,8 +14206,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (IsBiomeMatch(_world.GetBiomeNameAt(originX, originZ), targetBiomeToken))
             return true;
 
-        EnsureBiomeCatalog();
-        var hasCatalogTarget = BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId);
+        var hasCatalogTarget = BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId);
 
         var step = maxRadius >= 4096 ? 8 : 4;
         var bestDistSq = long.MaxValue;
@@ -12808,14 +14235,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             found = true;
         }
 
-        if (hasCatalogTarget
-            && _biomeCatalog != null
-            && _biomeCatalog.TryFindNearest(targetBiomeId, originX, originZ, maxRadius, out var catalogX, out var catalogZ, out _))
+        if (hasCatalogTarget)
         {
-            for (var wz = catalogZ - BiomeSearchRefineWindow; wz <= catalogZ + BiomeSearchRefineWindow; wz++)
+            // Use BiomeService for deterministic biome lookup instead of catalog
+            for (var wz = originZ - BiomeSearchRefineWindow; wz <= originZ + BiomeSearchRefineWindow; wz++)
             {
-                for (var wx = catalogX - BiomeSearchRefineWindow; wx <= catalogX + BiomeSearchRefineWindow; wx++)
-                    EvaluateCandidate(wx, wz);
+                for (var wx = originX - BiomeSearchRefineWindow; wx <= originX + BiomeSearchRefineWindow; wx++)
+                {
+                    if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                    {
+                        EvaluateCandidate(wx, wz);
+                    }
+                }
             }
         }
 
@@ -12841,14 +14272,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             var worldRadius = GetBiomeSearchWorldRadius();
 
-            if (hasCatalogTarget
-                && _biomeCatalog != null
-                && _biomeCatalog.TryFindNearest(targetBiomeId, originX, originZ, worldRadius, out var globalCatalogX, out var globalCatalogZ, out _))
+            if (hasCatalogTarget)
             {
-                for (var wz = globalCatalogZ - BiomeSearchRefineWindow; wz <= globalCatalogZ + BiomeSearchRefineWindow; wz++)
+                // Use BiomeService for deterministic biome lookup instead of catalog
+                for (var wz = originZ - BiomeSearchRefineWindow; wz <= originZ + BiomeSearchRefineWindow; wz++)
                 {
-                    for (var wx = globalCatalogX - BiomeSearchRefineWindow; wx <= globalCatalogX + BiomeSearchRefineWindow; wx++)
-                        EvaluateCandidate(wx, wz);
+                    for (var wx = originX - BiomeSearchRefineWindow; wx <= originX + BiomeSearchRefineWindow; wx++)
+                    {
+                        if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                        {
+                            EvaluateCandidate(wx, wz);
+                        }
+                    }
                 }
             }
         }
@@ -12948,21 +14383,20 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             found = true;
         }
 
-        EnsureBiomeCatalog();
-        if (BiomeCatalog.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId) && _biomeCatalog != null)
+        if (BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
         {
-            var points = _biomeCatalog.GetPoints(targetBiomeId);
-            for (var i = 0; i < points.Count; i++)
-                EvaluateCandidate(points[i].X, points[i].Z);
-
-            if (found)
+            // Use BiomeService for deterministic biome lookup instead of catalog
+            var stride = 64;
+            var maxX = Math.Max(0, _meta.Size.Width - 1);
+            var maxZ = Math.Max(0, _meta.Size.Depth - 1);
+            for (var wz = 0; wz <= maxZ; wz += stride)
             {
-                var cx = bestXLocal;
-                var cz = bestZLocal;
-                for (var wz = cz - BiomeSearchRefineWindow; wz <= cz + BiomeSearchRefineWindow; wz++)
+                for (var wx = 0; wx <= maxX; wx += stride)
                 {
-                    for (var wx = cx - BiomeSearchRefineWindow; wx <= cx + BiomeSearchRefineWindow; wx++)
+                    if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                    {
                         EvaluateCandidate(wx, wz);
+                    }
                 }
             }
         }
@@ -13065,10 +14499,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var ocean = _world.GetOceanWeightAt(wx, wz);
             var desert = _world.GetDesertWeightAt(wx, wz);
+            var hills = _world.GetHillsWeightAt(wx, wz);
             var score = targetBiomeToken switch
             {
                 "ocean" => ocean,
                 "desert" => desert * (1f - ocean * 0.9f),
+                "hills" => hills,
                 _ => Math.Clamp(1f - MathF.Max(ocean, desert), 0f, 1f)
             };
 
@@ -13102,28 +14538,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return !float.IsNegativeInfinity(bestScore);
     }
 
-    private void EnsureBiomeCatalog()
-    {
-        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
-            return;
-
-        if (_biomeCatalog != null && _biomeCatalog.IsCompatible(_meta))
-            return;
-
-        _biomeCatalog = BiomeCatalog.Load(_worldPath, _log);
-        if (_biomeCatalog != null && _biomeCatalog.IsCompatible(_meta))
-            return;
-
-        try
-        {
-            _biomeCatalog = BiomeCatalog.BuildAndSave(_meta, _worldPath, _log);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Biome catalog rebuild failed: {ex.Message}");
-            _biomeCatalog = null;
-        }
-    }
 
     private bool IsWithinBiomeSearchBounds(int wx, int wz)
     {
@@ -13158,6 +14572,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             case "plains":
                 biomeToken = "grasslands";
                 biomeLabel = "Grasslands";
+                return true;
+            case "forest":
+            case "woods":
+            case "woodland":
+            case "trees":
+                biomeToken = "forest";
+                biomeLabel = "Forest";
+                return true;
+            case "hill":
+            case "hills":
+            case "highlands":
+                biomeToken = "hills";
+                biomeLabel = "Hills";
                 return true;
             case "ocean":
             case "sea":
@@ -14139,6 +15566,44 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public bool HasSpoiler { get; }
     }
 
+    private enum CatalogRarity
+    {
+        Common = 0,
+        Uncommon = 1,
+        Rare = 2,
+        Legendary = 3
+    }
+
+    private readonly struct CatalogLoreEntry
+    {
+        public CatalogLoreEntry(string displayName, string description, string[] tags, CatalogRarity rarity)
+        {
+            DisplayName = displayName;
+            Description = description;
+            Tags = tags;
+            Rarity = rarity;
+        }
+
+        public string DisplayName { get; }
+        public string Description { get; }
+        public string[] Tags { get; }
+        public CatalogRarity Rarity { get; }
+    }
+
+    private sealed class CatalogLoreFile
+    {
+        public List<CatalogLoreBlockDto> Blocks { get; set; } = new();
+    }
+
+    private sealed class CatalogLoreBlockDto
+    {
+        public string? BlockEnum { get; set; }
+        public int ByteId { get; set; }
+        public string? DisplayNameOverride { get; set; }
+        public string[]? LoreLines { get; set; }
+        public string[]? Tags { get; set; }
+    }
+
     private sealed class ChatLine
     {
         public string Text = "";
@@ -14176,6 +15641,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         public string Name;
         public Vector3 Position;
+        // Optional metadata (some builds persist/track these; keep them here to avoid compile churn)
+        public float Rotation;
+        public long LastVisitedTicks;
         public bool HasIconBlock;
         public BlockId IconBlock;
     }

@@ -1,18 +1,21 @@
+using System;
 using System.Collections.Generic;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 
 namespace LatticeVeilMonoGame.Core;
 
-public sealed class FirstPersonHandRenderer
+public sealed class FirstPersonHandRenderer : IDisposable
 {
     private readonly GraphicsDevice _device;
     private readonly BasicEffect _handEffect;
     private readonly BasicEffect _blockEffect;
+    private readonly AlphaTestEffect _blockCutoutEffect;
     private readonly VertexPositionColor[] _handVerts;
     private VertexPositionTexture[]? _blockVerts;
     private BlockId _cachedBlock = BlockId.Air;
     private BlockModel? _cachedModel;
+    private bool _disposed;
     public bool IsHandMeshValid => _handVerts.Length % 3 == 0;
     public bool IsHeldBlockMeshValid => _blockVerts == null || _blockVerts.Length % 3 == 0;
 
@@ -31,6 +34,12 @@ public sealed class FirstPersonHandRenderer
             TextureEnabled = true,
             LightingEnabled = false
         };
+        _blockCutoutEffect = new AlphaTestEffect(device)
+        {
+            VertexColorEnabled = false,
+            AlphaFunction = CompareFunction.Greater,
+            ReferenceAlpha = 128
+        };
 
         _handVerts = BuildHandMesh();
     }
@@ -40,7 +49,10 @@ public sealed class FirstPersonHandRenderer
         var right = Vector3.Normalize(Vector3.Cross(forward, up));
         var basis = Matrix.CreateWorld(Vector3.Zero, forward, up);
 
-        var handPos = camPos + forward * (0.75f * Scale.BlockSize) + right * (0.35f * Scale.BlockSize) - up * (0.32f * Scale.BlockSize);
+        var handPos = camPos
+            + forward * (Scale.FirstPersonHandForwardOffset * Scale.BlockSize)
+            + right * (Scale.FirstPersonHandRightOffset * Scale.BlockSize)
+            - up * (Scale.FirstPersonHandDownOffset * Scale.BlockSize);
         var handWorld = Matrix.CreateScale(Scale.HandScale * Scale.BlockSize) * basis * Matrix.CreateTranslation(handPos);
 
         _handEffect.View = view;
@@ -62,8 +74,14 @@ public sealed class FirstPersonHandRenderer
             _cachedModel = model;
             _blockVerts = model?.BuildMesh(atlas, heldBlock) ?? BlockModel.BuildCubeMesh(atlas, heldBlock);
         }
+        if (_blockVerts == null || _blockVerts.Length == 0)
+            return;
+        var blockVerts = _blockVerts;
 
-        var blockPos = camPos + forward * (0.8f * Scale.BlockSize) + right * (0.12f * Scale.BlockSize) - up * (0.2f * Scale.BlockSize);
+        var blockPos = camPos
+            + forward * (Scale.FirstPersonHeldForwardOffset * Scale.BlockSize)
+            + right * (Scale.FirstPersonHeldRightOffset * Scale.BlockSize)
+            - up * (Scale.FirstPersonHeldDownOffset * Scale.BlockSize);
         Matrix display;
         if (model != null && model.TryGetDisplayTransform(BlockModelContext.FirstPersonRightHand, out var displayTransform))
             display = Matrix.CreateScale(0.9f) * displayTransform;
@@ -71,25 +89,73 @@ public sealed class FirstPersonHandRenderer
             display = Matrix.CreateScale(Scale.HeldBlockScale * Scale.BlockSize);
 
         var blockWorld = display * basis * Matrix.CreateTranslation(blockPos);
+        var layer = BlockRegistry.Get(heldBlock).RenderLayer;
 
+        var prevBlend = _device.BlendState;
+        var prevDepth = _device.DepthStencilState;
+        try
+        {
+            _device.DepthStencilState = DepthStencilState.Default;
+            switch (layer)
+            {
+                case BlockRenderLayer.Cutout:
+                    _device.BlendState = BlendState.Opaque;
+                    DrawHeldBlockCutout(view, projection, blockWorld, atlas.Texture, blockVerts);
+                    break;
+                case BlockRenderLayer.Blended:
+                case BlockRenderLayer.Water:
+                    _device.BlendState = BlendState.NonPremultiplied;
+                    DrawHeldBlockTextured(view, projection, blockWorld, atlas.Texture, blockVerts);
+                    break;
+                default:
+                    _device.BlendState = BlendState.Opaque;
+                    DrawHeldBlockTextured(view, projection, blockWorld, atlas.Texture, blockVerts);
+                    break;
+            }
+        }
+        finally
+        {
+            _device.BlendState = prevBlend;
+            _device.DepthStencilState = prevDepth;
+        }
+    }
+
+    private void DrawHeldBlockTextured(Matrix view, Matrix projection, Matrix blockWorld, Texture2D texture, VertexPositionTexture[] blockVerts)
+    {
         _blockEffect.View = view;
         _blockEffect.Projection = projection;
         _blockEffect.World = blockWorld;
-        _blockEffect.Texture = atlas.Texture;
+        _blockEffect.Texture = texture;
+        _blockEffect.Alpha = 1f;
 
         foreach (var pass in _blockEffect.CurrentTechnique.Passes)
         {
             pass.Apply();
-            _device.DrawUserPrimitives(PrimitiveType.TriangleList, _blockVerts, 0, _blockVerts.Length / 3);
+            _device.DrawUserPrimitives(PrimitiveType.TriangleList, blockVerts, 0, blockVerts.Length / 3);
+        }
+    }
+
+    private void DrawHeldBlockCutout(Matrix view, Matrix projection, Matrix blockWorld, Texture2D texture, VertexPositionTexture[] blockVerts)
+    {
+        _blockCutoutEffect.View = view;
+        _blockCutoutEffect.Projection = projection;
+        _blockCutoutEffect.World = blockWorld;
+        _blockCutoutEffect.Texture = texture;
+        _blockCutoutEffect.Alpha = 1f;
+
+        foreach (var pass in _blockCutoutEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            _device.DrawUserPrimitives(PrimitiveType.TriangleList, blockVerts, 0, blockVerts.Length / 3);
         }
     }
 
     private static VertexPositionColor[] BuildHandMesh()
     {
         var verts = new List<VertexPositionColor>();
-        var skin = new Color(220, 190, 160);
-        AddBox(verts, new Vector3(-0.2f, -0.2f, 0f), new Vector3(0.2f, 0.2f, 0.6f), skin);
-        AddBox(verts, new Vector3(-0.25f, -0.25f, 0.6f), new Vector3(0.25f, 0.25f, 0.9f), skin);
+        var skin = new Color(223, 194, 166);
+        AddBox(verts, new Vector3(-0.18f, -0.18f, -0.34f), new Vector3(0.20f, 0.18f, 0.05f), skin);
+        AddBox(verts, new Vector3(-0.20f, -0.20f, 0.05f), new Vector3(0.24f, 0.20f, 0.95f), skin);
         return verts.ToArray();
     }
 
@@ -125,5 +191,16 @@ public sealed class FirstPersonHandRenderer
     private static void AddQuad(List<VertexPositionColor> verts, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Color color)
     {
         AddFace(verts, p0, p1, p2, p3, color);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _handEffect.Dispose();
+        _blockEffect.Dispose();
+        _blockCutoutEffect.Dispose();
+        _disposed = true;
     }
 }

@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
 
 namespace LatticeVeilMonoGame.Core;
 
@@ -29,6 +28,8 @@ public sealed class FriendLabelsStore
                 if (File.Exists(Paths.LegacyFriendLabelsJsonPath))
                     TryMigrateLegacyFile(log);
             }
+            if (File.Exists(Paths.FriendLabelsJsonPath) && LvcSerializer.IsJsonFormat(Paths.FriendLabelsJsonPath))
+                throw new LvcSerializer.LegacyFormatException($"Legacy JSON friend_labels detected: {Paths.ToUiPath(Paths.FriendLabelsJsonPath)}");
 
             if (!File.Exists(Paths.FriendLabelsJsonPath))
             {
@@ -37,10 +38,10 @@ public sealed class FriendLabelsStore
                 return created;
             }
 
-            var json = File.ReadAllText(Paths.FriendLabelsJsonPath);
-            var store = JsonSerializer.Deserialize<FriendLabelsStore>(json) ?? new FriendLabelsStore();
-
-            // Normalize
+            var data = LvcSerializer.Read(Paths.FriendLabelsJsonPath);
+            var store = new FriendLabelsStore();
+            LvcSerializer.ApplyObject(store, data);
+// Normalize
             store.Nicknames ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             store.Pinned ??= new List<string>();
             store.Pinned = store.Pinned
@@ -73,9 +74,9 @@ public sealed class FriendLabelsStore
         try
         {
             Directory.CreateDirectory(Paths.RootDir);
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(Paths.FriendLabelsJsonPath, json);
-        }
+            var data = LvcSerializer.SerializeObject(this);
+            LvcSerializer.Write(Paths.FriendLabelsJsonPath, data);
+}
         catch (Exception ex)
         {
             log.Warn($"Failed to save friend labels: {ex.Message}");
@@ -84,18 +85,7 @@ public sealed class FriendLabelsStore
 
     private static void TryMigrateLegacyFile(Logger log)
     {
-        try
-        {
-            if (!File.Exists(Paths.LegacyFriendLabelsJsonPath) || File.Exists(Paths.FriendLabelsJsonPath))
-                return;
-
-            File.Move(Paths.LegacyFriendLabelsJsonPath, Paths.FriendLabelsJsonPath);
-            log.Info($"Migrated friend labels file: {Path.GetFileName(Paths.LegacyFriendLabelsJsonPath)} -> {Path.GetFileName(Paths.FriendLabelsJsonPath)}");
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"Failed to migrate legacy friend labels file: {ex.Message}");
-        }
+        throw new LvcSerializer.LegacyFormatException("Legacy friend_labels format detected (migration disabled).");
     }
 
     public bool IsPinned(string friendKey)

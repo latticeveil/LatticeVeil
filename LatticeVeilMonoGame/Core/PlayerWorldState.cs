@@ -2,13 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
-using System.Text.Json;
 
 namespace LatticeVeilMonoGame.Core;
 
 public sealed class PlayerWorldState
 {
-    private const int CurrentVersion = 5;
+    private const int CurrentVersion = 6;
 
     public int Version { get; set; } = CurrentVersion;
     public string Username { get; set; } = "";
@@ -27,6 +26,7 @@ public sealed class PlayerWorldState
     public int SelectedIndex { get; set; }
     public HotbarSlot[] Hotbar { get; set; } = new HotbarSlot[Inventory.HotbarSize];
     public HotbarSlot[] InventoryGrid { get; set; } = new HotbarSlot[Inventory.GridSize];
+    public int[] ArtificerFavoriteBlockIds { get; set; } = Array.Empty<int>();
 
     public static PlayerWorldState LoadOrDefault(string worldPath, string username, Func<PlayerWorldState> defaultFactory, Logger log)
     {
@@ -34,36 +34,215 @@ public sealed class PlayerWorldState
         var path = GetSavePath(worldPath, safeName);
         if (File.Exists(path))
         {
+            // Try LVC format first (new format)
+            if (LvcSerializer.IsJsonFormat(path))
+            {
+                log.Warn($"Legacy JSON player state detected: {path}");
+                // Could migrate here, but for now fall back to default
+                return defaultFactory();
+            }
+            
+            try
+            {
+                var data = LvcSerializer.Read(path);
+                if (data.Count > 0)
+                {
+                    var state = new PlayerWorldState();
+                    if (int.TryParse(data.GetValueOrDefault("version"), out var version))
+                        state.Version = version;
+                    state.Username = data.GetValueOrDefault("username") ?? username;
+                    if (float.TryParse(data.GetValueOrDefault("posX"), out var posX))
+                        state.PosX = posX;
+                    if (float.TryParse(data.GetValueOrDefault("posY"), out var posY))
+                        state.PosY = posY;
+                    if (float.TryParse(data.GetValueOrDefault("posZ"), out var posZ))
+                        state.PosZ = posZ;
+                    if (float.TryParse(data.GetValueOrDefault("yaw"), out var yaw))
+                        state.Yaw = yaw;
+                    if (float.TryParse(data.GetValueOrDefault("pitch"), out var pitch))
+                        state.Pitch = pitch;
+                    if (bool.TryParse(data.GetValueOrDefault("isFlying"), out var isFlying))
+                        state.IsFlying = isFlying;
+                    if (Enum.TryParse<GameMode>(data.GetValueOrDefault("currentGameMode"), true, out var gameMode))
+                        state.CurrentGameMode = gameMode;
+                    if (bool.TryParse(data.GetValueOrDefault("hasHome"), out var hasHome))
+                        state.HasHome = hasHome;
+                    if (float.TryParse(data.GetValueOrDefault("homeX"), out var homeX))
+                        state.HomeX = homeX;
+                    if (float.TryParse(data.GetValueOrDefault("homeY"), out var homeY))
+                        state.HomeY = homeY;
+                    if (float.TryParse(data.GetValueOrDefault("homeZ"), out var homeZ))
+                        state.HomeZ = homeZ;
+                    if (int.TryParse(data.GetValueOrDefault("selectedIndex"), out var selectedIndex))
+                        state.SelectedIndex = selectedIndex;
+                    
+                    // Load homes
+                    if (int.TryParse(data.GetValueOrDefault("homesCount"), out var homesCount) && homesCount > 0)
+                    {
+                        state.Homes = new List<PlayerHomeState>();
+                        for (int i = 0; i < homesCount; i++)
+                        {
+                            var home = new PlayerHomeState
+                            {
+                                Name = data.GetValueOrDefault($"home.{i}.name") ?? $"home_{i}",
+                                PosX = float.TryParse(data.GetValueOrDefault($"home.{i}.posX"), out var hx) ? hx : 0f,
+                                PosY = float.TryParse(data.GetValueOrDefault($"home.{i}.posY"), out var hy) ? hy : 0f,
+                                PosZ = float.TryParse(data.GetValueOrDefault($"home.{i}.posZ"), out var hz) ? hz : 0f,
+                                IconBlockId = data.GetValueOrDefault($"home.{i}.iconBlockId") ?? string.Empty
+                            };
+                            state.Homes.Add(home);
+                        }
+                    }
+                    
+                    // Load hotbar
+                    if (int.TryParse(data.GetValueOrDefault("hotbarCount"), out var hotbarCount) && hotbarCount > 0)
+                    {
+                        state.Hotbar = new HotbarSlot[hotbarCount];
+                        for (int i = 0; i < hotbarCount; i++)
+                        {
+                            var id = BlockId.Air;
+                            var count = 0;
+                            if (int.TryParse(data.GetValueOrDefault($"hotbar.{i}.id"), out var blockId))
+                                id = (BlockId)blockId;
+                            if (int.TryParse(data.GetValueOrDefault($"hotbar.{i}.count"), out var stackCount))
+                                count = stackCount;
+                            
+                            state.Hotbar[i] = new HotbarSlot { Id = id, Count = count };
+                        }
+                    }
+                    
+                    // Load inventory grid
+                    if (int.TryParse(data.GetValueOrDefault("gridCount"), out var gridCount) && gridCount > 0)
+                    {
+                        state.InventoryGrid = new HotbarSlot[gridCount];
+                        for (int i = 0; i < gridCount; i++)
+                        {
+                            var id = BlockId.Air;
+                            var count = 0;
+                            if (int.TryParse(data.GetValueOrDefault($"grid.{i}.id"), out var blockId))
+                                id = (BlockId)blockId;
+                            if (int.TryParse(data.GetValueOrDefault($"grid.{i}.count"), out var stackCount))
+                                count = stackCount;
+                            
+                            state.InventoryGrid[i] = new HotbarSlot { Id = id, Count = count };
+                        }
+                    }
+
+                    if (int.TryParse(data.GetValueOrDefault("favoriteCount"), out var favoriteCount) && favoriteCount > 0)
+                    {
+                        var favorites = new List<int>(favoriteCount);
+                        for (int i = 0; i < favoriteCount; i++)
+                        {
+                            if (!int.TryParse(data.GetValueOrDefault($"favorite.{i}.id"), out var favoriteId))
+                                continue;
+                            if (favoriteId <= 0 || favoriteId > byte.MaxValue)
+                                continue;
+                            favorites.Add(favoriteId);
+                        }
+
+                        state.ArtificerFavoriteBlockIds = favorites.ToArray();
+                    }
+                    
+                    return state;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Failed to load LVC player state: {ex.Message}");
+            }
+            
+            // Fallback to binary format for existing saves
             if (TryLoadBinary(path, log, out var binary))
                 return binary;
         }
-
-        var legacyPath = GetLegacyJsonPath(worldPath, safeName);
-        if (File.Exists(legacyPath))
-        {
-            var legacy = TryLoadLegacyJson(legacyPath, log);
-            if (legacy != null)
-                return legacy;
-        }
-
         return defaultFactory();
-
     }
 
     public void Save(string worldPath, Logger log)
     {
+        Save(worldPath, Username, log);
+    }
+
+    /// <summary>
+    /// Save the player state to a per-world file using a stable save key (PlayerId).
+    /// Username remains the display name stored inside the file.
+    /// </summary>
+    public void Save(string worldPath, string saveKey, Logger log)
+    {
         try
         {
             Version = CurrentVersion;
-            var safeName = SanitizeUsername(Username);
-            var playersDir = Path.Combine(worldPath, "players");
-            Directory.CreateDirectory(playersDir);
+            var safeName = SanitizeUsername(saveKey);
+            var playerdataDir = Path.Combine(worldPath, "playerdata");
+            Directory.CreateDirectory(playerdataDir);
             var path = GetSavePath(worldPath, safeName);
 
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-            using var ds = new DeflateStream(fs, CompressionLevel.Fastest);
-            using var bw = new BinaryWriter(ds);
-            WriteBinaryPayload(bw);
+            // Save as LVC format (readable key=value)
+            var data = new Dictionary<string, string>
+            {
+                ["version"] = Version.ToString(),
+                ["username"] = Username,
+                ["posX"] = PosX.ToString("F6"),
+                ["posY"] = PosY.ToString("F6"),
+                ["posZ"] = PosZ.ToString("F6"),
+                ["yaw"] = Yaw.ToString("F6"),
+                ["pitch"] = Pitch.ToString("F6"),
+                ["isFlying"] = IsFlying.ToString(),
+                ["currentGameMode"] = CurrentGameMode.ToString(),
+                ["hasHome"] = HasHome.ToString(),
+                ["homeX"] = HomeX.ToString("F6"),
+                ["homeY"] = HomeY.ToString("F6"),
+                ["homeZ"] = HomeZ.ToString("F6"),
+                ["selectedIndex"] = SelectedIndex.ToString()
+            };
+            
+            // Save homes
+            if (Homes != null && Homes.Count > 0)
+            {
+                data["homesCount"] = Homes.Count.ToString();
+                for (int i = 0; i < Homes.Count; i++)
+                {
+                    var home = Homes[i];
+                    data[$"home.{i}.name"] = home.Name ?? string.Empty;
+                    data[$"home.{i}.posX"] = home.PosX.ToString("F6");
+                    data[$"home.{i}.posY"] = home.PosY.ToString("F6");
+                    data[$"home.{i}.posZ"] = home.PosZ.ToString("F6");
+                    data[$"home.{i}.iconBlockId"] = home.IconBlockId ?? string.Empty;
+                }
+            }
+            
+            // Save hotbar
+            if (Hotbar != null && Hotbar.Length > 0)
+            {
+                data["hotbarCount"] = Hotbar.Length.ToString();
+                for (int i = 0; i < Hotbar.Length; i++)
+                {
+                    var slot = Hotbar[i];
+                    data[$"hotbar.{i}.id"] = ((int)slot.Id).ToString();
+                    data[$"hotbar.{i}.count"] = slot.Count.ToString();
+                }
+            }
+            
+            // Save inventory grid
+            if (InventoryGrid != null && InventoryGrid.Length > 0)
+            {
+                data["gridCount"] = InventoryGrid.Length.ToString();
+                for (int i = 0; i < InventoryGrid.Length; i++)
+                {
+                    var slot = InventoryGrid[i];
+                    data[$"grid.{i}.id"] = ((int)slot.Id).ToString();
+                    data[$"grid.{i}.count"] = slot.Count.ToString();
+                }
+            }
+
+            if (ArtificerFavoriteBlockIds != null && ArtificerFavoriteBlockIds.Length > 0)
+            {
+                data["favoriteCount"] = ArtificerFavoriteBlockIds.Length.ToString();
+                for (int i = 0; i < ArtificerFavoriteBlockIds.Length; i++)
+                    data[$"favorite.{i}.id"] = ArtificerFavoriteBlockIds[i].ToString();
+            }
+            
+            LvcSerializer.Write(path, data);
         }
         catch (Exception ex)
         {
@@ -156,36 +335,31 @@ public sealed class PlayerWorldState
             bw.Write((byte)gridSlots[i].Id);
             bw.Write(gridSlots[i].Count);
         }
+
+        var favorites = ArtificerFavoriteBlockIds ?? Array.Empty<int>();
+        var favoriteCount = Math.Min(favorites.Length, byte.MaxValue);
+        bw.Write((byte)favoriteCount);
+        for (int i = 0; i < favoriteCount; i++)
+            bw.Write(favorites[i]);
     }
 
     private static string GetSavePath(string worldPath, string safeName)
     {
-        var playersDir = Path.Combine(worldPath, "players");
-        return Path.Combine(playersDir, $"{safeName}.dat");
-    }
-
-    private static string GetLegacyJsonPath(string worldPath, string safeName)
-    {
-        var playersDir = Path.Combine(worldPath, "players");
-        return Path.Combine(playersDir, $"{safeName}.json");
+        var playerdataDir = Path.Combine(worldPath, "playerdata");
+        return Path.Combine(playerdataDir, $"{safeName}{FileConventions.PlayerExtension}");
     }
 
     private static string SanitizeUsername(string? username)
     {
-        var name = (username ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(name))
-            return "PLAYER";
+        if (string.IsNullOrWhiteSpace(username))
+            return "player";
 
-        var invalid = Path.GetInvalidFileNameChars();
-        var chars = name.ToCharArray();
-        for (int i = 0; i < chars.Length; i++)
-        {
-            if (Array.IndexOf(invalid, chars[i]) >= 0)
-                chars[i] = '_';
-        }
-
-        var safe = new string(chars);
-        return string.IsNullOrWhiteSpace(safe) ? "PLAYER" : safe;
+        // Keep it filename-safe across platforms
+        var name = username.Trim();
+        foreach (var c in Path.GetInvalidFileNameChars())
+            name = name.Replace(c, '_');
+        name = name.Replace(' ', '_');
+        return string.IsNullOrWhiteSpace(name) ? "player" : name;
     }
 
     private static bool TryLoadBinary(string path, Logger log, out PlayerWorldState state)
@@ -200,7 +374,7 @@ public sealed class PlayerWorldState
         }
         catch (Exception ex)
         {
-            log.Warn($"Failed to load player state (binary): {ex.Message}");
+            log.Warn($"Failed to load player state: {ex.Message}");
             return false;
         }
     }
@@ -210,250 +384,75 @@ public sealed class PlayerWorldState
         state = new PlayerWorldState();
         try
         {
-            state.Version = br.ReadInt32();
+            var version = br.ReadInt32();
+            state.Version = version;
             state.Username = br.ReadString();
             state.PosX = br.ReadSingle();
             state.PosY = br.ReadSingle();
             state.PosZ = br.ReadSingle();
             state.Yaw = br.ReadSingle();
             state.Pitch = br.ReadSingle();
-            if (state.Version >= 2)
-                state.IsFlying = br.ReadBoolean();
-            if (state.Version >= 3)
-            {
-                state.CurrentGameMode = (GameMode)br.ReadByte();
-                state.HasHome = br.ReadBoolean();
-                state.HomeX = br.ReadSingle();
-                state.HomeY = br.ReadSingle();
-                state.HomeZ = br.ReadSingle();
-            }
-
-            state.SelectedIndex = Math.Clamp(br.ReadInt32(), 0, Inventory.HotbarSize - 1);
+            state.IsFlying = br.ReadBoolean();
+            state.CurrentGameMode = (GameMode)br.ReadByte();
+            state.HasHome = br.ReadBoolean();
+            state.HomeX = br.ReadSingle();
+            state.HomeY = br.ReadSingle();
+            state.HomeZ = br.ReadSingle();
+            state.SelectedIndex = br.ReadInt32();
 
             var hotbarCount = br.ReadByte();
             state.Hotbar = new HotbarSlot[Inventory.HotbarSize];
-            for (int i = 0; i < hotbarCount; i++)
+            for (int i = 0; i < Math.Min((int)hotbarCount, Inventory.HotbarSize); i++)
             {
-                var id = (BlockId)br.ReadByte();
-                var c = br.ReadInt32();
-                if (i >= 0 && i < state.Hotbar.Length)
-                    state.Hotbar[i] = new HotbarSlot { Id = id, Count = c };
+                state.Hotbar[i] = new HotbarSlot { Id = (BlockId)br.ReadByte(), Count = br.ReadInt32() };
             }
 
-            if (state.Version >= 4)
+            var homeCount = br.ReadByte();
+            state.Homes = new List<PlayerHomeState>(homeCount);
+            for (int i = 0; i < homeCount; i++)
             {
-                var homeCount = br.ReadByte();
-                state.Homes = new List<PlayerHomeState>(homeCount);
-                for (int i = 0; i < homeCount; i++)
+                var home = new PlayerHomeState
                 {
-                    var home = new PlayerHomeState
-                    {
-                        Name = br.ReadString(),
-                        PosX = br.ReadSingle(),
-                        PosY = br.ReadSingle(),
-                        PosZ = br.ReadSingle(),
-                        IconBlockId = br.ReadString()
-                    };
-                    if (!string.IsNullOrWhiteSpace(home.Name))
-                        state.Homes.Add(home);
-                }
+                    Name = br.ReadString(),
+                    PosX = br.ReadSingle(),
+                    PosY = br.ReadSingle(),
+                    PosZ = br.ReadSingle(),
+                    IconBlockId = br.ReadString()
+                };
+                state.Homes.Add(home);
             }
 
+            var gridCount = br.ReadByte();
             state.InventoryGrid = new HotbarSlot[Inventory.GridSize];
-            if (state.Version >= 5)
+            for (int i = 0; i < Math.Min((int)gridCount, Inventory.GridSize); i++)
             {
-                try
-                {
-                    var gridCount = br.ReadByte();
-                    for (int i = 0; i < gridCount; i++)
-                    {
-                        var id = (BlockId)br.ReadByte();
-                        var c = br.ReadInt32();
-                        if (i >= 0 && i < state.InventoryGrid.Length)
-                            state.InventoryGrid[i] = new HotbarSlot { Id = id, Count = c };
-                    }
-                }
-                catch (EndOfStreamException)
-                {
-                    // Older/truncated payloads may not include grid data.
-                }
-                catch (IOException)
-                {
-                    // Corrupt payload tail: keep defaults for grid.
-                }
+                state.InventoryGrid[i] = new HotbarSlot { Id = (BlockId)br.ReadByte(), Count = br.ReadInt32() };
             }
 
-            // Backward migration from single-home fields.
-            if (state.Homes.Count == 0 && state.HasHome)
+            if (version >= 6)
             {
-                state.Homes.Add(new PlayerHomeState
+                var favoriteCount = br.ReadByte();
+                var favorites = new List<int>(favoriteCount);
+                for (int i = 0; i < favoriteCount; i++)
                 {
-                    Name = "home",
-                    PosX = state.HomeX,
-                    PosY = state.HomeY,
-                    PosZ = state.HomeZ
-                });
+                    var favoriteId = br.ReadInt32();
+                    if (favoriteId <= 0 || favoriteId > byte.MaxValue)
+                        continue;
+                    favorites.Add(favoriteId);
+                }
+
+                state.ArtificerFavoriteBlockIds = favorites.ToArray();
             }
 
+            // Future-proofing: if old versions had fewer fields, they should have been handled before.
             return true;
         }
         catch (Exception ex)
         {
-            log?.Warn($"Failed to parse player state payload: {ex.Message}");
+            log?.Warn($"Failed to read player state payload: {ex.Message}");
+            state = new PlayerWorldState();
             return false;
         }
-    }
-
-    private static PlayerWorldState? TryLoadLegacyJson(string path, Logger log)
-    {
-        try
-        {
-            var json = File.ReadAllText(path);
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            var state = new PlayerWorldState
-            {
-                Username = ReadString(root, "Username") ?? "PLAYER",
-                PosX = ReadFloat(root, "PosX") ?? 0f,
-                PosY = ReadFloat(root, "PosY") ?? 0f,
-                PosZ = ReadFloat(root, "PosZ") ?? 0f,
-                Yaw = ReadFloat(root, "Yaw") ?? 0f,
-                Pitch = ReadFloat(root, "Pitch") ?? 0f,
-                IsFlying = ReadBool(root, "IsFlying") ?? false,
-                CurrentGameMode = ParseGameModeToken(ReadString(root, "CurrentGameMode") ?? ReadString(root, "GameMode")),
-                HasHome = ReadBool(root, "HasHome") ?? false,
-                HomeX = ReadFloat(root, "HomeX") ?? 0f,
-                HomeY = ReadFloat(root, "HomeY") ?? 0f,
-                HomeZ = ReadFloat(root, "HomeZ") ?? 0f,
-                Homes = ReadHomes(root)
-            };
-
-            if (state.Homes.Count == 0 && state.HasHome)
-            {
-                state.Homes.Add(new PlayerHomeState
-                {
-                    Name = "home",
-                    PosX = state.HomeX,
-                    PosY = state.HomeY,
-                    PosZ = state.HomeZ
-                });
-            }
-
-            if (TryGetProperty(root, "Inventory", out var inv) && TryGetProperty(inv, "Slots", out var slots) && slots.ValueKind == JsonValueKind.Array)
-            {
-                var i = 0;
-                foreach (var slot in slots.EnumerateArray())
-                {
-                    if (i >= state.Hotbar.Length)
-                        break;
-                    var itemId = ReadString(slot, "ItemId");
-                    var count = ReadInt(slot, "Count") ?? 0;
-                    var id = ResolveBlockId(itemId);
-                    state.Hotbar[i] = new HotbarSlot { Id = id, Count = count };
-                    i++;
-                }
-            }
-
-            return state;
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"Failed to load player state (legacy JSON): {ex.Message}");
-            return null;
-        }
-    }
-
-    private static BlockId ResolveBlockId(string? itemId)
-    {
-        if (string.IsNullOrWhiteSpace(itemId))
-            return BlockId.Air;
-
-        var normalized = itemId.Trim();
-        if (Enum.TryParse<BlockId>(normalized, true, out var parsed))
-            return parsed;
-
-        foreach (var def in BlockRegistry.All)
-        {
-            if (string.Equals(def.Name, normalized, StringComparison.OrdinalIgnoreCase))
-                return def.Id;
-        }
-
-        return BlockId.Air;
-    }
-
-    private static string? ReadString(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.String ? prop.GetString() : prop.ToString();
-    }
-
-    private static float? ReadFloat(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.Number && prop.TryGetSingle(out var v) ? v : null;
-    }
-
-    private static int? ReadInt(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out var v) ? v : null;
-    }
-
-    private static bool? ReadBool(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        if (prop.ValueKind == JsonValueKind.True)
-            return true;
-        if (prop.ValueKind == JsonValueKind.False)
-            return false;
-        return null;
-    }
-
-    private static bool TryGetProperty(JsonElement element, string name, out JsonElement value)
-    {
-        foreach (var prop in element.EnumerateObject())
-        {
-            if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
-            {
-                value = prop.Value;
-                return true;
-            }
-        }
-
-        value = default;
-        return false;
-    }
-
-    private static List<PlayerHomeState> ReadHomes(JsonElement root)
-    {
-        var homes = new List<PlayerHomeState>();
-        if (!TryGetProperty(root, "Homes", out var homesNode) && !TryGetProperty(root, "homes", out homesNode))
-            return homes;
-        if (homesNode.ValueKind != JsonValueKind.Array)
-            return homes;
-
-        foreach (var node in homesNode.EnumerateArray())
-        {
-            var name = ReadString(node, "Name") ?? ReadString(node, "name") ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(name))
-                continue;
-
-            homes.Add(new PlayerHomeState
-            {
-                Name = name.Trim(),
-                PosX = ReadFloat(node, "PosX") ?? ReadFloat(node, "x") ?? 0f,
-                PosY = ReadFloat(node, "PosY") ?? ReadFloat(node, "y") ?? 0f,
-                PosZ = ReadFloat(node, "PosZ") ?? ReadFloat(node, "z") ?? 0f,
-                IconBlockId = ReadString(node, "IconBlockId") ?? ReadString(node, "iconBlockId") ?? string.Empty
-            });
-        }
-
-        return homes;
     }
 
     private static GameMode ParseGameModeToken(string? value)

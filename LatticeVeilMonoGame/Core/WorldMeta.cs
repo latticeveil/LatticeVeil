@@ -3,80 +3,60 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace LatticeVeilMonoGame.Core;
 
+/// <summary>
+/// World metadata stored in key=value .lvc format (NO JSON).
+/// File: Worlds/<WorldName>/world.lvc (or whatever Paths.WorldMetaFileName points to).
+/// </summary>
 public sealed class WorldMeta
 {
-    [JsonPropertyName("worldVersion")]
-    public int WorldVersion { get; set; } = 1;
-
-    [JsonPropertyName("name")]
+    // New-format worlds are v2+. (Legacy conversion is intentionally not supported.)
+    public int WorldVersion { get; set; } = 2;
+    // New-format marker (replaces legacy level.lvc)
+    public string Format { get; set; } = "LVWORLD";
+    public int FormatVersion { get; set; } = 2;
     public string Name { get; set; } = "WORLD";
 
-    [JsonPropertyName("gameMode")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
+    // Keep these as explicit fields so existing game code can read them.
     public GameMode GameMode { get; set; } = GameMode.Artificer;
-
-    [JsonPropertyName("initialGameMode")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
     public GameMode InitialGameMode { get; set; } = GameMode.Artificer;
-
-    [JsonPropertyName("currentWorldGameMode")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
     public GameMode CurrentWorldGameMode { get; set; } = GameMode.Artificer;
 
-    [JsonPropertyName("generator")]
-    public string Generator { get; set; } = "flat_v1";
-
-    [JsonPropertyName("seed")]
+    public string Generator { get; set; } = "terrain_v1";
     public int Seed { get; set; }
-
-    [JsonPropertyName("created_at")]
     public string CreatedAt { get; set; } = string.Empty;
-
-    [JsonPropertyName("worldId")]
     public string WorldId { get; set; } = string.Empty;
 
-    [JsonPropertyName("size")]
     public WorldSize Size { get; set; } = new();
 
-    [JsonPropertyName("playerCollision")]
     public bool PlayerCollision { get; set; } = true;
-
-    [JsonPropertyName("hasCustomSpawn")]
     public bool HasCustomSpawn { get; set; }
-
-    [JsonPropertyName("spawnX")]
     public int SpawnX { get; set; }
-
-    [JsonPropertyName("spawnY")]
     public int SpawnY { get; set; }
-
-    [JsonPropertyName("spawnZ")]
     public int SpawnZ { get; set; }
 
-    [JsonPropertyName("enableMultipleHomes")]
     public bool EnableMultipleHomes { get; set; } = true;
-
-    [JsonPropertyName("maxHomesPerPlayer")]
     public int MaxHomesPerPlayer { get; set; } = 8;
-
-    [JsonPropertyName("enableCheats")]
     public bool EnableCheats { get; set; } = true;
 
-    [JsonPropertyName("difficulty")]
-    public int DifficultyLevel { get; set; } = 1; // 0=Peaceful, 1=Easy, 2=Normal, 3=Hard
+    /// <summary>0=Peaceful, 1=Easy, 2=Normal, 3=Hard</summary>
+    public int DifficultyLevel { get; set; } = 1;
 
-    [JsonPropertyName("operatorUsernames")]
     public List<string> OperatorUsernames { get; set; } = new();
+
+    // Consolidated settings (replaces legacy world_config.lvc)
+    public WorldGenerationSettings WorldGeneration { get; set; } = new();
+    public GameplaySettings Gameplay { get; set; } = new();
+    public PlayerSettings Player { get; set; } = new();
+    public PerformanceSettings Performance { get; set; } = new();
 
     public static WorldMeta CreateFlat(string name, GameMode mode, int width, int height, int depth, int seed)
     {
         return new WorldMeta
         {
+            WorldVersion = 2,
             Name = name,
             GameMode = mode,
             InitialGameMode = mode,
@@ -91,25 +71,120 @@ public sealed class WorldMeta
             MaxHomesPerPlayer = 8,
             EnableCheats = true,
             DifficultyLevel = 1,
-            OperatorUsernames = new List<string>()
+            OperatorUsernames = new List<string>(),
+            WorldGeneration = new WorldGenerationSettings
+            {
+                GenerateStructures = true,
+                GenerateCaves = true,
+                GenerateOres = true,
+                GenerateTrees = true,
+                WorldType = "flatlands",
+                WorldSize = new WorldSizeSettings { Width = width, Height = height, Depth = depth }
+            },
+            Gameplay = new GameplaySettings
+            {
+                EnableCheats = true,
+                EnableMultipleHomes = true,
+                MaxHomesPerPlayer = 8,
+                OperatorUsernames = new List<string>()
+            },
+            Player = new PlayerSettings
+            {
+                PlayerCollision = true,
+                HasCustomSpawn = false,
+                SpawnX = 0,
+                SpawnY = 0,
+                SpawnZ = 0
+            },
+            Performance = new PerformanceSettings
+            {
+                MaxLoadedChunks = 512,
+                ChunkUnloadDistance = 256,
+                EnableLOD = true,
+                LODLevels = 3
+            }
         };
+    }
+
+    public static WorldMeta CreateTerrain(string name, GameMode mode, int width, int height, int depth, int seed)
+    {
+        var meta = CreateFlat(name, mode, width, height, depth, seed);
+        meta.WorldGeneration.WorldType = "terrain";
+        meta.Generator = "terrain_v1";
+        return meta;
+    }
+
+    public static string CanonicalWorldType(string? worldType)
+    {
+        return string.Equals(worldType, "flatlands", StringComparison.OrdinalIgnoreCase)
+            ? "flatlands"
+            : "terrain";
+    }
+
+    public static string CanonicalGeneratorForWorldType(string? worldType)
+    {
+        return string.Equals(CanonicalWorldType(worldType), "flatlands", StringComparison.OrdinalIgnoreCase)
+            ? "flat_v1"
+            : "terrain_v1";
+    }
+
+    public void CanonicalizeWorldGenerationContract()
+    {
+        WorldGeneration ??= new WorldGenerationSettings();
+        WorldGeneration.WorldType = CanonicalWorldType(WorldGeneration.WorldType);
+        if (!string.Equals(WorldGeneration.WorldType, "flatlands", StringComparison.OrdinalIgnoreCase))
+            WorldGeneration.GenerateTrees = true;
+        Generator = CanonicalGeneratorForWorldType(WorldGeneration.WorldType);
     }
 
     public void Save(string path, Logger log)
     {
         try
         {
+            // Canonicalize + clamp
+            Format = "LVWORLD";
+            FormatVersion = 2;
+            WorldVersion = 2;
+
+            // Sync grouped settings -> legacy fields (so older code paths still work)
+            Gameplay ??= new GameplaySettings();
+            WorldGeneration ??= new WorldGenerationSettings();
+            Player ??= new PlayerSettings();
+            Performance ??= new PerformanceSettings();
+
+            CanonicalizeWorldGenerationContract();
+
+            EnableCheats = Gameplay.EnableCheats;
+            EnableMultipleHomes = Gameplay.EnableMultipleHomes;
+            MaxHomesPerPlayer = Gameplay.MaxHomesPerPlayer;
+            OperatorUsernames = Gameplay.OperatorUsernames ?? OperatorUsernames;
+            PlayerCollision = Player.PlayerCollision;
+            HasCustomSpawn = Player.HasCustomSpawn;
+            SpawnX = Player.SpawnX;
+            SpawnY = Player.SpawnY;
+            SpawnZ = Player.SpawnZ;
+
             GameMode = CurrentWorldGameMode;
             DifficultyLevel = Math.Clamp(DifficultyLevel, 0, 3);
+
             if (string.IsNullOrWhiteSpace(CreatedAt))
                 CreatedAt = DateTimeOffset.UtcNow.ToString("O");
+
             if (string.IsNullOrWhiteSpace(WorldId))
                 WorldId = BuildLegacyWorldId(this);
 
-            var options = new JsonSerializerOptions { WriteIndented = true };
-            options.Converters.Add(new JsonStringEnumConverter());
-            var json = JsonSerializer.Serialize(this, options);
-            File.WriteAllText(path, json);
+            MaxHomesPerPlayer = Math.Clamp(MaxHomesPerPlayer, 1, 32);
+            if (!EnableMultipleHomes)
+                MaxHomesPerPlayer = 1;
+
+            // LVC key=value only
+            var dict = LvcSerializer.SerializeObject(this);
+            LvcSerializer.Write(path, dict);
+        }
+        catch (LvcSerializer.LegacyFormatException)
+        {
+            // If the existing file is JSON, we intentionally fail.
+            throw;
         }
         catch (Exception ex)
         {
@@ -123,91 +198,69 @@ public sealed class WorldMeta
         {
             if (!File.Exists(path))
             {
-                var directory = Path.GetDirectoryName(path) ?? string.Empty;
-                var legacyPath = Path.Combine(directory, Paths.LegacyWorldMetaFileName);
-                if (File.Exists(legacyPath))
-                {
-                    try
-                    {
-                        File.Move(legacyPath, path);
-                        log.Info($"Migrated world meta: {Path.GetFileName(legacyPath)} -> {Path.GetFileName(path)}");
-                    }
-                    catch (Exception migrateEx)
-                    {
-                        log.Warn($"Failed to migrate world meta to {Path.GetFileName(path)}: {migrateEx.Message}");
-                        path = legacyPath;
-                    }
-                }
-                else
-                {
-                    log.Warn($"World data file missing: {path}");
-                    return null;
-                }
+                log.Warn($"World data file missing: {path}");
+                return null;
             }
 
-            var json = File.ReadAllText(path);
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
+            // Strict: no JSON migration.
+            if (LvcSerializer.IsJsonFormat(path))
+                throw new LvcSerializer.LegacyFormatException($"Legacy JSON world meta detected: {Paths.ToUiPath(path)}");
 
-            var meta = new WorldMeta
-            {
-                WorldVersion = ReadInt(root, "worldVersion") ?? ReadInt(root, "Version") ?? 1,
-                Name = ReadString(root, "name") ?? ReadString(root, "Name") ?? "WORLD",
-                Generator = ReadString(root, "generator") ?? ReadString(root, "Generator") ?? "flat_v1",
-                Seed = ReadInt(root, "seed") ?? ReadInt(root, "Seed") ?? 0,
-                CreatedAt = ReadString(root, "created_at") ?? ReadString(root, "createdAt") ?? ReadString(root, "CreatedAt") ?? string.Empty,
-                WorldId = ReadString(root, "worldId") ?? ReadString(root, "WorldId") ?? string.Empty,
-                GameMode = ParseMode(ReadString(root, "gameMode") ?? ReadString(root, "Mode") ?? ReadString(root, "mode")),
-                PlayerCollision = ReadBool(root, "playerCollision") ?? ReadBool(root, "PlayerCollision") ?? true,
-                HasCustomSpawn = ReadBool(root, "hasCustomSpawn") ?? ReadBool(root, "HasCustomSpawn") ?? false,
-                SpawnX = ReadInt(root, "spawnX") ?? ReadInt(root, "SpawnX") ?? 0,
-                SpawnY = ReadInt(root, "spawnY") ?? ReadInt(root, "SpawnY") ?? 0,
-                SpawnZ = ReadInt(root, "spawnZ") ?? ReadInt(root, "SpawnZ") ?? 0,
-                EnableMultipleHomes = ReadBool(root, "enableMultipleHomes") ?? ReadBool(root, "EnableMultipleHomes") ?? true,
-                MaxHomesPerPlayer = ReadInt(root, "maxHomesPerPlayer") ?? ReadInt(root, "MaxHomesPerPlayer") ?? 8,
-                EnableCheats = ReadBool(root, "enableCheats")
-                    ?? ReadBool(root, "EnableCheats")
-                    ?? ReadBool(root, "cheatsEnabled")
-                    ?? true,
-                DifficultyLevel = ReadInt(root, "difficulty")
-                    ?? ReadInt(root, "difficultyLevel")
-                    ?? ReadInt(root, "Difficulty")
-                    ?? 1,
-                OperatorUsernames = ReadStringList(root, "operatorUsernames")
-                    ?? ReadStringList(root, "OperatorUsernames")
-                    ?? ReadStringList(root, "ops")
-                    ?? new List<string>()
-            };
+            var data = LvcSerializer.Read(path);
 
+            var meta = new WorldMeta();
+            LvcSerializer.ApplyObject(meta, data);
+
+            // Ensure required markers
+            meta.Format = "LVWORLD";
+            meta.FormatVersion = 2;
+
+            // Ensure grouped settings exist
+            meta.WorldGeneration ??= new WorldGenerationSettings();
+            meta.Gameplay ??= new GameplaySettings();
+            meta.Player ??= new PlayerSettings();
+            meta.Performance ??= new PerformanceSettings();
+
+            meta.CanonicalizeWorldGenerationContract();
+
+            // Sync legacy fields -> grouped (preferred authoring)
+            meta.Gameplay.EnableCheats = meta.EnableCheats;
+            meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
+            meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
+            meta.Gameplay.OperatorUsernames = meta.OperatorUsernames ?? meta.Gameplay.OperatorUsernames;
+            meta.Player.PlayerCollision = meta.PlayerCollision;
+            meta.Player.HasCustomSpawn = meta.HasCustomSpawn;
+            meta.Player.SpawnX = meta.SpawnX;
+            meta.Player.SpawnY = meta.SpawnY;
+            meta.Player.SpawnZ = meta.SpawnZ;
+
+            // Post-load canonicalization
             meta.MaxHomesPerPlayer = Math.Clamp(meta.MaxHomesPerPlayer, 1, 32);
             if (!meta.EnableMultipleHomes)
                 meta.MaxHomesPerPlayer = 1;
             meta.DifficultyLevel = Math.Clamp(meta.DifficultyLevel, 0, 3);
 
-            meta.InitialGameMode = ParseMode(
-                ReadString(root, "initialGameMode")
-                ?? ReadString(root, "InitialGameMode")
-                ?? ReadString(root, "initial_mode")
-                ?? meta.GameMode.ToString());
-
-            meta.CurrentWorldGameMode = ParseMode(
-                ReadString(root, "currentWorldGameMode")
-                ?? ReadString(root, "CurrentWorldGameMode")
-                ?? ReadString(root, "current_mode")
-                ?? meta.GameMode.ToString());
-
+            // Keep the behavior from older code: GameMode mirrors current.
+            if (meta.CurrentWorldGameMode == default)
+                meta.CurrentWorldGameMode = meta.GameMode;
+            if (meta.InitialGameMode == default)
+                meta.InitialGameMode = meta.GameMode;
             meta.GameMode = meta.CurrentWorldGameMode;
-
-            var size = ReadSize(root);
-            if (size != null)
-                meta.Size = size;
 
             if (string.IsNullOrWhiteSpace(meta.CreatedAt))
                 meta.CreatedAt = DateTimeOffset.UtcNow.ToString("O");
             if (string.IsNullOrWhiteSpace(meta.WorldId))
                 meta.WorldId = BuildLegacyWorldId(meta);
 
+            // Ensure nested object isn't null
+            meta.Size ??= new WorldSize();
+
             return meta;
+        }
+        catch (LvcSerializer.LegacyFormatException)
+        {
+            // Caller decides how to present this (popup + abort).
+            throw;
         }
         catch (Exception ex)
         {
@@ -216,100 +269,17 @@ public sealed class WorldMeta
         }
     }
 
-    private static List<string>? ReadStringList(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var listNode))
-            return null;
-        if (listNode.ValueKind != JsonValueKind.Array)
-            return null;
+    private static string CreateWorldId() => Guid.NewGuid().ToString("N");
 
-        var list = new List<string>();
-        foreach (var entry in listNode.EnumerateArray())
-        {
-            var value = entry.ValueKind == JsonValueKind.String ? entry.GetString() : entry.ToString();
-            if (!string.IsNullOrWhiteSpace(value))
-                list.Add(value.Trim());
-        }
-
-        return list;
-    }
-
-    private static WorldSize? ReadSize(JsonElement root)
-    {
-        if (TryGetProperty(root, "size", out var sizeElem) || TryGetProperty(root, "Size", out sizeElem))
-        {
-            var width = ReadInt(sizeElem, "Width") ?? ReadInt(sizeElem, "width") ?? 0;
-            var height = ReadInt(sizeElem, "Height") ?? ReadInt(sizeElem, "height") ?? 0;
-            var depth = ReadInt(sizeElem, "Depth") ?? ReadInt(sizeElem, "depth") ?? 0;
-            if (width > 0 && height > 0 && depth > 0)
-                return new WorldSize { Width = width, Height = height, Depth = depth };
-        }
-
-        return null;
-    }
-
-    private static string CreateWorldId()
-    {
-        return Guid.NewGuid().ToString("N");
-    }
-
+    // NOTE: This keeps compatibility with previous world-id scheme so existing worlds don't change IDs.
     private static string BuildLegacyWorldId(WorldMeta meta)
     {
-        var payload =
-            $"{meta.Name}|{meta.Seed}|{meta.Size.Width}|{meta.Size.Height}|{meta.Size.Depth}|{meta.CreatedAt}";
+        var payload = $"{meta.Name}|{meta.Seed}|{meta.Size.Width}|{meta.Size.Height}|{meta.Size.Depth}|{meta.CreatedAt}";
         var bytes = Encoding.UTF8.GetBytes(payload);
         var hash = SHA256.HashData(bytes);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
-
-    private static GameMode ParseMode(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return GameMode.Artificer;
-
-        if (Enum.TryParse<GameMode>(value, ignoreCase: true, out var parsed))
-            return parsed;
-
-        return GameMode.Artificer;
-    }
-
-    private static string? ReadString(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.String ? prop.GetString() : prop.ToString();
-    }
-
-    private static int? ReadInt(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out var v) ? v : null;
-    }
-
-    private static bool? ReadBool(JsonElement element, string name)
-    {
-        if (!TryGetProperty(element, name, out var prop))
-            return null;
-        return prop.ValueKind == JsonValueKind.True || prop.ValueKind == JsonValueKind.False ? prop.GetBoolean() : null;
-    }
-
-    private static bool TryGetProperty(JsonElement element, string name, out JsonElement value)
-    {
-        foreach (var prop in element.EnumerateObject())
-        {
-            if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
-            {
-                value = prop.Value;
-                return true;
-            }
-        }
-
-        value = default;
-        return false;
-    }
 }
-
 public sealed class WorldSize
 {
     public int Width { get; set; }

@@ -16,10 +16,15 @@ public static class WorldListService
                 .Select(path =>
                 {
                     MigrateLegacyWorldFiles(path, log);
+                    WorldGenerationStateStore.TryLoadRecoverableState(path, TimeSpan.FromSeconds(90), out var worldgenState, log);
+                    var validation = WorldValidator.ValidateWorldFolder(path);
                     var folderName = Path.GetFileName(path) ?? string.Empty;
                     var metaPath = Paths.ResolveWorldMetaPath(path);
                     var meta = File.Exists(metaPath) ? WorldMeta.Load(metaPath, log) : null;
-                    var worldName = !string.IsNullOrWhiteSpace(meta?.Name) ? meta!.Name : folderName;
+                    var worldName = !string.IsNullOrWhiteSpace(meta?.Name)
+                        ? meta!.Name
+                        : (!string.IsNullOrWhiteSpace(worldgenState?.WorldName) ? worldgenState!.WorldName : folderName);
+                    var budget = WorldStorageBudgetService.GetBudgetState(path);
                     return new WorldListEntry
                     {
                         Name = worldName,
@@ -29,10 +34,16 @@ public static class WorldListService
                         PreviewPath = WorldPreviewGenerator.GetPreviewPath(path),
                         CurrentMode = meta?.CurrentWorldGameMode ?? meta?.GameMode ?? GameMode.Artificer,
                         InitialMode = meta?.InitialGameMode ?? meta?.GameMode ?? GameMode.Artificer,
-                        Seed = meta?.Seed ?? 0
+                        Seed = meta?.Seed ?? 0,
+                        ValidationStatus = validation.Status,
+                        ValidationReason = validation.Reason ?? string.Empty,
+                        GenerationState = worldgenState,
+                        WorldSizeBytes = budget.SizeBytes,
+                        StorageBudgetState = budget.State
                     };
                 })
-                .Where(x => !string.IsNullOrWhiteSpace(x.FolderName))
+                .Where(x => x.ValidationStatus != WorldValidationStatus.NotAWorld
+                    && !string.IsNullOrWhiteSpace(x.FolderName))
                 .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
@@ -60,13 +71,7 @@ public static class WorldListService
                 log.Info($"Migrated world meta: {Path.GetFileName(legacyMeta)} -> {Path.GetFileName(newMeta)}");
             }
 
-            var legacyConfig = Path.Combine(worldPath, Paths.LegacyWorldConfigFileName);
-            var newConfig = Path.Combine(worldPath, Paths.WorldConfigFileName);
-            if (File.Exists(legacyConfig) && !File.Exists(newConfig))
-            {
-                File.Move(legacyConfig, newConfig);
-                log.Info($"Migrated world config: {Path.GetFileName(legacyConfig)} -> {Path.GetFileName(newConfig)}");
-            }
+            // Legacy world_config.lvc migration removed - new worlds use world.lvc only
         }
         catch (Exception ex)
         {
@@ -85,4 +90,9 @@ public sealed class WorldListEntry
     public GameMode CurrentMode { get; init; } = GameMode.Artificer;
     public GameMode InitialMode { get; init; } = GameMode.Artificer;
     public int Seed { get; init; }
+    public WorldValidationStatus ValidationStatus { get; init; } = WorldValidationStatus.NotAWorld;
+    public string ValidationReason { get; init; } = string.Empty;
+    public WorldGenerationState? GenerationState { get; init; }
+    public long WorldSizeBytes { get; init; }
+    public WorldStorageBudgetState StorageBudgetState { get; init; } = WorldStorageBudgetState.Normal;
 }

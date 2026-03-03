@@ -13,6 +13,10 @@ namespace LatticeVeilMonoGame;
 
 public sealed class Game1 : Game
 {
+    // Optional global time hook for screens that want a stable animation clock without threading GameTime everywhere.
+    // (Some experimental UI code references this; keep it lightweight.)
+    public static TimeSpan TotalGameTime { get; private set; }
+
     private readonly GameStartOptions? _startOptions;
 
     private readonly GraphicsDeviceManager _graphics;
@@ -47,7 +51,7 @@ public sealed class Game1 : Game
     private const double StallThresholdSeconds = 2.0;
     private const double StallLogCooldownSeconds = 10.0;
     private Vector2 _smoothedLookDelta = Vector2.Zero;
-    private const float CaptureDeltaSmoothing = 0.45f;
+    private const float CaptureDeltaSmoothing = 0.85f; // Reduced smoothing for responsiveness
     private const int CaptureDeltaClampPixels = 200;
     private const float CaptureDeltaClampRadians = 0.45f;
 
@@ -207,6 +211,7 @@ public sealed class Game1 : Game
 
     protected override void Update(GameTime gameTime)
     {
+        TotalGameTime = gameTime.TotalGameTime;
         try
         {
             var exitRequestPath = Path.Combine(Paths.RootDir, "exit.request");
@@ -223,26 +228,31 @@ public sealed class Game1 : Game
         // Input is suppressed while inactive, but loading/network/refresh continue.
         if (!IsActive)
         {
+            if (_wasActive)
+            {
+                _log.Info("Window lost focus - releasing mouse capture and resetting input");
+            }
             ReleaseMouseCapture();
             _input.Reset();
             _wasActive = false;
             _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
+            base.Update(gameTime);
+            return;
         }
-        else
-        {
-            if (!_wasActive)
-            {
-                _input.Reset();
-                _wasActive = true;
-                UpdateMouseCapture(computeDelta: false);
-                _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
-                base.Update(gameTime);
-                return;
-            }
 
-            LogFrameStall(gameTime);
-            _input.Update();
+        if (!_wasActive)
+        {
+            _log.Info("Window gained focus - reinitializing input");
+            _input.Reset();
+            _wasActive = true;
+            UpdateMouseCapture(computeDelta: false);
+            _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
+            base.Update(gameTime);
+            return;
         }
+
+        LogFrameStall(gameTime);
+        _input.Update();
 
         RefreshSettingsIfChanged();
         UpdateUiLayout();
@@ -417,9 +427,12 @@ public sealed class Game1 : Game
 
             var raw = _input.RawMousePosition;
             var deltaPx = new Point(raw.X - _captureCenter.X, raw.Y - _captureCenter.Y);
+            
+            // Immediately set previous state to center to avoid accumulating deltas
+            _input.SetLookDelta(Vector2.Zero);
+            
             if (_ignoreNextCaptureDelta)
             {
-                _input.SetLookDelta(Vector2.Zero);
                 _smoothedLookDelta = Vector2.Zero;
                 _ignoreNextCaptureDelta = false;
             }
@@ -428,14 +441,21 @@ public sealed class Game1 : Game
                 var sensitivity = Math.Clamp(_settings.MouseSensitivity, 0.0005f, 0.01f);
                 var clampedPxX = Math.Clamp(deltaPx.X, -CaptureDeltaClampPixels, CaptureDeltaClampPixels);
                 var clampedPxY = Math.Clamp(deltaPx.Y, -CaptureDeltaClampPixels, CaptureDeltaClampPixels);
-                if (Math.Abs(clampedPxX) <= 1) clampedPxX = 0;
-                if (Math.Abs(clampedPxY) <= 1) clampedPxY = 0;
+                
+                // Reduce deadzone to prevent sticky movement
+                if (Math.Abs(clampedPxX) <= 0.5f) clampedPxX = 0;
+                if (Math.Abs(clampedPxY) <= 0.5f) clampedPxY = 0;
+                
                 var delta = new Vector2(clampedPxX * sensitivity, clampedPxY * sensitivity);
                 delta.X = Math.Clamp(delta.X, -CaptureDeltaClampRadians, CaptureDeltaClampRadians);
                 delta.Y = Math.Clamp(delta.Y, -CaptureDeltaClampRadians, CaptureDeltaClampRadians);
+                
+                // Apply lighter smoothing to maintain responsiveness
                 _smoothedLookDelta = Vector2.Lerp(_smoothedLookDelta, delta, CaptureDeltaSmoothing);
                 _input.SetLookDelta(_smoothedLookDelta);
             }
+            
+            // Recenter mouse AFTER reading state and computing delta
             Mouse.SetPosition(_captureCenter.X, _captureCenter.Y);
         }
         else
@@ -456,6 +476,8 @@ public sealed class Game1 : Game
         var viewport = GraphicsDevice.Viewport;
         _captureCenter = new Point(viewport.Width / 2, viewport.Height / 2);
         Mouse.SetPosition(_captureCenter.X, _captureCenter.Y);
+        
+        _log.Info($"Mouse capture ENGAGED for screen: {screen.GetType().Name}, center: {_captureCenter}");
         screen.OnMouseCaptureGained();
     }
 
@@ -469,6 +491,9 @@ public sealed class Game1 : Game
         _ignoreNextCaptureDelta = false;
         _smoothedLookDelta = Vector2.Zero;
         _input.SetLookDelta(Vector2.Zero);
+
+        var screenName = _captureOwner?.GetType().Name ?? "Unknown";
+        _log.Info($"Mouse capture RELEASED for screen: {screenName}");
 
         try
         {

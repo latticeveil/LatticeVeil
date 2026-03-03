@@ -2,23 +2,11 @@
   "version": 1,
   "dependencies": {
     "net8.0-windows7.0": {
-      "DotnetNoise": {
-        "type": "Direct",
-        "requested": "[1.0.0, )",
-        "resolved": "1.0.0",
-        "contentHash": "GdEL8YZXceS39AsanUUwZCX/lRseX26xhbQIhB0/+yz4+rx8eWy+0vkP6isPuAecEvd0PVkXO4peNRW0wMlzhg=="
-      },
       "GeonBit.UI": {
         "type": "Direct",
         "requested": "[4.3.0.4, )",
         "resolved": "4.3.0.4",
         "contentHash": "minQC9hUEXY1OdEsIaynIFuPoMIK4CKpszmVNUqc99Y/8DsTIog5Utn7wHIXb96m7CbIMH0FlmeTwC0cnjUmPQ=="
-      },
-      "LibNoise": {
-        "type": "Direct",
-        "requested": "[0.2.0, )",
-        "resolved": "0.2.0",
-        "contentHash": "tdYokEHB4QmTtM05X3ITNTaDv5odD+pOkzyemHBlVqLVTyfXwWl+l9qz81ZSBTGnQn0gkxgH1q5iXGwlT8GKjg=="
       },
       "Microsoft.Bcl.AsyncInterfaces": {
         "type": "Direct",
@@ -72,12 +60,6 @@
           "System.Memory": "4.5.3",
           "System.ValueTuple": "4.5.0"
         }
-      },
-      "SharpNoise": {
-        "type": "Direct",
-        "requested": "[0.12.1.1, )",
-        "resolved": "0.12.1.1",
-        "contentHash": "YU87vP4pCJpEtu+yigyZFEzZPy02rf49v3YfrTN/f9YTfk1SZFfOTUKYhPcP4r1+4MpNNOBbu7UNlTvcwpx5Ww=="
       },
       "System.Collections.Concurrent": {
         "type": "Direct",

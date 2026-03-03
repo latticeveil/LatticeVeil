@@ -9,7 +9,9 @@ public enum BiomeId : byte
     Unknown = 0,
     Grasslands = 1,
     Desert = 2,
-    Ocean = 3
+    Ocean = 3,
+    Forest = 4,
+    Hills = 5
 }
 
 public readonly struct BiomeCatalogPoint
@@ -26,7 +28,7 @@ public readonly struct BiomeCatalogPoint
 
 public sealed class BiomeCatalog
 {
-    private const int FormatVersion = 5;
+    private const int FormatVersion = 7;
     public const string FileName = "biome_catalog.bin";
     public const int DefaultStride = 8;
     private const int Magic = 0x4C56424D; // LVBM
@@ -34,6 +36,8 @@ public sealed class BiomeCatalog
     private readonly List<BiomeCatalogPoint> _grasslands;
     private readonly List<BiomeCatalogPoint> _desert;
     private readonly List<BiomeCatalogPoint> _ocean;
+    private readonly List<BiomeCatalogPoint> _forest;
+    private readonly List<BiomeCatalogPoint> _hills;
 
     private BiomeCatalog(
         int seed,
@@ -42,7 +46,9 @@ public sealed class BiomeCatalog
         int stride,
         List<BiomeCatalogPoint> grasslands,
         List<BiomeCatalogPoint> desert,
-        List<BiomeCatalogPoint> ocean)
+        List<BiomeCatalogPoint> ocean,
+        List<BiomeCatalogPoint> forest,
+        List<BiomeCatalogPoint> hills)
     {
         Seed = seed;
         Width = width;
@@ -51,6 +57,8 @@ public sealed class BiomeCatalog
         _grasslands = grasslands ?? new List<BiomeCatalogPoint>();
         _desert = desert ?? new List<BiomeCatalogPoint>();
         _ocean = ocean ?? new List<BiomeCatalogPoint>();
+        _forest = forest ?? new List<BiomeCatalogPoint>();
+        _hills = hills ?? new List<BiomeCatalogPoint>();
     }
 
     public int Seed { get; }
@@ -77,6 +85,8 @@ public sealed class BiomeCatalog
         {
             BiomeId.Desert => _desert,
             BiomeId.Ocean => _ocean,
+            BiomeId.Forest => _forest,
+            BiomeId.Hills => _hills,
             BiomeId.Grasslands => _grasslands,
             _ => Array.Empty<BiomeCatalogPoint>()
         };
@@ -129,6 +139,8 @@ public sealed class BiomeCatalog
         var grasslands = new List<BiomeCatalogPoint>();
         var desert = new List<BiomeCatalogPoint>();
         var ocean = new List<BiomeCatalogPoint>();
+        var forest = new List<BiomeCatalogPoint>();
+        var hills = new List<BiomeCatalogPoint>();
 
         foreach (var z in EnumerateSampleAxis(depth, stride))
         {
@@ -144,6 +156,12 @@ public sealed class BiomeCatalog
                     case BiomeId.Ocean:
                         ocean.Add(point);
                         break;
+                    case BiomeId.Forest:
+                        forest.Add(point);
+                        break;
+                    case BiomeId.Hills:
+                        hills.Add(point);
+                        break;
                     default:
                         grasslands.Add(point);
                         break;
@@ -156,43 +174,24 @@ public sealed class BiomeCatalog
         EnsureMinimumBiomePoint(world, BiomeId.Grasslands, width, depth, stride, grasslands);
         EnsureMinimumBiomePoint(world, BiomeId.Desert, width, depth, stride, desert);
         EnsureMinimumBiomePoint(world, BiomeId.Ocean, width, depth, stride, ocean);
+        EnsureMinimumBiomePoint(world, BiomeId.Forest, width, depth, stride, forest);
+        EnsureMinimumBiomePoint(world, BiomeId.Hills, width, depth, stride, hills);
 
-        return new BiomeCatalog(meta.Seed, width, depth, stride, grasslands, desert, ocean);
+        return new BiomeCatalog(meta.Seed, width, depth, stride, grasslands, desert, ocean, forest, hills);
     }
 
     public static BiomeCatalog BuildAndSave(WorldMeta meta, string worldPath, Logger log, int stride = DefaultStride)
     {
         var catalog = Build(meta, worldPath, log, stride);
-        catalog.Save(worldPath, log);
+        // Legacy artifact emission disabled in vNext.
+        log.Warn("BiomeCatalog persistence is disabled; using biome_index.lvbi instead.");
         return catalog;
     }
 
     public bool Save(string worldPath, Logger log)
     {
-        try
-        {
-            Directory.CreateDirectory(worldPath);
-            var path = GetPath(worldPath);
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-            using var bw = new BinaryWriter(fs);
-
-            bw.Write(Magic);
-            bw.Write(FormatVersion);
-            bw.Write(Seed);
-            bw.Write(Width);
-            bw.Write(Depth);
-            bw.Write(Stride);
-
-            WritePoints(bw, _grasslands);
-            WritePoints(bw, _desert);
-            WritePoints(bw, _ocean);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            log.Warn($"Failed to save biome catalog: {ex.Message}");
-            return false;
-        }
+        log.Warn("BiomeCatalog persistence is disabled; use BiomeIndexStore (.lvbi).");
+        return false;
     }
 
     public static BiomeCatalog? Load(string worldPath, Logger log)
@@ -210,7 +209,7 @@ public sealed class BiomeCatalog
                 return null;
 
             var version = br.ReadInt32();
-            if (version != FormatVersion)
+            if (version < 6 || version > FormatVersion)
                 return null;
 
             var seed = br.ReadInt32();
@@ -221,8 +220,10 @@ public sealed class BiomeCatalog
             var grasslands = ReadPoints(br);
             var desert = ReadPoints(br);
             var ocean = ReadPoints(br);
+            var forest = ReadPoints(br);
+            var hills = version >= 7 ? ReadPoints(br) : new List<BiomeCatalogPoint>();
 
-            return new BiomeCatalog(seed, width, depth, stride, grasslands, desert, ocean);
+            return new BiomeCatalog(seed, width, depth, stride, grasslands, desert, ocean, forest, hills);
         }
         catch (Exception ex)
         {
@@ -254,6 +255,16 @@ public sealed class BiomeCatalog
             case "water":
                 biome = BiomeId.Ocean;
                 return true;
+            case "forest":
+            case "woods":
+            case "woodland":
+                biome = BiomeId.Forest;
+                return true;
+            case "hill":
+            case "hills":
+            case "highlands":
+                biome = BiomeId.Hills;
+                return true;
             default:
                 return false;
         }
@@ -265,6 +276,8 @@ public sealed class BiomeCatalog
         {
             "desert" => BiomeId.Desert,
             "ocean" => BiomeId.Ocean,
+            "forest" => BiomeId.Forest,
+            "hills" => BiomeId.Hills,
             _ => BiomeId.Grasslands
         };
     }
@@ -457,10 +470,13 @@ public sealed class BiomeCatalog
 
             var ocean = world.GetOceanWeightAt(x, z);
             var desert = world.GetDesertWeightAt(x, z);
+            var forest = world.GetForestWeightAt(x, z);
             var score = biome switch
             {
                 BiomeId.Ocean => ocean,
                 BiomeId.Desert => desert * (1f - ocean * 0.9f),
+                BiomeId.Forest => forest,
+                BiomeId.Hills => world.GetHillsWeightAt(x, z),
                 _ => Math.Clamp(1f - MathF.Max(ocean, desert), 0f, 1f)
             };
 
@@ -503,6 +519,8 @@ public sealed class BiomeCatalog
         {
             BiomeId.Desert => "Desert",
             BiomeId.Ocean => "Ocean",
+            BiomeId.Forest => "Forest",
+            BiomeId.Hills => "Hills",
             BiomeId.Grasslands => "Grasslands",
             _ => string.Empty
         };
