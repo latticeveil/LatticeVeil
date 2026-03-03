@@ -10,6 +10,7 @@ namespace LatticeVeilMonoGame.Core;
 public enum WorldValidationStatus
 {
     ValidNew,
+    IncompleteGeneration,
     LegacyDetected,
     CorruptedNew,
     NotAWorld
@@ -24,6 +25,7 @@ public sealed class WorldValidationResult
     public string Reason { get; set; } = string.Empty;
     
     public static WorldValidationResult Valid() => new() { Status = WorldValidationStatus.ValidNew };
+    public static WorldValidationResult Incomplete(string reason) => new() { Status = WorldValidationStatus.IncompleteGeneration, Reason = reason };
     public static WorldValidationResult Legacy(string reason) => new() { Status = WorldValidationStatus.LegacyDetected, Reason = reason };
     public static WorldValidationResult Corrupted(string reason) => new() { Status = WorldValidationStatus.CorruptedNew, Reason = reason };
     public static WorldValidationResult NotAWorld() => new() { Status = WorldValidationStatus.NotAWorld };
@@ -46,52 +48,116 @@ public static class WorldValidator
             return WorldValidationResult.NotAWorld();
         }
 
-        var levelPath = Path.Combine(worldPath, FileConventions.LevelFileName);
-        
-        // Check for new format (level.lvc exists)
-        if (File.Exists(levelPath))
+        var worldFile = Path.Combine(worldPath, "world.lvc");
+
+        // Fail-fast: old layout files present => legacy (no auto-convert)
+        var legacyLevel = Path.Combine(worldPath, "level.lvc");
+        var legacyCfg = Path.Combine(worldPath, "world_config.lvc");
+        if (File.Exists(legacyLevel) || File.Exists(legacyCfg))
         {
-            return ValidateNewFormat(worldPath, levelPath);
+            return WorldValidationResult.Legacy("Legacy world layout (level.lvc/world_config.lvc) present");
         }
-        
+
+        // New format uses world.lvc only
+        if (File.Exists(worldFile))
+        {
+            if (WorldGenerationStateStore.TryLoadRecoverableState(worldPath, TimeSpan.FromSeconds(90), out var worldgenState)
+                && worldgenState != null
+                && !worldgenState.IsCompleted)
+            {
+                var stage = string.IsNullOrWhiteSpace(worldgenState.Stage) ? "PREPARING" : worldgenState.Stage;
+                var reason = string.IsNullOrWhiteSpace(worldgenState.ErrorReason)
+                    ? $"Generation state is {worldgenState.Status} at stage {stage}."
+                    : worldgenState.ErrorReason;
+                return WorldValidationResult.Incomplete(reason);
+            }
+
+            return ValidateNewFormat(worldPath, worldFile);
+        }
+
         // Check for legacy format markers
         return CheckLegacyMarkers(worldPath);
-    }
+}
     
     /// <summary>
     /// Validates new format world structure
     /// </summary>
-    private static WorldValidationResult ValidateNewFormat(string worldPath, string levelPath)
+    private static WorldValidationResult ValidateNewFormat(string worldPath, string worldFile)
     {
         try
         {
-            var levelLines = File.ReadAllLines(levelPath);
-            var formatLine = levelLines.FirstOrDefault(line => line.StartsWith("format=", StringComparison.OrdinalIgnoreCase));
-            var versionLine = levelLines.FirstOrDefault(line => line.StartsWith("format_version=", StringComparison.OrdinalIgnoreCase));
+            var levelLines = File.ReadAllLines(worldFile);
+
+            // Accept both snake_case (format_version) and the current serializer's PascalCase (FormatVersion)
+            // so worlds don't get flagged as corrupted due to key naming differences.
+            var formatLine = levelLines.FirstOrDefault(line =>
+                line.StartsWith("format=", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Format=", StringComparison.OrdinalIgnoreCase));
+
+            var versionLine = levelLines.FirstOrDefault(line =>
+                line.StartsWith("format_version=", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("FormatVersion=", StringComparison.OrdinalIgnoreCase));
             
             // Check required keys
             if (string.IsNullOrWhiteSpace(formatLine) || !formatLine.Contains("LVWORLD"))
             {
-                return WorldValidationResult.Corrupted("Invalid or missing format key in level.lvc");
+                return WorldValidationResult.Corrupted("Invalid or missing format key in world.lvc");
             }
             
-            if (string.IsNullOrWhiteSpace(versionLine) || !versionLine.Contains("2"))
+            if (string.IsNullOrWhiteSpace(versionLine))
+                return WorldValidationResult.Corrupted("Invalid or missing format_version key in world.lvc");
+
+            // Parse the version after '=' and require >= 2.
+            var eq = versionLine.IndexOf('=');
+            if (eq < 0 || !int.TryParse(versionLine.Substring(eq + 1).Trim().Trim('"'), out var ver) || ver < 2)
+                return WorldValidationResult.Corrupted("Invalid or missing format_version key in world.lvc");
+            
+            // If legacy storage exists alongside a v2 marker, treat as legacy/invalid (no auto-convert).
+            var legacyChunksDir = Path.Combine(worldPath, "chunks");
+            if (Directory.Exists(legacyChunksDir))
             {
-                return WorldValidationResult.Corrupted("Invalid or missing format_version key in level.lvc");
+                try
+                {
+                    if (Directory.GetFiles(legacyChunksDir, "chunk_*.bin", SearchOption.TopDirectoryOnly).Length > 0)
+                        return WorldValidationResult.Legacy("Legacy chunk storage (chunks/*.bin) present");
+                }
+                catch { }
             }
-            
+
             // Check required directories
-            var regionsDir = Path.Combine(worldPath, FileConventions.RegionsDirName);
+            var regionsDir = Path.Combine(worldPath, "regions");
+            var legacyRegionsDir = Path.Combine(worldPath, "Regions");
+            if (!Directory.Exists(regionsDir) && Directory.Exists(legacyRegionsDir))
+            {
+                return WorldValidationResult.Corrupted("Regions directory casing invalid (expected regions/)");
+            }
             if (!Directory.Exists(regionsDir))
             {
-                return WorldValidationResult.Corrupted("Missing Regions/ directory");
+                return WorldValidationResult.Corrupted("Missing regions/ directory");
             }
-            
+
+            // vNext optional artifacts are valid if present:
+            // - biome_index.lvbi
+            // - Spawn.lvpwarm
+            // - worldgen_state.lvc
+            // - playerdata/*.lvplayer
+
+            // Must contain at least one region file for valid new format
+            try
+            {
+                if (Directory.GetFiles(regionsDir, "*.lvregion", SearchOption.TopDirectoryOnly).Length == 0)
+                    return WorldValidationResult.Corrupted("No .lvregion files found in regions/");
+            }
+            catch (Exception ex)
+            {
+                return WorldValidationResult.Corrupted($"Failed to enumerate regions/: {ex.Message}");
+            }
+
             return WorldValidationResult.Valid();
         }
         catch (Exception ex)
         {
-            return WorldValidationResult.Corrupted($"Failed to read level.lvc: {ex.Message}");
+            return WorldValidationResult.Corrupted($"Failed to read world.lvc: {ex.Message}");
         }
     }
     
@@ -102,6 +168,8 @@ public static class WorldValidator
     {
         var chunksDir = Path.Combine(worldPath, "chunks");
         var meshcacheDir = Path.Combine(worldPath, "meshcache");
+        var spawnMeshcacheDir = Path.Combine(worldPath, "spawn_meshcache");
+        var legacySpawnPrewarm = Path.Combine(worldPath, "spawn_prewarm.bin");
         var biomeCatalog = Path.Combine(worldPath, "biome_catalog.bin");
         
         var hasLegacyMarkers = false;
@@ -141,12 +209,26 @@ public static class WorldValidator
                 // Ignore access errors for validation
             }
         }
+
+        if (Directory.Exists(spawnMeshcacheDir))
+        {
+            hasLegacyMarkers = true;
+            if (reasons.Length > 0) reasons.Append("; ");
+            reasons.Append("spawn_meshcache/ found");
+        }
         
         if (File.Exists(biomeCatalog))
         {
             hasLegacyMarkers = true;
             if (reasons.Length > 0) reasons.Append("; ");
             reasons.Append("biome_catalog.bin found");
+        }
+
+        if (File.Exists(legacySpawnPrewarm))
+        {
+            hasLegacyMarkers = true;
+            if (reasons.Length > 0) reasons.Append("; ");
+            reasons.Append("spawn_prewarm.bin found");
         }
         
         if (hasLegacyMarkers)

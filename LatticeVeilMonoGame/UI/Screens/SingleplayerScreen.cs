@@ -27,6 +27,7 @@ public sealed class SingleplayerScreen : IScreen
     private Texture2D? _panel;
 
     private readonly Button _createBtn;
+    private readonly Button _resumeBtn;
     private readonly Button _deleteBtn;
     private readonly Button _backBtn;
     private readonly Button _confirmDeleteBtn;
@@ -70,6 +71,7 @@ public sealed class SingleplayerScreen : IScreen
         _settings = GameSettings.LoadOrCreate(_log);
 
         _createBtn = new Button("CREATE WORLD", OpenCreateWorld);
+        _resumeBtn = new Button("RESUME GENERATION", ResumeSelectedWorldGeneration);
         _deleteBtn = new Button("DELETE WORLD", DeleteSelectedWorld);
         _backBtn = new Button("BACK", () => _menus.Pop());
         _confirmDeleteBtn = new Button("DELETE", ConfirmDeleteSelectedWorld) { BoldText = true, BackgroundColor = new Color(100, 26, 26) };
@@ -178,6 +180,7 @@ public sealed class SingleplayerScreen : IScreen
         var actionsStartX = _panelRect.X + (_panelRect.Width - actionsTotal) / 2;
         _createBtn.Bounds = new Rectangle(actionsStartX, createY, createBtnW, createBtnH);
         _deleteBtn.Bounds = new Rectangle(_createBtn.Bounds.Right + gap, createY, deleteSize, deleteSize);
+        _resumeBtn.Bounds = new Rectangle(_createBtn.Bounds.X - createBtnW - gap, createY, createBtnW, createBtnH);
 
         ClampScroll();
         LayoutDeleteConfirmOverlay();
@@ -209,6 +212,8 @@ public sealed class SingleplayerScreen : IScreen
         }
 
         _createBtn.Update(input);
+        SyncActionButtons();
+        _resumeBtn.Update(input);
         _deleteBtn.Update(input);
         _backBtn.Update(input);
         _overlayMousePos = input.MousePosition;
@@ -255,6 +260,7 @@ public sealed class SingleplayerScreen : IScreen
         DrawWorldList(sb);
 
         _createBtn.Draw(sb, _pixel, _font);
+        _resumeBtn.Draw(sb, _pixel, _font);
         _deleteBtn.Draw(sb, _pixel, _font);
         _backBtn.Draw(sb, _pixel, _font);
 
@@ -361,6 +367,31 @@ public sealed class SingleplayerScreen : IScreen
             var subtitlePos = new Vector2(textLeft, rowRect.Bottom - _font.LineHeight - 6);
             _rowFont.DrawString(sb, titleText, titlePos, Color.White);
             _font.DrawString(sb, subtitle, subtitlePos, new Color(220, 220, 220));
+
+            var badgeX = textLeft + Math.Max(0, (int)_rowFont.MeasureString(titleText).X + 12);
+            if (entry.ValidationStatus == WorldValidationStatus.IncompleteGeneration)
+            {
+                var badge = new Rectangle(badgeX, rowRect.Y + 8, 124, 22);
+                sb.Draw(_pixel, badge, new Color(124, 78, 20, 220));
+                DrawBorder(sb, badge, new Color(255, 220, 160));
+                _font.DrawString(sb, "INCOMPLETE", new Vector2(badge.X + 8, badge.Y + 4), Color.White);
+                badgeX = badge.Right + 8;
+            }
+
+            if (entry.StorageBudgetState >= WorldStorageBudgetState.Warn)
+            {
+                var label = entry.StorageBudgetState >= WorldStorageBudgetState.OverTarget ? "SIZE 1GB+" : "SIZE WARN";
+                var badge = new Rectangle(badgeX, rowRect.Y + 8, 116, 22);
+                var badgeBg = entry.StorageBudgetState >= WorldStorageBudgetState.OverTarget
+                    ? new Color(114, 32, 32, 225)
+                    : new Color(120, 96, 18, 225);
+                var border = entry.StorageBudgetState >= WorldStorageBudgetState.OverTarget
+                    ? new Color(255, 190, 190)
+                    : new Color(255, 232, 164);
+                sb.Draw(_pixel, badge, badgeBg);
+                DrawBorder(sb, badge, border);
+                _font.DrawString(sb, label, new Vector2(badge.X + 8, badge.Y + 4), Color.White);
+            }
 
             // Always show seed info section
             var seedRect = new Rectangle(rowRect.Right - seedSectionWidth, rowRect.Y + 4, seedSectionWidth - 6, rowRect.Height - 8);
@@ -580,6 +611,18 @@ public sealed class SingleplayerScreen : IScreen
         _menus.Push(new CreateWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, OnWorldCreated), _viewport);
     }
 
+    private void ResumeSelectedWorldGeneration()
+    {
+        if (!IsSelectedIncompleteWorld())
+        {
+            ShowStatus("SELECT AN INCOMPLETE WORLD");
+            return;
+        }
+
+        var entry = _worlds[_selectedIndex];
+        _menus.Push(new CreateWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, OnWorldCreated, entry.WorldPath), _viewport);
+    }
+
     private void OnWorldCreated(string worldName)
     {
         RefreshWorlds();
@@ -618,21 +661,70 @@ public sealed class SingleplayerScreen : IScreen
 
         var entry = _worlds[index];
         var name = entry.Name;
+        var path = entry.WorldPath;
 
         try
         {
-            var path = entry.WorldPath;
             if (Directory.Exists(path))
+            {
+                // Clear read-only attributes recursively before deletion
+                ClearReadOnlyAttributes(path);
+                
+                // Try to delete both possible region folders (case sensitivity issues)
+                var regionsPath = Path.Combine(path, "regions");
+                var regionsPathUpper = Path.Combine(path, "Regions");
+                
+                if (Directory.Exists(regionsPath))
+                {
+                    ClearReadOnlyAttributes(regionsPath);
+                    Directory.Delete(regionsPath, true);
+                }
+                
+                if (Directory.Exists(regionsPathUpper) && regionsPathUpper != regionsPath)
+                {
+                    ClearReadOnlyAttributes(regionsPathUpper);
+                    Directory.Delete(regionsPathUpper, true);
+                }
+                
+                // Finally delete the world folder
                 Directory.Delete(path, true);
+            }
 
-            _log.Info($"Deleted world: {name}");
+            _log.Info($"Deleted world: {name} at {path}");
             RefreshWorlds();
             ShowStatus("WORLD DELETED");
         }
         catch (Exception ex)
         {
-            _log.Warn($"Failed to delete world {name}: {ex.Message}");
+            _log.Warn($"Failed to delete world {name} at {path}: {ex.Message}");
             ShowStatus("FAILED TO DELETE WORLD");
+        }
+    }
+
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        try
+        {
+            var dirInfo = new DirectoryInfo(path);
+            if (dirInfo.Exists)
+            {
+                dirInfo.Attributes &= ~FileAttributes.ReadOnly;
+                
+                foreach (var file in dirInfo.GetFiles("*", SearchOption.AllDirectories))
+                {
+                    file.Attributes &= ~FileAttributes.ReadOnly;
+                }
+                
+                foreach (var dir in dirInfo.GetDirectories("*", SearchOption.AllDirectories))
+                {
+                    dir.Attributes &= ~FileAttributes.ReadOnly;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Non-critical - just log and continue
+            Console.WriteLine($"Warning: Failed to clear read-only attributes for {path}: {ex.Message}");
         }
     }
 
@@ -676,6 +768,10 @@ public sealed class SingleplayerScreen : IScreen
                 }
                 _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, worldPath, metaPath), _viewport);
                 break;
+
+            case WorldValidationStatus.IncompleteGeneration:
+                ResumeSelectedWorldGeneration();
+                break;
                 
             case WorldValidationStatus.LegacyDetected:
                 ShowLegacyWorldPopup(name, validation.Reason);
@@ -711,6 +807,21 @@ public sealed class SingleplayerScreen : IScreen
         sb.Draw(_pixel, new Rectangle(rect.X, rect.Bottom - 2, rect.Width, 2), color);
         sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, 2, rect.Height), color);
         sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
+    }
+
+    private bool IsSelectedIncompleteWorld()
+    {
+        if (_selectedIndex < 0 || _selectedIndex >= _worlds.Count)
+            return false;
+        return _worlds[_selectedIndex].ValidationStatus == WorldValidationStatus.IncompleteGeneration;
+    }
+
+    private void SyncActionButtons()
+    {
+        var showResume = IsSelectedIncompleteWorld();
+        _resumeBtn.Visible = showResume;
+        _resumeBtn.Enabled = showResume;
+        _deleteBtn.Label = showResume ? "DELETE PARTIAL" : "DELETE WORLD";
     }
 
     private void LayoutDeleteConfirmOverlay()
@@ -808,4 +919,3 @@ public sealed class SingleplayerScreen : IScreen
         public DateTime LastWriteUtc { get; }
     }
 }
-

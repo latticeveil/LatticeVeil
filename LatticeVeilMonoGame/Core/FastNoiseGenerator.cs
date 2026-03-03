@@ -58,17 +58,17 @@ public sealed class FastNoiseGenerator : IDisposable
 
     /// <summary>
     /// Generate cave density at a given world position (3D)
-    /// Returns value between -1 and 1, where positive values are solid rock
+    /// Returns value between 0 and 1.
+    /// Lower values represent more "cave" (air) potential.
     /// </summary>
     public float GetCaveDensity(float worldX, float worldY, float worldZ)
     {
-        // Base cave noise
-        var caveValue = _caveNoise.GetNoise(worldX, worldY, worldZ);
-        
-        // Add Y-axis modulation for more interesting cave shapes
-        var yModulation = (float)Math.Pow(worldY * 0.1f, 2) - 1;
-        
-        return caveValue + yModulation;
+        // IMPORTANT: keep density stable and normalized.
+        // Prior versions added strong Y-axis modulation which drove values very negative,
+        // effectively carving the entire world into air.
+        var n = _caveNoise.GetNoise(worldX, worldY, worldZ); // [-1..1]
+        var normalized = (n + 1.0f) * 0.5f;                 // [0..1]
+        return Math.Clamp(normalized, 0.0f, 1.0f);
     }
 
     /// <summary>

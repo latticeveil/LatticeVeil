@@ -210,7 +210,7 @@ public sealed class OptionsScreen : IScreen
     // Controls binding
     private readonly List<string> _bindOrder = new()
     {
-        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","StructureFinder","GamemodeModifier","GamemodeWheel","InviteQuickAction"
+        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","StructureFinder","GamemodeModifier","GamemodeWheel","VeilseerXrayToggle","InviteQuickAction"
     };
     private string? _bindingAction;
     private Rectangle _controlsListRect;
@@ -677,7 +677,7 @@ public sealed class OptionsScreen : IScreen
         if (_qualityOpen)
             DrawSimpleDropdownList(sb, qualityBox, QualityPresets, qualityIndex);
         if (_particleOpen)
-            DrawSimpleDropdownList(sb, particleBox, ParticlePresets, particleIndex);
+            DrawSimpleDropdownList(sb, particleBox, ParticlePresets, particleIndex, openAbove: true);
     }
 
     private void UpdateResolutionDropdown(InputState input)
@@ -763,7 +763,7 @@ public sealed class OptionsScreen : IScreen
         {
             _working.ParticlePreset = ParticlePresets[idx];
             _log.Info($"Option changed: ParticlePreset = {_working.ParticlePreset}");
-        });
+        }, openAbove: true);
     }
 
     private void UpdateReticleStyleDropdown(InputState input)
@@ -1097,9 +1097,13 @@ public sealed class OptionsScreen : IScreen
         }
 
         var notesY = listRect.Bottom + 8;
+        var modeModifierLabel = _working.Keybinds.TryGetValue("GamemodeModifier", out var modeModifierKey)
+            ? modeModifierKey.ToString().ToUpperInvariant()
+            : "ALT";
         _font.DrawString(sb, "NON-REBINDABLE: HOLD TAB = PLAYER LIST", new Vector2(listRect.X, notesY), new Color(210, 210, 210));
-        _font.DrawString(sb, "MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL OR 1-9 HOTBAR", new Vector2(listRect.X, notesY + _font.LineHeight + 2), new Color(180, 180, 180));
-        _font.DrawString(sb, "UI: ENTER SENDS CHAT/COMMAND | ESC CLOSES MENUS", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 2), new Color(180, 180, 180));
+        _font.DrawString(sb, $"MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL HOTBAR | HOLD {modeModifierLabel}+WHEEL (FLYING ARTIFICER) FOR FLY SPEED", new Vector2(listRect.X, notesY + _font.LineHeight + 2), new Color(180, 180, 180));
+        _font.DrawString(sb, "VEILSEER: 1-9 SPECTATE PLAYER | 0 FREECAM", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 2), new Color(180, 180, 180));
+        _font.DrawString(sb, "UI: ENTER SENDS CHAT/COMMAND | ESC CLOSES MENUS", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 3), new Color(180, 180, 180));
 
         var maxScroll = GetMaxScroll(Tab.Controls);
         if (maxScroll > 0)
@@ -1239,7 +1243,7 @@ public sealed class OptionsScreen : IScreen
         _notificationModeOpen = false;
     }
 
-    private void UpdateSimpleDropdown(InputState input, Rectangle box, ref bool open, IReadOnlyList<string> items, Action<int> onSelect)
+    private void UpdateSimpleDropdown(InputState input, Rectangle box, ref bool open, IReadOnlyList<string> items, Action<int> onSelect, bool openAbove = false)
     {
         if (!input.IsNewLeftClick())
             return;
@@ -1256,7 +1260,7 @@ public sealed class OptionsScreen : IScreen
         if (!open)
             return;
 
-        var listRect = GetDropdownListRect(box, items.Count);
+        var listRect = GetDropdownListRect(box, items.Count, openAbove);
         if (listRect.Contains(p))
         {
             var idx = (p.Y - (listRect.Y + 6)) / DropdownItemHeight;
@@ -1360,12 +1364,12 @@ public sealed class OptionsScreen : IScreen
         _font.DrawString(sb, open ? "A" : "V", new Vector2(box.Right - 40, box.Y + 12), Color.White);
     }
 
-    private void DrawSimpleDropdownList(SpriteBatch sb, Rectangle box, IReadOnlyList<string> items, int currentIndex)
+    private void DrawSimpleDropdownList(SpriteBatch sb, Rectangle box, IReadOnlyList<string> items, int currentIndex, bool openAbove = false)
     {
         if (items.Count == 0)
             return;
 
-        var listRect = GetDropdownListRect(box, items.Count);
+        var listRect = GetDropdownListRect(box, items.Count, openAbove);
         sb.Draw(_pixel, listRect, new Color(12,12,12));
         DrawBorder(sb, listRect, Color.White);
 
@@ -1521,8 +1525,13 @@ public sealed class OptionsScreen : IScreen
         }
     }
 
-    private static Rectangle GetDropdownListRect(Rectangle box, int itemCount) =>
-        new(box.X, box.Bottom + 4, box.Width, itemCount * DropdownItemHeight + 6);
+    private static Rectangle GetDropdownListRect(Rectangle box, int itemCount, bool openAbove = false)
+    {
+        var height = itemCount * DropdownItemHeight + 6;
+        return openAbove
+            ? new Rectangle(box.X, box.Y - 4 - height, box.Width, height)
+            : new Rectangle(box.X, box.Bottom + 4, box.Width, height);
+    }
 
     private void HandleScroll(InputState input)
     {
@@ -1836,6 +1845,7 @@ public sealed class OptionsScreen : IScreen
             "StructureFinder" => "FINDER GUI",
             "GamemodeModifier" => "MODE MODIFIER",
             "GamemodeWheel" => "MODE WHEEL",
+            "VeilseerXrayToggle" => "VEILSEER XRAY TOGGLE",
             "InviteQuickAction" => "INVITE QUICK ACTION",
             _ => action.ToUpperInvariant()
         };

@@ -23,33 +23,32 @@ public static class WorldCreator
             // Create world directory
             Directory.CreateDirectory(worldPath);
             
-            // Create level.lvc with required keys
-            var levelContent = $@"format=LVWORLD
+            // Create world.lvc manifest with required keys
+            var worldManifestContent = $@"format=LVWORLD
 format_version=2
 world_name=""{worldName}""
 created_utc={DateTimeOffset.UtcNow:yyyy-MM-ddTHH\:mm\:ss.fffZ}
 seed={seed}
-generator_id=""core:nextgen""
-region_size_chunks=32";
+generator_id=""terrain_v1""
+world_type=terrain
+generator=terrain_v1
+region_size_chunks=32
+spawn_x=0
+spawn_y=64
+spawn_z=0
+game_mode={gameMode}
+difficulty=1
+cheats_enabled=false";
             
-            var levelPath = FileConventions.GetFutureLevelPath(worldPath);
-            File.WriteAllText(levelPath, levelContent);
+            var worldManifestPath = FileConventions.GetWorldManifestPath(worldPath);
+            File.WriteAllText(worldManifestPath, worldManifestContent);
             
-            // Create worldstate.lvc with defaults
-            var worldstateContent = @"pvp_enabled=true
-allow_cheats=false
-keep_inventory=false
-time_of_day_ticks=6000
-day_count=0
-weather=""clear""";
+            // Create required directories (lowercase regions only)
+            Directory.CreateDirectory(Path.Combine(worldPath, "regions"));
+            Directory.CreateDirectory(Path.Combine(worldPath, "playerdata"));
+            Directory.CreateDirectory(Path.Combine(worldPath, "history"));
             
-            var worldstatePath = FileConventions.GetFutureWorldStatePath(worldPath);
-            File.WriteAllText(worldstatePath, worldstateContent);
-            
-            // Create required directories
-            Directory.CreateDirectory(FileConventions.GetFutureRegionsDir(worldPath));
-            Directory.CreateDirectory(FileConventions.GetFuturePlayerDataDir(worldPath));
-            Directory.CreateDirectory(FileConventions.GetFutureHistoryDir(worldPath));
+            // DO NOT create legacy directories (chunks, meshcache)
             
             return true;
         }

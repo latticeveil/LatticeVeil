@@ -1,5 +1,50 @@
 # LatticeVeil Changelog
 
+## v10.0.0 - "Worldshaper Reforged" - 2026-03-03
+
+### 🌍 World Generation vNext
+- **Terrain-First Defaults**: New worlds now default to non-flat terrain generation, with flatlands preserved as an opt-in path.
+- **Biome Expansion**: Added Forest and Hills to the active biome set with deterministic selection and smoother transition behavior.
+- **Biome Locate Reliability**: `/biome` and `/biomes` now resolve from deterministic biome-index data to reduce locate failures.
+- **Tree Rules by Biome**: Forest has highest tree density; Grasslands/Hills are moderate; Desert/Ocean are tree-free.
+
+### ⚙️ Stability, Recovery, and Rejoin
+- **Freeze-Safe Worldgen Pipeline**: Creation work is moved off the UI thread to keep menu/game responsiveness during generation.
+- **Generation Recovery**: Added generation-state tracking with pause/resume semantics for interrupted creation sessions.
+- **Spawn Readiness Flow**: Improved spawn prewarm behavior for faster, safer rejoin and first-load world readiness.
+
+### 💾 World Storage vNext
+- **Canonical Region Storage**: Active chunk persistence standardized to `regions/*.lvregion`.
+- **Artifact Convention Update**: Spawn prewarm uses `Spawn.lvpwarm`; player state uses `playerdata/*.lvplayer`.
+- **Legacy Path Isolation**: Runtime paths no longer depend on legacy chunk/mesh `.bin` artifacts for vNext worlds.
+- **Growth Guardrails**: Added world-size budget/compaction groundwork for long-term save health.
+
+### 🎨 Rendering and Visual Fidelity
+- **Transparency Pipeline Fixes**: Improved cutout/blended routing to reduce xray-like transparency artifacts.
+- **Glass + Leaves Pass**: Better glass readability and foliage transparency behavior across world and held-item rendering.
+- **Connected Visuals**: Glass seam behavior was refined for cleaner multi-block panels.
+
+### 👁️ VeilSeer and First-Person UX
+- **VeilSeer Functionality**: Spectate/no-clip behavior and mode-specific controls were hardened.
+- **Control Feedback**: Added clearer fly-speed interaction cues and updated in-game controls/help messaging.
+- **HUD Behavior**: VeilSeer HUD presentation was cleaned up while preserving inventory persistence.
+
+### 🎒 Inventory and Command UX
+- **Artificer Catalog Upgrade**: Added smooth scroll flow, search, favorites tooling, and clear-inventory controls.
+- **Search/Interaction Polish**: Improved focus behavior, text editing ergonomics, and catalog usability.
+- **Give Command Improvements**: `/give` token resolution and autocomplete now better support named block lookup.
+- **Naming Consistency**: Ore naming and command-facing identifiers were normalized.
+
+### 🌐 Multiplayer and Contract Alignment
+- **World Contract Consistency**: World type/generator expectations are enforced more strictly across host/join paths.
+- **Session Reliability**: Multiplayer world-state handling remains aligned with vNext storage/generation assumptions.
+
+### ⚠️ Compatibility Notes
+- This release intentionally includes breaking-format behavior in worldgen/storage paths.
+- Legacy world artifacts are treated as non-vNext and may require regeneration/migration strategy.
+
+---
+
 ## v9.0.0 - "Gatekeeper's Fix" - 2026-02-21
 
 ### 🚀 Major Online System Overhaul

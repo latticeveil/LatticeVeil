@@ -12,13 +12,17 @@ public sealed class PlayerController
     private const float Gravity = -25f;
     private const float JumpSpeed = 8f;
     private const float WalkSpeed = 6f * Scale.BlockSize;
-    private const float FlySpeed = 18f * Scale.BlockSize;
+    private const float BaseFlySpeed = 18f * Scale.BlockSize;
+    private const float MinFlySpeedMultiplier = 0.35f;
+    private const float MaxFlySpeedMultiplier = 3.00f;
+    private const float FlySpeedAdjustStep = 0.10f;
     private const double DoubleTapSeconds = 0.30;
     private const float Eps = 0.001f;
 
     private double _lastSpaceTapTime;
     private Vector3 _moveIntent;
     private float _swayAccumulator;
+    private float _flySpeedMultiplier = 1.0f;
 
     public Vector3 Position { get; set; } = new(8f, 6f, -12f);
     public Vector3 Velocity { get; set; }
@@ -28,6 +32,12 @@ public sealed class PlayerController
     public bool IsFlying { get; private set; }
     public Vector3 MoveIntent => _moveIntent;
     public bool AllowFlying { get; set; } = true;
+    public bool NoClipEnabled { get; set; }
+    public float FlySpeedMultiplier => _flySpeedMultiplier;
+    public float FlySpeedMinMultiplier => MinFlySpeedMultiplier;
+    public float FlySpeedMaxMultiplier => MaxFlySpeedMultiplier;
+    public float FlySpeedNormalized => (_flySpeedMultiplier - MinFlySpeedMultiplier) / (MaxFlySpeedMultiplier - MinFlySpeedMultiplier);
+    public float CurrentFlySpeed => BaseFlySpeed * _flySpeedMultiplier;
 
     public const float ColliderHalfWidth = HalfWidth;
     public const float ColliderHeight = Height;
@@ -36,6 +46,19 @@ public sealed class PlayerController
     {
         IsFlying = value;
         Velocity = Vector3.Zero;
+    }
+
+    public bool AdjustFlySpeedMultiplier(int wheelStep)
+    {
+        if (wheelStep == 0)
+            return false;
+
+        var next = Math.Clamp(_flySpeedMultiplier + wheelStep * FlySpeedAdjustStep, MinFlySpeedMultiplier, MaxFlySpeedMultiplier);
+        if (MathF.Abs(next - _flySpeedMultiplier) < 0.0001f)
+            return false;
+
+        _flySpeedMultiplier = next;
+        return true;
     }
 
     public Vector3 HeadOffset
@@ -79,9 +102,15 @@ public sealed class PlayerController
         var delta = input.LookDelta;
         if (delta.X != 0f || delta.Y != 0f)
         {
+            // Apply delta first
             Yaw += delta.X;
             Pitch -= delta.Y;
+            
+            // Clamp pitch AFTER applying delta
             Pitch = Math.Clamp(Pitch, -1.4f, 1.4f);
+            
+            // Normalize yaw to prevent precision issues over time
+            Yaw = MathHelper.WrapAngle(Yaw);
         }
     }
 
@@ -115,7 +144,7 @@ public sealed class PlayerController
         if (moveXZ != Vector3.Zero)
             moveXZ.Normalize();
 
-        var speed = IsFlying ? FlySpeed : WalkSpeed;
+        var speed = IsFlying ? CurrentFlySpeed : WalkSpeed;
 
         if (IsFlying)
         {
@@ -126,6 +155,15 @@ public sealed class PlayerController
             var move = new Vector3(moveXZ.X, vertical, moveXZ.Z);
             if (move.LengthSquared() > 1f)
                 move.Normalize();
+
+            if (NoClipEnabled)
+            {
+                Position += move * speed * dt;
+                Velocity = Vector3.Zero;
+                IsGrounded = false;
+                _moveIntent = move;
+                return;
+            }
 
             var flyVel = move * speed;
             MoveWithCollisions(ref flyVel, dt, getBlock);

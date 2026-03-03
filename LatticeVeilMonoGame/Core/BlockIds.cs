@@ -11,18 +11,23 @@ public static class BlockIds
     public const byte Wood = 6;
     public const byte Leaves = 7;
     public const byte Chest = 10;
-    public const byte Coal = 11;
-    public const byte Iron = 12;
+    public const byte CoalOre = 11;
+    public const byte Coal = CoalOre;
+    public const byte IronOre = 12;
+    public const byte Iron = IronOre;
     public const byte ArtificerBench = 13;
     public const byte ArtificersWorkbench = ArtificerBench;
     public const byte CraftingTable = ArtificerBench;
     public const byte Glass = 14;
     public const byte Nullrock = 15;
+    // Back-compat alias (older code uses different casing)
+    public const byte NullRock = Nullrock;
     public const byte Nullblock = Nullrock;
     public const byte Corestone = Nullrock;
     public const byte Gravel = 16;
     public const byte Plank = 17;
     public const byte Gold = 18;
+    public const byte GoldOre = Gold;
     public const byte Diamond = 19;
     public const byte Runestone = 20;
     public const byte Veinstone = 21;

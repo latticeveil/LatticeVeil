@@ -41,7 +41,7 @@ public static class JoinedWorldCache
             return SanitizeId(raw);
 
         var fallback =
-            $"{info.Seed}|{info.Width}|{info.Height}|{info.Depth}|{(int)info.GameMode}|{(info.PlayerCollision ? 1 : 0)}";
+            $"{info.Seed}|{info.Width}|{info.Height}|{info.Depth}|{(int)info.GameMode}|{(info.PlayerCollision ? 1 : 0)}|{WorldMeta.CanonicalWorldType(info.WorldType)}|{info.Generator}";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(fallback));
         return Convert.ToHexString(hash).ToLowerInvariant();
     }

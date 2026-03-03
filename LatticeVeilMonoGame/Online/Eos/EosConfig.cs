@@ -14,7 +14,7 @@ internal static class EosPublicDefaults
     public const string DeploymentId = "843fd58fa18545eaa1a7c8232eb7522b";
     public const string ClientId = "xyza7891M5Mc8NNr3Bln7pSpVXN7252e";
     public const string ProductName = "RedactedCraft";
-    public const string ProductVersion = "9.0.0";
+    public const string ProductVersion = "10.0.0";
 }
 
 public sealed class EosConfig
@@ -30,7 +30,7 @@ public sealed class EosConfig
 
     private const string AppDataVendorFolder = "RedactedCraft";
     private const string DefaultProductName = "RedactedCraft";
-    private const string DefaultProductVersion = "9.0.0";
+    private const string DefaultProductVersion = "10.0.0";
     private const string DefaultLoginMode = "deviceid";
 
     public string ProductId { get; set; } = string.Empty;

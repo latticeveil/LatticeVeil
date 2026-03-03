@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace LatticeVeilMonoGame.Core;
@@ -16,11 +17,17 @@ public sealed class Inventory
     public const int GridRows = 3;
     public const int GridSize = GridCols * GridRows;
     private const int DefaultStackSize = 60;
+    private static readonly string[] EmptySearchTerms = Array.Empty<string>();
+
     private readonly HotbarSlot[] _hotbar = new HotbarSlot[HotbarSize];
     private readonly HotbarSlot[] _grid = new HotbarSlot[GridSize];
     private readonly HotbarSlot[] _sandboxCatalogSlots = new HotbarSlot[GridSize];
+    private readonly List<int> _sandboxCatalogFilteredIndices = new();
+    private readonly HashSet<BlockId> _sandboxCatalogFavorites = new();
     private bool _sandboxCatalogBuilt;
-    private int _sandboxCatalogPage;
+    private string _sandboxCatalogSearchQuery = string.Empty;
+    private bool _sandboxCatalogFavoritesOnly;
+    private string[] _sandboxCatalogSearchTerms = EmptySearchTerms;
     private static BlockId[]? _sandboxCatalogEntriesCache;
 
     public GameMode Mode { get; private set; } = GameMode.Artificer;
@@ -29,22 +36,18 @@ public sealed class Inventory
 
     public HotbarSlot[] Hotbar => _hotbar;
     public HotbarSlot[] Grid => _grid;
+
+    // Compatibility snapshot only; active Artificer catalog rendering uses filtered list APIs.
     public HotbarSlot[] SandboxCatalogSlots => _sandboxCatalogSlots;
 
     public BlockId SelectedId => _hotbar[SelectedIndex].Id;
 
     public int SelectedCount => _hotbar[SelectedIndex].Count;
 
-    public int SandboxCatalogPage => _sandboxCatalogPage + 1;
-
-    public int SandboxCatalogPageCount
-    {
-        get
-        {
-            var total = GetSandboxCatalogEntries().Length;
-            return Math.Max(1, (int)Math.Ceiling(total / (double)GridSize));
-        }
-    }
+    public int SandboxCatalogPage => 1;
+    public int SandboxCatalogPageCount => 1;
+    public string SandboxCatalogSearchQuery => _sandboxCatalogSearchQuery;
+    public bool SandboxCatalogFavoritesOnly => _sandboxCatalogFavoritesOnly;
 
     public void SetMode(GameMode mode)
     {
@@ -55,23 +58,115 @@ public sealed class Inventory
 
     public bool TryAdvanceSandboxCatalogPage(int delta)
     {
-        if (Mode != GameMode.Artificer)
+        _ = delta;
+        return false;
+    }
+
+    public void SetSandboxCatalogSearchQuery(string query)
+    {
+        var normalized = NormalizeSearchQuery(query);
+        if (string.Equals(_sandboxCatalogSearchQuery, normalized, StringComparison.Ordinal))
+            return;
+
+        _sandboxCatalogSearchQuery = normalized;
+        _sandboxCatalogSearchTerms = BuildSearchTerms(normalized);
+        RebuildSandboxCatalogFilteredEntries();
+    }
+
+    public void ClearSandboxCatalogSearchQuery()
+    {
+        SetSandboxCatalogSearchQuery(string.Empty);
+    }
+
+    public void SetSandboxCatalogFavoritesOnly(bool enabled)
+    {
+        if (_sandboxCatalogFavoritesOnly == enabled)
+            return;
+
+        _sandboxCatalogFavoritesOnly = enabled;
+        RebuildSandboxCatalogFilteredEntries();
+    }
+
+    public bool ToggleSandboxCatalogFavorite(int blockId)
+    {
+        if (!TryConvertCatalogBlockId(blockId, out var parsed))
             return false;
 
-        var pageCount = SandboxCatalogPageCount;
-        if (pageCount <= 1)
+        var changed = _sandboxCatalogFavorites.Remove(parsed);
+        if (!changed)
+            changed = _sandboxCatalogFavorites.Add(parsed);
+
+        if (changed)
+            RebuildSandboxCatalogFilteredEntries();
+
+        return changed;
+    }
+
+    public bool IsSandboxCatalogFavorite(int blockId)
+    {
+        if (!TryConvertCatalogBlockId(blockId, out var parsed))
             return false;
 
-        var next = (_sandboxCatalogPage + delta) % pageCount;
-        if (next < 0)
-            next += pageCount;
+        return _sandboxCatalogFavorites.Contains(parsed);
+    }
 
-        if (next == _sandboxCatalogPage && _sandboxCatalogBuilt)
-            return false;
+    public void SetSandboxCatalogFavorites(IEnumerable<int>? favoriteBlockIds)
+    {
+        _sandboxCatalogFavorites.Clear();
+        if (favoriteBlockIds != null)
+        {
+            foreach (var id in favoriteBlockIds)
+            {
+                if (!TryConvertCatalogBlockId(id, out var parsed))
+                    continue;
 
-        _sandboxCatalogPage = next;
-        RebuildSandboxCatalog();
-        return true;
+                _sandboxCatalogFavorites.Add(parsed);
+            }
+        }
+
+        RebuildSandboxCatalogFilteredEntries();
+    }
+
+    public int[] GetSandboxCatalogFavoriteBlockIds()
+    {
+        EnsureSandboxCatalog();
+        if (_sandboxCatalogFavorites.Count == 0)
+            return Array.Empty<int>();
+
+        var all = GetSandboxCatalogEntries();
+        var output = new List<int>(_sandboxCatalogFavorites.Count);
+        for (var i = 0; i < all.Length; i++)
+        {
+            if (_sandboxCatalogFavorites.Contains(all[i]))
+                output.Add((int)all[i]);
+        }
+
+        return output.ToArray();
+    }
+
+    public int GetSandboxCatalogFilteredCount()
+    {
+        EnsureSandboxCatalog();
+        return _sandboxCatalogFilteredIndices.Count;
+    }
+
+    public int GetSandboxCatalogTotalCount()
+    {
+        return GetSandboxCatalogEntries().Length;
+    }
+
+    public HotbarSlot GetSandboxCatalogFilteredEntryAt(int filteredIndex)
+    {
+        EnsureSandboxCatalog();
+        if (filteredIndex < 0 || filteredIndex >= _sandboxCatalogFilteredIndices.Count)
+            return default;
+
+        var all = GetSandboxCatalogEntries();
+        var sourceIndex = _sandboxCatalogFilteredIndices[filteredIndex];
+        if (sourceIndex < 0 || sourceIndex >= all.Length)
+            return default;
+
+        return new HotbarSlot { Id = all[sourceIndex], Count = 1 };
     }
 
     public void Select(int index)
@@ -240,7 +335,7 @@ public sealed class Inventory
     }
 
     // Tool IDs: stack size = 1. Locked names: Excavator, Shovel, Woodcutter (add when item IDs exist).
-    private static readonly System.Collections.Generic.HashSet<BlockId> ToolIds = new()
+    private static readonly HashSet<BlockId> ToolIds = new()
     {
         BlockId.CinderbranchStaff,
         BlockId.StormreedStaff
@@ -251,28 +346,116 @@ public sealed class Inventory
         if (_sandboxCatalogBuilt)
             return;
 
-        RebuildSandboxCatalog();
+        RebuildSandboxCatalogFilteredEntries();
         _sandboxCatalogBuilt = true;
     }
 
-    private void RebuildSandboxCatalog()
+    private void RebuildSandboxCatalogFilteredEntries()
     {
         var all = GetSandboxCatalogEntries();
-        var pageStart = _sandboxCatalogPage * _sandboxCatalogSlots.Length;
+        _sandboxCatalogFilteredIndices.Clear();
+
+        var favoriteMatches = new List<int>();
+        var standardMatches = new List<int>();
+
+        for (var sourceIndex = 0; sourceIndex < all.Length; sourceIndex++)
+        {
+            var id = all[sourceIndex];
+            var isFavorite = _sandboxCatalogFavorites.Contains(id);
+            if (_sandboxCatalogFavoritesOnly && !isFavorite)
+                continue;
+
+            if (!MatchesCatalogSearch(id, _sandboxCatalogSearchTerms))
+                continue;
+
+            if (isFavorite)
+                favoriteMatches.Add(sourceIndex);
+            else
+                standardMatches.Add(sourceIndex);
+        }
+
+        _sandboxCatalogFilteredIndices.AddRange(favoriteMatches);
+        _sandboxCatalogFilteredIndices.AddRange(standardMatches);
+        RebuildSandboxCatalogSlotPreview(all);
+    }
+
+    private void RebuildSandboxCatalogSlotPreview(BlockId[] allEntries)
+    {
         for (var i = 0; i < _sandboxCatalogSlots.Length; i++)
         {
-            var source = pageStart + i;
-            if (source >= 0 && source < all.Length)
+            if (i >= _sandboxCatalogFilteredIndices.Count)
             {
-                _sandboxCatalogSlots[i].Id = all[source];
-                _sandboxCatalogSlots[i].Count = 1;
+                _sandboxCatalogSlots[i] = default;
+                continue;
             }
-            else
+
+            var sourceIndex = _sandboxCatalogFilteredIndices[i];
+            if (sourceIndex < 0 || sourceIndex >= allEntries.Length)
             {
-                _sandboxCatalogSlots[i].Id = BlockId.Air;
-                _sandboxCatalogSlots[i].Count = 0;
+                _sandboxCatalogSlots[i] = default;
+                continue;
             }
+
+            _sandboxCatalogSlots[i].Id = allEntries[sourceIndex];
+            _sandboxCatalogSlots[i].Count = 1;
         }
+    }
+
+    private static string NormalizeSearchQuery(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return string.Empty;
+
+        return string.Join(' ', query.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static string[] BuildSearchTerms(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return EmptySearchTerms;
+
+        return query
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Select(term => term.Trim().ToLowerInvariant())
+            .Where(term => term.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static bool MatchesCatalogSearch(BlockId id, string[] terms)
+    {
+        if (terms == null || terms.Length == 0)
+            return true;
+
+        var def = BlockRegistry.Get(id);
+        var name = def.Name.ToLowerInvariant();
+        var token = id.ToString().ToLowerInvariant();
+        var texture = (def.TextureName ?? string.Empty).ToLowerInvariant();
+
+        for (var i = 0; i < terms.Length; i++)
+        {
+            var term = terms[i];
+            if (name.Contains(term, StringComparison.Ordinal))
+                continue;
+            if (token.Contains(term, StringComparison.Ordinal))
+                continue;
+            if (texture.Contains(term, StringComparison.Ordinal))
+                continue;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryConvertCatalogBlockId(int rawValue, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+        if (rawValue <= 0 || rawValue > byte.MaxValue)
+            return false;
+
+        blockId = (BlockId)rawValue;
+        var def = BlockRegistry.Get(blockId);
+        return def.Id == blockId && def.IsVisibleInInventory;
     }
 
     private static BlockId[] GetSandboxCatalogEntries()
@@ -281,7 +464,7 @@ public sealed class Inventory
             return _sandboxCatalogEntriesCache;
 
         _sandboxCatalogEntriesCache = BlockRegistry.All
-            .Where(def => def.Id != BlockId.Air)
+            .Where(def => def.Id != BlockId.Air && def.IsVisibleInInventory)
             .OrderBy(def => def.AtlasIndex)
             .Select(def => def.Id)
             .ToArray();
@@ -308,7 +491,7 @@ public sealed class Inventory
             return;
 
         Array.Copy(data, _hotbar, HotbarSize);
-        
+
         // Clamp selected index to valid range
         if (SelectedIndex >= HotbarSize)
             SelectedIndex = HotbarSize - 1;

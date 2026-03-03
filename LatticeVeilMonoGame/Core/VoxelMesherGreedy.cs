@@ -10,13 +10,17 @@ public static class VoxelMesherGreedy
     public static ChunkMesh BuildChunkMesh(VoxelWorld world, VoxelChunkData chunk, CubeNetAtlas atlas, Logger log)
     {
         // Normal mesh with full greedy optimization
-        return BuildChunkMeshInternal(chunk, atlas, log, useGreedyOptimization: true, world.GetBlock);
+        // Wrap in a lambda so we stay compatible even if the world's GetBlock return type changes.
+        byte GetBlockCompat(int wx, int wy, int wz) => (byte)world.GetBlock(wx, wy, wz);
+        return BuildChunkMeshInternal(chunk, atlas, log, useGreedyOptimization: true, GetBlockCompat);
     }
 
     public static ChunkMesh BuildChunkMeshFast(VoxelWorld world, VoxelChunkData chunk, CubeNetAtlas atlas, Logger log)
     {
         // C) Fast mesh - no greedy merge, no neighbor dependency
-        return BuildChunkMeshInternal(chunk, atlas, log, useGreedyOptimization: false, world.GetBlock);
+        // Wrap in a lambda so we stay compatible even if the world's GetBlock return type changes.
+        byte GetBlockCompat(int wx, int wy, int wz) => (byte)world.GetBlock(wx, wy, wz);
+        return BuildChunkMeshInternal(chunk, atlas, log, useGreedyOptimization: false, GetBlockCompat);
     }
 
     /// <summary>
@@ -44,7 +48,7 @@ public static class VoxelMesherGreedy
             if ((uint)lx < sizeX && (uint)ly < sizeY && (uint)lz < sizeZ)
                 return localBlocks[lx, ly, lz];
 
-            return world.GetBlock(wx, wy, wz);
+            return (byte)world.GetBlock(wx, wy, wz);
         }
 
         // Keep priority path fast (no greedy merge) but geometry-identical to normal meshing.
@@ -54,6 +58,7 @@ public static class VoxelMesherGreedy
     private static ChunkMesh BuildChunkMeshInternal(VoxelChunkData chunk, CubeNetAtlas atlas, Logger log, bool useGreedyOptimization, Func<int, int, int, byte> getBlock)
     {
         var opaque = new List<VertexPositionTexture>();
+        var cutout = new List<VertexPositionTexture>();
         var transparent = new List<VertexPositionTexture>();
         var water = new List<VertexPositionTexture>();
 
@@ -95,7 +100,7 @@ public static class VoxelMesherGreedy
 
                         var a = getBlock(ax, ay, az);
                         var b = getBlock(bx, by, bz);
-                        mask[n++] = BuildMaskCell(a, b, d, atlas);
+                        mask[n++] = BuildMaskCell(a, b, d);
                     }
                 }
 
@@ -113,9 +118,13 @@ public static class VoxelMesherGreedy
                             continue;
                         }
 
-                        // C) FAST-FIRST MESHING - Skip greedy optimization for fast path
+                        // C) FAST-FIRST MESHING - Skip greedy optimization for fast path.
+                        // Connected-texture blocks also avoid merge so per-tile edge masking
+                        // can remove interior seams in any layout/shape.
                         int w, h;
-                        if (useGreedyOptimization)
+                        var useConnectedTexture = BlockRegistry.UsesConnectedTexture(cell.BlockId);
+                        var allowMerge = useGreedyOptimization && !useConnectedTexture;
+                        if (allowMerge)
                         {
                             // Normal greedy optimization
                             w = 1;
@@ -161,11 +170,38 @@ public static class VoxelMesherGreedy
                         atlas.GetFaceUvRect(cell.BlockId, cell.Face, out var uv00, out var uv10, out var uv11, out var uv01);
                         AdjustFaceUvs(cell.Face, ref uv00, ref uv10, ref uv11, ref uv01);
                         List<VertexPositionTexture> list;
-                        if (cell.BlockId == BlockIds.Water)
+                        if (cell.RenderLayer == BlockRenderLayer.Water)
                             list = water;
+                        else if (cell.RenderLayer == BlockRenderLayer.Cutout)
+                            list = cutout;
+                        else if (cell.RenderLayer == BlockRenderLayer.Blended)
+                            list = transparent;
                         else
-                            list = cell.Transparent ? transparent : opaque;
-                        AddTiledQuad(list, originX, originY, originZ, px, py, pz, u, v, w, h, bs, uv00, uv10, uv11, uv01, IsBackFace(cell.Face));
+                            list = opaque;
+                        AddTiledQuad(
+                            list,
+                            originX,
+                            originY,
+                            originZ,
+                            px,
+                            py,
+                            pz,
+                            u,
+                            v,
+                            w,
+                            h,
+                            bs,
+                            uv00,
+                            uv10,
+                            uv11,
+                            uv01,
+                            IsBackFace(cell.Face),
+                            useConnectedTexture,
+                            cell.BlockId,
+                            cell.Face,
+                            getBlock,
+                            atlas.Texture.Width,
+                            atlas.Texture.Height);
 
                         for (var y = 0; y < h; y++)
                         {
@@ -179,11 +215,11 @@ public static class VoxelMesherGreedy
             }
         }
 
-        AppendCustomModels(chunk, atlas, log, originX, originY, originZ, bs, opaque, transparent);
+        AppendCustomModels(chunk, atlas, log, originX, originY, originZ, bs, opaque, cutout, transparent);
 
         var min = new Vector3(originX * bs, originY * bs, originZ * bs);
         var max = min + new Vector3(sizeX * bs, sizeY * bs, sizeZ * bs);
-        return new ChunkMesh(chunk.Coord, opaque.ToArray(), transparent.ToArray(), water.ToArray(), new BoundingBox(min, max));
+        return new ChunkMesh(chunk.Coord, opaque.ToArray(), cutout.ToArray(), transparent.ToArray(), water.ToArray(), new BoundingBox(min, max));
     }
 
     private static void AppendCustomModels(
@@ -195,6 +231,7 @@ public static class VoxelMesherGreedy
         int originZ,
         float blockSize,
         List<VertexPositionTexture> opaque,
+        List<VertexPositionTexture> cutout,
         List<VertexPositionTexture> transparent)
     {
         var cache = new Dictionary<byte, VertexPositionTexture[]>();
@@ -229,7 +266,12 @@ public static class VoxelMesherGreedy
                         (originY + y) * blockSize,
                         (originZ + z) * blockSize) + centerOffset;
 
-                    var target = def.IsTransparent ? transparent : opaque;
+                    var target = def.RenderLayer switch
+                    {
+                        BlockRenderLayer.Cutout => cutout,
+                        BlockRenderLayer.Blended => transparent,
+                        _ => opaque
+                    };
                     for (var i = 0; i < mesh.Length; i++)
                     {
                         var v = mesh[i];
@@ -240,7 +282,7 @@ public static class VoxelMesherGreedy
         }
     }
 
-    private static MaskCell BuildMaskCell(byte a, byte b, int axis, CubeNetAtlas atlas)
+    private static MaskCell BuildMaskCell(byte a, byte b, int axis)
     {
         var aDef = BlockRegistry.Get(a);
         var bDef = BlockRegistry.Get(b);
@@ -251,29 +293,58 @@ public static class VoxelMesherGreedy
         if (!aFilled && !bFilled)
             return default;
 
-        var aTransparent = aFilled && atlas.IsTransparent(a);
-        var bTransparent = bFilled && atlas.IsTransparent(b);
+        var aLayer = aFilled ? aDef.RenderLayer : BlockRenderLayer.Opaque;
+        var bLayer = bFilled ? bDef.RenderLayer : BlockRenderLayer.Opaque;
 
         if (aFilled && !bFilled)
-            return new MaskCell(a, FaceDirPos(axis), aTransparent);
+            return new MaskCell(a, FaceDirPos(axis), aLayer);
 
         if (!aFilled && bFilled)
-            return new MaskCell(b, FaceDirNeg(axis), bTransparent);
+            return new MaskCell(b, FaceDirNeg(axis), bLayer);
 
         if (a == b)
             return default;
 
-        if (aTransparent && !bTransparent)
-            return new MaskCell(a, FaceDirPos(axis), aTransparent);
+        var aOpaque = aLayer == BlockRenderLayer.Opaque;
+        var bOpaque = bLayer == BlockRenderLayer.Opaque;
 
-        if (!aTransparent && bTransparent)
-            return new MaskCell(b, FaceDirNeg(axis), bTransparent);
+        if (aOpaque && bOpaque)
+            return default;
 
-        if (aTransparent && bTransparent)
-            return new MaskCell(a, FaceDirPos(axis), aTransparent);
+        // Keep opaque boundary faces owned by the opaque side so transparent
+        // neighbors do not punch unintended holes into terrain.
+        if (aOpaque && !bOpaque)
+            return new MaskCell(a, FaceDirPos(axis), aLayer);
 
-        return default;
+        if (!aOpaque && bOpaque)
+            return new MaskCell(b, FaceDirNeg(axis), bLayer);
+
+        if (aLayer == bLayer)
+        {
+            if (a <= b)
+                return new MaskCell(a, FaceDirPos(axis), aLayer);
+            return new MaskCell(b, FaceDirNeg(axis), bLayer);
+        }
+
+        var aPriority = GetNonOpaquePriority(aLayer);
+        var bPriority = GetNonOpaquePriority(bLayer);
+        if (aPriority > bPriority)
+            return new MaskCell(a, FaceDirPos(axis), aLayer);
+        if (bPriority > aPriority)
+            return new MaskCell(b, FaceDirNeg(axis), bLayer);
+
+        if (a <= b)
+            return new MaskCell(a, FaceDirPos(axis), aLayer);
+        return new MaskCell(b, FaceDirNeg(axis), bLayer);
     }
+
+    private static int GetNonOpaquePriority(BlockRenderLayer layer) => layer switch
+    {
+        BlockRenderLayer.Cutout => 3,
+        BlockRenderLayer.Blended => 2,
+        BlockRenderLayer.Water => 1,
+        _ => 0
+    };
 
     private static FaceDirection FaceDirPos(int axis) => axis switch
     {
@@ -294,7 +365,30 @@ public static class VoxelMesherGreedy
         return face == FaceDirection.NegX || face == FaceDirection.NegY || face == FaceDirection.NegZ;
     }
 
-    private static void AddTiledQuad(List<VertexPositionTexture> verts, int originX, int originY, int originZ, int px, int py, int pz, int u, int v, int w, int h, float bs, Vector2 uv00, Vector2 uv10, Vector2 uv11, Vector2 uv01, bool flip)
+    private static void AddTiledQuad(
+        List<VertexPositionTexture> verts,
+        int originX,
+        int originY,
+        int originZ,
+        int px,
+        int py,
+        int pz,
+        int u,
+        int v,
+        int w,
+        int h,
+        float bs,
+        Vector2 uv00,
+        Vector2 uv10,
+        Vector2 uv11,
+        Vector2 uv01,
+        bool flip,
+        bool useConnectedTexture,
+        byte connectedBlockId,
+        FaceDirection face,
+        Func<int, int, int, byte> getBlock,
+        int atlasWidth,
+        int atlasHeight)
     {
         var stepUx = u == 0 ? 1 : 0;
         var stepUy = u == 1 ? 1 : 0;
@@ -316,10 +410,128 @@ public static class VoxelMesherGreedy
                 var p1 = new Vector3((originX + x + stepUx) * bs, (originY + y + stepUy) * bs, (originZ + z + stepUz) * bs);
                 var p2 = new Vector3((originX + x + stepUx + stepVx) * bs, (originY + y + stepUy + stepVy) * bs, (originZ + z + stepUz + stepVz) * bs);
                 var p3 = new Vector3((originX + x + stepVx) * bs, (originY + y + stepVy) * bs, (originZ + z + stepVz) * bs);
+                var tileUv00 = uv00;
+                var tileUv10 = uv10;
+                var tileUv11 = uv11;
+                var tileUv01 = uv01;
 
-                AddQuad(verts, p0, p1, p2, p3, uv00, uv10, uv11, uv01, flip);
+                if (useConnectedTexture)
+                {
+                    var faceWorldX = originX + x;
+                    var faceWorldY = originY + y;
+                    var faceWorldZ = originZ + z;
+                    GetFaceOwnerBlock(faceWorldX, faceWorldY, faceWorldZ, face, out var ownerX, out var ownerY, out var ownerZ);
+
+                    var left = getBlock(ownerX - stepUx, ownerY - stepUy, ownerZ - stepUz);
+                    var right = getBlock(ownerX + stepUx, ownerY + stepUy, ownerZ + stepUz);
+                    var top = getBlock(ownerX - stepVx, ownerY - stepVy, ownerZ - stepVz);
+                    var bottom = getBlock(ownerX + stepVx, ownerY + stepVy, ownerZ + stepVz);
+
+                    var hideLeft = CanSeamlesslyConnect(connectedBlockId, left);
+                    var hideRight = CanSeamlesslyConnect(connectedBlockId, right);
+                    var hideTop = CanSeamlesslyConnect(connectedBlockId, top);
+                    var hideBottom = CanSeamlesslyConnect(connectedBlockId, bottom);
+
+                    ApplyConnectedTextureInsets(
+                        ref tileUv00,
+                        ref tileUv10,
+                        ref tileUv11,
+                        ref tileUv01,
+                        hideLeft,
+                        hideRight,
+                        hideTop,
+                        hideBottom,
+                        1f / atlasWidth,
+                        1f / atlasHeight);
+                }
+
+                AddQuad(verts, p0, p1, p2, p3, tileUv00, tileUv10, tileUv11, tileUv01, flip);
             }
         }
+    }
+
+    private static bool CanSeamlesslyConnect(byte currentId, byte neighborId)
+    {
+        if (neighborId == BlockIds.Air)
+            return false;
+        if (!BlockRegistry.UsesConnectedTexture(neighborId))
+            return false;
+
+        var current = BlockRegistry.Get(currentId);
+        var neighbor = BlockRegistry.Get(neighborId);
+        return current.RenderLayer == neighbor.RenderLayer;
+    }
+
+    private static void GetFaceOwnerBlock(int faceX, int faceY, int faceZ, FaceDirection face, out int blockX, out int blockY, out int blockZ)
+    {
+        blockX = faceX;
+        blockY = faceY;
+        blockZ = faceZ;
+        switch (face)
+        {
+            case FaceDirection.PosX:
+                blockX--;
+                break;
+            case FaceDirection.PosY:
+                blockY--;
+                break;
+            case FaceDirection.PosZ:
+                blockZ--;
+                break;
+        }
+    }
+
+    private static void ApplyConnectedTextureInsets(
+        ref Vector2 uv00,
+        ref Vector2 uv10,
+        ref Vector2 uv11,
+        ref Vector2 uv01,
+        bool hideLeft,
+        bool hideRight,
+        bool hideTop,
+        bool hideBottom,
+        float uStep,
+        float vStep)
+    {
+        if (hideLeft)
+        {
+            uv00 = StepUvTowards(uv00, uv10, uStep, vStep);
+            uv01 = StepUvTowards(uv01, uv11, uStep, vStep);
+        }
+
+        if (hideRight)
+        {
+            uv10 = StepUvTowards(uv10, uv00, uStep, vStep);
+            uv11 = StepUvTowards(uv11, uv01, uStep, vStep);
+        }
+
+        if (hideTop)
+        {
+            uv00 = StepUvTowards(uv00, uv01, uStep, vStep);
+            uv10 = StepUvTowards(uv10, uv11, uStep, vStep);
+        }
+
+        if (hideBottom)
+        {
+            uv01 = StepUvTowards(uv01, uv00, uStep, vStep);
+            uv11 = StepUvTowards(uv11, uv10, uStep, vStep);
+        }
+    }
+
+    private static Vector2 StepUvTowards(Vector2 from, Vector2 to, float uStep, float vStep)
+    {
+        var dx = to.X - from.X;
+        var dy = to.Y - from.Y;
+        if (MathF.Abs(dx) >= MathF.Abs(dy))
+        {
+            if (dx == 0f)
+                return from;
+            return new Vector2(from.X + MathF.Sign(dx) * uStep, from.Y);
+        }
+
+        if (dy == 0f)
+            return from;
+        return new Vector2(from.X, from.Y + MathF.Sign(dy) * vStep);
     }
 
     private static void AddQuad(List<VertexPositionTexture> verts, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector2 uv00, Vector2 uv10, Vector2 uv11, Vector2 uv01, bool flip)
@@ -404,19 +616,19 @@ public static class VoxelMesherGreedy
         public readonly bool IsValid;
         public readonly byte BlockId;
         public readonly FaceDirection Face;
-        public readonly bool Transparent;
+        public readonly BlockRenderLayer RenderLayer;
 
-        public MaskCell(byte blockId, FaceDirection face, bool transparent)
+        public MaskCell(byte blockId, FaceDirection face, BlockRenderLayer renderLayer)
         {
             IsValid = true;
             BlockId = blockId;
             Face = face;
-            Transparent = transparent;
+            RenderLayer = renderLayer;
         }
 
         public bool SameAs(MaskCell other)
         {
-            return IsValid && other.IsValid && BlockId == other.BlockId && Face == other.Face && Transparent == other.Transparent;
+            return IsValid && other.IsValid && BlockId == other.BlockId && Face == other.Face && RenderLayer == other.RenderLayer;
         }
     }
 }

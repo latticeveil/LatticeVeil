@@ -135,14 +135,14 @@ namespace LatticeVeilMonoGame.Core
             log.Info($"  Stone: {stoneCount}");
             log.Info($"  Dirt: {dirtCount}");
             log.Info($"  Grass: {grassCount}");
-            log.Info($"  Nullrock (bedrock): {nullrockCount}");
+            log.Info($"  Nullrock (bottom unbreakable layer): {nullrockCount}");
             log.Info($"  Water: {waterCount}");
             log.Info($"  Trees (wood): {treeCount}");
             
-            // Verify we have bedrock at bottom
+            // Verify we have bottom unbreakable layer
             if (nullrockCount > 0)
             {
-                log.Info("✅ Nullrock bedrock layer detected");
+                log.Info("✅ Nullrock bottom layer detected");
             }
             
             // Verify we have terrain

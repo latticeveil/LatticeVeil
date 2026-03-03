@@ -25,6 +25,9 @@ namespace LatticeVeilMonoGame.Core
         private readonly byte[,,] _water;
         private readonly byte[,,] _metadata;
         
+        // Biome layer - 16x16 grid for XZ coordinates
+        private byte[] _biomeIdsXZ; // length 256 for 16x16
+        
         // Thread safety
         private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
         
@@ -79,6 +82,7 @@ namespace LatticeVeilMonoGame.Core
             _blocks = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
             _water = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
             _metadata = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
+            _biomeIdsXZ = new byte[256]; // 16x16 biome grid
             LastModified = DateTime.UtcNow;
             Version = 1;
         }
@@ -89,6 +93,7 @@ namespace LatticeVeilMonoGame.Core
             _blocks = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
             _water = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
             _metadata = new byte[ChunkSizeX, ChunkSizeY, ChunkSizeZ];
+            _biomeIdsXZ = new byte[256]; // 16x16 biome grid
             LastModified = DateTime.UtcNow;
             Version = 1;
         }
@@ -299,6 +304,18 @@ namespace LatticeVeilMonoGame.Core
                 _lock.ExitWriteLock();
             }
         }
+
+        // -----------------------------------------------------------------
+        // FAST GENERATION / MESHING PATHS (NO LOCKS, NO DIRTY MARKING)
+        //
+        // World generation creates a brand-new chunk that is not yet visible
+        // to other threads. Using per-voxel locks + MarkDirty() makes chunk
+        // generation take tens of seconds. These helpers are intentionally
+        // internal and must ONLY be used when the caller guarantees exclusive
+        // access to the chunk instance.
+        // -----------------------------------------------------------------
+        internal byte GetBlockRaw(int x, int y, int z) => _blocks[x, y, z];
+        internal void SetBlockRaw(int x, int y, int z, byte blockId) => _blocks[x, y, z] = blockId;
         
         /// <summary>
         /// Get water level at local coordinates (thread-safe)
@@ -630,6 +647,9 @@ namespace LatticeVeilMonoGame.Core
                     }
                 }
                 
+                // Copy biome layer
+                Array.Copy(_biomeIdsXZ, clone._biomeIdsXZ, 256);
+                
                 // Copy metadata
                 clone.IsDirty = IsDirty;
                 clone.NeedsSave = NeedsSave;
@@ -650,6 +670,103 @@ namespace LatticeVeilMonoGame.Core
         public void Dispose()
         {
             _lock?.Dispose();
+        }
+        
+        /// <summary>
+        /// Biome layer data (16x16 grid for XZ coordinates)
+        /// </summary>
+        public byte[] BiomeIdsXZ 
+        { 
+            get
+            {
+                _lock.EnterReadLock();
+                try
+                {
+                    return (byte[])_biomeIdsXZ.Clone();
+                }
+                finally
+                {
+                    _lock.ExitReadLock();
+                }
+            }
+            set
+            {
+                _lock.EnterWriteLock();
+                try
+                {
+                    _biomeIdsXZ = value?.Length == 256 ? (byte[])value.Clone() : new byte[256];
+                    MarkDirty();
+                }
+                finally
+                {
+                    _lock.ExitWriteLock();
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Get biome ID at local XZ coordinates
+        /// </summary>
+        public BiomeId GetBiomeLocal(int lx, int lz)
+        {
+            if (lx < 0 || lx >= ChunkSizeX || lz < 0 || lz >= ChunkSizeZ)
+                return BiomeId.Unknown;
+            
+            _lock.EnterReadLock();
+            try
+            {
+                var index = lz * ChunkSizeX + lx;
+                return (BiomeId)_biomeIdsXZ[index];
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+        }
+        
+        /// <summary>
+        /// Set biome ID at local XZ coordinates
+        /// </summary>
+        public void SetBiomeLocal(int lx, int lz, BiomeId biomeId)
+        {
+            if (lx < 0 || lx >= ChunkSizeX || lz < 0 || lz >= ChunkSizeZ)
+                return;
+            
+            _lock.EnterWriteLock();
+            try
+            {
+                var index = lz * ChunkSizeX + lx;
+                var newId = (byte)biomeId;
+                if (_biomeIdsXZ[index] != newId)
+                {
+                    _biomeIdsXZ[index] = newId;
+                    MarkDirty();
+                }
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
+        }
+        
+        /// <summary>
+        /// Get biome ID at world coordinates (if this chunk contains the position)
+        /// </summary>
+        public BiomeId GetBiomeWorld(int worldX, int worldZ)
+        {
+            var lx = worldX - Coord.X * ChunkSizeX;
+            var lz = worldZ - Coord.Z * ChunkSizeZ;
+            return GetBiomeLocal(lx, lz);
+        }
+        
+        /// <summary>
+        /// Set biome ID at world coordinates (if this chunk contains the position)
+        /// </summary>
+        public void SetBiomeWorld(int worldX, int worldZ, BiomeId biomeId)
+        {
+            var lx = worldX - Coord.X * ChunkSizeX;
+            var lz = worldZ - Coord.Z * ChunkSizeZ;
+            SetBiomeLocal(lx, lz, biomeId);
         }
     }
     

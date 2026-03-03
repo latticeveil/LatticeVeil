@@ -217,7 +217,9 @@ public static class WorldHostBootstrap
             Depth = meta.Size.Depth,
             Seed = meta.Seed,
             PlayerCollision = meta.PlayerCollision,
-            WorldId = meta.WorldId
+            WorldId = meta.WorldId,
+            WorldType = WorldMeta.CanonicalWorldType(meta.WorldGeneration?.WorldType),
+            Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration?.WorldType)
         };
     }
 

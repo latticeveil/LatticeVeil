@@ -50,6 +50,8 @@ public readonly struct LanWorldInfo
     public int Seed { get; init; }
     public bool PlayerCollision { get; init; }
     public string WorldId { get; init; }
+    public string WorldType { get; init; }
+    public string Generator { get; init; }
 }
 
 public readonly struct LanPlayerState
@@ -463,7 +465,7 @@ public sealed class LanHostSession : ILanSession
     private void SendInitialWorldData(ClientState client)
     {
         // Use snapshot to avoid enumeration modification crash
-        var chunkSnapshot = _world.AllChunks().ToArray();
+        var chunkSnapshot = _world.AllChunks.ToArray();
         
         foreach (var chunk in chunkSnapshot)
         {
@@ -641,6 +643,10 @@ public sealed class LanHostSession : ILanSession
                 bw.Write(info.Seed);
                 bw.Write(info.PlayerCollision);
                 bw.Write(info.WorldId ?? string.Empty);
+                bw.Write(WorldMeta.CanonicalWorldType(info.WorldType));
+                bw.Write(string.IsNullOrWhiteSpace(info.Generator)
+                    ? WorldMeta.CanonicalGeneratorForWorldType(info.WorldType)
+                    : info.Generator);
             });
         }
 
@@ -1223,21 +1229,39 @@ public static class LanReader
             case LanMessageType.Welcome:
                 return new LanMessage { Type = type, PlayerId = br.ReadInt32() };
             case LanMessageType.WorldInfo:
+            {
+                var worldName = br.ReadString();
+                var gameMode = (GameMode)br.ReadByte();
+                var width = br.ReadInt32();
+                var height = br.ReadInt32();
+                var depth = br.ReadInt32();
+                var seed = br.ReadInt32();
+                var playerCollision = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var worldId = br.BaseStream.Position < br.BaseStream.Length ? br.ReadString() : string.Empty;
+                var worldType = br.BaseStream.Position < br.BaseStream.Length ? br.ReadString() : "terrain";
+                var generator = br.BaseStream.Position < br.BaseStream.Length
+                    ? br.ReadString()
+                    : WorldMeta.CanonicalGeneratorForWorldType(worldType);
                 return new LanMessage
                 {
                     Type = type,
                     WorldInfo = new LanWorldInfo
                     {
-                        WorldName = br.ReadString(),
-                        GameMode = (GameMode)br.ReadByte(),
-                        Width = br.ReadInt32(),
-                        Height = br.ReadInt32(),
-                        Depth = br.ReadInt32(),
-                        Seed = br.ReadInt32(),
-                        PlayerCollision = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true,
-                        WorldId = br.BaseStream.Position < br.BaseStream.Length ? br.ReadString() : string.Empty
+                        WorldName = worldName,
+                        GameMode = gameMode,
+                        Width = width,
+                        Height = height,
+                        Depth = depth,
+                        Seed = seed,
+                        PlayerCollision = playerCollision,
+                        WorldId = worldId,
+                        WorldType = WorldMeta.CanonicalWorldType(worldType),
+                        Generator = string.IsNullOrWhiteSpace(generator)
+                            ? WorldMeta.CanonicalGeneratorForWorldType(worldType)
+                            : generator
                     }
                 };
+            }
             case LanMessageType.PlayerState:
                 return new LanMessage
                 {

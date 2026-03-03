@@ -948,6 +948,8 @@ public sealed class MultiplayerScreen : IScreen
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
+        meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(info.WorldType);
+        meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);
         meta.Save(metaPath, _log);
 
         _status = $"Connected to {hostName}!";
@@ -1015,8 +1017,10 @@ public sealed class MultiplayerScreen : IScreen
             switch (result.Status)
             {
                 case EosJoinApprovalStatus.Approved:
+                    // If the host approves quickly, proceed immediately so JOIN doesn't feel like "every other click".
                     SetJoinRequestState(joinKey, JoinRequestStateKind.Approved);
-                    _status = $"Join approved by {entry.HostName}. Click JOIN.";
+                    _status = $"Join approved by {entry.HostName}. Joining...";
+                    await JoinOnlineSessionAsync(entry);
                     break;
                 case EosJoinApprovalStatus.Pending:
                     SetJoinRequestState(joinKey, JoinRequestStateKind.Requested);
@@ -1340,6 +1344,8 @@ public sealed class MultiplayerScreen : IScreen
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
+        meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(info.WorldType);
+        meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);
         meta.Save(metaPath, _log);
 
         _status = $"Connected to {host}.";

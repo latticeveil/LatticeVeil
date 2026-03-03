@@ -334,6 +334,8 @@ public sealed class JoinByCodeScreen : IScreen
 
             meta.PlayerCollision = info.PlayerCollision;
             meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
+            meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(info.WorldType);
+            meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);
             meta.Save(metaPath, _log);
 
             _menus.Push(

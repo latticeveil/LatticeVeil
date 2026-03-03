@@ -17,12 +17,12 @@ public static class FileConventions
     /// <summary>
     /// Directory name for region files (chunk storage)
     /// </summary>
-    public const string RegionsDirName = "Regions";
+    public const string RegionsDirName = "regions";
     
     /// <summary>
-    /// Directory name for mesh cache files
+    /// Legacy mesh cache directory (runtime persistence disabled).
     /// </summary>
-    public const string MeshCacheDirName = "MeshCache";
+    public const string MeshCacheDirName = "meshcache";
     
     /// <summary>
     /// Directory name for player data files
@@ -39,9 +39,9 @@ public static class FileConventions
     // ================================
     
     /// <summary>
-    /// World metadata file name (future format)
+    /// World manifest file name (new format)
     /// </summary>
-    public const string LevelFileName = "level.lvc";
+    public const string WorldManifestFileName = "world.lvc";
     
     /// <summary>
     /// World state file name (future format)
@@ -59,6 +59,11 @@ public static class FileConventions
     public const string HistoryConfigFileName = "history.lvc";
     
     /// <summary>
+    /// Spawn prewarm manifest file name (vNext).
+    /// </summary>
+    public const string SpawnPrewarmFileName = "Spawn.lvpwarm";
+    
+    /// <summary>
     /// Console log file name (future format)
     /// </summary>
     public const string ConsoleLogFileName = "console.lvlog";
@@ -73,7 +78,7 @@ public static class FileConventions
     public const string RegionExtension = ".lvregion";
     
     /// <summary>
-    /// Mesh cache file extension (future format)
+    /// Mesh cache file extension (legacy planning constant)
     /// </summary>
     public const string MeshExtension = ".lvmesh";
     
@@ -92,13 +97,13 @@ public static class FileConventions
     // ================================
     
     /// <summary>
-    /// Gets the path to the future level.lvc file for a world
+    /// Gets the path to the world.lvc manifest file for a world
     /// </summary>
     /// <param name="worldPath">Base world directory path</param>
-    /// <returns>Full path to level.lvc</returns>
-    public static string GetFutureLevelPath(string worldPath)
+    /// <returns>Full path to world.lvc</returns>
+    public static string GetWorldManifestPath(string worldPath)
     {
-        return Path.Combine(worldPath, LevelFileName);
+        return Path.Combine(worldPath, WorldManifestFileName);
     }
     
     /// <summary>
@@ -179,5 +184,13 @@ public static class FileConventions
     public static string GetFutureConsoleLogPath(string worldPath)
     {
         return Path.Combine(worldPath, ConsoleLogFileName);
+    }
+
+    /// <summary>
+    /// Gets the path to the spawn prewarm manifest for a world.
+    /// </summary>
+    public static string GetSpawnPrewarmPath(string worldPath)
+    {
+        return Path.Combine(worldPath, SpawnPrewarmFileName);
     }
 }

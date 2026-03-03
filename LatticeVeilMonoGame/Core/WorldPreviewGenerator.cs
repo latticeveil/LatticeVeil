@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Threading;
 using DrawingColor = System.Drawing.Color;
 
 namespace LatticeVeilMonoGame.Core;
@@ -19,13 +20,25 @@ public static class WorldPreviewGenerator
         return Path.Combine(worldPath, PreviewFileName);
     }
 
-    public static void GenerateAndSave(WorldMeta meta, string worldPath, Logger log, int size = DefaultPreviewSize)
+    public static void GenerateAndSave(
+        WorldMeta meta,
+        string worldPath,
+        Logger log,
+        int size = DefaultPreviewSize,
+        CancellationToken cancellationToken = default)
     {
         var (centerX, centerZ) = GetDefaultCenter(meta);
-        GenerateAndSave(meta, worldPath, centerX, centerZ, log, size);
+        GenerateAndSave(meta, worldPath, centerX, centerZ, log, size, cancellationToken);
     }
 
-    public static void GenerateAndSave(WorldMeta meta, string worldPath, int centerX, int centerZ, Logger log, int size = DefaultPreviewSize)
+    public static void GenerateAndSave(
+        WorldMeta meta,
+        string worldPath,
+        int centerX,
+        int centerZ,
+        Logger log,
+        int size = DefaultPreviewSize,
+        CancellationToken cancellationToken = default)
     {
         if (meta == null || string.IsNullOrWhiteSpace(worldPath))
             return;
@@ -33,6 +46,7 @@ public static class WorldPreviewGenerator
         size = Math.Clamp(size, MinPreviewSize, MaxPreviewSize);
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             Directory.CreateDirectory(worldPath);
             var previewPath = GetPreviewPath(worldPath);
 
@@ -45,10 +59,13 @@ public static class WorldPreviewGenerator
 
             var maxY = Math.Max(1, meta.Size?.Height ?? VoxelChunkData.ChunkSizeY);
             var chunkCache = new Dictionary<ChunkCoord, VoxelChunkData?>();
-            var worldForBiomeFallback = new VoxelWorld(meta, worldPath, log);
+            using var worldForPreview = new VoxelWorld(meta, worldPath, log);
 
             for (int py = 0; py < size; py++)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(cancellationToken);
+
                 for (int px = 0; px < size; px++)
                 {
                     var wx = SampleWorldCoordinate(centerX, px, size);
@@ -56,14 +73,14 @@ public static class WorldPreviewGenerator
                     var wz = SampleWorldCoordinate(centerZ, size - 1 - py, size);
 
                     DrawingColor color;
-                    if (TryGetTopBlock(worldPath, wx, wz, maxY, chunkCache, out var topBlock, out var topY))
+                    if (TryGetTopBlock(worldForPreview, wx, wz, maxY, chunkCache, out var topBlock, out var topY))
                     {
                         color = ColorForBlock(topBlock);
                         color = ApplyElevationTint(color, topY, maxY);
                     }
                     else
                     {
-                        color = ColorForBiome(worldForBiomeFallback.GetBiomeNameAt(wx, wz));
+                        color = ColorForBiome(worldForPreview.GetBiomeNameAt(wx, wz));
                     }
 
                     bitmap.SetPixel(px, py, color);
@@ -77,6 +94,10 @@ public static class WorldPreviewGenerator
             }
 
             log.Info($"World preview updated: {previewPath} ({centerX}, {centerZ})");
+        }
+        catch (OperationCanceledException)
+        {
+            log.Info($"World preview generation canceled: {worldPath}");
         }
         catch (Exception ex)
         {
@@ -111,7 +132,7 @@ public static class WorldPreviewGenerator
     }
 
     private static bool TryGetTopBlock(
-        string worldPath,
+        VoxelWorld world,
         int wx,
         int wz,
         int maxY,
@@ -132,7 +153,7 @@ public static class WorldPreviewGenerator
             var cy = FloorDiv(wy, VoxelChunkData.ChunkSizeY);
             var ly = Mod(wy, VoxelChunkData.ChunkSizeY);
             var coord = new ChunkCoord(cx, cy, cz);
-            if (!TryGetChunk(worldPath, coord, chunkCache, out var chunk) || chunk == null)
+            if (!TryGetChunk(world, coord, chunkCache, out var chunk) || chunk == null)
                 continue;
 
             var id = chunk.GetLocal(lx, ly, lz);
@@ -148,7 +169,7 @@ public static class WorldPreviewGenerator
     }
 
     private static bool TryGetChunk(
-        string worldPath,
+        VoxelWorld world,
         ChunkCoord coord,
         Dictionary<ChunkCoord, VoxelChunkData?> chunkCache,
         out VoxelChunkData? chunk)
@@ -156,20 +177,10 @@ public static class WorldPreviewGenerator
         if (chunkCache.TryGetValue(coord, out chunk))
             return chunk != null;
 
-        var chunkPath = Path.Combine(worldPath, "chunks", $"chunk_{coord.X}_{coord.Y}_{coord.Z}.bin");
-        if (!File.Exists(chunkPath))
-        {
-            chunkCache[coord] = null;
-            chunk = null;
-            return false;
-        }
-
         try
         {
-            var loaded = new VoxelChunkData(coord);
-            loaded.Load(chunkPath);
-            chunkCache[coord] = loaded;
-            chunk = loaded;
+            chunk = world.GetOrCreateChunk(coord);
+            chunkCache[coord] = chunk;
             return true;
         }
         catch
@@ -189,6 +200,8 @@ public static class WorldPreviewGenerator
         {
             "desert" => DrawingColor.FromArgb(255, 214, 196, 136),
             "ocean" => DrawingColor.FromArgb(255, 63, 125, 188),
+            "forest" => DrawingColor.FromArgb(255, 72, 128, 72),
+            "hills" => DrawingColor.FromArgb(255, 110, 146, 96),
             _ => DrawingColor.FromArgb(255, 96, 156, 92)
         };
     }
@@ -205,7 +218,7 @@ public static class WorldPreviewGenerator
             BlockIds.Gravel => DrawingColor.FromArgb(255, 136, 136, 132),
             BlockIds.Wood => DrawingColor.FromArgb(255, 118, 84, 52),
             BlockIds.Leaves => DrawingColor.FromArgb(255, 82, 136, 72),
-            BlockIds.Nullblock => DrawingColor.FromArgb(255, 84, 84, 88),
+            BlockIds.Nullrock => DrawingColor.FromArgb(255, 84, 84, 88),
             _ => DrawingColor.FromArgb(255, 142, 132, 118)
         };
     }

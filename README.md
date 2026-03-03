@@ -4,19 +4,19 @@ LatticeVeil is a voxel survival game with procedural world generation, EOS-backe
 
 ## Current Release
 
-- Version: `v8.0.0`
-- Release name: `Worldforge Convergence`
+- Version: `v10.0.0`
+- Release name: `Worldshaper Reforged`
 - Platform: Windows x64 (`net8.0-windows`, single-file EXE)
 
-This release ships without changing game protocol contracts. It focuses on worldgen/loading stability, multiplayer fixes, and launcher/asset reliability.
+This release is a major vNext pass covering world generation, storage conventions, rendering stability, VeilSeer functionality, and inventory/command UX improvements.
 
 ## Distribution Model
 
 Player-facing release artifacts are:
 
 - `LatticeVeilMonoGame.exe`
-- `LatticeVeil-v8.0.0-worldforge-convergence-win-x64.zip`
-- `LatticeVeil-v8.0.0-worldforge-convergence-source-safe.zip`
+- `LatticeVeil-v10.0.0-worldshaper-reforged-win-x64.zip`
+- `LatticeVeil-v10.0.0-worldshaper-reforged-source-safe.zip`
 
 Assets are distributed through the separate `latticeveil/Assets` release feed as `Assets.zip`.
 
@@ -34,7 +34,7 @@ Launcher behavior:
 
 Compatibility notice:
 
-- Older multiplayer world saves may not be compatible with this release due to worldgen and sync pipeline changes.
+- Older worlds and multiplayer states may not be compatible with this release due to vNext worldgen/storage contract changes.
 
 ## Build and Local Dev
 
@@ -165,7 +165,7 @@ At runtime/publish, `EOSSDK-Win64-Shipping.dll` must be present next to the buil
   "DeploymentId": "REPLACE_WITH_DEPLOYMENT_ID",
   "ClientId": "REPLACE_WITH_CLIENT_ID",
   "ProductName": "RedactedCraft",
-  "ProductVersion": "1.0"
+  "ProductVersion": "10.0.0"
 }
 ```
 
@@ -226,7 +226,7 @@ Example deployment flow:
 
 ```powershell
 supabase functions deploy eos-config
-supabase secrets set EOS_PRODUCT_ID=... EOS_SANDBOX_ID=... EOS_DEPLOYMENT_ID=... EOS_CLIENT_ID=... EOS_PRODUCT_NAME=RedactedCraft EOS_PRODUCT_VERSION=1.0
+supabase secrets set EOS_PRODUCT_ID=... EOS_SANDBOX_ID=... EOS_DEPLOYMENT_ID=... EOS_CLIENT_ID=... EOS_PRODUCT_NAME=RedactedCraft EOS_PRODUCT_VERSION=10.0.0
 ```
 
 ## Veilnet Launcher Link
