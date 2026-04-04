@@ -7,7 +7,7 @@ public static class UiLayout
 {
     public const float BaseScale = 0.8f;
     public const float MinScale = 0.6f;
-    public const float MaxScale = 2.0f;
+    public const float MaxScale = 1.0f;
 
     public static float Scale { get; private set; } = 1f;
     public static Point Offset { get; private set; } = Point.Zero;

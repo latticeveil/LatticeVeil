@@ -57,6 +57,22 @@ public sealed class FastNoiseGenerator : IDisposable
     }
 
     /// <summary>
+    /// Get raw 3D noise value at a given world position [-1..1]
+    /// </summary>
+    public float GetNoise3D(float worldX, float worldY, float worldZ)
+    {
+        return _terrainNoise.GetNoise(worldX, worldY, worldZ);
+    }
+
+    /// <summary>
+    /// Get fractal 3D noise value at a given world position [-1..1]
+    /// </summary>
+    public float GetFractalNoise3D(float worldX, float worldY, float worldZ)
+    {
+        return _terrainNoise.GetFBM(worldX, worldY, worldZ);
+    }
+
+    /// <summary>
     /// Generate cave density at a given world position (3D)
     /// Returns value between 0 and 1.
     /// Lower values represent more "cave" (air) potential.

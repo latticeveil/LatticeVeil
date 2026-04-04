@@ -88,6 +88,7 @@ public sealed class MultiplayerScreen : IScreen
     private bool _joining;
     private string _status = "";
     private BrowserFilter _activeFilter = BrowserFilter.Online;
+    private readonly bool _onlineUiAvailable;
 
     private Texture2D? _bg;
     private Texture2D? _panel;
@@ -148,6 +149,7 @@ public sealed class MultiplayerScreen : IScreen
                 _log.Warn("MultiplayerScreen: EOS client not available.");
         }
         _onlineGate = OnlineGateClient.GetOrCreate();
+        _onlineUiAvailable = !offlineLaunch && _onlineGate.CanUseOfficialOnline(_log, out _);
         _identityStore = EosIdentityStore.LoadOrCreate(_log);
         _reservedUsername = (_identityStore.ReservedUsername ?? string.Empty).Trim();
 
@@ -162,6 +164,7 @@ public sealed class MultiplayerScreen : IScreen
         _filterLanBtn = new Button("LAN", () => SetBrowserFilter(BrowserFilter.Lan)) { BoldText = true };
         _filterOnlineBtn = new Button("ONLINE", () => SetBrowserFilter(BrowserFilter.Online)) { BoldText = true };
         _backBtn = new Button("BACK", () => { Cleanup(); _menus.Pop(); }) { BoldText = true };
+        _activeFilter = _onlineUiAvailable ? BrowserFilter.Online : BrowserFilter.Lan;
 
         try
         {
@@ -415,10 +418,11 @@ public sealed class MultiplayerScreen : IScreen
     private void DrawFilters(SpriteBatch sb)
     {
         _filterLanBtn.BackgroundColor = _activeFilter == BrowserFilter.Lan ? new Color(80, 100, 150) : null;
-        _filterOnlineBtn.BackgroundColor = _activeFilter == BrowserFilter.Online ? new Color(80, 100, 150) : null;
+        _filterOnlineBtn.BackgroundColor = _onlineUiAvailable && _activeFilter == BrowserFilter.Online ? new Color(80, 100, 150) : null;
 
         _filterLanBtn.Draw(sb, _pixel, _font);
-        _filterOnlineBtn.Draw(sb, _pixel, _font);
+        if (_onlineUiAvailable)
+            _filterOnlineBtn.Draw(sb, _pixel, _font);
     }
 
     private void DrawList(SpriteBatch sb)
@@ -785,7 +789,7 @@ public sealed class MultiplayerScreen : IScreen
 
     private void OpenHostWorlds()
     {
-        var wantsOnlineHost = _activeFilter != BrowserFilter.Lan;
+        var wantsOnlineHost = _onlineUiAvailable && _activeFilter != BrowserFilter.Lan;
         if (wantsOnlineHost)
         {
             if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
@@ -900,6 +904,13 @@ public sealed class MultiplayerScreen : IScreen
 
     private void LayoutFilterButtons()
     {
+        if (!_onlineUiAvailable)
+        {
+            _filterLanBtn.Bounds = _filterRowRect;
+            _filterOnlineBtn.Bounds = Rectangle.Empty;
+            return;
+        }
+
         var gap = 8;
         var buttonCount = 2;
         var buttonW = Math.Max(90, (_filterRowRect.Width - gap * (buttonCount - 1)) / buttonCount);
@@ -913,6 +924,9 @@ public sealed class MultiplayerScreen : IScreen
 
     private void SetBrowserFilter(BrowserFilter filter)
     {
+        if (filter == BrowserFilter.Online && !_onlineUiAvailable)
+            filter = BrowserFilter.Lan;
+
         if (_activeFilter == filter)
             return;
 
@@ -947,6 +961,19 @@ public sealed class MultiplayerScreen : IScreen
         var metaPath = Paths.GetWorldMetaPath(worldDir);
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
+        meta.Player.PlayerCollision = info.PlayerCollision;
+        meta.EnableMultipleHomes = info.EnableMultipleHomes;
+        meta.MaxHomesPerPlayer = Math.Clamp(info.MaxHomesPerPlayer, 1, 32);
+        meta.TimeCycleEnabled = info.TimeCycleEnabled;
+        meta.WeatherCycleEnabled = info.WeatherCycleEnabled;
+        meta.TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(info.TimeOfDayTicks);
+        meta.WeatherState = WorldMeta.CanonicalWeatherState(info.WeatherState);
+        meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
+        meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
+        meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
+        meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
+        meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
+        meta.Gameplay.WeatherState = meta.WeatherState;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
         meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(info.WorldType);
         meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);
@@ -1343,6 +1370,19 @@ public sealed class MultiplayerScreen : IScreen
         var metaPath = Paths.GetWorldMetaPath(worldDir);
         var meta = WorldMeta.CreateFlat(info.WorldName, info.GameMode, info.Width, info.Height, info.Depth, info.Seed);
         meta.PlayerCollision = info.PlayerCollision;
+        meta.Player.PlayerCollision = info.PlayerCollision;
+        meta.EnableMultipleHomes = info.EnableMultipleHomes;
+        meta.MaxHomesPerPlayer = Math.Clamp(info.MaxHomesPerPlayer, 1, 32);
+        meta.TimeCycleEnabled = info.TimeCycleEnabled;
+        meta.WeatherCycleEnabled = info.WeatherCycleEnabled;
+        meta.TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(info.TimeOfDayTicks);
+        meta.WeatherState = WorldMeta.CanonicalWeatherState(info.WeatherState);
+        meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
+        meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
+        meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
+        meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
+        meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
+        meta.Gameplay.WeatherState = meta.WeatherState;
         meta.WorldId = JoinedWorldCache.ResolveWorldId(info);
         meta.WorldGeneration.WorldType = WorldMeta.CanonicalWorldType(info.WorldType);
         meta.Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration.WorldType);

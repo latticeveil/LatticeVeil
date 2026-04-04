@@ -25,8 +25,8 @@ public sealed class MoreWorldOptionsScreen : IScreen
     private readonly Texture2D _pixel;
     private readonly Logger _log;
 
-    private readonly Action<bool, bool, bool, bool, string, bool, int> _onSettingsChanged;
-    // (generateOres, generateCaves, generateStructures, generateTrees, worldType, enableHomes, homeSlots)
+    private readonly Action<bool, bool, bool, bool, string, bool, int, bool> _onSettingsChanged;
+    // (generateOres, generateCaves, generateStructures, generateTrees, worldType, enableHomes, homeSlots, playerCollision)
 
     // Tabs
     private readonly Button _tabWorldGenBtn;
@@ -42,6 +42,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
     private readonly Button _generateStructuresBtn;
 
     // Gameplay controls
+    private readonly Button _playerCollisionBtn;
     private readonly Button _enableHomesBtn;
     private Rectangle _homeSlotsInputRect;
 
@@ -59,6 +60,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
     private int _maxHomesPerPlayer = 2;
     private bool _unlimitedHomes;
     private int _maxHomesCap = 10;
+    private bool _playerCollision = true;
     private bool _homeSlotsInputActive;
     private string _homeSlotsInputText = "2";
     private double _now;
@@ -85,8 +87,9 @@ public sealed class MoreWorldOptionsScreen : IScreen
         string worldType,
         bool enableHomes,
         int maxHomesPerPlayer,
+        bool playerCollision,
         int maxHomesCap,
-        Action<bool, bool, bool, bool, string, bool, int> onSettingsChanged)
+        Action<bool, bool, bool, bool, string, bool, int, bool> onSettingsChanged)
     {
         _menus = menus;
         _assets = assets;
@@ -104,6 +107,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
         _enableHomes = enableHomes;
         _maxHomesCap = Math.Clamp(maxHomesCap, 1, 64);
         _maxHomesPerPlayer = Math.Clamp(maxHomesPerPlayer, 1, _maxHomesCap);
+        _playerCollision = playerCollision;
         _homeSlotsInputText = _maxHomesPerPlayer.ToString();
 
         _onSettingsChanged = onSettingsChanged;
@@ -121,6 +125,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
         _generateStructuresBtn = new Button(string.Empty, ToggleGenerateStructures);
 
         // Gameplay
+        _playerCollisionBtn = new Button(string.Empty, TogglePlayerCollision);
         _enableHomesBtn = new Button(string.Empty, ToggleEnableHomes);
         _homeSlotsInputRect = Rectangle.Empty;
 
@@ -213,6 +218,8 @@ public sealed class MoreWorldOptionsScreen : IScreen
 
         // Gameplay layout
         var gY = _tabsArea.Bottom + 18;
+        _playerCollisionBtn.Bounds = new Rectangle(buttonX, gY, buttonW, buttonH);
+        gY += 56;
         _enableHomesBtn.Bounds = new Rectangle(buttonX, gY, buttonW, buttonH);
         gY += 62;
         _homeSlotsInputRect = new Rectangle(buttonX + 170, gY, 120, 30);
@@ -271,6 +278,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
                 }
             }
 
+            _playerCollisionBtn.Update(input);
             _enableHomesBtn.Update(input);
         }
 
@@ -326,6 +334,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
         }
         else if (_activeTab == Tab.Gameplay)
         {
+            _playerCollisionBtn.Draw(sb, _pixel, _font);
             _enableHomesBtn.Draw(sb, _pixel, _font);
             DrawHomeSlotsInput(sb);
         }
@@ -414,6 +423,13 @@ public sealed class MoreWorldOptionsScreen : IScreen
         NotifySettingsChanged();
     }
 
+    private void TogglePlayerCollision()
+    {
+        _playerCollision = !_playerCollision;
+        SyncButtonLabels();
+        NotifySettingsChanged();
+    }
+
     private void ToggleEnableHomes()
     {
         _enableHomes = !_enableHomes;
@@ -497,6 +513,7 @@ public sealed class MoreWorldOptionsScreen : IScreen
         _generateCavesBtn.Label = _generateCaves ? "CAVES: Enabled" : "CAVES: Disabled";
         _generateStructuresBtn.Label = _generateStructures ? "STRUCTURES: Enabled" : "STRUCTURES: Disabled";
 
+        _playerCollisionBtn.Label = _playerCollision ? "PLAYER COLLISION: Enabled" : "PLAYER COLLISION: Disabled";
         _enableHomesBtn.Label = _enableHomes ? "HOMES: Enabled" : "HOMES: Disabled";
     }
 
@@ -509,7 +526,8 @@ public sealed class MoreWorldOptionsScreen : IScreen
             _generateTrees,
             _worldType,
             _enableHomes,
-            _unlimitedHomes ? -1 : _maxHomesPerPlayer);
+            _unlimitedHomes ? -1 : _maxHomesPerPlayer,
+            _playerCollision);
     }
 
     private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)

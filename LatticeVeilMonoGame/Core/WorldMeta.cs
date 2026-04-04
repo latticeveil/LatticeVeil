@@ -24,7 +24,7 @@ public sealed class WorldMeta
     public GameMode InitialGameMode { get; set; } = GameMode.Artificer;
     public GameMode CurrentWorldGameMode { get; set; } = GameMode.Artificer;
 
-    public string Generator { get; set; } = "terrain_v1";
+    public string Generator { get; set; } = "terrain";
     public int Seed { get; set; }
     public string CreatedAt { get; set; } = string.Empty;
     public string WorldId { get; set; } = string.Empty;
@@ -39,7 +39,11 @@ public sealed class WorldMeta
 
     public bool EnableMultipleHomes { get; set; } = true;
     public int MaxHomesPerPlayer { get; set; } = 8;
-    public bool EnableCheats { get; set; } = true;
+    public bool EnableCheats { get; set; } = false;
+    public bool TimeCycleEnabled { get; set; } = true;
+    public bool WeatherCycleEnabled { get; set; } = true;
+    public int TimeOfDayTicks { get; set; } = 1000;
+    public string WeatherState { get; set; } = "clear";
 
     /// <summary>0=Peaceful, 1=Easy, 2=Normal, 3=Hard</summary>
     public int DifficultyLevel { get; set; } = 1;
@@ -69,7 +73,11 @@ public sealed class WorldMeta
             PlayerCollision = true,
             EnableMultipleHomes = true,
             MaxHomesPerPlayer = 8,
-            EnableCheats = true,
+            EnableCheats = false,
+            TimeCycleEnabled = true,
+            WeatherCycleEnabled = true,
+            TimeOfDayTicks = 1000,
+            WeatherState = "clear",
             DifficultyLevel = 1,
             OperatorUsernames = new List<string>(),
             WorldGeneration = new WorldGenerationSettings
@@ -83,9 +91,13 @@ public sealed class WorldMeta
             },
             Gameplay = new GameplaySettings
             {
-                EnableCheats = true,
+                EnableCheats = false,
                 EnableMultipleHomes = true,
                 MaxHomesPerPlayer = 8,
+                TimeCycleEnabled = true,
+                WeatherCycleEnabled = true,
+                TimeOfDayTicks = 1000,
+                WeatherState = "clear",
                 OperatorUsernames = new List<string>()
             },
             Player = new PlayerSettings
@@ -110,7 +122,7 @@ public sealed class WorldMeta
     {
         var meta = CreateFlat(name, mode, width, height, depth, seed);
         meta.WorldGeneration.WorldType = "terrain";
-        meta.Generator = "terrain_v1";
+        meta.Generator = "terrain";
         return meta;
     }
 
@@ -125,7 +137,34 @@ public sealed class WorldMeta
     {
         return string.Equals(CanonicalWorldType(worldType), "flatlands", StringComparison.OrdinalIgnoreCase)
             ? "flat_v1"
-            : "terrain_v1";
+            : "terrain"; // Canonical default generator for all non-flat worlds
+    }
+
+    public static bool IsTerrainGeneratorId(string? generator)
+    {
+        var token = (generator ?? string.Empty).Trim();
+        return string.Equals(token, "terrain", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "terrain_v2", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "landscape_v2", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public bool HasFiniteWorldBounds()
+        => string.Equals(CanonicalWorldType(WorldGeneration?.WorldType), "flatlands", StringComparison.OrdinalIgnoreCase);
+
+    public static string CanonicalWeatherState(string? weatherState)
+    {
+        var token = (weatherState ?? string.Empty).Trim().ToLowerInvariant();
+        return token switch
+        {
+            "rain" => "rain",
+            "storm" => "storm",
+            _ => "clear"
+        };
+    }
+
+    public static int CanonicalTimeTicks(int ticks)
+    {
+        return ((ticks % 24000) + 24000) % 24000;
     }
 
     public void CanonicalizeWorldGenerationContract()
@@ -157,6 +196,10 @@ public sealed class WorldMeta
             EnableCheats = Gameplay.EnableCheats;
             EnableMultipleHomes = Gameplay.EnableMultipleHomes;
             MaxHomesPerPlayer = Gameplay.MaxHomesPerPlayer;
+            TimeCycleEnabled = Gameplay.TimeCycleEnabled;
+            WeatherCycleEnabled = Gameplay.WeatherCycleEnabled;
+            TimeOfDayTicks = Gameplay.TimeOfDayTicks;
+            WeatherState = Gameplay.WeatherState;
             OperatorUsernames = Gameplay.OperatorUsernames ?? OperatorUsernames;
             PlayerCollision = Player.PlayerCollision;
             HasCustomSpawn = Player.HasCustomSpawn;
@@ -176,6 +219,21 @@ public sealed class WorldMeta
             MaxHomesPerPlayer = Math.Clamp(MaxHomesPerPlayer, 1, 32);
             if (!EnableMultipleHomes)
                 MaxHomesPerPlayer = 1;
+            TimeOfDayTicks = CanonicalTimeTicks(TimeOfDayTicks);
+            WeatherState = CanonicalWeatherState(WeatherState);
+
+            Gameplay.EnableCheats = EnableCheats;
+            Gameplay.EnableMultipleHomes = EnableMultipleHomes;
+            Gameplay.MaxHomesPerPlayer = MaxHomesPerPlayer;
+            Gameplay.TimeCycleEnabled = TimeCycleEnabled;
+            Gameplay.WeatherCycleEnabled = WeatherCycleEnabled;
+            Gameplay.TimeOfDayTicks = TimeOfDayTicks;
+            Gameplay.WeatherState = WeatherState;
+            Player.PlayerCollision = PlayerCollision;
+            Player.HasCustomSpawn = HasCustomSpawn;
+            Player.SpawnX = SpawnX;
+            Player.SpawnY = SpawnY;
+            Player.SpawnZ = SpawnZ;
 
             // LVC key=value only
             var dict = LvcSerializer.SerializeObject(this);
@@ -227,6 +285,10 @@ public sealed class WorldMeta
             meta.Gameplay.EnableCheats = meta.EnableCheats;
             meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
             meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
+            meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
+            meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
+            meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
+            meta.Gameplay.WeatherState = meta.WeatherState;
             meta.Gameplay.OperatorUsernames = meta.OperatorUsernames ?? meta.Gameplay.OperatorUsernames;
             meta.Player.PlayerCollision = meta.PlayerCollision;
             meta.Player.HasCustomSpawn = meta.HasCustomSpawn;
@@ -238,7 +300,22 @@ public sealed class WorldMeta
             meta.MaxHomesPerPlayer = Math.Clamp(meta.MaxHomesPerPlayer, 1, 32);
             if (!meta.EnableMultipleHomes)
                 meta.MaxHomesPerPlayer = 1;
+            meta.TimeOfDayTicks = CanonicalTimeTicks(meta.TimeOfDayTicks);
+            meta.WeatherState = CanonicalWeatherState(meta.WeatherState);
             meta.DifficultyLevel = Math.Clamp(meta.DifficultyLevel, 0, 3);
+
+            meta.Gameplay.EnableCheats = meta.EnableCheats;
+            meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
+            meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
+            meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
+            meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
+            meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
+            meta.Gameplay.WeatherState = meta.WeatherState;
+            meta.Player.PlayerCollision = meta.PlayerCollision;
+            meta.Player.HasCustomSpawn = meta.HasCustomSpawn;
+            meta.Player.SpawnX = meta.SpawnX;
+            meta.Player.SpawnY = meta.SpawnY;
+            meta.Player.SpawnZ = meta.SpawnZ;
 
             // Keep the behavior from older code: GameMode mirrors current.
             if (meta.CurrentWorldGameMode == default)

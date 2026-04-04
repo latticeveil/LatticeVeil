@@ -591,9 +591,7 @@ public class OnlineGateClient
 
         var endpoint = $"{_gateUrl}/friend-list";
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        if (!string.IsNullOrWhiteSpace(anonKey))
-            request.Headers.TryAddWithoutValidation("apikey", anonKey);
+        ApplyTicketFunctionHeaders(request, accessToken, anonKey);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         Debug.WriteLine($"[friend-list] request url={endpoint} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)}");
@@ -660,9 +658,7 @@ public class OnlineGateClient
             var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             request.Content = content;
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-            if (!string.IsNullOrWhiteSpace(anonKey))
-                request.Headers.TryAddWithoutValidation("apikey", anonKey);
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
             Debug.WriteLine($"[friend-request] request url={endpoint} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)}");
@@ -722,9 +718,7 @@ public class OnlineGateClient
 
         var endpoint = $"{_gateUrl}/friend-lookup?username={Uri.EscapeDataString(username)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        if (!string.IsNullOrWhiteSpace(anonKey))
-            request.Headers.TryAddWithoutValidation("apikey", anonKey);
+        ApplyTicketFunctionHeaders(request, accessToken, anonKey);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         Debug.WriteLine($"[friend-lookup] request url={endpoint} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)}");
@@ -822,9 +816,7 @@ public class OnlineGateClient
             var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             request.Content = content;
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-            if (!string.IsNullOrWhiteSpace(anonKey))
-                request.Headers.TryAddWithoutValidation("apikey", anonKey);
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
             Debug.WriteLine($"[friend-respond] request url={endpoint} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} accept={accept} block={block}");
@@ -907,8 +899,8 @@ public class OnlineGateClient
         var normalizedTicket = ticket.Trim();
         var endpoints = new[]
         {
-            $"{_gateUrl.TrimEnd('/')}/online-ticket-validate",
-            $"{_gateUrl.TrimEnd('/')}/online-ticket/validate"
+            $"{_gateUrl.TrimEnd('/')}/online_ticket_validate",
+            $"{_gateUrl.TrimEnd('/')}/online_ticket/validate"
         };
         var requiredChannel = _buildFlavor == "dev" ? "dev" : "release";
 
@@ -938,7 +930,8 @@ public class OnlineGateClient
                 {
                     Content = new StringContent(body, Encoding.UTF8, "application/json")
                 };
-                ApplyTicketFunctionHeaders(request, string.Empty, anonKey);
+                var accessToken = ResolveVeilnetAccessToken();
+                ApplyTicketFunctionHeaders(request, accessToken, anonKey);
 
                 using var response = Http.SendAsync(request, cts.Token).GetAwaiter().GetResult();
                 var responseBody = response.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
@@ -1541,7 +1534,12 @@ public class OnlineGateClient
         if (!IsUsableAccessToken(token))
             return false;
 
+        // Use standard Authorization header for our token. 
+        // Supabase gateway will pass this through if verify_jwt = false.
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        
+        // Also keep x-veilnet-auth for functions that specifically look for it.
+        request.Headers.TryAddWithoutValidation("x-veilnet-auth", token);
         return true;
     }
 
@@ -1555,10 +1553,10 @@ public class OnlineGateClient
         if (string.IsNullOrWhiteSpace(normalizedBase))
             return new List<string>();
 
-        if (normalizedBase.EndsWith("/online-ticket", StringComparison.OrdinalIgnoreCase))
+        if (normalizedBase.EndsWith("/online_ticket", StringComparison.OrdinalIgnoreCase))
             return new List<string> { normalizedBase };
 
-        return new List<string> { $"{normalizedBase}/online-ticket" };
+        return new List<string> { $"{normalizedBase}/online_ticket" };
     }
 
     private static bool IsSupabaseFunctionsEndpoint(string url)

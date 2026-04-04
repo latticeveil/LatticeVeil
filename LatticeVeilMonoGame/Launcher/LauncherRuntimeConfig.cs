@@ -10,6 +10,7 @@ internal sealed class LauncherRuntimeConfig
         public string? VeilnetFunctionsBaseUrl { get; set; }
         public string? GameHashesGetUrl { get; set; }
         public string? VeilnetLauncherPageUrl { get; set; }
+        public string? SupabaseAnonKey { get; set; }
     }
 
     public static readonly string ConfigDirectory = Path.Combine(
@@ -21,6 +22,7 @@ internal sealed class LauncherRuntimeConfig
     public string VeilnetFunctionsBaseUrl { get; init; } = string.Empty;
     public string GameHashesGetUrl { get; init; } = string.Empty;
     public string VeilnetLauncherPageUrl { get; init; } = string.Empty;
+    public string SupabaseAnonKey { get; init; } = string.Empty;
 
     public static LauncherRuntimeConfig Empty { get; } = new();
 
@@ -47,7 +49,8 @@ internal sealed class LauncherRuntimeConfig
             {
                 VeilnetFunctionsBaseUrl = NormalizeUrl(raw.VeilnetFunctionsBaseUrl, trimTrailingSlash: true),
                 GameHashesGetUrl = NormalizeUrl(raw.GameHashesGetUrl),
-                VeilnetLauncherPageUrl = NormalizeUrl(raw.VeilnetLauncherPageUrl)
+                VeilnetLauncherPageUrl = NormalizeUrl(raw.VeilnetLauncherPageUrl),
+                SupabaseAnonKey = (raw.SupabaseAnonKey ?? string.Empty).Trim()
             };
 
             log.Info($"Loaded launcher runtime config from {ConfigPath}");

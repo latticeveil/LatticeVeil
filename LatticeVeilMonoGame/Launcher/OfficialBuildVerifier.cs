@@ -15,6 +15,7 @@ internal sealed class OfficialBuildVerifier
 
     private readonly Logger _log;
     private readonly string _endpoint;
+    private readonly string _apiKey;
     private readonly TimeSpan _cacheTtl = TimeSpan.FromMinutes(10);
     private readonly object _cacheSync = new();
     private DateTime _cacheExpiresUtc = DateTime.MinValue;
@@ -48,17 +49,18 @@ internal sealed class OfficialBuildVerifier
         public string ReleaseHash { get; init; }
     }
 
-    public OfficialBuildVerifier(Logger log, string endpoint)
+    public OfficialBuildVerifier(Logger log, string endpoint, string apiKey = "")
     {
         _log = log;
         _endpoint = (endpoint ?? string.Empty).Trim();
+        _apiKey = (apiKey ?? string.Empty).Trim();
     }
 
     private static string GetGameVersion()
     {
         var version = Assembly.GetExecutingAssembly()
             .GetName()
-            .Version?.ToString() ?? "10.0.0";
+            .Version?.ToString() ?? "13.0.0";
         return version.StartsWith("v") ? version : $"v{version}";
     }
 
@@ -199,10 +201,38 @@ internal sealed class OfficialBuildVerifier
             // Determine target based on current build configuration
             var target = Paths.IsDevBuild ? "dev" : "release";
             var version = GetGameVersion();
-            var endpointWithParams = $"{_endpoint}?target={target}&version={version}";
-            _log?.Info($"Hash lookup: target={target}, version={version}");
+            
+            // Build robust query params based on endpoint type
+            var isRest = _endpoint.Contains("/rest/v1/", StringComparison.OrdinalIgnoreCase);
+            var query = new List<string>();
+            
+            if (isRest)
+            {
+                // Fetch all active hashes, ordered by most recent first
+                query.Add("is_active=eq.true");
+                query.Add("select=hash,target,is_active,updated_at");
+                query.Add("order=updated_at.desc");
+            }
+            else
+            {
+                query.Add($"target={target}");
+                query.Add($"version={version}");
+            }
+
+            var separator = _endpoint.Contains("?") ? "&" : "?";
+            var endpointWithParams = $"{_endpoint}{separator}{string.Join("&", query)}";
+            _log?.Info($"Hash lookup: {endpointWithParams}");
             
             using var request = new HttpRequestMessage(HttpMethod.Get, endpointWithParams);
+            
+            // Add Supabase headers if key is provided
+            if (!string.IsNullOrWhiteSpace(_apiKey))
+            {
+                request.Headers.Add("apikey", _apiKey);
+                // DO NOT add Authorization header here as it causes 'Invalid JWT' errors 
+                // on the Supabase gateway if the key is not a valid JWT.
+            }
+
             using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -215,18 +245,19 @@ internal sealed class OfficialBuildVerifier
                     var code when (int)code >= 500 => VerifyFailure.ServiceUnavailable,
                     _ => VerifyFailure.BadResponse
                 };
-                var message = $"Official hash fetch failed (HTTP {(int)response.StatusCode}).";
+                var message = $"Official hash fetch failed (HTTP {(int)response.StatusCode}). {body}";
                 return (false, failure, message, null);
             }
 
             using var doc = JsonDocument.Parse(body);
             _log?.Info($"Supabase response: {body}");
             var snapshot = ExtractSnapshot(doc.RootElement);
-            var targetHash = target == "dev" ? snapshot.DevHash : snapshot.ReleaseHash;
-            _log?.Info($"Fetched {target} hash: {targetHash}");
-            if (!IsSha256(targetHash))
+            var fetchedHash = target == "dev" ? snapshot.DevHash : snapshot.ReleaseHash;
+            _log?.Info($"Fetched {target} hash: {fetchedHash}");
+            
+            if (!IsSha256(fetchedHash))
             {
-                return (false, VerifyFailure.BadResponse, "Official hash payload is missing dev/release hashes.", null);
+                return (false, VerifyFailure.BadResponse, $"Official hash payload is missing valid {target} hash.", null);
             }
 
             lock (_cacheSync)

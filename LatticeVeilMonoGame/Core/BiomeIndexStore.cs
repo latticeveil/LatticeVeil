@@ -53,6 +53,9 @@ public sealed class BiomeIndexStore
         if (meta?.Size == null)
             return false;
 
+        if (!meta.HasFiniteWorldBounds())
+            return Seed == meta.Seed;
+
         return Seed == meta.Seed
             && Width == Math.Max(1, meta.Size.Width)
             && Depth == Math.Max(1, meta.Size.Depth);

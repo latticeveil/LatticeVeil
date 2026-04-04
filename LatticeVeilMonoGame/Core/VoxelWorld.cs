@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
 using System.Linq;
 
 namespace LatticeVeilMonoGame.Core;
@@ -11,7 +12,9 @@ namespace LatticeVeilMonoGame.Core;
 public sealed class VoxelWorld : IDisposable
 {
     private readonly Dictionary<ChunkCoord, VoxelChunkData> _chunks = new();
+    private readonly Dictionary<ChunkCoord, Task<VoxelChunkData>> _pendingGenerations = new();
     private readonly object _chunksLock = new();
+    private readonly object _generatorLock = new();
     private readonly Logger _log;
     private readonly int _maxChunkY;
     
@@ -22,7 +25,6 @@ public sealed class VoxelWorld : IDisposable
     // Deterministic generator used when a v2 chunk isn't present in region storage yet.
     // Without this, unexplored/unloaded areas become all-air "void" chunks.
     private IChunkGenerator? _generator;
-    private readonly object _generatorLock = new();
     private bool _disposed;
 
     public WorldMeta Meta { get; }
@@ -404,6 +406,9 @@ public sealed class VoxelWorld : IDisposable
 
     public VoxelChunkData? GetOrCreateChunk(ChunkCoord coord)
     {
+        Task<VoxelChunkData>? pendingTask = null;
+        TaskCompletionSource<VoxelChunkData>? generationCompletion = null;
+
         lock (_chunksLock)
         {
             if (_chunks.TryGetValue(coord, out var existing))
@@ -416,33 +421,73 @@ public sealed class VoxelWorld : IDisposable
                 return data;
             }
 
-            // v2 worlds: if not present in region storage yet, generate deterministic base terrain.
+            if (_pendingGenerations.TryGetValue(coord, out pendingTask))
+                goto WaitForPendingChunk;
+
+            // Generate deterministic terrain outside the world lock so chunk reads and rendering stay responsive.
             if (_isNewFormat && _generator != null)
             {
-                try
+                generationCompletion = new TaskCompletionSource<VoxelChunkData>(TaskCreationOptions.RunContinuationsAsynchronously);
+                pendingTask = generationCompletion.Task;
+                _pendingGenerations[coord] = pendingTask;
+            }
+        }
+
+        if (generationCompletion != null && _generator != null)
+        {
+            VoxelChunkData generated;
+            try
+            {
+                lock (_generatorLock)
                 {
-                    VoxelChunkData generated;
-                    lock (_generatorLock)
-                    {
-                        generated = _generator.GenerateChunk(coord);
-                    }
-                    // Base terrain should be considered clean; only player edits should mark dirty.
-                    generated.MarkClean();
-                    _chunks[coord] = generated;
-                    _log.Info($"GeneratedChunkV2 coord={coord} source=generator");
-                    return generated;
+                    var sw = Stopwatch.StartNew();
+                    generated = _generator.GenerateChunk(coord);
+                    sw.Stop();
+
+                    if (sw.ElapsedMilliseconds >= 50)
+                        _log.Warn($"SlowChunkGen coord={coord} ms={sw.ElapsedMilliseconds} generator={_generator.GetType().Name}");
                 }
-                catch (Exception ex)
-                {
-                    _log.Warn($"Chunk generator failed for {coord}: {ex.Message}");
-                }
+
+                generated.MarkClean();
+                _log.Info($"GeneratedChunkV2 coord={coord} source=generator");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Chunk generator failed for {coord}: {ex.Message}");
+                generated = new VoxelChunkData(coord);
             }
 
-            // Generate new chunk
-            var newChunk = new VoxelChunkData(coord);
-            _chunks[coord] = newChunk;
-            return newChunk;
+            lock (_chunksLock)
+            {
+                if (_chunks.TryGetValue(coord, out var existingAfterGeneration))
+                {
+                    _pendingGenerations.Remove(coord);
+                    generationCompletion.TrySetResult(existingAfterGeneration);
+                    return existingAfterGeneration;
+                }
+
+                _chunks[coord] = generated;
+                _pendingGenerations.Remove(coord);
+            }
+
+            generationCompletion.TrySetResult(generated);
+            return generated;
         }
+
+WaitForPendingChunk:
+        if (pendingTask != null)
+            return pendingTask.GetAwaiter().GetResult();
+
+        var newChunk = new VoxelChunkData(coord);
+        lock (_chunksLock)
+        {
+            if (_chunks.TryGetValue(coord, out var existingBlank))
+                return existingBlank;
+
+            _chunks[coord] = newChunk;
+        }
+
+        return newChunk;
     }
 
     public void SaveChunk(ChunkCoord coord)
@@ -551,8 +596,12 @@ public sealed class VoxelWorld : IDisposable
         var worldType = WorldMeta.CanonicalWorldType(requestedWorldType);
         var expectedGenerator = WorldMeta.CanonicalGeneratorForWorldType(worldType);
 
-        if (!string.Equals(requestedGenerator, expectedGenerator, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(requestedGenerator)
+            && !string.Equals(requestedGenerator, expectedGenerator, StringComparison.OrdinalIgnoreCase)
+            && !WorldMeta.IsTerrainGeneratorId(requestedGenerator))
+        {
             _log.Warn($"Generator mismatch detected (Generator=\"{requestedGenerator}\", WorldType=\"{requestedWorldType}\"). Using \"{expectedGenerator}\".");
+        }
 
         meta.WorldGeneration.WorldType = worldType;
         if (!string.Equals(worldType, "flatlands", StringComparison.OrdinalIgnoreCase))
@@ -566,8 +615,47 @@ public sealed class VoxelWorld : IDisposable
             return new SuperflatWorldGenerator(meta.Seed, settings, _log);
         }
 
+        if (string.Equals(worldType, "terrain", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.Equals(requestedGenerator, "terrain_v2", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(requestedGenerator, "landscape_v2", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Warn($"Generator alias \"{requestedGenerator}\" is legacy. Routing to \"terrain\".");
+            }
+
+            _log.Info($"Using TerrainGenerator (Generator=\"{meta.Generator}\", WorldType=\"{meta.WorldGeneration.WorldType}\")");
+            return new TerrainGenerator(meta.Seed, BuildTerrainSettings(meta), _log);
+        }
+
         _log.Info($"Using BasicWorldGenerator (Generator=\"{meta.Generator}\", WorldType=\"{meta.WorldGeneration.WorldType}\")");
         return new BasicWorldGenerator(meta.Seed, BuildGeneratorSettings(meta), _log);
+    }
+
+    private static TerrainGenerator.TerrainSettings BuildTerrainSettings(WorldMeta meta)
+    {
+        var worldHeight = 256;
+        if (meta?.WorldGeneration?.WorldSize != null && meta.WorldGeneration.WorldSize.Height > 0)
+            worldHeight = meta.WorldGeneration.WorldSize.Height;
+        else if (meta?.Size != null && meta.Size.Height > 0)
+            worldHeight = meta.Size.Height;
+        
+        var caves = meta?.WorldGeneration?.GenerateCaves ?? true;
+        var ores = meta?.WorldGeneration?.GenerateOres ?? true;
+        var trees = meta?.WorldGeneration?.GenerateTrees ?? true;
+
+        return new TerrainGenerator.TerrainSettings(chunkSize: 16, worldHeight: Math.Max(64, worldHeight))
+        {
+            GenerateCaves = caves,
+            GenerateOres = ores,
+            GenerateTrees = trees,
+            SeaLevel = 64f,
+            BaseFrequency = 0.02f,
+            DetailFrequency = 0.1f,
+            Octaves = 6,
+            Persistence = 0.5f,
+            ErosionStrength = 0.3f
+        };
+
     }
 
     private static SuperflatWorldGenerator.Settings BuildSuperflatSettings(WorldMeta meta)
@@ -584,7 +672,6 @@ public sealed class VoxelWorld : IDisposable
 
         return new SuperflatWorldGenerator.Settings(worldHeight: Math.Max(64, worldHeight), seaLevel: 64, generateCaves: caves, generateOres: ores, generateTrees: trees);
     }
-
 
     private static BasicWorldGenerator.WorldSettings BuildGeneratorSettings(WorldMeta meta)
     {

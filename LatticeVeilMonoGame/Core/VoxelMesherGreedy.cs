@@ -57,10 +57,16 @@ public static class VoxelMesherGreedy
 
     private static ChunkMesh BuildChunkMeshInternal(VoxelChunkData chunk, CubeNetAtlas atlas, Logger log, bool useGreedyOptimization, Func<int, int, int, byte> getBlock)
     {
-        var opaque = new List<VertexPositionTexture>();
-        var cutout = new List<VertexPositionTexture>();
-        var transparent = new List<VertexPositionTexture>();
-        var water = new List<VertexPositionTexture>();
+        // Max vertices for a chunk (16x16x16 * 6 faces * 6 vertices per face)
+        // 4096 * 36 = 147,456 vertices max. Renting a buffer slightly larger.
+        const int MaxPossibleVertices = 150000;
+        
+        var opaqueBuffer = SimpleMemoryManager.RentVertices(MaxPossibleVertices);
+        var cutoutBuffer = SimpleMemoryManager.RentVertices(MaxPossibleVertices);
+        var transparentBuffer = SimpleMemoryManager.RentVertices(MaxPossibleVertices);
+        var waterBuffer = SimpleMemoryManager.RentVertices(MaxPossibleVertices);
+
+        var counts = new int[4]; // opaque, cutout, transparent, water
 
         var sizeX = VoxelChunkData.ChunkSizeX;
         var sizeY = VoxelChunkData.ChunkSizeY;
@@ -118,15 +124,11 @@ public static class VoxelMesherGreedy
                             continue;
                         }
 
-                        // C) FAST-FIRST MESHING - Skip greedy optimization for fast path.
-                        // Connected-texture blocks also avoid merge so per-tile edge masking
-                        // can remove interior seams in any layout/shape.
                         int w, h;
                         var useConnectedTexture = BlockRegistry.UsesConnectedTexture(cell.BlockId);
                         var allowMerge = useGreedyOptimization && !useConnectedTexture;
                         if (allowMerge)
                         {
-                            // Normal greedy optimization
                             w = 1;
                             while (i + w < dims[u] && mask[index + w].SameAs(cell))
                                 w++;
@@ -150,7 +152,6 @@ public static class VoxelMesherGreedy
                         }
                         else
                         {
-                            // Fast path - no merging, single quad per face
                             w = 1;
                             h = 1;
                         }
@@ -169,17 +170,17 @@ public static class VoxelMesherGreedy
 
                         atlas.GetFaceUvRect(cell.BlockId, cell.Face, out var uv00, out var uv10, out var uv11, out var uv01);
                         AdjustFaceUvs(cell.Face, ref uv00, ref uv10, ref uv11, ref uv01);
-                        List<VertexPositionTexture> list;
-                        if (cell.RenderLayer == BlockRenderLayer.Water)
-                            list = water;
-                        else if (cell.RenderLayer == BlockRenderLayer.Cutout)
-                            list = cutout;
-                        else if (cell.RenderLayer == BlockRenderLayer.Blended)
-                            list = transparent;
-                        else
-                            list = opaque;
+                        
+                        VertexPositionTexture[] targetBuffer;
+                        int bufferIndex;
+                        if (cell.RenderLayer == BlockRenderLayer.Water) { targetBuffer = waterBuffer; bufferIndex = 3; }
+                        else if (cell.RenderLayer == BlockRenderLayer.Cutout) { targetBuffer = cutoutBuffer; bufferIndex = 1; }
+                        else if (cell.RenderLayer == BlockRenderLayer.Blended) { targetBuffer = transparentBuffer; bufferIndex = 2; }
+                        else { targetBuffer = opaqueBuffer; bufferIndex = 0; }
+
                         AddTiledQuad(
-                            list,
+                            targetBuffer,
+                            ref counts[bufferIndex],
                             originX,
                             originY,
                             originZ,
@@ -215,11 +216,30 @@ public static class VoxelMesherGreedy
             }
         }
 
-        AppendCustomModels(chunk, atlas, log, originX, originY, originZ, bs, opaque, cutout, transparent);
+        AppendCustomModels(chunk, atlas, log, originX, originY, originZ, bs, opaqueBuffer, ref counts[0], cutoutBuffer, ref counts[1], transparentBuffer, ref counts[2]);
 
         var min = new Vector3(originX * bs, originY * bs, originZ * bs);
         var max = min + new Vector3(sizeX * bs, sizeY * bs, sizeZ * bs);
-        return new ChunkMesh(chunk.Coord, opaque.ToArray(), cutout.ToArray(), transparent.ToArray(), water.ToArray(), new BoundingBox(min, max));
+
+        var opaque = FinalizeBuffer(opaqueBuffer, counts[0]);
+        var cutout = FinalizeBuffer(cutoutBuffer, counts[1]);
+        var transparent = FinalizeBuffer(transparentBuffer, counts[2]);
+        var water = FinalizeBuffer(waterBuffer, counts[3]);
+
+        SimpleMemoryManager.ReturnVertices(opaqueBuffer);
+        SimpleMemoryManager.ReturnVertices(cutoutBuffer);
+        SimpleMemoryManager.ReturnVertices(transparentBuffer);
+        SimpleMemoryManager.ReturnVertices(waterBuffer);
+
+        return new ChunkMesh(chunk.Coord, opaque, cutout, transparent, water, new BoundingBox(min, max));
+    }
+
+    private static VertexPositionTexture[] FinalizeBuffer(VertexPositionTexture[] buffer, int count)
+    {
+        if (count == 0) return Array.Empty<VertexPositionTexture>();
+        var result = new VertexPositionTexture[count];
+        Array.Copy(buffer, result, count);
+        return result;
     }
 
     private static void AppendCustomModels(
@@ -230,9 +250,12 @@ public static class VoxelMesherGreedy
         int originY,
         int originZ,
         float blockSize,
-        List<VertexPositionTexture> opaque,
-        List<VertexPositionTexture> cutout,
-        List<VertexPositionTexture> transparent)
+        VertexPositionTexture[] opaque,
+        ref int opaqueCount,
+        VertexPositionTexture[] cutout,
+        ref int cutoutCount,
+        VertexPositionTexture[] transparent,
+        ref int transparentCount)
     {
         var cache = new Dictionary<byte, VertexPositionTexture[]>();
         var centerOffset = new Vector3(0.5f * blockSize, 0.5f * blockSize, 0.5f * blockSize);
@@ -266,16 +289,20 @@ public static class VoxelMesherGreedy
                         (originY + y) * blockSize,
                         (originZ + z) * blockSize) + centerOffset;
 
-                    var target = def.RenderLayer switch
+                    if (def.RenderLayer == BlockRenderLayer.Cutout)
                     {
-                        BlockRenderLayer.Cutout => cutout,
-                        BlockRenderLayer.Blended => transparent,
-                        _ => opaque
-                    };
-                    for (var i = 0; i < mesh.Length; i++)
+                        for (var i = 0; i < mesh.Length; i++)
+                            cutout[cutoutCount++] = new VertexPositionTexture(mesh[i].Position + offset, mesh[i].TextureCoordinate);
+                    }
+                    else if (def.RenderLayer == BlockRenderLayer.Blended)
                     {
-                        var v = mesh[i];
-                        target.Add(new VertexPositionTexture(v.Position + offset, v.TextureCoordinate));
+                        for (var i = 0; i < mesh.Length; i++)
+                            transparent[transparentCount++] = new VertexPositionTexture(mesh[i].Position + offset, mesh[i].TextureCoordinate);
+                    }
+                    else
+                    {
+                        for (var i = 0; i < mesh.Length; i++)
+                            opaque[opaqueCount++] = new VertexPositionTexture(mesh[i].Position + offset, mesh[i].TextureCoordinate);
                     }
                 }
             }
@@ -366,7 +393,8 @@ public static class VoxelMesherGreedy
     }
 
     private static void AddTiledQuad(
-        List<VertexPositionTexture> verts,
+        VertexPositionTexture[] verts,
+        ref int count,
         int originX,
         int originY,
         int originZ,
@@ -445,7 +473,7 @@ public static class VoxelMesherGreedy
                         1f / atlasHeight);
                 }
 
-                AddQuad(verts, p0, p1, p2, p3, tileUv00, tileUv10, tileUv11, tileUv01, flip);
+                AddQuad(verts, ref count, p0, p1, p2, p3, tileUv00, tileUv10, tileUv11, tileUv01, flip);
             }
         }
     }
@@ -534,25 +562,25 @@ public static class VoxelMesherGreedy
         return new Vector2(from.X, from.Y + MathF.Sign(dy) * vStep);
     }
 
-    private static void AddQuad(List<VertexPositionTexture> verts, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector2 uv00, Vector2 uv10, Vector2 uv11, Vector2 uv01, bool flip)
+    private static void AddQuad(VertexPositionTexture[] verts, ref int count, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector2 uv00, Vector2 uv10, Vector2 uv11, Vector2 uv01, bool flip)
     {
         if (!flip)
         {
-            verts.Add(new VertexPositionTexture(p0, uv00));
-            verts.Add(new VertexPositionTexture(p1, uv10));
-            verts.Add(new VertexPositionTexture(p2, uv11));
-            verts.Add(new VertexPositionTexture(p0, uv00));
-            verts.Add(new VertexPositionTexture(p2, uv11));
-            verts.Add(new VertexPositionTexture(p3, uv01));
+            verts[count++] = new VertexPositionTexture(p0, uv00);
+            verts[count++] = new VertexPositionTexture(p1, uv10);
+            verts[count++] = new VertexPositionTexture(p2, uv11);
+            verts[count++] = new VertexPositionTexture(p0, uv00);
+            verts[count++] = new VertexPositionTexture(p2, uv11);
+            verts[count++] = new VertexPositionTexture(p3, uv01);
         }
         else
         {
-            verts.Add(new VertexPositionTexture(p0, uv00));
-            verts.Add(new VertexPositionTexture(p2, uv11));
-            verts.Add(new VertexPositionTexture(p1, uv10));
-            verts.Add(new VertexPositionTexture(p0, uv00));
-            verts.Add(new VertexPositionTexture(p3, uv01));
-            verts.Add(new VertexPositionTexture(p2, uv11));
+            verts[count++] = new VertexPositionTexture(p0, uv00);
+            verts[count++] = new VertexPositionTexture(p2, uv11);
+            verts[count++] = new VertexPositionTexture(p1, uv10);
+            verts[count++] = new VertexPositionTexture(p0, uv00);
+            verts[count++] = new VertexPositionTexture(p3, uv01);
+            verts[count++] = new VertexPositionTexture(p2, uv11);
         }
     }
 

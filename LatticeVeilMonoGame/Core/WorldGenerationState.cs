@@ -16,7 +16,7 @@ public sealed class WorldGenerationState
     public string LastHeartbeatUtc { get; set; } = DateTimeOffset.UtcNow.ToString("O");
     public int WorldSeed { get; set; }
     public string WorldType { get; set; } = "terrain";
-    public string Generator { get; set; } = "terrain_v1";
+    public string Generator { get; set; } = "terrain";
     public string ErrorReason { get; set; } = string.Empty;
     public string WorldName { get; set; } = string.Empty;
 
@@ -34,4 +34,3 @@ public sealed class WorldGenerationState
     public bool IsPaused
         => string.Equals(Status, StatusPaused, StringComparison.OrdinalIgnoreCase);
 }
-

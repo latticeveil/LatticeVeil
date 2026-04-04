@@ -66,11 +66,12 @@ public sealed class CreateWorldScreen : IScreen
     private bool _oresEnabled = true;
     private bool _treesEnabled = true;
     private string _worldType = "terrain";
-    private bool _cheatsEnabled = true;
+    private bool _cheatsEnabled = false;
     private bool _multipleHomesEnabled = true;
     private int _maxHomesPerPlayer = 2;
     private bool _unlimitedHomes = false;
     private int _maxHomesCap = 10;
+    private bool _playerCollisionEnabled = true;
     private bool _difficultyDropdownOpen;
     private string _modeDescriptionText = string.Empty;
     private bool _worldNameActive = true;
@@ -148,8 +149,8 @@ public sealed class CreateWorldScreen : IScreen
         var moreOptionsScreen = new MoreWorldOptionsScreen(
             _menus, _assets, _font, _pixel, _log,
             _oresEnabled, _cavesEnabled, _structuresEnabled, _treesEnabled, _worldType,
-            _multipleHomesEnabled, _maxHomesPerPlayer, _maxHomesCap,
-            (generateOres, generateCaves, generateStructures, generateTrees, worldType, enableHomes, homeSlots) =>
+            _multipleHomesEnabled, _maxHomesPerPlayer, _playerCollisionEnabled, _maxHomesCap,
+            (generateOres, generateCaves, generateStructures, generateTrees, worldType, enableHomes, homeSlots, playerCollision) =>
             {
                 _oresEnabled = generateOres;
                 _cavesEnabled = generateCaves;
@@ -161,6 +162,7 @@ public sealed class CreateWorldScreen : IScreen
                 _multipleHomesEnabled = enableHomes;
                 _maxHomesPerPlayer = homeSlots == -1 ? _maxHomesCap : Math.Clamp(homeSlots, 1, _maxHomesCap);
                 _unlimitedHomes = homeSlots == -1;
+                _playerCollisionEnabled = playerCollision;
                 SyncEnableCheatsLabel();
                 SyncEnableHomesLabel();
             });
@@ -416,6 +418,16 @@ public sealed class CreateWorldScreen : IScreen
 
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
 
+        // While generating, show only the loading overlay to avoid the create UI sitting behind it.
+        if (_isGeneratingWorld)
+        {
+            DrawGeneratingOverlay(sb);
+            if (_generationPausePromptOpen)
+                DrawGenerationPausePrompt(sb);
+            sb.End();
+            return;
+        }
+
         // Draw panel
         if (_panel != null)
         {
@@ -477,11 +489,6 @@ public sealed class CreateWorldScreen : IScreen
             var statusSize = _font.MeasureString(_statusMessage);
             var statusPos = new Vector2(_panelRect.Center.X - statusSize.X / 2f, _createBtn.Bounds.Top - _font.LineHeight - 8);
             _font.DrawString(sb, _statusMessage, statusPos, new Color(230, 210, 90));
-        }
-
-        if (_isGeneratingWorld)
-        {
-            DrawGeneratingOverlay(sb);
         }
 
         if (_generationPausePromptOpen)
@@ -613,7 +620,8 @@ public sealed class CreateWorldScreen : IScreen
         var seed = Environment.TickCount;
         var meta = WorldMeta.CreateTerrain(worldName, _selectedGameMode, width, height, depth, seed);
         meta.CreatedAt = DateTimeOffset.UtcNow.ToString("O");
-        meta.PlayerCollision = true;
+        meta.PlayerCollision = _playerCollisionEnabled;
+        meta.Player.PlayerCollision = _playerCollisionEnabled;
         meta.EnableMultipleHomes = _multipleHomesEnabled;
         meta.MaxHomesPerPlayer = _multipleHomesEnabled ? (_unlimitedHomes ? -1 : Math.Clamp(_maxHomesPerPlayer, 1, Math.Max(1, _maxHomesCap))) : 1;
         meta.EnableCheats = _cheatsEnabled;
@@ -681,6 +689,7 @@ public sealed class CreateWorldScreen : IScreen
         _cheatsEnabled = meta.Gameplay?.EnableCheats ?? meta.EnableCheats;
         _multipleHomesEnabled = meta.Gameplay?.EnableMultipleHomes ?? meta.EnableMultipleHomes;
         _maxHomesPerPlayer = meta.Gameplay?.MaxHomesPerPlayer ?? meta.MaxHomesPerPlayer;
+        _playerCollisionEnabled = meta.Player?.PlayerCollision ?? meta.PlayerCollision;
 
         WorldGenerationStateStore.TryLoadRecoverableState(resumePath, TimeSpan.FromSeconds(90), out var resumeState, _log);
         StartWorldGeneration(meta.Name, resumePath, meta, allowExistingWorld: true, resumeState: resumeState);
@@ -765,6 +774,13 @@ public sealed class CreateWorldScreen : IScreen
         _isGeneratingWorld = false;
         _generationPausePromptOpen = true;
         _generationPauseReason = reason;
+
+        // Include current stage/progress in logs so stalls are diagnosable from current.lvlog.
+        try
+        {
+            _log.Warn($"World generation paused: stage=\"{_generationStage}\" progress={_generationProgress:0.000} reason=\"{reason}\"");
+        }
+        catch { }
         PersistGenerationState(WorldGenerationState.StatusPaused, _generationStage, _generationProgress, reason);
     }
 
@@ -905,7 +921,11 @@ public sealed class CreateWorldScreen : IScreen
 
             Report(0.42f, "PREWARM", forcePersist: true);
             var spawn = GetSpawnPoint(meta);
-            VoxelWorld.WorldToChunk((int)spawn.X, 64, (int)spawn.Y, out var spawnChunkX, out _, out var spawnChunkZ);
+            // Raise spawn Y well above terrain to avoid spawning underground
+            const int spawnYOffset = 140; // Well above max terrain height (SeaLevel + 120)
+            const int seaLevel = 64;
+            var spawnY = seaLevel + spawnYOffset;
+            VoxelWorld.WorldToChunk((int)spawn.X, spawnY, (int)spawn.Y, out var spawnChunkX, out _, out var spawnChunkZ);
             var spawnRegionX = (int)Math.Floor(spawnChunkX / 32.0);
             var spawnRegionZ = (int)Math.Floor(spawnChunkZ / 32.0);
             RegionChunkStore.EnsureRegionExists(worldPath, spawnRegionX, spawnRegionZ);
@@ -955,6 +975,12 @@ public sealed class CreateWorldScreen : IScreen
                         var includeInGate = Math.Abs(dx) <= gateRadius && Math.Abs(dz) <= gateRadius;
                         BakeColumn(cx, cz, includeInGate);
                         bakedColumnCount++;
+
+                        // Heartbeat frequently while prewarming. A single column can take long
+                        // with heavy generators, and the UI watchdog will pause if it sees no
+                        // heartbeat/progress updates for too long.
+                        var bakeProgressColumn = 0.42f + 0.18f * (bakedColumnCount / (float)Math.Max(1, totalColumns));
+                        Report(bakeProgressColumn, "PREWARM");
                     }
 
                     var bakeProgress = 0.42f + 0.18f * (bakedColumnCount / (float)Math.Max(1, totalColumns));
@@ -998,7 +1024,31 @@ public sealed class CreateWorldScreen : IScreen
             }
             else
             {
-                WorldPreviewGenerator.GenerateAndSave(meta, worldPath, _log);
+                var previewTask = Task.Run(() =>
+                {
+                    WorldPreviewGenerator.GenerateAndSave(meta, worldPath, _log, cancellationToken: cancellationToken);
+                }, cancellationToken);
+
+                var previewDeadlineUtc = DateTime.UtcNow + TimeSpan.FromSeconds(90);
+                while (!previewTask.IsCompleted)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    // Heartbeat while preview generation is running so the UI watchdog doesn't
+                    // treat long previews as a stall.
+                    Report(0.86f, "WORLD PREVIEW");
+
+                    if (DateTime.UtcNow >= previewDeadlineUtc)
+                    {
+                        _log.Warn("World preview generation timed out; skipping preview to finish world creation.");
+                        break;
+                    }
+
+                    Thread.Sleep(200);
+                }
+
+                // Observe exceptions if it finished.
+                if (previewTask.IsCompleted)
+                    previewTask.GetAwaiter().GetResult();
             }
 
             Report(1.0f, "FINALIZING", forcePersist: true);

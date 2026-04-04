@@ -9,6 +9,8 @@ namespace LatticeVeilMonoGame.Core;
 
 public sealed class GitHubReleaseClient
 {
+    private const string DefaultOwner = "latticeveil";
+    private const string DefaultRepo = "Assets";
     private readonly HttpClient _client;
     private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -19,15 +21,34 @@ public sealed class GitHubReleaseClient
 
     public async Task<GitHubRelease?> FetchLatestReleaseAsync(CancellationToken ct)
     {
-        var url = "https://api.github.com/repos/latticeveil/Assets/releases/latest";
-        return await FetchReleaseAsync(url, ct);
+        return await FetchLatestReleaseAsync(DefaultOwner, DefaultRepo, ct);
     }
 
     public async Task<GitHubRelease?> FetchReleaseByTagAsync(string tag, CancellationToken ct)
     {
-        var safeTag = Uri.EscapeDataString(tag);
-        var url = $"https://api.github.com/repos/latticeveil/Assets/releases/tags/{safeTag}";
+        return await FetchReleaseByTagAsync(DefaultOwner, DefaultRepo, tag, ct);
+    }
+
+    public async Task<GitHubRelease?> FetchLatestReleaseAsync(string owner, string repo, CancellationToken ct)
+    {
+        var url = BuildLatestReleaseUrl(owner, repo);
         return await FetchReleaseAsync(url, ct);
+    }
+
+    public async Task<GitHubRelease?> FetchReleaseByTagAsync(string owner, string repo, string tag, CancellationToken ct)
+    {
+        var safeTag = Uri.EscapeDataString(tag);
+        var safeOwner = Uri.EscapeDataString(owner);
+        var safeRepo = Uri.EscapeDataString(repo);
+        var url = $"https://api.github.com/repos/{safeOwner}/{safeRepo}/releases/tags/{safeTag}";
+        return await FetchReleaseAsync(url, ct);
+    }
+
+    private static string BuildLatestReleaseUrl(string owner, string repo)
+    {
+        var safeOwner = Uri.EscapeDataString(owner);
+        var safeRepo = Uri.EscapeDataString(repo);
+        return $"https://api.github.com/repos/{safeOwner}/{safeRepo}/releases/latest";
     }
 
     private async Task<GitHubRelease?> FetchReleaseAsync(string url, CancellationToken ct)
@@ -56,6 +77,7 @@ public sealed class GitHubReleaseClient
 public sealed class GitHubRelease
 {
     public string? tag_name { get; set; }
+    public string? name { get; set; }
     public DateTimeOffset? published_at { get; set; }
     public GitHubAsset[]? assets { get; set; }
 }

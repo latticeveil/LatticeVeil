@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using LatticeVeilMonoGame.Core;
 
 namespace LatticeVeilMonoGame.Core
@@ -29,6 +30,10 @@ namespace LatticeVeilMonoGame.Core
                 // Test 3: BasicWorldGenerator
                 log.Info("Test 3: BasicWorldGenerator");
                 TestBasicWorldGenerator(log);
+
+                // Test 4: TerrainGenerator
+                log.Info("Test 4: TerrainGenerator");
+                TestTerrainGenerator(log);
                 
                 log.Info("=== All Tests Passed! World Generation System Ready ===");
             }
@@ -164,6 +169,173 @@ namespace LatticeVeilMonoGame.Core
             }
             
             log.Info("✅ BasicWorldGenerator test passed");
+        }
+
+        private static void TestTerrainGenerator(Logger log)
+        {
+            log.Info("Initializing TerrainGenerator...");
+
+            var settings = new TerrainGenerator.TerrainSettings(chunkSize: 16, worldHeight: 256)
+            {
+                GenerateCaves = true,
+                GenerateOres = true,
+                GenerateStructures = true,
+                GenerateTrees = true,
+                SeaLevel = 64f,
+                BaseFrequency = 0.02f,
+                DetailFrequency = 0.1f,
+                Octaves = 6,
+                Persistence = 0.5f,
+                ErosionStrength = 0.3f
+            };
+
+            using var generator = new TerrainGenerator(1337, settings, log);
+
+            var descriptors = CollectTreeDescriptors(generator, maxWorld: 256);
+            if (descriptors.Count == 0)
+                throw new Exception("TerrainGenerator produced no deterministic tree descriptors in the sample area.");
+
+            foreach (var descriptor in descriptors)
+            {
+                if (!generator.TryGetDebugTreeDescriptorAtWorld(descriptor.OriginX, descriptor.OriginZ, out var repeat)
+                    || repeat != descriptor)
+                {
+                    throw new Exception($"Tree descriptor determinism failed at ({descriptor.OriginX},{descriptor.OriginZ}).");
+                }
+            }
+
+            log.Info($"Collected {descriptors.Count} deterministic tree descriptors.");
+
+            var seamTree = FindChunkSeamTree(descriptors);
+            if (seamTree == null)
+                throw new Exception("Could not find a seam-crossing tree in the default terrain sample area.");
+
+            var leftChunkCoord = new ChunkCoord(FloorDiv(seamTree.Value.OriginX, 16), 0, FloorDiv(seamTree.Value.OriginZ, 16));
+            var leftChunk = generator.GenerateChunk(leftChunkCoord);
+            var rightChunk = generator.GenerateChunk(new ChunkCoord(leftChunkCoord.X + 1, 0, leftChunkCoord.Z));
+
+            var leftTreeBlocks = CountTreeBlocks(leftChunk, startX: 13, endX: 15);
+            var rightTreeBlocks = CountTreeBlocks(rightChunk, startX: 0, endX: 2);
+            if (leftTreeBlocks == 0 || rightTreeBlocks == 0)
+                throw new Exception("Seam-crossing tree did not stamp blocks into both adjacent chunks.");
+
+            log.Info($"Seam tree verified across chunks: leftEdgeBlocks={leftTreeBlocks}, rightEdgeBlocks={rightTreeBlocks}");
+
+            ValidateBiomeTerrainAgreement(generator, log, BiomeId.Ocean, "ocean");
+            ValidateBiomeTerrainAgreement(generator, log, BiomeId.Forest, "forest");
+            ValidateBiomeTerrainAgreement(generator, log, BiomeId.Hills, "hills");
+            ValidateBiomeTerrainAgreement(generator, log, BiomeId.Grasslands, "grasslands");
+
+            log.Info("✅ TerrainGenerator test passed");
+        }
+
+        private static List<TerrainGenerator.DebugTreeDescriptor> CollectTreeDescriptors(TerrainGenerator generator, int maxWorld)
+        {
+            var descriptors = new List<TerrainGenerator.DebugTreeDescriptor>();
+            for (var z = 0; z <= maxWorld; z++)
+            {
+                for (var x = 0; x <= maxWorld; x++)
+                {
+                    if (generator.TryGetDebugTreeDescriptorAtWorld(x, z, out var descriptor))
+                        descriptors.Add(descriptor);
+                }
+            }
+
+            return descriptors;
+        }
+
+        private static TerrainGenerator.DebugTreeDescriptor? FindChunkSeamTree(IEnumerable<TerrainGenerator.DebugTreeDescriptor> descriptors)
+        {
+            foreach (var descriptor in descriptors)
+            {
+                var localX = descriptor.OriginX % 16;
+                if (localX >= 13 || localX <= 2)
+                    return descriptor;
+            }
+
+            return null;
+        }
+
+        private static int CountTreeBlocks(VoxelChunkData chunk, int startX, int endX)
+        {
+            var count = 0;
+            for (var x = startX; x <= endX; x++)
+            {
+                for (var y = 0; y < VoxelChunkData.ChunkSizeY; y++)
+                {
+                    for (var z = 0; z < VoxelChunkData.ChunkSizeZ; z++)
+                    {
+                        var block = chunk.GetBlock(x, y, z);
+                        if (block == BlockIds.Wood || block == BlockIds.Leaves)
+                            count++;
+                    }
+                }
+            }
+
+            return count;
+        }
+
+        private static void ValidateBiomeTerrainAgreement(TerrainGenerator generator, Logger log, BiomeId biomeId, string label)
+        {
+            if (!TryFindBiomeSample(generator, biomeId, out var sampleX, out var sampleZ, out var column))
+                throw new Exception($"Could not find a {label} sample for terrain validation.");
+
+            log.Info($"{label} sample at ({sampleX},{sampleZ}) => zone={column.Zone}, surfaceY={column.SurfaceY}, biome={column.Biome.BiomeId}");
+
+            if (biomeId == BiomeId.Ocean)
+            {
+                if (column.Zone != TerrainGenerator.TerrainZone.DeepOcean
+                    && column.Zone != TerrainGenerator.TerrainZone.ShallowOcean)
+                {
+                    throw new Exception("Ocean biome sample was not classified as an ocean zone.");
+                }
+
+                if (column.SurfaceY >= 64)
+                    throw new Exception("Ocean biome sample surface was not below sea level.");
+            }
+            else
+            {
+                if (column.Zone == TerrainGenerator.TerrainZone.DeepOcean
+                    || column.Zone == TerrainGenerator.TerrainZone.ShallowOcean)
+                {
+                    throw new Exception($"{label} biome sample was incorrectly classified as ocean.");
+                }
+
+                if (column.SurfaceY <= 64)
+                    throw new Exception($"{label} biome sample did not rise above sea level.");
+            }
+        }
+
+        private static bool TryFindBiomeSample(TerrainGenerator generator, BiomeId targetBiome, out int foundX, out int foundZ, out TerrainGenerator.TerrainColumnSample sample)
+        {
+            for (var z = 0; z <= 1024; z += 8)
+            {
+                for (var x = 0; x <= 1024; x += 8)
+                {
+                    var column = generator.SampleDebugColumn(x, z);
+                    if (column.Biome.BiomeId != targetBiome)
+                        continue;
+
+                    foundX = x;
+                    foundZ = z;
+                    sample = column;
+                    return true;
+                }
+            }
+
+            foundX = 0;
+            foundZ = 0;
+            sample = default;
+            return false;
+        }
+
+        private static int FloorDiv(int value, int divisor)
+        {
+            var quotient = value / divisor;
+            var remainder = value % divisor;
+            if (remainder != 0 && ((remainder > 0) != (divisor > 0)))
+                quotient--;
+            return quotient;
         }
         
         /// <summary>

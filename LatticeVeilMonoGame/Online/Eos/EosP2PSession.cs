@@ -60,6 +60,7 @@ public sealed class EosP2PHostSession : ILanSession
     private readonly ConcurrentQueue<LanChunkData> _chunkData = new();
     private readonly ConcurrentQueue<bool> _worldSyncComplete = new();
     private readonly ConcurrentQueue<LanTeleport> _teleports = new();
+    private readonly ConcurrentQueue<LanInventoryView> _inventoryViews = new();
     private readonly ConcurrentQueue<LanPlayerPersistenceSnapshot> _persistenceSnapshots = new();
     private readonly Dictionary<string, ClientState> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PendingJoinState> _pendingJoinByPeer = new(StringComparer.OrdinalIgnoreCase);
@@ -193,6 +194,38 @@ public sealed class EosP2PHostSession : ILanSession
         // Host does not send snapshots to itself.
     }
 
+    public void SendInventoryView(LanInventoryView inventoryView)
+    {
+#if EOS_SDK
+        if (!IsConnected)
+            return;
+
+        if (IsHost)
+        {
+            // Host forwards to the requesting viewer (ViewerPlayerId)
+            ClientState? target = null;
+            lock (_clientLock)
+            {
+                foreach (var client in _clients.Values)
+                {
+                    if (client.Id != inventoryView.ViewerPlayerId)
+                        continue;
+                    target = client;
+                    break;
+                }
+            }
+
+            if (target == null)
+                return;
+
+            EosP2PWire.SendInventoryView(_p2p, _localUserId, target.PeerId, _socketId, inventoryView, _log);
+            return;
+        }
+#else
+        // No-op when EOS SDK is not available
+#endif
+    }
+
     public bool SendPersistenceRestore(int targetPlayerId, LanPlayerPersistenceSnapshot snapshot)
     {
 #if EOS_SDK
@@ -228,7 +261,7 @@ public sealed class EosP2PHostSession : ILanSession
 #endif
     }
 
-    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status)
+    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId)
     {
 #if EOS_SDK
         if (!IsConnected)
@@ -240,7 +273,8 @@ public sealed class EosP2PHostSession : ILanSession
             Position = position,
             Yaw = yaw,
             Pitch = pitch,
-            Status = status
+            Status = status,
+            HeldBlockId = heldBlockId
         };
         BroadcastPlayerState(state);
 #else
@@ -344,6 +378,16 @@ public sealed class EosP2PHostSession : ILanSession
         return _persistenceSnapshots.TryDequeue(out snapshot);
 #else
         snapshot = default;
+        return false;
+#endif
+    }
+
+    public bool TryDequeueInventoryView(out LanInventoryView inventoryView)
+    {
+#if EOS_SDK
+        return _inventoryViews.TryDequeue(out inventoryView);
+#else
+        inventoryView = default;
         return false;
 #endif
     }
@@ -647,6 +691,11 @@ public sealed class EosP2PHostSession : ILanSession
                             Payload = snapshot.Payload ?? Array.Empty<byte>(),
                             TimestampUtc = snapshot.TimestampUtc <= 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : snapshot.TimestampUtc
                         });
+                        break;
+                    case LanMessageType.InventoryView:
+                        if (!TryGetClient(peerId, out _))
+                            break;
+                        _inventoryViews.Enqueue(msg.InventoryView);
                         break;
                 }
             }
@@ -995,6 +1044,7 @@ public sealed class EosP2PClientSession : ILanSession
     private readonly ConcurrentQueue<LanChunkData> _chunkData = new();
     private readonly ConcurrentQueue<bool> _worldSyncComplete = new();
     private readonly ConcurrentQueue<LanTeleport> _teleports = new();
+    private readonly ConcurrentQueue<LanInventoryView> _inventoryViews = new();
     private readonly ConcurrentQueue<LanPlayerPersistenceSnapshot> _persistenceRestores = new();
     private readonly ConcurrentQueue<string> _disconnectReasons = new();
     private ulong _notifyClosedId;
@@ -1262,7 +1312,7 @@ public sealed class EosP2PClientSession : ILanSession
 #endif
     }
 
-    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status)
+    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId)
     {
 #if EOS_SDK
         if (!IsConnected)
@@ -1274,7 +1324,8 @@ public sealed class EosP2PClientSession : ILanSession
             Position = position,
             Yaw = yaw,
             Pitch = pitch,
-            Status = status
+            Status = status,
+            HeldBlockId = heldBlockId
         };
         EosP2PWire.SendPlayerState(_p2p, _localUserId, _hostUserId, _socketId, state, _log);
 #else
@@ -1460,6 +1511,28 @@ public sealed class EosP2PClientSession : ILanSession
         return false;
     }
 
+    public void SendInventoryView(LanInventoryView inventoryView)
+    {
+#if EOS_SDK
+        if (!IsConnected)
+            return;
+
+        EosP2PWire.SendInventoryView(_p2p, _localUserId, _hostUserId, _socketId, inventoryView, _log);
+#else
+        // No-op when EOS SDK is not available
+#endif
+    }
+
+    public bool TryDequeueInventoryView(out LanInventoryView inventoryView)
+    {
+#if EOS_SDK
+        return _inventoryViews.TryDequeue(out inventoryView);
+#else
+        inventoryView = default;
+        return false;
+#endif
+    }
+
     public bool TryDequeuePersistenceRestore(out LanPlayerPersistenceSnapshot snapshot)
     {
 #if EOS_SDK
@@ -1564,6 +1637,9 @@ public sealed class EosP2PClientSession : ILanSession
                     case LanMessageType.PersistenceRestore:
                         _persistenceRestores.Enqueue(msg.PersistenceSnapshot);
                         break;
+                    case LanMessageType.InventoryView:
+                        _inventoryViews.Enqueue(msg.InventoryView);
+                        break;
                     case LanMessageType.JoinDenied:
                         SetDisconnectReasonOnce(string.IsNullOrWhiteSpace(msg.JoinDeniedReason)
                             ? "Host denied join request."
@@ -1596,8 +1672,6 @@ public sealed class EosP2PClientSession : ILanSession
             return null;
 
         var value = joinInfo.Trim();
-        if (value.StartsWith("latticeveil://join/", StringComparison.OrdinalIgnoreCase))
-            value = value.Substring("latticeveil://join/".Length).Trim();
         if (value.StartsWith("puid=", StringComparison.OrdinalIgnoreCase))
             value = value.Substring(5).Trim();
 
@@ -1642,6 +1716,7 @@ public sealed class EosP2PClientSession : ILanSession
 internal static class EosP2PWire
 {
     private const byte Channel = 0;
+    private const byte InventoryChannel = 2;
     private const string SocketName = "rc_mp";
 
     public static SocketId CreateSocket()
@@ -1699,6 +1774,12 @@ internal static class EosP2PWire
             bw.Write(string.IsNullOrWhiteSpace(info.Generator)
                 ? WorldMeta.CanonicalGeneratorForWorldType(info.WorldType)
                 : info.Generator);
+            bw.Write(info.EnableMultipleHomes);
+            bw.Write(info.MaxHomesPerPlayer);
+            bw.Write(info.TimeCycleEnabled);
+            bw.Write(info.WeatherCycleEnabled);
+            bw.Write(info.TimeOfDayTicks);
+            bw.Write(WorldMeta.CanonicalWeatherState(info.WeatherState));
         }, log);
         SendRaw(p2p, localUserId, remoteUserId, socketId, payload, PacketReliability.ReliableOrdered, log);
     }
@@ -1715,6 +1796,7 @@ internal static class EosP2PWire
             bw.Write(state.Yaw);
             bw.Write(state.Pitch);
             bw.Write(state.Status);
+            bw.Write(state.HeldBlockId);
         }, log);
         SendRaw(p2p, localUserId, remoteUserId, socketId, payload, PacketReliability.UnreliableUnordered, log);
     }
@@ -1784,6 +1866,38 @@ internal static class EosP2PWire
             bw.Write(chat.Text ?? string.Empty);
         }, log);
         SendRaw(p2p, localUserId, remoteUserId, socketId, payload, PacketReliability.ReliableOrdered, log);
+    }
+
+    public static void SendInventoryView(P2PInterface p2p, ProductUserId localUserId, ProductUserId remoteUserId, SocketId socketId, LanInventoryView inventoryView, Logger log)
+    {
+        var payload = BuildPayload(bw =>
+        {
+            bw.Write((byte)LanMessageType.InventoryView);
+            bw.Write(inventoryView.ViewerPlayerId);
+            bw.Write(inventoryView.TargetPlayerId);
+            bw.Write(inventoryView.SelectedIndex);
+
+            var hotbarIds = inventoryView.HotbarIds ?? Array.Empty<byte>();
+            var hotbarCounts = inventoryView.HotbarCounts ?? Array.Empty<byte>();
+            var gridIds = inventoryView.GridIds ?? Array.Empty<byte>();
+            var gridCounts = inventoryView.GridCounts ?? Array.Empty<byte>();
+
+            bw.Write(hotbarIds.Length);
+            bw.Write(hotbarIds);
+            bw.Write(hotbarCounts.Length);
+            bw.Write(hotbarCounts);
+            bw.Write(gridIds.Length);
+            bw.Write(gridIds);
+            bw.Write(gridCounts.Length);
+            bw.Write(gridCounts);
+        }, log);
+
+        // Inventory snapshots are replaceable; avoid reliable backlog that triggers EOS LimitExceeded.
+        // Control packets (empty arrays) stay reliable.
+        var isControl = (inventoryView.HotbarIds == null || inventoryView.HotbarIds.Length == 0)
+                        && (inventoryView.GridIds == null || inventoryView.GridIds.Length == 0);
+        var reliability = isControl ? PacketReliability.ReliableOrdered : PacketReliability.UnreliableUnordered;
+        SendRaw(p2p, localUserId, remoteUserId, socketId, payload, reliability, log, InventoryChannel);
     }
 
     public static void SendPersistenceSnapshot(P2PInterface p2p, ProductUserId localUserId, ProductUserId remoteUserId, SocketId socketId, LanPlayerPersistenceSnapshot snapshot, Logger log)
@@ -1889,12 +2003,20 @@ internal static class EosP2PWire
 
     public static bool SendRaw(P2PInterface p2p, ProductUserId localUserId, ProductUserId remoteUserId, SocketId socketId, byte[] payload, PacketReliability reliability, Logger log)
     {
+        return SendRaw(p2p, localUserId, remoteUserId, socketId, payload, reliability, log, Channel);
+    }
+
+    public static bool SendRaw(P2PInterface p2p, ProductUserId localUserId, ProductUserId remoteUserId, SocketId socketId, byte[] payload, PacketReliability reliability, Logger log, byte channel)
+    {
+        if (payload.Length == 0)
+            return false;
+
         var options = new SendPacketOptions
         {
             LocalUserId = localUserId,
             RemoteUserId = remoteUserId,
             SocketId = socketId,
-            Channel = Channel,
+            Channel = channel,
             Data = new ArraySegment<byte>(payload),
             Reliability = reliability,
             AllowDelayedDelivery = false,
@@ -1911,15 +2033,23 @@ internal static class EosP2PWire
         return true;
     }
 
-    public static bool TryReceivePacket(P2PInterface p2p, ProductUserId localUserId, SocketId socketId, out ProductUserId peerId, out LanMessage msg)
+    public static bool TryReceivePacket(P2PInterface p2p, ProductUserId localUserId, SocketId socketId, out ProductUserId? remoteUserId, out LanMessage msg)
+    {
+        // Prefer inventory channel packets first to keep UI responsive under load.
+        if (TryReceivePacket(p2p, localUserId, socketId, InventoryChannel, out remoteUserId, out msg))
+            return true;
+        return TryReceivePacket(p2p, localUserId, socketId, Channel, out remoteUserId, out msg);
+    }
+
+    private static bool TryReceivePacket(P2PInterface p2p, ProductUserId localUserId, SocketId socketId, byte requestedChannel, out ProductUserId? remoteUserId, out LanMessage msg)
     {
         msg = default;
-        peerId = null!;
+        remoteUserId = null;
 
         var sizeOptions = new GetNextReceivedPacketSizeOptions
         {
             LocalUserId = localUserId,
-            RequestedChannel = Channel
+            RequestedChannel = requestedChannel
         };
 
         var sizeResult = p2p.GetNextReceivedPacketSize(ref sizeOptions, out var size);
@@ -1937,13 +2067,13 @@ internal static class EosP2PWire
         {
             LocalUserId = localUserId,
             MaxDataSizeBytes = size,
-            RequestedChannel = Channel
+            RequestedChannel = requestedChannel
         };
 
         var outSocket = new SocketId();
         byte outChannel;
         uint bytesWritten;
-        var recvResult = p2p.ReceivePacket(ref receiveOptions, ref peerId, ref outSocket, out outChannel, new ArraySegment<byte>(buffer), out bytesWritten);
+        var recvResult = p2p.ReceivePacket(ref receiveOptions, ref remoteUserId, ref outSocket, out outChannel, new ArraySegment<byte>(buffer), out bytesWritten);
         if (recvResult != Result.Success || bytesWritten == 0)
             return false;
 
@@ -2005,6 +2135,12 @@ internal static class EosP2PWire
                 var generator = br.BaseStream.Position < br.BaseStream.Length
                     ? br.ReadString()
                     : WorldMeta.CanonicalGeneratorForWorldType(worldType);
+                var enableMultipleHomes = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var maxHomesPerPlayer = br.BaseStream.Position < br.BaseStream.Length ? br.ReadInt32() : 8;
+                var timeCycleEnabled = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var weatherCycleEnabled = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var timeOfDayTicks = br.BaseStream.Position < br.BaseStream.Length ? br.ReadInt32() : 1000;
+                var weatherState = br.BaseStream.Position < br.BaseStream.Length ? br.ReadString() : "clear";
                 msg = new LanMessage
                 {
                     Type = type,
@@ -2021,7 +2157,13 @@ internal static class EosP2PWire
                         WorldType = WorldMeta.CanonicalWorldType(worldType),
                         Generator = string.IsNullOrWhiteSpace(generator)
                             ? WorldMeta.CanonicalGeneratorForWorldType(worldType)
-                            : generator
+                            : generator,
+                        EnableMultipleHomes = enableMultipleHomes,
+                        MaxHomesPerPlayer = Math.Clamp(maxHomesPerPlayer, 1, 32),
+                        TimeCycleEnabled = timeCycleEnabled,
+                        WeatherCycleEnabled = weatherCycleEnabled,
+                        TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(timeOfDayTicks),
+                        WeatherState = WorldMeta.CanonicalWeatherState(weatherState)
                     }
                 };
                 return true;
@@ -2036,7 +2178,10 @@ internal static class EosP2PWire
                         Position = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                         Yaw = br.ReadSingle(),
                         Pitch = br.ReadSingle(),
-                        Status = br.ReadByte()
+                        Status = br.ReadByte(),
+                        HeldBlockId = br.BaseStream.Position < br.BaseStream.Length
+                            ? br.ReadByte()
+                            : (byte)BlockId.Air
                     }
                 };
                 return true;
@@ -2204,6 +2349,48 @@ internal static class EosP2PWire
                             Username = username,
                             TimestampUtc = timestampUtc,
                             Payload = payload
+                        }
+                    };
+                    return true;
+                }
+            case LanMessageType.InventoryView:
+                {
+                    var viewerPlayerId = br.ReadInt32();
+                    var targetPlayerId = br.ReadInt32();
+                    var selectedIndex = br.ReadInt32();
+
+                    var hotbarIdsLen = br.ReadInt32();
+                    if (hotbarIdsLen < 0 || hotbarIdsLen > 4096)
+                        return false;
+                    var hotbarIds = br.ReadBytes(hotbarIdsLen);
+
+                    var hotbarCountsLen = br.ReadInt32();
+                    if (hotbarCountsLen < 0 || hotbarCountsLen > 4096)
+                        return false;
+                    var hotbarCounts = br.ReadBytes(hotbarCountsLen);
+
+                    var gridIdsLen = br.ReadInt32();
+                    if (gridIdsLen < 0 || gridIdsLen > 8192)
+                        return false;
+                    var gridIds = br.ReadBytes(gridIdsLen);
+
+                    var gridCountsLen = br.ReadInt32();
+                    if (gridCountsLen < 0 || gridCountsLen > 8192)
+                        return false;
+                    var gridCounts = br.ReadBytes(gridCountsLen);
+
+                    msg = new LanMessage
+                    {
+                        Type = type,
+                        InventoryView = new LanInventoryView
+                        {
+                            ViewerPlayerId = viewerPlayerId,
+                            TargetPlayerId = targetPlayerId,
+                            SelectedIndex = selectedIndex,
+                            HotbarIds = hotbarIds,
+                            HotbarCounts = hotbarCounts,
+                            GridIds = gridIds,
+                            GridCounts = gridCounts
                         }
                     };
                     return true;

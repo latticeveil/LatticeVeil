@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using Microsoft.Xna.Framework.Graphics;
 using LatticeVeilMonoGame.Core;
 
@@ -12,6 +13,9 @@ public static class SimpleMemoryManager
 {
     private static readonly Logger _log = new Logger("SimpleMemoryManager");
     
+    // Memory pools
+    private static readonly ArrayPool<VertexPositionTexture> _vertexPool = ArrayPool<VertexPositionTexture>.Create();
+    
     // Memory tracking
     private static long _totalAllocated;
     private static long _peakUsage;
@@ -21,6 +25,22 @@ public static class SimpleMemoryManager
     static SimpleMemoryManager()
     {
         InitializeMemoryManagement();
+    }
+
+    /// <summary>
+    /// Rents a vertex array from the pool.
+    /// </summary>
+    public static VertexPositionTexture[] RentVertices(int minimumLength)
+    {
+        return _vertexPool.Rent(minimumLength);
+    }
+
+    /// <summary>
+    /// Returns a vertex array to the pool.
+    /// </summary>
+    public static void ReturnVertices(VertexPositionTexture[] array, bool clearArray = false)
+    {
+        _vertexPool.Return(array, clearArray);
     }
     
     /// <summary>

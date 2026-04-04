@@ -175,21 +175,6 @@ public sealed class Game1 : Game
                 new AssetViewerScreen(_menus, _assets, _font, _pixel, _log),
                 UiLayout.Viewport);
         }
-        else if (_startOptions?.HasJoinToken == true)
-        {
-            _menus.Push(
-                new JoinByCodeScreen(
-                    _menus,
-                    _assets,
-                    _font,
-                    _pixel,
-                    _log,
-                    _profile,
-                    _graphics,
-                    _eosClient,
-                    _startOptions.JoinToken),
-                UiLayout.Viewport);
-        }
         else
         {
             _menus.Push(
@@ -653,4 +638,3 @@ public sealed class Game1 : Game
             UiLayout.Viewport);
     }
 }
-

@@ -1,5 +1,6 @@
 {
   "VeilnetFunctionsBaseUrl": "https://YOUR_SUPABASE_PROJECT.supabase.co/functions/v1",
-  "GameHashesGetUrl": "https://YOUR_SUPABASE_PROJECT.supabase.co/functions/v1/game-hashes-get",
-  "VeilnetLauncherPageUrl": "https://YOUR_SITE_DOMAIN/veilnet/launcher/"
+  "GameHashesGetUrl": "https://YOUR_SUPABASE_PROJECT.supabase.co/rest/v1/game_hashes",
+  "VeilnetLauncherPageUrl": "https://YOUR_GITHUB_PAGES.github.io/veilnet/launcher/",
+  "SupabaseAnonKey": "YOUR_SUPABASE_ANON_KEY"
 }

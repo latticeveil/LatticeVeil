@@ -25,6 +25,7 @@ public sealed class SingleplayerWorldOptionsScreen : IScreen
     private readonly Button _openLanBtn;
     private readonly Button _hostOnlineBtn;
     private readonly Button _backBtn;
+    private readonly bool _onlineHostingAvailable;
 
     private Rectangle _viewport;
     private Rectangle _panelRect;
@@ -50,10 +51,13 @@ public sealed class SingleplayerWorldOptionsScreen : IScreen
         _profile = profile;
         _graphics = graphics;
         _worldEntry = worldEntry;
+        var launchMode = (Environment.GetEnvironmentVariable("LV_LAUNCH_MODE") ?? string.Empty).Trim();
+        _onlineHostingAvailable = !string.Equals(launchMode, "offline", StringComparison.OrdinalIgnoreCase)
+            && OnlineGateClient.GetOrCreate().CanUseOfficialOnline(_log, out _);
 
         _playBtn = new Button("PLAY", PlayWorld) { BoldText = true };
         _openLanBtn = new Button("OPEN TO LAN", OpenToLan) { BoldText = true };
-        _hostOnlineBtn = new Button("HOST ONLINE", HostOnline) { BoldText = true };
+        _hostOnlineBtn = new Button(_onlineHostingAvailable ? "HOST ONLINE" : "HOST IN LAN", HostOnline) { BoldText = true };
         _backBtn = new Button("BACK", () => _menus.Pop()) { BoldText = true };
     }
 
@@ -161,6 +165,12 @@ public sealed class SingleplayerWorldOptionsScreen : IScreen
     {
         if (!EnsureWorldPaths())
             return;
+
+        if (!_onlineHostingAvailable)
+        {
+            OpenToLan();
+            return;
+        }
 
         _log.Info($"HOST_CLICKED world={_worldEntry.Name} mode=singleplayer_options transport=online");
         var gate = OnlineGateClient.GetOrCreate();

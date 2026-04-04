@@ -219,7 +219,13 @@ public static class WorldHostBootstrap
             PlayerCollision = meta.PlayerCollision,
             WorldId = meta.WorldId,
             WorldType = WorldMeta.CanonicalWorldType(meta.WorldGeneration?.WorldType),
-            Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration?.WorldType)
+            Generator = WorldMeta.CanonicalGeneratorForWorldType(meta.WorldGeneration?.WorldType),
+            EnableMultipleHomes = meta.EnableMultipleHomes,
+            MaxHomesPerPlayer = Math.Clamp(meta.MaxHomesPerPlayer, 1, 32),
+            TimeCycleEnabled = meta.TimeCycleEnabled,
+            WeatherCycleEnabled = meta.WeatherCycleEnabled,
+            TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(meta.TimeOfDayTicks),
+            WeatherState = WorldMeta.CanonicalWeatherState(meta.WeatherState)
         };
     }
 
@@ -245,12 +251,13 @@ public static class WorldHostBootstrap
         public bool IsConnected => _inner.IsConnected;
         public int LocalPlayerId => _inner.LocalPlayerId;
 
-        public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status) => _inner.SendPlayerState(position, yaw, pitch, status);
+        public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId) => _inner.SendPlayerState(position, yaw, pitch, status, heldBlockId);
         public void SendBlockSet(int x, int y, int z, byte id) => _inner.SendBlockSet(x, y, z, id);
         public void SendItemSpawn(LanItemSpawn item) => _inner.SendItemSpawn(item);
         public void SendItemPickup(int itemId) => _inner.SendItemPickup(itemId);
         public void SendChat(LanChatMessage message) => _inner.SendChat(message);
         public void SendPersistenceSnapshot(LanPlayerPersistenceSnapshot snapshot) => _inner.SendPersistenceSnapshot(snapshot);
+        public void SendInventoryView(LanInventoryView inventoryView) => _inner.SendInventoryView(inventoryView);
         public bool SendPersistenceRestore(int targetPlayerId, LanPlayerPersistenceSnapshot snapshot) => _inner.SendPersistenceRestore(targetPlayerId, snapshot);
         public bool SendTeleport(int targetPlayerId, Vector3 position, float yaw, float pitch) => _inner.SendTeleport(targetPlayerId, position, yaw, pitch);
         public bool TryDequeuePlayerState(out LanPlayerState state) => _inner.TryDequeuePlayerState(out state);
@@ -263,6 +270,7 @@ public static class WorldHostBootstrap
         public bool TryDequeueWorldSyncComplete(out bool complete) => _inner.TryDequeueWorldSyncComplete(out complete);
         public bool TryDequeueTeleport(out LanTeleport teleport) => _inner.TryDequeueTeleport(out teleport);
         public bool TryDequeuePersistenceSnapshot(out LanPlayerPersistenceSnapshot snapshot) => _inner.TryDequeuePersistenceSnapshot(out snapshot);
+        public bool TryDequeueInventoryView(out LanInventoryView inventoryView) => _inner.TryDequeueInventoryView(out inventoryView);
         public bool TryDequeuePersistenceRestore(out LanPlayerPersistenceSnapshot snapshot) => _inner.TryDequeuePersistenceRestore(out snapshot);
         public bool TryDequeueDisconnectReason(out string reason) => _inner.TryDequeueDisconnectReason(out reason);
         public bool KickPlayer(int targetPlayerId, string reason) => _inner.KickPlayer(targetPlayerId, reason);

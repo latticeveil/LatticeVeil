@@ -68,14 +68,14 @@ public class UIManager
     
     public void CreateMainMenuLayout()
     {
-        var buttonSize = new Rectangle(0, 0, 500, 180);
-        var spacing = 20; // Positive spacing to prevent button overlap
+        var buttonSize = new Rectangle(0, 0, 560, 200);
+        var spacing = 2;
         
         // Use virtual resolution coordinates (1920x1080)
         var centerX = VirtualResolution.VirtualWidth / 2;
         var buttonsCount = 4;
         var totalHeight = buttonSize.Height * buttonsCount + spacing * (buttonsCount - 1);
-        var startY = (VirtualResolution.VirtualHeight - totalHeight) / 2;
+        var startY = Math.Max(90, (VirtualResolution.VirtualHeight - totalHeight) / 2 - 10);
         
         // Main menu buttons - properly spaced in virtual coordinates
         AddButton("singleplayer", new Rectangle(
@@ -107,20 +107,22 @@ public class UIManager
         ), "Quit button - bottom of main buttons");
         
         // Profile button - bottom left in virtual coordinates (perfect square, bigger)
-        var profileSize = new Rectangle(0, 0, 120, 120); // Perfect square, bigger
+        var footerMarginX = 18;
+        var footerMarginY = 18;
+        var footerButtonSize = new Rectangle(0, 0, 136, 136);
         AddButton("profile", new Rectangle(
-            20,
-            VirtualResolution.VirtualHeight - profileSize.Height - 50,
-            profileSize.Width,
-            profileSize.Height
+            footerMarginX,
+            VirtualResolution.VirtualHeight - footerButtonSize.Height - footerMarginY,
+            footerButtonSize.Width,
+            footerButtonSize.Height
         ), "Profile button - bottom left corner");
         
         // Screenshots button - bottom right in virtual coordinates
         AddButton("screenshots", new Rectangle(
-            VirtualResolution.VirtualWidth - 250 - 80,
-            VirtualResolution.VirtualHeight - profileSize.Height - 50,
-            250,
-            profileSize.Height
+            VirtualResolution.VirtualWidth - footerButtonSize.Width - footerMarginX,
+            VirtualResolution.VirtualHeight - footerButtonSize.Height - footerMarginY,
+            footerButtonSize.Width,
+            footerButtonSize.Height
         ), "Screenshots button - bottom right corner");
     }
     

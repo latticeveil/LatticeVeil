@@ -39,10 +39,9 @@ public sealed class OptionsScreen : IScreen
     };
     private static readonly (float value, string label)[] GuiScaleCandidates = new[]
     {
-        (1.0f, "1.0X"),
-        (1.25f, "1.25X"),
-        (1.5f, "1.5X"),
-        (2.0f, "2.0X")
+        (0.75f, "0.75X"),
+        (0.85f, "0.85X"),
+        (1.0f, "1.0X")
     };
     private static readonly string[] GuiScaleLabels = GuiScaleCandidates.Select(c => c.label).ToArray();
     private static readonly string[] QualityPresets = { "LOW", "MEDIUM", "HIGH", "ULTRA" };
@@ -54,6 +53,7 @@ public sealed class OptionsScreen : IScreen
         (SocialNotificationMode.On, "ON")
     };
     private static readonly string[] NotificationModeLabels = NotificationModeOptions.Select(o => o.label).ToArray();
+    private static readonly string[] NametagModeLabels = { "STATIC", "FADE", "OFF" };
     private const int ReticleSizeMin = 2;
     private const int ReticleSizeMax = 32;
     private const int ReticleThicknessMin = 1;
@@ -139,7 +139,9 @@ public sealed class OptionsScreen : IScreen
     private static extern bool EnumDisplaySettingsEx(string? lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode, uint dwFlags);
 
     private enum Tab { Video, Audio, Controls, Packs }
+    private enum ControlsSubTab { Movement, Gameplay, Interface, AllBinds }
     private Tab _tab = Tab.Video;
+    private ControlsSubTab _controlsSubTab = ControlsSubTab.Movement;
 
     private Texture2D? _bg;
     private Texture2D? _panel;
@@ -210,17 +212,44 @@ public sealed class OptionsScreen : IScreen
     // Controls binding
     private readonly List<string> _bindOrder = new()
     {
-        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","StructureFinder","GamemodeModifier","GamemodeWheel","VeilseerXrayToggle","InviteQuickAction"
+        "MoveUp","MoveDown","MoveLeft","MoveRight","Jump","Crouch","Sprint","FlyDescend","Inventory","DropItem","GiveItem","Pause","Chat","Command","HomeGui","StructureFinder","GamemodeModifier","GamemodeWheel","VeilseerXrayToggle","InviteQuickAction"
+    };
+    private static readonly string[] MovementBindActions =
+    {
+        "MoveUp", "MoveDown", "MoveLeft", "MoveRight", "Jump", "Crouch", "Sprint", "FlyDescend"
+    };
+    private static readonly string[] GameplayBindActions =
+    {
+        "Inventory", "DropItem", "GiveItem", "HomeGui", "StructureFinder", "GamemodeModifier", "GamemodeWheel", "VeilseerXrayToggle", "InviteQuickAction"
+    };
+    private static readonly string[] InterfaceBindActions =
+    {
+        "Pause", "Chat", "Command"
     };
     private string? _bindingAction;
     private Rectangle _controlsListRect;
+    private Rectangle _controlsMovementTabRect;
+    private Rectangle _controlsGameplayTabRect;
+    private Rectangle _controlsInterfaceTabRect;
+    private Rectangle _controlsAllBindsTabRect;
+    private Rectangle _controlsBodyClipRect;
+    private Rectangle _crouchModeCycleRect;
+    private Rectangle _sprintModeCycleRect;
     private Checkbox _reticleEnabled;
+    private Checkbox _toggleCrouchEnabled;
+    private Checkbox _indicatorsEnabled;
     private Rectangle _reticleStyleBox;
     private bool _reticleStyleOpen;
     private Rectangle _reticleColorBox;
     private bool _reticleColorOpen;
     private Rectangle _blockOutlineColorBox;
     private bool _blockOutlineColorOpen;
+    private Checkbox _flyingOutlineEnabled;
+    private Rectangle _flyingOutlineColorBox;
+    private bool _flyingOutlineColorOpen;
+    private Rectangle _nametagModeBox;
+    private bool _nametagModeOpen;
+    private Slider _nametagFadeSeconds;
     private Slider _reticleSize;
     private Slider _reticleThickness;
 
@@ -236,6 +265,13 @@ public sealed class OptionsScreen : IScreen
     private float _scrollAudio;
     private float _scrollControls;
     private float _scrollPacks;
+    private string _applyFeedbackText = string.Empty;
+    private float _applyFeedbackTimer;
+    private bool _applyFeedbackIsError;
+    private string _lastLayoutSnapshot = string.Empty;
+    private bool _scrollbarDragging;
+    private Tab _scrollbarDragTab;
+    private int _scrollbarDragOffsetY;
 
     public OptionsScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics)
     {
@@ -302,11 +338,34 @@ public sealed class OptionsScreen : IScreen
                 _working.MouseSensitivity = value;
                 _log.Info($"Option changed: MouseSensitivity = {value:0.0000}");
             });
+        _toggleCrouchEnabled = new Checkbox("TOGGLE CROUCH", _working.ToggleCrouchEnabled, v =>
+        {
+            _working.ToggleCrouchEnabled = v;
+            _log.Info($"Option changed: ToggleCrouchEnabled = {v}");
+        });
         _reticleEnabled = new Checkbox("RETICLE", _working.ReticleEnabled, v =>
         {
             _working.ReticleEnabled = v;
             _log.Info($"Option changed: ReticleEnabled = {v}");
         });
+        _indicatorsEnabled = new Checkbox("INDICATORS", _working.IndicatorsEnabled, v =>
+        {
+            _working.IndicatorsEnabled = v;
+            _log.Info($"Option changed: IndicatorsEnabled = {v}");
+        });
+        _flyingOutlineEnabled = new Checkbox("FLY OUTLINE", _working.FlyingOutlineEnabled, v =>
+        {
+            _working.FlyingOutlineEnabled = v;
+            _log.Info($"Option changed: FlyingOutlineEnabled = {v}");
+        });
+        _nametagFadeSeconds = new Slider("NAMETAG FADE", NametagFadeSecondsToSlider(_working.NametagFadeSeconds),
+            v => _working.NametagFadeSeconds = SliderToNametagFadeSeconds(v),
+            v =>
+            {
+                var value = SliderToNametagFadeSeconds(v);
+                _working.NametagFadeSeconds = value;
+                _log.Info($"Option changed: NametagFadeSeconds = {value:0.0}");
+            });
         _reticleSize = new Slider("RETICLE SIZE", ReticleSizeToSlider(_working.ReticleSize),
             v => _working.ReticleSize = SliderToReticleSize(v),
             v =>
@@ -389,83 +448,96 @@ public sealed class OptionsScreen : IScreen
     {
         _viewport = viewport;
 
-        var panelW = Math.Min(1300, viewport.Width - 20); // Reduced from 1400
-        var panelH = Math.Min(700, viewport.Height - 30); // Reduced from 760
+        var panelW = Math.Min(1248, viewport.Width - 20);
+        var panelH = Math.Min(680, viewport.Height - 30);
         _panelRect = new Rectangle(
             viewport.X + (viewport.Width - panelW) / 2,
             viewport.Y + (viewport.Height - panelH) / 2,
             panelW,
             panelH);
 
-        // Tabs just above the panel
-        var tabW = panelW / 4 - 10;
-        var tabH = (int)(tabW * 0.30f);
-        var tabY = _panelRect.Y - 40; // Move down by a couple inches from previous position
-        _tabVideo.Bounds = new Rectangle(_panelRect.X + 10, tabY, tabW, tabH);
-        _tabAudio.Bounds = new Rectangle(_tabVideo.Bounds.Right + 10, tabY, tabW, tabH);
-        _tabControls.Bounds = new Rectangle(_tabAudio.Bounds.Right + 10, tabY, tabW, tabH);
-        _tabPacks.Bounds = new Rectangle(_tabControls.Bounds.Right + 10, tabY, tabW, tabH);
+        var layoutScale = Math.Clamp(Math.Min(panelW / 1180f, panelH / 680f), 0.82f, 1.0f);
+        var sidePadding = (int)Math.Round(44f * layoutScale);
+        var frameInsetX = Math.Max(sidePadding, (int)Math.Round(104f * layoutScale));
+        var frameInsetTop = Math.Max((int)Math.Round(48f * layoutScale), (int)Math.Round(58f * layoutScale));
+        var frameInsetBottom = Math.Max((int)Math.Round(24f * layoutScale), (int)Math.Round(30f * layoutScale));
+        var sectionGap = (int)Math.Round(28f * layoutScale);
+        var rowGap = (int)Math.Round(18f * layoutScale);
+        var smallRowGap = (int)Math.Round(12f * layoutScale);
+        var dropdownHeight = Math.Max(36, (int)Math.Round(40f * layoutScale));
+        var checkboxHeight = Math.Max(34, (int)Math.Round(38f * layoutScale));
+        var sliderHeight = Math.Max(16, (int)Math.Round(18f * layoutScale));
+        var buttonHeight = Math.Max(48, (int)Math.Round(62f * layoutScale));
+        var footerPadding = (int)Math.Round(16f * layoutScale);
+        var tabGap = Math.Max(6, (int)Math.Round(8f * layoutScale));
+        var tabY = _panelRect.Y - Math.Max(34, (int)Math.Round(42f * layoutScale));
 
-        // Bottom buttons
-        var btnW = panelW / 3 - 15; // Reduced from panelW / 2
-        var btnH = (int)(btnW * 0.25f); // Reduced from 0.30f
-        var btnY = _panelRect.Bottom - btnH - 80; // Moved up by 60 pixels (2 inches)
-        
-        // Position back button in bottom-left corner of full screen with proper aspect ratio
-        var backBtnMargin = 20;
-        var backBtnBaseW = Math.Max(_back.Texture?.Width ?? 0, 320);
-        var backBtnBaseH = Math.Max(_back.Texture?.Height ?? 0, (int)(backBtnBaseW * 0.28f));
-        var backBtnScale = Math.Min(1f, Math.Min(240f / backBtnBaseW, 240f / backBtnBaseH)); // Increased from 200f to 240f
-        var backBtnW = Math.Max(1, (int)Math.Round(backBtnBaseW * backBtnScale));
-        var backBtnH = Math.Max(1, (int)Math.Round(backBtnBaseH * backBtnScale));
-        _back.Bounds = new Rectangle(
-            viewport.X + backBtnMargin, 
-            viewport.Bottom - backBtnMargin - backBtnH, 
-            backBtnW, 
-            backBtnH
-        );
-        
-        // Position apply button in bottom-center (without back button)
-        var applyBtnX = _panelRect.X + (_panelRect.Width - btnW) / 2;
-        _apply.Bounds = new Rectangle(applyBtnX, btnY, btnW, btnH);
+        Rectangle FitAspectRect(int x, int y, int maxWidth, int targetHeight, Texture2D? texture, float fallbackAspect)
+        {
+            var aspect = texture is not null && texture.Height > 0
+                ? texture.Width / (float)texture.Height
+                : fallbackAspect;
+            var width = Math.Min(maxWidth, Math.Max(1, (int)Math.Round(targetHeight * aspect)));
+            return new Rectangle(x, y, width, targetHeight);
+        }
 
-        // Content area
-        var contentX = _panelRect.X + 30;
-        var contentTop = _tabVideo.Bounds.Bottom + 20;
-        var contentY = _tabVideo.Bounds.Bottom + 150; // Move down by 50 pixels more
-        var contentW = panelW - 60;
-        var contentBottom = _apply.Bounds.Y - 20;
+        var tabGroupWidth = _panelRect.Width - frameInsetX * 2;
+        var tabHeight = Math.Max(44, (int)Math.Round(Math.Min(70f, tabGroupWidth * 0.095f) * layoutScale));
+        var videoTab = FitAspectRect(0, tabY, tabGroupWidth, tabHeight, _tabVideo.Texture, 3.25f);
+        var audioTab = FitAspectRect(0, tabY, tabGroupWidth, tabHeight, _tabAudio.Texture, 3.25f);
+        var controlsTab = FitAspectRect(0, tabY, tabGroupWidth, tabHeight, _tabControls.Texture, 3.25f);
+        var packsTab = FitAspectRect(0, tabY, tabGroupWidth, tabHeight, _tabPacks.Texture, 3.25f);
+        var actualTabGroupWidth = videoTab.Width + audioTab.Width + controlsTab.Width + packsTab.Width + tabGap * 3;
+        var tabStartX = _panelRect.Center.X - actualTabGroupWidth / 2;
+        _tabVideo.Bounds = new Rectangle(tabStartX, tabY, videoTab.Width, videoTab.Height);
+        _tabAudio.Bounds = new Rectangle(_tabVideo.Bounds.Right + tabGap, tabY, audioTab.Width, audioTab.Height);
+        _tabControls.Bounds = new Rectangle(_tabAudio.Bounds.Right + tabGap, tabY, controlsTab.Width, controlsTab.Height);
+        _tabPacks.Bounds = new Rectangle(_tabControls.Bounds.Right + tabGap, tabY, packsTab.Width, packsTab.Height);
+
+        var footerGap = Math.Max(16, (int)Math.Round(24f * layoutScale));
+        var buttonMaxWidth = Math.Max(260, (int)Math.Round(320f * layoutScale));
+        var backMargin = Math.Max(10, (int)Math.Round(12f * layoutScale));
+        var applyBottomMargin = Math.Max(2, (int)Math.Round(4f * layoutScale));
+        _back.Bounds = FitAspectRect(viewport.X + backMargin, viewport.Bottom - backMargin - buttonHeight, buttonMaxWidth, buttonHeight, _back.Texture, 3.6f);
+        _apply.Bounds = FitAspectRect(_panelRect.Center.X - buttonMaxWidth / 2, viewport.Bottom - applyBottomMargin - buttonHeight, buttonMaxWidth, buttonHeight, _apply.Texture, 3.6f);
+
+        var contentX = _panelRect.X + frameInsetX;
+        var contentTop = _panelRect.Y + frameInsetTop;
+        var contentY = contentTop + Math.Max(42, (int)Math.Round(48f * layoutScale));
+        var contentW = panelW - frameInsetX * 2;
+        var contentBottom = _apply.Bounds.Y - Math.Max(footerPadding, frameInsetBottom);
         var contentH = Math.Max(1, contentBottom - contentTop);
-        var clipW = Math.Max(1, _panelRect.Width - 40);
-        _contentClipRect = new Rectangle(_panelRect.X + 20, contentTop, clipW, contentH);
+        var clipW = Math.Max(1, _panelRect.Width - frameInsetX * 2);
+        _contentClipRect = new Rectangle(contentX, contentTop, clipW, contentH);
 
         var infoHeight = _font.LineHeight + 6;
         _videoInfoY = contentY;
         var videoContentY = contentY + infoHeight;
 
-        var columnGap = 30;
-        var columnW = (contentW - columnGap) / 2 - 80; // Reduce column width to match left spacing
-        var leftX = contentX + 60; // Shift left by two inches
-        var rightX = contentX + columnW + columnGap + 60; // Shift left by two inches
+        var columnGap = sectionGap;
+        var columnW = (contentW - columnGap) / 2;
+        var leftX = contentX;
+        var rightX = contentX + columnW + columnGap;
+        var dropdownWidth = Math.Min(Math.Max(240, (int)Math.Round(380f * layoutScale)), columnW);
+        var sliderWidth = Math.Min(Math.Max(260, (int)Math.Round(390f * layoutScale)), columnW);
 
-        _fullscreen.Bounds = new Rectangle(leftX, videoContentY, columnW, 36);
-        _vsync.Bounds = new Rectangle(leftX, videoContentY + 50, columnW, 36);
+        _fullscreen.Bounds = new Rectangle(leftX, videoContentY, columnW, checkboxHeight);
+        _vsync.Bounds = new Rectangle(leftX, videoContentY + checkboxHeight + smallRowGap, columnW, checkboxHeight);
 
-        // Resolution dropdown area
-        _resolutionBox = new Rectangle(leftX, videoContentY + 110, Math.Min(420, columnW), 40);
+        _resolutionBox = new Rectangle(leftX, _vsync.Bounds.Bottom + rowGap, dropdownWidth, dropdownHeight);
 
-        _guiScaleBox = new Rectangle(rightX, videoContentY, Math.Min(420, columnW), 40);
-        _qualityBox = new Rectangle(rightX, videoContentY + 60, Math.Min(420, columnW), 40);
-        _brightness.Bounds = new Rectangle(rightX, videoContentY + 120, Math.Min(420, columnW), 18);
-        _fov.Bounds = new Rectangle(rightX, videoContentY + 180, Math.Min(420, columnW), 18);
-        _renderDistance.Bounds = new Rectangle(rightX, videoContentY + 240, Math.Min(420, columnW), 18);
-        _particleBox = new Rectangle(rightX, videoContentY + 290, Math.Min(420, columnW), 40);
+        _guiScaleBox = new Rectangle(rightX, videoContentY, dropdownWidth, dropdownHeight);
+        _qualityBox = new Rectangle(rightX, _guiScaleBox.Bottom + rowGap, dropdownWidth, dropdownHeight);
+        _brightness.Bounds = new Rectangle(rightX, _qualityBox.Bottom + rowGap, sliderWidth, sliderHeight);
+        _fov.Bounds = new Rectangle(rightX, _brightness.Bounds.Bottom + rowGap + _font.LineHeight, sliderWidth, sliderHeight);
+        _renderDistance.Bounds = new Rectangle(rightX, _fov.Bounds.Bottom + rowGap + _font.LineHeight, sliderWidth, sliderHeight);
+        _particleBox = new Rectangle(rightX, _renderDistance.Bounds.Bottom + rowGap + _font.LineHeight, dropdownWidth, dropdownHeight);
 
-        // Audio device dropdowns + sliders
-        var audioBoxW = contentW - 120; // Reduce audio box width to match left spacing
-        _inputBox = new Rectangle(contentX + 60, contentY + 10, audioBoxW, 40);
-        _outputBox = new Rectangle(contentX + 60, contentY + 70, audioBoxW, 40);
-        _multistream.Bounds = new Rectangle(contentX + 60, contentY + 130, audioBoxW, 36);
+        var audioRightInset = Math.Max(44, (int)Math.Round(62f * layoutScale));
+        var audioBoxW = Math.Max(340, contentW - audioRightInset);
+        _inputBox = new Rectangle(contentX, contentY + 10, audioBoxW, dropdownHeight);
+        _outputBox = new Rectangle(contentX, _inputBox.Bottom + rowGap, audioBoxW, dropdownHeight);
+        _multistream.Bounds = new Rectangle(contentX, _outputBox.Bottom + rowGap, audioBoxW, checkboxHeight);
 
         var labelStartX = _multistream.Bounds.X + _multistream.Bounds.Height + 10;
         var labelWidth = (int)_font.MeasureString(_multistream.Label).X;
@@ -474,13 +546,13 @@ public sealed class OptionsScreen : IScreen
             helpX = _panelRect.Right - 34;
         _multistreamHelpRect = new Rectangle(helpX, _multistream.Bounds.Y + 4, 24, 24);
 
-        var audioDetailY = contentY + 190;
+        var audioDetailY = _multistream.Bounds.Bottom + rowGap;
         int sliderStartY;
         if (_working.MultistreamAudio)
         {
-            _voiceOutputBox = new Rectangle(contentX, audioDetailY, audioBoxW, 40);
-            _gameOutputBox = new Rectangle(contentX, audioDetailY + 60, audioBoxW, 40);
-            sliderStartY = audioDetailY + 120;
+            _voiceOutputBox = new Rectangle(contentX, audioDetailY, audioBoxW, dropdownHeight);
+            _gameOutputBox = new Rectangle(contentX, _voiceOutputBox.Bottom + rowGap, audioBoxW, dropdownHeight);
+            sliderStartY = _gameOutputBox.Bottom + rowGap;
         }
         else
         {
@@ -489,34 +561,93 @@ public sealed class OptionsScreen : IScreen
             sliderStartY = audioDetailY;
         }
 
-        _master.Bounds = new Rectangle(contentX + 60, sliderStartY, Math.Min(400, contentW - 120), 18);
-        _music.Bounds = new Rectangle(contentX + 60, sliderStartY + 60, Math.Min(400, contentW - 120), 18);
-        _sfx.Bounds = new Rectangle(contentX + 60, sliderStartY + 120, Math.Min(400, contentW - 120), 18);
+        var audioSliderWidth = Math.Min(Math.Max(300, (int)Math.Round(390f * layoutScale)), contentW);
+        _master.Bounds = new Rectangle(contentX, sliderStartY, audioSliderWidth, sliderHeight);
+        _music.Bounds = new Rectangle(contentX, _master.Bounds.Bottom + rowGap + _font.LineHeight, audioSliderWidth, sliderHeight);
+        _sfx.Bounds = new Rectangle(contentX, _music.Bounds.Bottom + rowGap + _font.LineHeight, audioSliderWidth, sliderHeight);
 
-        var micStartY = sliderStartY + 180;
-        var micButtonW = Math.Min(240, contentW);
-        _micTest.Bounds = new Rectangle(contentX + 60, micStartY, micButtonW, 40);
-        var monitorX = _micTest.Bounds.Right + 20;
-        var monitorW = Math.Max(200, contentW - (monitorX - contentX));
-        _micMonitor.Bounds = new Rectangle(monitorX, micStartY + 4, monitorW, 36);
-        _micMeterRect = new Rectangle(contentX + 60, micStartY + 60, Math.Min(400, contentW - 120), 18);
+        var micStartY = _sfx.Bounds.Bottom + rowGap + _font.LineHeight;
+        var micButtonW = Math.Min(Math.Max(220, (int)Math.Round(260f * layoutScale)), contentW);
+        _micTest.Bounds = new Rectangle(contentX, micStartY, micButtonW, dropdownHeight);
+        _micMonitor.Bounds = new Rectangle(contentX, _micTest.Bounds.Bottom + smallRowGap, audioBoxW, checkboxHeight);
+        _micMeterRect = new Rectangle(contentX, _micMonitor.Bounds.Bottom + rowGap, audioSliderWidth, sliderHeight);
 
-        _mouseSensitivity.Bounds = new Rectangle(contentX + 60, contentY + 10, Math.Min(400, contentW - 120), 18);
-        var reticleTop = contentY + 60;
-        _reticleEnabled.Bounds = new Rectangle(contentX + 60, reticleTop, Math.Min(400, contentW - 120), 36);
-        _reticleStyleBox = new Rectangle(contentX + 60, reticleTop + 50, Math.Min(400, contentW - 120), 40);
-        _reticleColorBox = new Rectangle(contentX + 60, reticleTop + 110, Math.Min(400, contentW - 120), 40);
-        _blockOutlineColorBox = new Rectangle(contentX + 60, reticleTop + 170, Math.Min(400, contentW - 120), 40);
-        _notificationModeBox = new Rectangle(contentX + 60, reticleTop + 230, Math.Min(400, contentW - 120), 40);
-        _reticleSize.Bounds = new Rectangle(contentX + 60, reticleTop + 290, Math.Min(400, contentW - 120), 18);
-        _reticleThickness.Bounds = new Rectangle(contentX + 60, reticleTop + 350, Math.Min(400, contentW - 120), 18);
-        var controlsRowHeight = 36;
-        var controlsListHeight = Math.Max(300, (_bindOrder.Count * controlsRowHeight) + 4);
-        _controlsListRect = new Rectangle(contentX + 60, reticleTop + 410, Math.Min(500, contentW - 120), controlsListHeight);
-        _packsListRect = new Rectangle(contentX + 60, contentY + 20, Math.Min(500, contentW - 120), 300);
+        var contentBottomLimit = _micMeterRect.Bottom + Math.Max(6, (int)Math.Round(8f * layoutScale));
+        _contentClipRect = new Rectangle(contentX, contentTop, clipW, Math.Max(1, contentBottomLimit - contentTop));
+
+        var controlsListWidth = Math.Min(Math.Max(640, (int)Math.Round(760f * layoutScale)), contentW);
+        var controlsValueWidth = Math.Min(Math.Max(460, (int)Math.Round(560f * layoutScale)), contentW);
+        var controlsX = _panelRect.Center.X - controlsListWidth / 2;
+        var controlsSubTabY = contentTop + Math.Max(24, (int)Math.Round(28f * layoutScale));
+        var controlsSubTabGap = Math.Max(10, (int)Math.Round(14f * layoutScale));
+        var controlsSubTabWidth = Math.Clamp((controlsListWidth - (controlsSubTabGap * 3)) / 4, 140, 240);
+        var controlsTabsTotalWidth = controlsSubTabWidth * 4 + controlsSubTabGap * 3;
+        var controlsTabsStartX = _panelRect.Center.X - controlsTabsTotalWidth / 2;
+        var controlsTabHeight = Math.Max(36, (int)Math.Round(38f * layoutScale));
+        _controlsMovementTabRect = new Rectangle(controlsTabsStartX, controlsSubTabY, controlsSubTabWidth, controlsTabHeight);
+        _controlsGameplayTabRect = new Rectangle(_controlsMovementTabRect.Right + controlsSubTabGap, controlsSubTabY, controlsSubTabWidth, 38);
+        _controlsGameplayTabRect = new Rectangle(_controlsMovementTabRect.Right + controlsSubTabGap, controlsSubTabY, controlsSubTabWidth, controlsTabHeight);
+        _controlsInterfaceTabRect = new Rectangle(_controlsGameplayTabRect.Right + controlsSubTabGap, controlsSubTabY, controlsSubTabWidth, controlsTabHeight);
+        _controlsAllBindsTabRect = new Rectangle(_controlsInterfaceTabRect.Right + controlsSubTabGap, controlsSubTabY, controlsSubTabWidth, controlsTabHeight);
+
+        var controlsBodyTop = _controlsMovementTabRect.Bottom + Math.Max(10, (int)Math.Round(14f * layoutScale));
+        _controlsBodyClipRect = new Rectangle(
+            _contentClipRect.X,
+            controlsBodyTop,
+            _contentClipRect.Width,
+            Math.Max(1, _contentClipRect.Bottom - controlsBodyTop));
+
+        var controlsTop = controlsBodyTop + Math.Max(14, (int)Math.Round(18f * layoutScale));
+        var controlsValueX = _panelRect.Center.X - controlsValueWidth / 2;
+        _mouseSensitivity.Bounds = new Rectangle(controlsValueX, controlsTop, controlsValueWidth, sliderHeight);
+        _crouchModeCycleRect = new Rectangle(controlsValueX, controlsTop + 48, controlsValueWidth, 42);
+        _sprintModeCycleRect = new Rectangle(controlsValueX, controlsTop + 102, controlsValueWidth, 42);
+        _toggleCrouchEnabled.Bounds = _crouchModeCycleRect;
+
+        var reticleTop = controlsTop + 4;
+        _reticleEnabled.Bounds = new Rectangle(controlsValueX, reticleTop, controlsValueWidth, 42);
+        _reticleStyleBox = new Rectangle(controlsValueX, reticleTop + 62, controlsValueWidth, dropdownHeight);
+        _reticleColorBox = new Rectangle(controlsValueX, reticleTop + 122, controlsValueWidth, dropdownHeight);
+        _blockOutlineColorBox = new Rectangle(controlsValueX, reticleTop + 182, controlsValueWidth, dropdownHeight);
+        _flyingOutlineEnabled.Bounds = new Rectangle(controlsValueX, reticleTop + 242, controlsValueWidth, 42);
+        _flyingOutlineColorBox = new Rectangle(controlsValueX, reticleTop + 302, controlsValueWidth, dropdownHeight);
+        _notificationModeBox = new Rectangle(controlsValueX, reticleTop + 362, controlsValueWidth, dropdownHeight);
+        _indicatorsEnabled.Bounds = new Rectangle(controlsValueX, reticleTop + 422, controlsValueWidth, 42);
+        _nametagModeBox = new Rectangle(controlsValueX, reticleTop + 482, controlsValueWidth, dropdownHeight);
+        _nametagFadeSeconds.Bounds = new Rectangle(controlsValueX, reticleTop + 542, controlsValueWidth, sliderHeight);
+        _reticleSize.Bounds = new Rectangle(controlsValueX, reticleTop + 602, controlsValueWidth, sliderHeight);
+        _reticleThickness.Bounds = new Rectangle(controlsValueX, reticleTop + 662, controlsValueWidth, sliderHeight);
+
+        var controlsListHeight = Math.Max(200, _controlsBodyClipRect.Height - 24);
+        _controlsListRect = new Rectangle(controlsX, controlsTop + 200, controlsListWidth, controlsListHeight);
+        _packsListRect = new Rectangle(contentX, contentY + 20, Math.Min(Math.Max(420, (int)Math.Round(520f * layoutScale)), contentW), 300);
 
         ClampAllScroll();
+        LogLayoutSnapshot(layoutScale, frameInsetX, frameInsetTop, frameInsetBottom);
     }
+
+    private void LogLayoutSnapshot(float layoutScale, int frameInsetX, int frameInsetTop, int frameInsetBottom)
+    {
+        var snapshot = string.Join(" | ",
+            $"viewport={FormatRect(_viewport)}",
+            $"panel={FormatRect(_panelRect)}",
+            $"clip={FormatRect(_contentClipRect)}",
+            $"tabs=V{FormatRect(_tabVideo.Bounds)} A{FormatRect(_tabAudio.Bounds)} C{FormatRect(_tabControls.Bounds)} P{FormatRect(_tabPacks.Bounds)}",
+            $"videoLeft={FormatRect(_fullscreen.Bounds)}->{FormatRect(_resolutionBox)}",
+            $"videoRight={FormatRect(_guiScaleBox)}->{FormatRect(_particleBox)}",
+            $"footer=back{FormatRect(_back.Bounds)} apply{FormatRect(_apply.Bounds)}",
+            $"layoutScale={layoutScale:0.000}",
+            $"frameInset=({frameInsetX},{frameInsetTop},{frameInsetBottom})");
+
+        if (string.Equals(snapshot, _lastLayoutSnapshot, StringComparison.Ordinal))
+            return;
+
+        _lastLayoutSnapshot = snapshot;
+        _log.Info($"Options layout: {snapshot}");
+    }
+
+    private static string FormatRect(Rectangle rect) =>
+        $"{rect.X},{rect.Y},{rect.Width}x{rect.Height}";
 
     public void Update(GameTime gameTime, InputState input)
     {
@@ -529,6 +660,12 @@ public sealed class OptionsScreen : IScreen
         _lastMouse = input.MousePosition;
 
         ApplyPendingAudioRefresh();
+        if (_applyFeedbackTimer > 0f)
+        {
+            _applyFeedbackTimer = Math.Max(0f, _applyFeedbackTimer - (float)gameTime.ElapsedGameTime.TotalSeconds);
+            if (_applyFeedbackTimer <= 0f)
+                _applyFeedbackText = string.Empty;
+        }
 
         _tabVideo.Update(input);
         _tabAudio.Update(input);
@@ -539,6 +676,7 @@ public sealed class OptionsScreen : IScreen
         _back.Update(input);
 
         HandleScroll(input);
+        UpdateScrollbarDrag(input);
 
         switch (_tab)
         {
@@ -565,14 +703,28 @@ public sealed class OptionsScreen : IScreen
                 break;
 
             case Tab.Controls:
-                UpdateSliderWithScroll(_mouseSensitivity, input);
-                UpdateCheckboxWithScroll(_reticleEnabled, input);
-                UpdateReticleStyleDropdown(input);
-                UpdateReticleColorDropdown(input);
-                UpdateBlockOutlineColorDropdown(input);
-                UpdateNotificationModeDropdown(input);
-                UpdateSliderWithScroll(_reticleSize, input);
-                UpdateSliderWithScroll(_reticleThickness, input);
+                UpdateControlsSubTab(input);
+                if (_controlsSubTab == ControlsSubTab.Movement)
+                {
+                    UpdateSliderWithScroll(_mouseSensitivity, input);
+                    UpdateCrouchModeCycle(input);
+                    UpdateSprintModeCycle(input);
+                }
+                else if (_controlsSubTab == ControlsSubTab.Interface)
+                {
+                    UpdateCheckboxWithScroll(_reticleEnabled, input);
+                    UpdateCheckboxWithScroll(_indicatorsEnabled, input);
+                    UpdateCheckboxWithScroll(_flyingOutlineEnabled, input);
+                    UpdateReticleStyleDropdown(input);
+                    UpdateReticleColorDropdown(input);
+                    UpdateBlockOutlineColorDropdown(input);
+                    UpdateFlyingOutlineColorDropdown(input);
+                    UpdateNotificationModeDropdown(input);
+                    UpdateNametagModeDropdown(input);
+                    UpdateSliderWithScroll(_nametagFadeSeconds, input);
+                    UpdateSliderWithScroll(_reticleSize, input);
+                    UpdateSliderWithScroll(_reticleThickness, input);
+                }
                 UpdateControlsBinding(input);
                 break;
 
@@ -607,6 +759,7 @@ public sealed class OptionsScreen : IScreen
 
         _apply.Draw(sb, _pixel, _font);
         _back.Draw(sb, _pixel, _font);
+        DrawApplyFeedback(sb);
 
         // Content header - removed section text
 
@@ -617,28 +770,43 @@ public sealed class OptionsScreen : IScreen
             return;
 
         var priorScissor = device.ScissorRectangle;
-        device.ScissorRectangle = UiLayout.ToScreenRect(_contentClipRect);
-
-        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
-        switch (_tab)
+        if (_tab == Tab.Controls)
         {
-            case Tab.Video:
-                DrawVideo(sb);
-                break;
-            case Tab.Audio:
-                DrawAudio(sb);
-                break;
-            case Tab.Controls:
-                DrawControls(sb);
-                break;
-            case Tab.Packs:
-                DrawPacks(sb);
-                break;
+            device.ScissorRectangle = UiLayout.ToScreenRect(_contentClipRect);
+            sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
+            DrawControlsSubTabs(sb);
+            sb.End();
+
+            device.ScissorRectangle = UiLayout.ToScreenRect(_controlsBodyClipRect);
+            sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
+            DrawControls(sb);
+            sb.End();
+        }
+        else
+        {
+            device.ScissorRectangle = UiLayout.ToScreenRect(_contentClipRect);
+            sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
+            switch (_tab)
+            {
+                case Tab.Video:
+                    DrawVideo(sb);
+                    break;
+                case Tab.Audio:
+                    DrawAudio(sb);
+                    break;
+                case Tab.Packs:
+                    DrawPacks(sb);
+                    break;
+            }
+
+            sb.End();
         }
 
-        sb.End();
-
         device.ScissorRectangle = priorScissor;
+
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        DrawScrollbars(sb);
+        sb.End();
     }
 
     private void DrawVideo(SpriteBatch sb)
@@ -799,6 +967,17 @@ public sealed class OptionsScreen : IScreen
         });
     }
 
+    private void UpdateFlyingOutlineColorDropdown(InputState input)
+    {
+        var scroll = GetScrollOffset();
+        var box = ScrollRect(_flyingOutlineColorBox, scroll);
+        UpdateSimpleDropdown(input, box, ref _flyingOutlineColorOpen, ReticleColorLabels, idx =>
+        {
+            _working.FlyingOutlineColor = ReticleColorOptions[idx].hex;
+            _log.Info($"Option changed: FlyingOutlineColor = {_working.FlyingOutlineColor}");
+        });
+    }
+
     private void UpdateNotificationModeDropdown(InputState input)
     {
         var scroll = GetScrollOffset();
@@ -808,6 +987,22 @@ public sealed class OptionsScreen : IScreen
             var selected = NotificationModeOptions[Math.Clamp(idx, 0, NotificationModeOptions.Length - 1)].value;
             _working.SetSocialNotificationMode(selected);
             _log.Info($"Option changed: SocialNotifications = {_working.SocialNotifications}");
+        });
+    }
+
+    private void UpdateNametagModeDropdown(InputState input)
+    {
+        var scroll = GetScrollOffset();
+        var box = ScrollRect(_nametagModeBox, scroll);
+        UpdateSimpleDropdown(input, box, ref _nametagModeOpen, NametagModeLabels, idx =>
+        {
+            _working.NametagMode = idx switch
+            {
+                0 => "Static",
+                1 => "Fade",
+                _ => "Off"
+            };
+            _log.Info($"Option changed: NametagMode = {_working.NametagMode}");
         });
     }
 
@@ -1007,19 +1202,20 @@ public sealed class OptionsScreen : IScreen
 
     private void UpdateControlsBinding(InputState input)
     {
+        var visibleActions = GetVisibleBindActions();
+        var scroll = GetScrollOffset();
+        var listRect = GetCurrentBindListRect(scroll);
         if (_bindingAction is null)
         {
             if (input.IsNewLeftClick())
             {
                 var p = input.MousePosition;
-                var scroll = GetScrollOffset();
-                var listRect = ScrollRect(_controlsListRect, scroll);
                 if (listRect.Contains(p))
                 {
                     var rowH = 36;
                     var idx = (p.Y - listRect.Y) / rowH;
-                    if (idx >= 0 && idx < _bindOrder.Count)
-                        _bindingAction = _bindOrder[idx];
+                    if (idx >= 0 && idx < visibleActions.Count)
+                        _bindingAction = visibleActions[idx];
                 }
             }
         }
@@ -1036,6 +1232,8 @@ public sealed class OptionsScreen : IScreen
             {
                 if ((k == Keys.LeftShift || k == Keys.RightShift)
                     && !string.Equals(_bindingAction, "Crouch", StringComparison.Ordinal)
+                    && !string.Equals(_bindingAction, "Sprint", StringComparison.Ordinal)
+                    && !string.Equals(_bindingAction, "FlyDescend", StringComparison.Ordinal)
                     && !string.Equals(_bindingAction, "GamemodeModifier", StringComparison.Ordinal))
                     continue;
                 _working.Keybinds[_bindingAction] = k;
@@ -1046,47 +1244,248 @@ public sealed class OptionsScreen : IScreen
         }
     }
 
+    private void UpdateCrouchModeCycle(InputState input)
+    {
+        if (!input.IsNewLeftClick())
+            return;
+
+        var rect = ScrollRect(_crouchModeCycleRect);
+        if (!rect.Contains(input.MousePosition))
+            return;
+
+        _working.ToggleCrouchEnabled = !_working.ToggleCrouchEnabled;
+        _toggleCrouchEnabled.Value = _working.ToggleCrouchEnabled;
+        _log.Info($"Option changed: ToggleCrouchEnabled = {_working.ToggleCrouchEnabled}");
+    }
+
+    private void UpdateSprintModeCycle(InputState input)
+    {
+        if (!input.IsNewLeftClick())
+            return;
+
+        var rect = ScrollRect(_sprintModeCycleRect);
+        if (!rect.Contains(input.MousePosition))
+            return;
+
+        _working.SprintLatchEnabled = !_working.SprintLatchEnabled;
+        _log.Info($"Option changed: SprintLatchEnabled = {_working.SprintLatchEnabled}");
+    }
+
+    private void DrawModeCycleRowWithScroll(SpriteBatch sb, Rectangle rowBounds, string label, string value)
+    {
+        var rect = ScrollRect(rowBounds, GetScrollOffset());
+        sb.Draw(_pixel, rect, new Color(16, 20, 28, 220));
+        DrawBorder(sb, rect, new Color(136, 146, 168), 1);
+
+        _font.DrawString(sb, label, new Vector2(rect.X + 12, rect.Y + 11), new Color(224, 232, 245));
+
+        var valueBox = new Rectangle(rect.Right - 210, rect.Y + 6, 198, rect.Height - 12);
+        sb.Draw(_pixel, valueBox, new Color(28, 36, 56, 235));
+        DrawBorder(sb, valueBox, new Color(212, 226, 245), 1);
+        var valueText = $"< {value} >";
+        var valueSize = _font.MeasureString(valueText);
+        var valuePos = new Vector2(
+            valueBox.X + (valueBox.Width - valueSize.X) * 0.5f,
+            valueBox.Y + (valueBox.Height - valueSize.Y) * 0.5f);
+        _font.DrawString(sb, valueText, valuePos, new Color(242, 248, 255));
+    }
+
+    private void DrawBinarySwitchRowWithScroll(SpriteBatch sb, Rectangle rowBounds, string label, bool enabled)
+    {
+        var rect = ScrollRect(rowBounds, GetScrollOffset());
+        var rowFill = enabled
+            ? new Color(18, 36, 24, 220)
+            : new Color(24, 20, 20, 220);
+        var rowBorder = enabled
+            ? new Color(152, 236, 172)
+            : new Color(236, 152, 152);
+        sb.Draw(_pixel, rect, rowFill);
+        DrawBorder(sb, rect, rowBorder, 1);
+
+        _font.DrawString(sb, label, new Vector2(rect.X + 12, rect.Y + 11), new Color(232, 238, 245));
+
+        var trackWidth = Math.Clamp(rect.Width / 4, 120, 170);
+        var trackHeight = Math.Clamp(rect.Height - 12, 20, 30);
+        var trackRect = new Rectangle(rect.Right - trackWidth - 10, rect.Y + (rect.Height - trackHeight) / 2, trackWidth, trackHeight);
+        sb.Draw(_pixel, trackRect, new Color(10, 12, 18, 230));
+        DrawBorder(sb, trackRect, new Color(180, 190, 210), 1);
+
+        var offColor = enabled ? new Color(120, 120, 120) : new Color(255, 214, 214);
+        var onColor = enabled ? new Color(214, 255, 224) : new Color(120, 120, 120);
+        _font.DrawString(sb, "OFF", new Vector2(trackRect.X + 8, trackRect.Y + 4), offColor);
+        var onSize = _font.MeasureString("ON");
+        _font.DrawString(sb, "ON", new Vector2(trackRect.Right - onSize.X - 8, trackRect.Y + 4), onColor);
+
+        var knobWidth = (trackRect.Width / 2) - 6;
+        var knobRect = new Rectangle(
+            enabled ? trackRect.Right - knobWidth - 3 : trackRect.X + 3,
+            trackRect.Y + 3,
+            knobWidth,
+            trackRect.Height - 6);
+        var knobColor = enabled ? new Color(98, 198, 122) : new Color(206, 108, 108);
+        sb.Draw(_pixel, knobRect, knobColor);
+        DrawBorder(sb, knobRect, new Color(240, 240, 240), 1);
+    }
+
     private void DrawControls(SpriteBatch sb)
     {
         var scroll = GetScrollOffset();
-        DrawSliderWithScroll(_mouseSensitivity, sb);
-        var sensRect = ScrollRect(_mouseSensitivity.Bounds, scroll);
-        _font.DrawString(sb, $"SENS: {_working.MouseSensitivity:0.0000}", new Vector2(sensRect.Right + 20, sensRect.Y - _font.LineHeight + 2), Color.White);
 
-        DrawCheckboxWithScroll(_reticleEnabled, sb);
-        var styleBox = ScrollRect(_reticleStyleBox, scroll);
-        var styleIndex = GetReticleStyleIndex(_working.ReticleStyle);
-        DrawSimpleDropdownBox(sb, styleBox, "RETICLE STYLE", _reticleStyleOpen, ReticleStyleLabels, styleIndex);
+        if (_controlsSubTab == ControlsSubTab.Movement)
+        {
+            DrawSliderWithScroll(_mouseSensitivity, sb);
 
-        var colorBox = ScrollRect(_reticleColorBox, scroll);
-        var colorIndex = GetReticleColorIndex(_working.ReticleColor);
-        DrawColorDropdownBox(sb, colorBox, "RETICLE COLOR", _reticleColorOpen, colorIndex);
+            var sensRect = ScrollRect(_mouseSensitivity.Bounds, scroll);
+            _font.DrawString(sb, $"SENS: {_working.MouseSensitivity:0.0000}", new Vector2(sensRect.Right + 20, sensRect.Y - _font.LineHeight + 2), Color.White);
+            DrawModeCycleRowWithScroll(
+                sb,
+                _crouchModeCycleRect,
+                "CROUCH MODE",
+                _working.ToggleCrouchEnabled ? "TOGGLE" : "HOLD");
+            DrawBinarySwitchRowWithScroll(sb, _sprintModeCycleRect, "AUTO SPRINT", _working.SprintLatchEnabled);
+            var sprintRect = ScrollRect(_sprintModeCycleRect, scroll);
+            _font.DrawString(sb, "OFF=HOLD | ON=LATCH", new Vector2(sprintRect.X, sprintRect.Bottom + 6), new Color(195, 210, 230));
+        }
+        else if (_controlsSubTab == ControlsSubTab.Interface)
+        {
+            DrawCheckboxWithScroll(_reticleEnabled, sb);
+            DrawCheckboxWithScroll(_indicatorsEnabled, sb);
+            DrawCheckboxWithScroll(_flyingOutlineEnabled, sb);
 
-        var outlineBox = ScrollRect(_blockOutlineColorBox, scroll);
-        var outlineIndex = GetReticleColorIndex(_working.BlockOutlineColor);
-        DrawColorDropdownBox(sb, outlineBox, "BLOCK OUTLINE", _blockOutlineColorOpen, outlineIndex);
+            var styleBox = ScrollRect(_reticleStyleBox, scroll);
+            var styleIndex = GetReticleStyleIndex(_working.ReticleStyle);
+            DrawSimpleDropdownBox(sb, styleBox, "RETICLE STYLE", _reticleStyleOpen, ReticleStyleLabels, styleIndex);
 
-        var notificationBox = ScrollRect(_notificationModeBox, scroll);
-        var notificationModeIndex = GetNotificationModeIndex(_working.GetSocialNotificationMode());
-        DrawSimpleDropdownBox(sb, notificationBox, "NOTIFICATIONS", _notificationModeOpen, NotificationModeLabels, notificationModeIndex);
+            var colorBox = ScrollRect(_reticleColorBox, scroll);
+            var colorIndex = GetReticleColorIndex(_working.ReticleColor);
+            DrawColorDropdownBox(sb, colorBox, "RETICLE COLOR", _reticleColorOpen, colorIndex);
 
-        DrawSliderWithScroll(_reticleSize, sb);
-        DrawSliderWithScroll(_reticleThickness, sb);
-        var sizeRect = ScrollRect(_reticleSize.Bounds, scroll);
-        _font.DrawString(sb, $"SIZE: {_working.ReticleSize}", new Vector2(sizeRect.Right + 20, sizeRect.Y - _font.LineHeight + 2), Color.White);
-        var thickRect = ScrollRect(_reticleThickness.Bounds, scroll);
-        _font.DrawString(sb, $"THICK: {_working.ReticleThickness}", new Vector2(thickRect.Right + 20, thickRect.Y - _font.LineHeight + 2), Color.White);
+            var outlineBox = ScrollRect(_blockOutlineColorBox, scroll);
+            var outlineIndex = GetReticleColorIndex(_working.BlockOutlineColor);
+            DrawColorDropdownBox(sb, outlineBox, "BLOCK OUTLINE", _blockOutlineColorOpen, outlineIndex);
 
+            var flyingOutlineBox = ScrollRect(_flyingOutlineColorBox, scroll);
+            var flyingOutlineIndex = GetReticleColorIndex(_working.FlyingOutlineColor);
+            DrawColorDropdownBox(sb, flyingOutlineBox, "FLY OUTLINE COLOR", _flyingOutlineColorOpen, flyingOutlineIndex);
+
+            var notificationBox = ScrollRect(_notificationModeBox, scroll);
+            var notificationModeIndex = GetNotificationModeIndex(_working.GetSocialNotificationMode());
+            DrawSimpleDropdownBox(sb, notificationBox, "NOTIFICATIONS", _notificationModeOpen, NotificationModeLabels, notificationModeIndex);
+
+            var nametagBox = ScrollRect(_nametagModeBox, scroll);
+            var nametagModeIndex = GetNametagModeIndex(_working.NametagMode);
+            DrawSimpleDropdownBox(sb, nametagBox, "NAMETAGS", _nametagModeOpen, NametagModeLabels, nametagModeIndex);
+
+            DrawSliderWithScroll(_nametagFadeSeconds, sb);
+            var nameFadeRect = ScrollRect(_nametagFadeSeconds.Bounds, scroll);
+            _font.DrawString(sb, $"FADE SECS: {_working.NametagFadeSeconds:0.0}", new Vector2(nameFadeRect.Right + 20, nameFadeRect.Y - _font.LineHeight + 2), Color.White);
+            var nametagHint = _working.NametagMode switch
+            {
+                "Fade" => "FADE: HOLD TAB TO SHOW NAMES, THEN THEY FADE OUT.",
+                "Off" => "OFF: PLAYER NAMETAGS ARE HIDDEN.",
+                _ => "STATIC: PLAYER NAMETAGS ARE ALWAYS VISIBLE."
+            };
+            _font.DrawString(sb, nametagHint, new Vector2(nametagBox.X, nameFadeRect.Bottom + 4), new Color(185, 198, 220));
+
+            DrawSliderWithScroll(_reticleSize, sb);
+            DrawSliderWithScroll(_reticleThickness, sb);
+            var sizeRect = ScrollRect(_reticleSize.Bounds, scroll);
+            _font.DrawString(sb, $"SIZE: {_working.ReticleSize}", new Vector2(sizeRect.Right + 20, sizeRect.Y - _font.LineHeight + 2), Color.White);
+            var thickRect = ScrollRect(_reticleThickness.Bounds, scroll);
+            _font.DrawString(sb, $"THICK: {_working.ReticleThickness}", new Vector2(thickRect.Right + 20, thickRect.Y - _font.LineHeight + 2), Color.White);
+
+            if (_reticleStyleOpen)
+                DrawSimpleDropdownList(sb, styleBox, ReticleStyleLabels, styleIndex);
+            if (_reticleColorOpen)
+                DrawColorDropdownList(sb, colorBox, colorIndex);
+            if (_blockOutlineColorOpen)
+                DrawColorDropdownList(sb, outlineBox, outlineIndex);
+            if (_flyingOutlineColorOpen)
+                DrawColorDropdownList(sb, flyingOutlineBox, flyingOutlineIndex);
+            if (_notificationModeOpen)
+                DrawSimpleDropdownList(sb, notificationBox, NotificationModeLabels, notificationModeIndex);
+            if (_nametagModeOpen)
+                DrawSimpleDropdownList(sb, nametagBox, NametagModeLabels, nametagModeIndex);
+        }
+
+        DrawBindList(sb, scroll, GetVisibleBindActions(), _controlsSubTab == ControlsSubTab.AllBinds);
+    }
+
+    private void UpdateControlsSubTab(InputState input)
+    {
+        if (!input.IsNewLeftClick())
+            return;
+
+        var click = input.MousePosition;
+        if (_controlsMovementTabRect.Contains(click))
+            SetControlsSubTab(ControlsSubTab.Movement);
+        else if (_controlsGameplayTabRect.Contains(click))
+            SetControlsSubTab(ControlsSubTab.Gameplay);
+        else if (_controlsInterfaceTabRect.Contains(click))
+            SetControlsSubTab(ControlsSubTab.Interface);
+        else if (_controlsAllBindsTabRect.Contains(click))
+            SetControlsSubTab(ControlsSubTab.AllBinds);
+    }
+
+    private void SetControlsSubTab(ControlsSubTab tab)
+    {
+        if (_controlsSubTab == tab)
+            return;
+
+        _controlsSubTab = tab;
+        _bindingAction = null;
+        CloseAllDropdowns();
+    }
+
+    private void DrawControlsSubTabs(SpriteBatch sb)
+    {
+        DrawControlsSubTabButton(sb, _controlsMovementTabRect, "MOVEMENT", _controlsSubTab == ControlsSubTab.Movement);
+        DrawControlsSubTabButton(sb, _controlsGameplayTabRect, "GAMEPLAY", _controlsSubTab == ControlsSubTab.Gameplay);
+        DrawControlsSubTabButton(sb, _controlsInterfaceTabRect, "INTERFACE", _controlsSubTab == ControlsSubTab.Interface);
+        DrawControlsSubTabButton(sb, _controlsAllBindsTabRect, "ALL BINDS", _controlsSubTab == ControlsSubTab.AllBinds);
+    }
+
+    private void DrawControlsSubTabButton(SpriteBatch sb, Rectangle rect, string label, bool selected)
+    {
+        var fill = selected ? new Color(40, 56, 86, 235) : new Color(16, 20, 28, 220);
+        var border = selected ? new Color(226, 240, 255) : new Color(120, 132, 150);
+        var text = selected ? new Color(245, 250, 255) : new Color(210, 220, 235);
+        sb.Draw(_pixel, rect, fill);
+        DrawBorder(sb, rect, border, 1);
+        var textSize = _font.MeasureString(label);
+        var textPos = new Vector2(rect.X + (rect.Width - textSize.X) * 0.5f, rect.Y + (rect.Height - textSize.Y) * 0.5f);
+        _font.DrawString(sb, label, textPos, text);
+    }
+
+    private IReadOnlyList<string> GetVisibleBindActions()
+    {
+        return _controlsSubTab switch
+        {
+            ControlsSubTab.Movement => MovementBindActions,
+            ControlsSubTab.Gameplay => GameplayBindActions,
+            ControlsSubTab.Interface => InterfaceBindActions,
+            _ => _bindOrder
+        };
+    }
+
+    private Rectangle GetCurrentBindListRect(int scroll)
+    {
         var listRect = ScrollRect(_controlsListRect, scroll);
+        return new Rectangle(listRect.X, GetCurrentBindListTop() - scroll, listRect.Width, listRect.Height);
+    }
+
+    private void DrawBindList(SpriteBatch sb, int scroll, IReadOnlyList<string> actions, bool drawExtendedNotes)
+    {
+        var listRect = GetCurrentBindListRect(scroll);
         _font.DrawString(sb, "CLICK AN ACTION TO REBIND", new Vector2(listRect.X, listRect.Y - _font.LineHeight), Color.White);
 
         var rowH = 36;
-        for (int i = 0; i < _bindOrder.Count; i++)
+        for (int i = 0; i < actions.Count; i++)
         {
-            var action = _bindOrder[i];
+            var action = actions[i];
             var y = listRect.Y + i * rowH;
             var row = new Rectangle(listRect.X, y, listRect.Width, rowH - 4);
-            sb.Draw(_pixel, row, new Color(18,18,18));
+            sb.Draw(_pixel, row, new Color(18, 18, 18));
             DrawBorder(sb, row, Color.White);
 
             _font.DrawString(sb, GetBindActionLabel(action), new Vector2(row.X + 10, row.Y + 10), Color.White);
@@ -1096,36 +1495,55 @@ public sealed class OptionsScreen : IScreen
             _font.DrawString(sb, keyText, new Vector2(row.Right - 220, row.Y + 10), Color.White);
         }
 
-        var notesY = listRect.Bottom + 8;
-        var modeModifierLabel = _working.Keybinds.TryGetValue("GamemodeModifier", out var modeModifierKey)
-            ? modeModifierKey.ToString().ToUpperInvariant()
-            : "ALT";
-        _font.DrawString(sb, "NON-REBINDABLE: HOLD TAB = PLAYER LIST", new Vector2(listRect.X, notesY), new Color(210, 210, 210));
-        _font.DrawString(sb, $"MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL HOTBAR | HOLD {modeModifierLabel}+WHEEL (FLYING ARTIFICER) FOR FLY SPEED", new Vector2(listRect.X, notesY + _font.LineHeight + 2), new Color(180, 180, 180));
-        _font.DrawString(sb, "VEILSEER: 1-9 SPECTATE PLAYER | 0 FREECAM", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 2), new Color(180, 180, 180));
-        _font.DrawString(sb, "UI: ENTER SENDS CHAT/COMMAND | ESC CLOSES MENUS", new Vector2(listRect.X, notesY + (_font.LineHeight + 2) * 3), new Color(180, 180, 180));
-
-        var maxScroll = GetMaxScroll(Tab.Controls);
-        if (maxScroll > 0)
+        if (drawExtendedNotes)
         {
-            var currentScroll = GetScroll(Tab.Controls);
-            var indicatorWidth = 26;
-            var indicatorHeight = 20;
-            var indicatorX = listRect.Right - indicatorWidth - 6;
-            var upRect = new Rectangle(indicatorX, listRect.Y + 6, indicatorWidth, indicatorHeight);
-            var downRect = new Rectangle(indicatorX, listRect.Bottom - indicatorHeight - 6, indicatorWidth, indicatorHeight);
-            DrawScrollIndicator(sb, upRect, "^", currentScroll > 1f);
-            DrawScrollIndicator(sb, downRect, "v", currentScroll < maxScroll - 1f);
-        }
+            var modeModifierLabel = _working.Keybinds.TryGetValue("GamemodeModifier", out var modeModifierKey)
+                ? modeModifierKey.ToString().ToUpperInvariant()
+                : "ALT";
+            var notes = new (string text, Color color)[]
+            {
+                ("NON-REBINDABLE: HOLD TAB = PLAYER LIST", new Color(210, 210, 210)),
+                ($"MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL HOTBAR | HOLD {modeModifierLabel}+WHEEL (FLYING) FOR FLY SPEED", new Color(180, 180, 180)),
+                ("VEILSEER: 1-9 SPECTATE PLAYER | 0/SHIFT DETACH TO FREECAM", new Color(180, 180, 180)),
+                ("HOME GUI: PENCIL TO RENAME | DRAG HOTBAR OR PRESS 1-9 OVER A HOME FOR ICON", new Color(180, 180, 180)),
+                ("UI: ENTER SENDS CHAT/COMMAND | ESC UNFOCUSES TEXT FIELD FIRST", new Color(180, 180, 180))
+            };
 
-        if (_reticleStyleOpen)
-            DrawSimpleDropdownList(sb, styleBox, ReticleStyleLabels, styleIndex);
-        if (_reticleColorOpen)
-            DrawColorDropdownList(sb, colorBox, colorIndex);
-        if (_blockOutlineColorOpen)
-            DrawColorDropdownList(sb, outlineBox, outlineIndex);
-        if (_notificationModeOpen)
-            DrawSimpleDropdownList(sb, notificationBox, NotificationModeLabels, notificationModeIndex);
+            var notesY = listRect.Y + actions.Count * rowH + 8;
+            var lineAdvance = _font.LineHeight + 2;
+            var notesMaxWidth = Math.Max(220, listRect.Width - 16);
+            foreach (var (text, color) in notes)
+            {
+                foreach (var wrappedLine in WrapText(text, notesMaxWidth))
+                {
+                    _font.DrawString(sb, wrappedLine, new Vector2(listRect.X, notesY), color);
+                    notesY += lineAdvance;
+                }
+            }
+        }
+    }
+
+    private void DrawApplyFeedback(SpriteBatch sb)
+    {
+        if (_applyFeedbackTimer <= 0f || string.IsNullOrWhiteSpace(_applyFeedbackText))
+            return;
+
+        var alpha = Math.Clamp(_applyFeedbackTimer / 1.8f, 0f, 1f);
+        var border = _applyFeedbackIsError
+            ? new Color(255, 138, 138, Math.Clamp((int)(220f * alpha), 0, 255))
+            : new Color(168, 242, 186, Math.Clamp((int)(220f * alpha), 0, 255));
+        var textColor = _applyFeedbackIsError
+            ? new Color(255, 214, 214, Math.Clamp((int)(255f * alpha), 0, 255))
+            : new Color(226, 255, 232, Math.Clamp((int)(255f * alpha), 0, 255));
+        var bg = new Color(0, 0, 0, Math.Clamp((int)(168f * alpha), 0, 255));
+
+        var size = _font.MeasureString(_applyFeedbackText);
+        var width = (int)Math.Ceiling(size.X) + 22;
+        var height = _font.LineHeight + 12;
+        var rect = new Rectangle(_apply.Bounds.Center.X - width / 2, _apply.Bounds.Bottom + 10, width, height);
+        sb.Draw(_pixel, rect, bg);
+        DrawBorder(sb, rect, border, 1);
+        _font.DrawString(sb, _applyFeedbackText, new Vector2(rect.X + 11, rect.Y + 6), textColor);
     }
 
     private void RefreshPacks()
@@ -1203,6 +1621,179 @@ public sealed class OptionsScreen : IScreen
         }
     }
 
+    private int GetCurrentBindListTop()
+    {
+        return _controlsSubTab switch
+        {
+            ControlsSubTab.Interface => _reticleThickness.Bounds.Bottom + 84,
+            ControlsSubTab.Movement => _sprintModeCycleRect.Bottom + 62,
+            _ => _controlsBodyClipRect.Y + 20
+        };
+    }
+
+    private int GetCurrentBindListBottom()
+    {
+        const int rowH = 36;
+        var bottom = GetCurrentBindListTop() + GetVisibleBindActions().Count * rowH;
+        if (_controlsSubTab == ControlsSubTab.AllBinds)
+            bottom += 8 + (GetAllBindsNoteLineCount() * (_font.LineHeight + 2));
+        return bottom;
+    }
+
+    private int GetAllBindsNoteLineCount()
+    {
+        var modeModifierLabel = _working.Keybinds.TryGetValue("GamemodeModifier", out var modeModifierKey)
+            ? modeModifierKey.ToString().ToUpperInvariant()
+            : "ALT";
+        var notes = new[]
+        {
+            "NON-REBINDABLE: HOLD TAB = PLAYER LIST",
+            $"MOUSE: LEFT BREAK/USE | RIGHT PLACE/USE | WHEEL HOTBAR | HOLD {modeModifierLabel}+WHEEL (FLYING) FOR FLY SPEED",
+            "VEILSEER: 1-9 SPECTATE PLAYER | 0/SHIFT DETACH TO FREECAM",
+            "HOME GUI: PENCIL TO RENAME | DRAG HOTBAR OR PRESS 1-9 OVER A HOME FOR ICON",
+            "UI: ENTER SENDS CHAT/COMMAND | ESC UNFOCUSES TEXT FIELD FIRST"
+        };
+
+        var notesMaxWidth = Math.Max(220, _controlsListRect.Width - 16);
+        var total = 0;
+        foreach (var note in notes)
+            total += WrapText(note, notesMaxWidth).Count;
+        return total;
+    }
+
+    private List<string> WrapText(string text, int maxWidth)
+    {
+        var lines = new List<string>();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            lines.Add(string.Empty);
+            return lines;
+        }
+
+        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var current = words[0];
+        for (int i = 1; i < words.Length; i++)
+        {
+            var candidate = $"{current} {words[i]}";
+            if (_font.MeasureString(candidate).X <= maxWidth)
+            {
+                current = candidate;
+                continue;
+            }
+
+            lines.Add(current);
+            current = words[i];
+        }
+
+        lines.Add(current);
+        return lines;
+    }
+
+    private void DrawScrollbars(SpriteBatch sb)
+    {
+        if (_tab == Tab.Controls)
+            DrawScrollbar(sb, _controlsBodyClipRect, Tab.Controls);
+    }
+
+    private void DrawScrollbar(SpriteBatch sb, Rectangle viewportRect, Tab tab)
+    {
+        var maxScroll = GetMaxScroll(tab);
+        if (maxScroll <= 0)
+            return;
+
+        var contentHeight = GetContentHeight(tab);
+        if (contentHeight <= viewportRect.Height)
+            return;
+
+        var trackRect = GetScrollbarTrackRect(viewportRect);
+        sb.Draw(_pixel, trackRect, new Color(10, 12, 18, 185));
+        DrawBorder(sb, trackRect, new Color(120, 132, 150), 1);
+
+        var thumbRect = GetScrollbarThumbRect(trackRect, viewportRect, tab, contentHeight, maxScroll);
+        sb.Draw(_pixel, thumbRect, new Color(220, 226, 235, 210));
+        DrawBorder(sb, thumbRect, Color.White, 1);
+    }
+
+    private static Rectangle GetScrollbarTrackRect(Rectangle viewportRect) =>
+        new(viewportRect.Right - 14, viewportRect.Y + 4, 10, Math.Max(20, viewportRect.Height - 8));
+
+    private Rectangle GetScrollbarThumbRect(Rectangle trackRect, Rectangle viewportRect, Tab tab, int contentHeight, int maxScroll)
+    {
+        var thumbHeight = Math.Max(24, (int)Math.Round(trackRect.Height * (viewportRect.Height / (float)contentHeight)));
+        var thumbTravel = Math.Max(0, trackRect.Height - thumbHeight);
+        var thumbY = trackRect.Y;
+        if (thumbTravel > 0 && maxScroll > 0)
+            thumbY += (int)Math.Round((GetScroll(tab) / maxScroll) * thumbTravel);
+        return new Rectangle(trackRect.X + 1, thumbY + 1, trackRect.Width - 2, thumbHeight - 2);
+    }
+
+    private Rectangle GetScrollViewportRect(Tab tab) =>
+        tab == Tab.Controls ? _controlsBodyClipRect : _contentClipRect;
+
+    private void UpdateScrollbarDrag(InputState input)
+    {
+        if (_scrollbarDragging)
+        {
+            if (!input.IsLeftDown())
+            {
+                _scrollbarDragging = false;
+                return;
+            }
+
+            var tab = _scrollbarDragTab;
+            var viewportRect = GetScrollViewportRect(tab);
+            var maxScroll = GetMaxScroll(tab);
+            var contentHeight = GetContentHeight(tab);
+            if (maxScroll <= 0 || contentHeight <= viewportRect.Height)
+            {
+                _scrollbarDragging = false;
+                return;
+            }
+
+            var trackRect = GetScrollbarTrackRect(viewportRect);
+            var thumbRect = GetScrollbarThumbRect(trackRect, viewportRect, tab, contentHeight, maxScroll);
+            var minThumbY = trackRect.Y + 1;
+            var maxThumbY = trackRect.Bottom - thumbRect.Height - 1;
+            var desiredThumbY = Math.Clamp(input.MousePosition.Y - _scrollbarDragOffsetY, minThumbY, maxThumbY);
+            var ratio = (desiredThumbY - minThumbY) / (float)Math.Max(1, maxThumbY - minThumbY);
+            SetScroll(tab, ratio * maxScroll);
+            ClampScroll(tab);
+            return;
+        }
+
+        if (!input.IsNewLeftClick() || _tab != Tab.Controls)
+            return;
+
+        var viewport = GetScrollViewportRect(_tab);
+        var max = GetMaxScroll(_tab);
+        var contentHeightForTab = GetContentHeight(_tab);
+        if (max <= 0 || contentHeightForTab <= viewport.Height)
+            return;
+
+        var track = GetScrollbarTrackRect(viewport);
+        if (!track.Contains(input.MousePosition))
+            return;
+
+        var thumb = GetScrollbarThumbRect(track, viewport, _tab, contentHeightForTab, max);
+        if (thumb.Contains(input.MousePosition))
+        {
+            _scrollbarDragging = true;
+            _scrollbarDragTab = _tab;
+            _scrollbarDragOffsetY = input.MousePosition.Y - thumb.Y;
+            return;
+        }
+
+        var clickMinThumbY = track.Y + 1;
+        var clickMaxThumbY = track.Bottom - thumb.Height - 1;
+        var targetThumbY = Math.Clamp(input.MousePosition.Y - (thumb.Height / 2), clickMinThumbY, clickMaxThumbY);
+        var ratioToClick = (targetThumbY - clickMinThumbY) / (float)Math.Max(1, clickMaxThumbY - clickMinThumbY);
+        SetScroll(_tab, ratioToClick * max);
+        ClampScroll(_tab);
+        _scrollbarDragging = true;
+        _scrollbarDragTab = _tab;
+        _scrollbarDragOffsetY = input.MousePosition.Y - targetThumbY;
+    }
+
     private void UpdateApplyTexture()
     {
         _apply.Texture = _tab switch
@@ -1211,20 +1802,6 @@ public sealed class OptionsScreen : IScreen
             Tab.Audio => _applyAudioTexture ?? _applyDefaultTexture ?? _apply.Texture,
             _ => _applyDefaultTexture ?? _apply.Texture
         };
-    }
-
-    private void DrawScrollIndicator(SpriteBatch sb, Rectangle rect, string glyph, bool active)
-    {
-        var fill = active ? new Color(20, 24, 34, 235) : new Color(10, 12, 18, 180);
-        var border = active ? new Color(255, 255, 255) : new Color(140, 140, 140);
-        var textColor = active ? new Color(245, 232, 126) : new Color(120, 120, 120);
-        sb.Draw(_pixel, rect, fill);
-        DrawBorder(sb, rect, border, 1);
-        var textSize = _font.MeasureString(glyph);
-        var textPos = new Vector2(
-            rect.X + (rect.Width - textSize.X) * 0.5f,
-            rect.Y + (rect.Height - textSize.Y) * 0.5f);
-        _font.DrawString(sb, glyph, textPos, textColor);
     }
 
     private void CloseAllDropdowns()
@@ -1240,7 +1817,9 @@ public sealed class OptionsScreen : IScreen
         _reticleStyleOpen = false;
         _reticleColorOpen = false;
         _blockOutlineColorOpen = false;
+        _flyingOutlineColorOpen = false;
         _notificationModeOpen = false;
+        _nametagModeOpen = false;
     }
 
     private void UpdateSimpleDropdown(InputState input, Rectangle box, ref bool open, IReadOnlyList<string> items, Action<int> onSelect, bool openAbove = false)
@@ -1549,7 +2128,8 @@ public sealed class OptionsScreen : IScreen
             }
         }
 
-        if (!_contentClipRect.Contains(input.MousePosition))
+        var activeClip = _tab == Tab.Controls ? _controlsBodyClipRect : _contentClipRect;
+        if (!activeClip.Contains(input.MousePosition))
             return;
 
         var step = Math.Sign(delta) * ScrollStep;
@@ -1578,10 +2158,41 @@ public sealed class OptionsScreen : IScreen
 
     private void DrawCheckboxWithScroll(Checkbox checkbox, SpriteBatch sb)
     {
-        var original = checkbox.Bounds;
-        checkbox.Bounds = ScrollRect(original);
-        checkbox.Draw(sb, _pixel, _font);
-        checkbox.Bounds = original;
+        var rect = ScrollRect(checkbox.Bounds);
+        var rowFill = checkbox.Value
+            ? new Color(18, 36, 24, 220)
+            : new Color(24, 20, 20, 220);
+        var rowBorder = checkbox.Value
+            ? new Color(152, 236, 172)
+            : new Color(236, 152, 152);
+        sb.Draw(_pixel, rect, rowFill);
+        DrawBorder(sb, rect, rowBorder, 1);
+
+        _font.DrawString(sb, checkbox.Label, new Vector2(rect.X + 12, rect.Y + 10), new Color(232, 238, 245));
+
+        var trackWidth = Math.Clamp(rect.Width / 4, 120, 170);
+        var trackHeight = Math.Clamp(rect.Height - 12, 20, 30);
+        var trackRect = new Rectangle(rect.Right - trackWidth - 10, rect.Y + (rect.Height - trackHeight) / 2, trackWidth, trackHeight);
+        sb.Draw(_pixel, trackRect, new Color(10, 12, 18, 230));
+        DrawBorder(sb, trackRect, new Color(180, 190, 210), 1);
+
+        var offLabel = "OFF";
+        var onLabel = "ON";
+        var offColor = checkbox.Value ? new Color(120, 120, 120) : new Color(255, 214, 214);
+        var onColor = checkbox.Value ? new Color(214, 255, 224) : new Color(120, 120, 120);
+        _font.DrawString(sb, offLabel, new Vector2(trackRect.X + 8, trackRect.Y + 4), offColor);
+        var onSize = _font.MeasureString(onLabel);
+        _font.DrawString(sb, onLabel, new Vector2(trackRect.Right - onSize.X - 8, trackRect.Y + 4), onColor);
+
+        var knobWidth = (trackRect.Width / 2) - 6;
+        var knobRect = new Rectangle(
+            checkbox.Value ? trackRect.Right - knobWidth - 3 : trackRect.X + 3,
+            trackRect.Y + 3,
+            knobWidth,
+            trackRect.Height - 6);
+        var knobColor = checkbox.Value ? new Color(98, 198, 122) : new Color(206, 108, 108);
+        sb.Draw(_pixel, knobRect, knobColor);
+        DrawBorder(sb, knobRect, new Color(240, 240, 240), 1);
     }
 
     private void UpdateButtonWithScroll(Button button, InputState input)
@@ -1718,7 +2329,8 @@ public sealed class OptionsScreen : IScreen
         if (contentHeight <= 0)
             return 0;
 
-        var max = contentHeight - _contentClipRect.Height;
+        var viewportHeight = GetScrollViewportRect(tab).Height;
+        var max = contentHeight - viewportHeight;
         return max > 0 ? max : 0;
     }
 
@@ -1757,11 +2369,10 @@ public sealed class OptionsScreen : IScreen
             }
             case Tab.Controls:
             {
-                var bottom = Math.Max(_controlsListRect.Bottom, _mouseSensitivity.Bounds.Bottom);
+                top = _controlsBodyClipRect.Y;
+                var bottom = Math.Max(GetCurrentBindListBottom(), _controlsBodyClipRect.Bottom);
                 bottom = Math.Max(bottom, _reticleThickness.Bounds.Bottom);
-                bottom = Math.Max(bottom, _notificationModeBox.Bottom);
-                var controlsNotesBottom = _controlsListRect.Bottom + 12 + ((_font.LineHeight + 2) * 3);
-                bottom = Math.Max(bottom, controlsNotesBottom);
+                bottom = Math.Max(bottom, _sprintModeCycleRect.Bottom);
                 return Math.Max(0, bottom - top + padding);
             }
             case Tab.Packs:
@@ -1802,6 +2413,16 @@ public sealed class OptionsScreen : IScreen
         return NotificationModeOptions.Length - 1;
     }
 
+    private static int GetNametagModeIndex(string? mode)
+    {
+        var text = (mode ?? string.Empty).Trim();
+        if (text.Equals("fade", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (text.Equals("off", StringComparison.OrdinalIgnoreCase))
+            return 2;
+        return 0;
+    }
+
     private static int GetQualityIndex(string? value)
     {
         var normalized = NormalizeQuality(value);
@@ -1835,6 +2456,8 @@ public sealed class OptionsScreen : IScreen
             "MoveRight" => "MOVE RIGHT",
             "Jump" => "JUMP",
             "Crouch" => "CROUCH",
+            "Sprint" => "SPRINT",
+            "FlyDescend" => "FLY DESCEND",
             "Inventory" => "INVENTORY",
             "DropItem" => "DROP ITEM",
             "GiveItem" => "GIVE ITEM",
@@ -1960,6 +2583,12 @@ public sealed class OptionsScreen : IScreen
 
     private static int SliderToReticleThickness(float slider) =>
         (int)Math.Round(ReticleThicknessMin + Clamp01(slider) * (ReticleThicknessMax - ReticleThicknessMin));
+
+    private static float NametagFadeSecondsToSlider(float value) =>
+        (Math.Clamp(value, 0.5f, 12f) - 0.5f) / 11.5f;
+
+    private static float SliderToNametagFadeSeconds(float slider) =>
+        0.5f + Clamp01(slider) * 11.5f;
 
     private void SnapWorkingVideoOptions()
     {
@@ -2100,10 +2729,16 @@ public sealed class OptionsScreen : IScreen
 
             // We do apply audio immediately.
             _working.ApplyAudio();
+            _applyFeedbackText = "APPLIED";
+            _applyFeedbackTimer = 1.8f;
+            _applyFeedbackIsError = false;
         }
         catch (Exception ex)
         {
             _log.Error($"Apply settings failed: {ex.Message}");
+            _applyFeedbackText = "APPLY FAILED";
+            _applyFeedbackTimer = 2.4f;
+            _applyFeedbackIsError = true;
         }
     }
 
@@ -2119,7 +2754,11 @@ public sealed class OptionsScreen : IScreen
         _fov.Value = FovToSlider(_working.FieldOfView);
         _renderDistance.Value = RenderDistanceToSlider(_working.RenderDistanceChunks);
         _mouseSensitivity.Value = SensitivityToSlider(_working.MouseSensitivity);
+        _toggleCrouchEnabled.Value = _working.ToggleCrouchEnabled;
         _reticleEnabled.Value = _working.ReticleEnabled;
+        _indicatorsEnabled.Value = _working.IndicatorsEnabled;
+        _flyingOutlineEnabled.Value = _working.FlyingOutlineEnabled;
+        _nametagFadeSeconds.Value = NametagFadeSecondsToSlider(_working.NametagFadeSeconds);
         _reticleSize.Value = ReticleSizeToSlider(_working.ReticleSize);
         _reticleThickness.Value = ReticleThicknessToSlider(_working.ReticleThickness);
         _multistream.Value = _working.MultistreamAudio;
@@ -2129,6 +2768,9 @@ public sealed class OptionsScreen : IScreen
         _bindingAction = null;
         CloseAllDropdowns();
         _showMultistreamHelp = false;
+        _applyFeedbackText = string.Empty;
+        _applyFeedbackTimer = 0f;
+        _applyFeedbackIsError = false;
     }
 
     private void ExitOptions()

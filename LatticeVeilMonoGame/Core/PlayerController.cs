@@ -7,7 +7,12 @@ namespace LatticeVeilMonoGame.Core;
 public sealed class PlayerController
 {
     private const float HalfWidth = Scale.PlayerWidth * 0.5f;
-    private const float Height = Scale.PlayerHeight;
+    private const float StandingHeight = Scale.PlayerHeight;
+    private const float SneakHeight = Scale.PlayerHeight - 0.5f;
+    private const float StandingHeadHeight = Scale.PlayerHeadHeight;
+    private const float SneakHeadHeight = Scale.PlayerHeadHeight - 0.5f;
+    private const float SneakMoveMultiplier = 0.58f;
+    private const float SprintMoveMultiplier = 1.35f;
     private const float Skin = 0.001f;
     private const float Gravity = -25f;
     private const float JumpSpeed = 8f;
@@ -23,6 +28,8 @@ public sealed class PlayerController
     private Vector3 _moveIntent;
     private float _swayAccumulator;
     private float _flySpeedMultiplier = 1.0f;
+    private bool _toggleSneakLatched;
+    private bool _sprintLatched;
 
     public Vector3 Position { get; set; } = new(8f, 6f, -12f);
     public Vector3 Velocity { get; set; }
@@ -30,21 +37,38 @@ public sealed class PlayerController
     public float Pitch { get; set; } = -0.25f;
     public bool IsGrounded { get; private set; }
     public bool IsFlying { get; private set; }
+    public bool IsSneaking { get; private set; }
+    public bool IsSprinting { get; private set; }
     public Vector3 MoveIntent => _moveIntent;
     public bool AllowFlying { get; set; } = true;
+    public bool AllowCrouch { get; set; } = true;
+    public bool ToggleCrouchEnabled { get; set; }
+    public bool SprintLatchEnabled { get; set; }
     public bool NoClipEnabled { get; set; }
+    public bool SuppressLookInput { get; set; }
     public float FlySpeedMultiplier => _flySpeedMultiplier;
     public float FlySpeedMinMultiplier => MinFlySpeedMultiplier;
     public float FlySpeedMaxMultiplier => MaxFlySpeedMultiplier;
     public float FlySpeedNormalized => (_flySpeedMultiplier - MinFlySpeedMultiplier) / (MaxFlySpeedMultiplier - MinFlySpeedMultiplier);
     public float CurrentFlySpeed => BaseFlySpeed * _flySpeedMultiplier;
+    public float ColliderHeight => IsSneaking ? SneakHeight : StandingHeight;
+    public Keys CrouchKey { get; set; } = Keys.LeftShift;
+    public Keys SprintKey { get; set; } = Keys.LeftControl;
+    public Keys FlyDescendKey { get; set; } = Keys.LeftShift;
 
     public const float ColliderHalfWidth = HalfWidth;
-    public const float ColliderHeight = Height;
+    public const float ColliderStandingHeight = StandingHeight;
 
     public void SetFlying(bool value)
     {
         IsFlying = value;
+        if (value)
+        {
+            IsSneaking = false;
+            _toggleSneakLatched = false;
+        }
+        _sprintLatched = false;
+        IsSprinting = false;
         Velocity = Vector3.Zero;
     }
 
@@ -65,7 +89,7 @@ public sealed class PlayerController
     {
         get
         {
-            var offset = new Vector3(0f, Scale.PlayerHeadHeight, 0f);
+            var offset = new Vector3(0f, IsSneaking ? SneakHeadHeight : StandingHeadHeight, 0f);
             if (IsFlying)
             {
                 offset.Y += MathF.Sin(_swayAccumulator * 1.5f) * 0.04f;
@@ -99,31 +123,31 @@ public sealed class PlayerController
 
     private void ApplyLook(InputState input)
     {
+        if (SuppressLookInput)
+            return;
+
         var delta = input.LookDelta;
         if (delta.X != 0f || delta.Y != 0f)
         {
-            // Apply delta first
             Yaw += delta.X;
             Pitch -= delta.Y;
-            
-            // Clamp pitch AFTER applying delta
             Pitch = Math.Clamp(Pitch, -1.4f, 1.4f);
-            
-            // Normalize yaw to prevent precision issues over time
             Yaw = MathHelper.WrapAngle(Yaw);
         }
     }
 
     private void HandleFlyToggle(double nowSeconds, InputState input)
     {
-        if (!AllowFlying)
-            return;
-        if (!input.IsNewKeyPress(Keys.Space))
+        if (!AllowFlying || !input.IsNewKeyPress(Keys.Space))
             return;
 
         if (nowSeconds - _lastSpaceTapTime <= DoubleTapSeconds)
         {
             IsFlying = !IsFlying;
+            if (IsFlying)
+                IsSneaking = false;
+            if (IsFlying)
+                _sprintLatched = false;
             Velocity = Vector3.Zero;
         }
 
@@ -144,13 +168,16 @@ public sealed class PlayerController
         if (moveXZ != Vector3.Zero)
             moveXZ.Normalize();
 
-        var speed = IsFlying ? CurrentFlySpeed : WalkSpeed;
-
         if (IsFlying)
         {
+            IsSprinting = false;
+            IsSneaking = false;
+            _toggleSneakLatched = false;
+            _sprintLatched = false;
+
             var vertical = 0f;
             if (input.IsKeyDown(Keys.Space)) vertical += 1f;
-            if (input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl) || input.IsKeyDown(Keys.C)) vertical -= 1f;
+            if (IsControlDown(input, FlyDescendKey)) vertical -= 1f;
 
             var move = new Vector3(moveXZ.X, vertical, moveXZ.Z);
             if (move.LengthSquared() > 1f)
@@ -158,28 +185,96 @@ public sealed class PlayerController
 
             if (NoClipEnabled)
             {
-                Position += move * speed * dt;
+                Position += move * CurrentFlySpeed * dt;
                 Velocity = Vector3.Zero;
                 IsGrounded = false;
                 _moveIntent = move;
                 return;
             }
 
-            var flyVel = move * speed;
+            var flyVel = move * CurrentFlySpeed;
             MoveWithCollisions(ref flyVel, dt, getBlock);
-            Velocity = Vector3.Zero; // Reset velocity after movement to prevent accumulation
+            Velocity = Vector3.Zero;
             IsGrounded = false;
             _moveIntent = move;
             return;
         }
 
+        if (!AllowCrouch)
+        {
+            IsSneaking = false;
+            _toggleSneakLatched = false;
+        }
+        else if (ToggleCrouchEnabled)
+        {
+            if (IsControlNewPress(input, CrouchKey))
+            {
+                if (_toggleSneakLatched)
+                {
+                    if (CanStandUp(Position, getBlock))
+                    {
+                        IsSneaking = false;
+                        _toggleSneakLatched = false;
+                    }
+                }
+                else
+                {
+                    IsSneaking = true;
+                    _toggleSneakLatched = true;
+                }
+            }
+        }
+        else
+        {
+            _toggleSneakLatched = false;
+            var crouchRequested = IsControlDown(input, CrouchKey);
+            if (crouchRequested)
+            {
+                IsSneaking = true;
+            }
+            else if (IsSneaking)
+            {
+                if (CanStandUp(Position, getBlock))
+                    IsSneaking = false;
+            }
+        }
+
         var vel = Velocity;
+        var speed = WalkSpeed;
+        if (IsSneaking)
+        {
+            speed *= SneakMoveMultiplier;
+            _sprintLatched = false;
+        }
+
+        var groundedNow = IsGrounded || IsGroundedCheck(Position, getBlock, ColliderHeight);
+        var hasMoveInput = moveXZ != Vector3.Zero;
+        if (!hasMoveInput)
+            _sprintLatched = false;
+
+        if (!SprintLatchEnabled)
+        {
+            _sprintLatched = false;
+        }
+        else if (IsControlNewPress(input, SprintKey) && !IsSneaking && !IsFlying)
+        {
+            // Arm sprint even before movement begins so sprint starts as soon as motion resumes.
+            _sprintLatched = true;
+        }
+
+        var canSprint = groundedNow
+            && !IsSneaking
+            && hasMoveInput
+            && (SprintLatchEnabled ? _sprintLatched : IsControlDown(input, SprintKey));
+        IsSprinting = canSprint;
+        if (IsSprinting)
+            speed *= SprintMoveMultiplier;
+
         vel.X = moveXZ.X * speed;
         vel.Z = moveXZ.Z * speed;
         var wasGrounded = IsGrounded;
         IsGrounded = false;
 
-        var groundedNow = wasGrounded || IsGroundedCheck(Position, getBlock);
         if (input.IsNewKeyPress(Keys.Space) && groundedNow)
         {
             vel.Y = JumpSpeed;
@@ -199,24 +294,25 @@ public sealed class PlayerController
     private void MoveWithCollisions(ref Vector3 vel, float dt, Func<int, int, int, byte> getBlock)
     {
         var pos = Position;
+        var height = ColliderHeight;
 
-        pos.X = MoveAxisX(pos, vel.X * dt, getBlock, ref vel);
-        pos.Y = MoveAxisY(pos, vel.Y * dt, getBlock, ref vel);
-        pos.Z = MoveAxisZ(pos, vel.Z * dt, getBlock, ref vel);
+        pos.X = MoveAxisX(pos, vel.X * dt, getBlock, ref vel, height);
+        pos.Y = MoveAxisY(pos, vel.Y * dt, getBlock, ref vel, height);
+        pos.Z = MoveAxisZ(pos, vel.Z * dt, getBlock, ref vel, height);
 
-        if (!IsGrounded && vel.Y <= 0f && IsGroundedCheck(pos, getBlock))
+        if (!IsGrounded && vel.Y <= 0f && IsGroundedCheck(pos, getBlock, height))
             IsGrounded = true;
 
         Position = pos;
     }
 
-    private static float MoveAxisX(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel)
+    private float MoveAxisX(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel, float height)
     {
         if (delta == 0f)
             return pos.X;
 
         pos.X += delta;
-        GetAabb(pos, out var min, out var max);
+        GetAabb(pos, height, out var min, out var max);
 
         var minX = (int)Math.Floor(min.X + Eps);
         var maxX = (int)Math.Floor(max.X - Eps);
@@ -224,6 +320,18 @@ public sealed class PlayerController
         var maxY = (int)Math.Floor(max.Y - Eps);
         var minZ = (int)Math.Floor(min.Z + Eps);
         var maxZ = (int)Math.Floor(max.Z - Eps);
+
+        // Anti-fall check: if crouching and not flying, prevent walking off edges
+        if (IsSneaking && !IsFlying && IsGrounded)
+        {
+            var testPos = new Vector3(pos.X, Position.Y, Position.Z);
+            if (!HasSolidGroundBelow(testPos, getBlock))
+            {
+                // Don't allow movement - there's no solid ground below
+                vel.X = 0f;
+                return Position.X; // Return original position
+            }
+        }
 
         if (delta > 0f)
         {
@@ -255,13 +363,13 @@ public sealed class PlayerController
         return pos.X;
     }
 
-    private float MoveAxisY(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel)
+    private float MoveAxisY(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel, float height)
     {
         if (delta == 0f)
             return pos.Y;
 
         pos.Y += delta;
-        GetAabb(pos, out var min, out var max);
+        GetAabb(pos, height, out var min, out var max);
 
         var minX = (int)Math.Floor(min.X + Eps);
         var maxX = (int)Math.Floor(max.X - Eps);
@@ -278,7 +386,7 @@ public sealed class PlayerController
             {
                 if (!BlockRegistry.IsSolid(getBlock(x, y, z)))
                     continue;
-                pos.Y = y - Height;
+                pos.Y = y - height;
                 vel.Y = 0f;
                 return pos.Y;
             }
@@ -301,13 +409,13 @@ public sealed class PlayerController
         return pos.Y;
     }
 
-    private static float MoveAxisZ(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel)
+    private float MoveAxisZ(Vector3 pos, float delta, Func<int, int, int, byte> getBlock, ref Vector3 vel, float height)
     {
         if (delta == 0f)
             return pos.Z;
 
         pos.Z += delta;
-        GetAabb(pos, out var min, out var max);
+        GetAabb(pos, height, out var min, out var max);
 
         var minX = (int)Math.Floor(min.X + Eps);
         var maxX = (int)Math.Floor(max.X - Eps);
@@ -315,6 +423,18 @@ public sealed class PlayerController
         var maxY = (int)Math.Floor(max.Y - Eps);
         var minZ = (int)Math.Floor(min.Z + Eps);
         var maxZ = (int)Math.Floor(max.Z - Eps);
+
+        // Anti-fall check: if crouching and not flying, prevent walking off edges
+        if (IsSneaking && !IsFlying && IsGrounded)
+        {
+            var testPos = new Vector3(Position.X, Position.Y, pos.Z);
+            if (!HasSolidGroundBelow(testPos, getBlock))
+            {
+                // Don't allow movement - there's no solid ground below
+                vel.Z = 0f;
+                return Position.Z; // Return original position
+            }
+        }
 
         if (delta > 0f)
         {
@@ -346,9 +466,27 @@ public sealed class PlayerController
         return pos.Z;
     }
 
-    private static bool IsGroundedCheck(Vector3 pos, Func<int, int, int, byte> getBlock)
+    private bool HasSolidGroundBelow(Vector3 pos, Func<int, int, int, byte> getBlock)
     {
-        GetAabb(pos, out var min, out var max);
+        // Check blocks just below the player's feet
+        var checkY = (int)Math.Floor(pos.Y - 0.1f); // Slightly below feet
+        var minX = (int)Math.Floor(pos.X - HalfWidth + Eps);
+        var maxX = (int)Math.Floor(pos.X + HalfWidth - Eps);
+        var minZ = (int)Math.Floor(pos.Z - HalfWidth + Eps);
+        var maxZ = (int)Math.Floor(pos.Z + HalfWidth - Eps);
+
+        for (var x = minX; x <= maxX; x++)
+        for (var z = minZ; z <= maxZ; z++)
+        {
+            if (BlockRegistry.IsSolid(getBlock(x, checkY, z)))
+                return true;
+        }
+        return false;
+    }
+
+    private bool IsGroundedCheck(Vector3 pos, Func<int, int, int, byte> getBlock, float height)
+    {
+        GetAabb(pos, height, out var min, out var max);
         var minX = (int)Math.Floor(min.X + Eps);
         var maxX = (int)Math.Floor(max.X - Eps);
         var minZ = (int)Math.Floor(min.Z + Eps);
@@ -361,9 +499,50 @@ public sealed class PlayerController
         return false;
     }
 
-    private static void GetAabb(Vector3 pos, out Vector3 min, out Vector3 max)
+    private bool CanStandUp(Vector3 pos, Func<int, int, int, byte> getBlock)
+    {
+        GetAabb(pos, StandingHeight, out var min, out var max);
+        var minX = (int)Math.Floor(min.X + Eps);
+        var maxX = (int)Math.Floor(max.X - Eps);
+        var minY = (int)Math.Floor(min.Y + Eps);
+        var maxY = (int)Math.Floor(max.Y - Eps);
+        var minZ = (int)Math.Floor(min.Z + Eps);
+        var maxZ = (int)Math.Floor(max.Z - Eps);
+
+        for (var x = minX; x <= maxX; x++)
+        for (var y = minY; y <= maxY; y++)
+        for (var z = minZ; z <= maxZ; z++)
+            if (BlockRegistry.IsSolid(getBlock(x, y, z)))
+                return false;
+
+        return true;
+    }
+
+    private static void GetAabb(Vector3 pos, float colliderHeight, out Vector3 min, out Vector3 max)
     {
         min = new Vector3(pos.X - HalfWidth + Skin, pos.Y + Skin, pos.Z - HalfWidth + Skin);
-        max = new Vector3(pos.X + HalfWidth - Skin, pos.Y + Height - Skin, pos.Z + HalfWidth - Skin);
+        max = new Vector3(pos.X + HalfWidth - Skin, pos.Y + colliderHeight - Skin, pos.Z + HalfWidth - Skin);
+    }
+
+    private static bool IsControlDown(InputState input, Keys key)
+    {
+        return key switch
+        {
+            Keys.LeftShift or Keys.RightShift => input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift),
+            Keys.LeftControl or Keys.RightControl => input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl),
+            Keys.LeftAlt or Keys.RightAlt => input.IsKeyDown(Keys.LeftAlt) || input.IsKeyDown(Keys.RightAlt),
+            _ => input.IsKeyDown(key)
+        };
+    }
+
+    private static bool IsControlNewPress(InputState input, Keys key)
+    {
+        return key switch
+        {
+            Keys.LeftShift or Keys.RightShift => input.IsNewKeyPress(Keys.LeftShift) || input.IsNewKeyPress(Keys.RightShift),
+            Keys.LeftControl or Keys.RightControl => input.IsNewKeyPress(Keys.LeftControl) || input.IsNewKeyPress(Keys.RightControl),
+            Keys.LeftAlt or Keys.RightAlt => input.IsNewKeyPress(Keys.LeftAlt) || input.IsNewKeyPress(Keys.RightAlt),
+            _ => input.IsNewKeyPress(key)
+        };
     }
 }

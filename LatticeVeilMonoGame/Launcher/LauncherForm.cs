@@ -84,8 +84,8 @@ public sealed class LauncherForm : Form
     private readonly TextBox _offlineNameBox = new();
     private readonly Button _saveOfflineNameBtn = new();
     private readonly Button _claimUsernameBtn = new();
-    private readonly CheckBox _keepOpenBox = new();
-    private readonly CheckBox _darkModeBox = new();
+    private readonly SliderToggleCheckBox _keepOpenBox = new();
+    private readonly SliderToggleCheckBox _darkModeBox = new();
     private readonly Label _recommendedLabel = new();
     private readonly Button _useRecommendedBtn = new();
     private readonly CheckBox _advancedModeBox = new();
@@ -100,6 +100,7 @@ public sealed class LauncherForm : Form
     private readonly Button _openLogsBtn = new();
     private readonly Button _openGameFolderBtn = new();
     private readonly Button _saveLogsBtn = new();
+    private readonly Button _updateBtn = new();
     private readonly ToolTip _toolTip = new();
     private DImage? _rocketIcon;
     private DImage? _paperIcon;
@@ -122,9 +123,16 @@ public sealed class LauncherForm : Form
     private bool _logSessionDateSet;
 
     private readonly AssetPackInstaller _assetInstaller;
+    private readonly GameReleaseUpdater _gameReleaseUpdater;
     private CancellationTokenSource? _assetCts;
+    private CancellationTokenSource? _gameUpdateCts;
     private bool _assetBusy;
     private bool _assetPendingLaunch;
+    private bool _gameUpdateBusy;
+    private bool _gameUpdateCheckInProgress;
+    private bool _gameUpdateReminderShown;
+    private string _gameUpdateStatusDetail = "Checking for updates...";
+    private GameReleaseCheckResult? _gameUpdateCheck;
 
     private readonly Panel _assetPanel = new();
     private readonly Panel _assetCard = new();
@@ -142,10 +150,15 @@ public sealed class LauncherForm : Form
     private readonly TableLayoutPanel _root = new();
     private readonly FlowLayoutPanel _right = new();
     private readonly FlowLayoutPanel _buttons = new();
+    private readonly Panel _bottomLeftHost = new();
+    private readonly Panel _logsHost = new();
+    private readonly Panel _launchModeHost = new();
+    private readonly Panel _buttonSpacer = new();
 
     private readonly Panel _topBar = new();
     private readonly PictureBox _logoBox = new();
     private readonly Label _title = new();
+    private readonly Label _releaseTitleLabel = new();
     private readonly Button _minBtn = new();
     private readonly Button _closeBtn = new();
 
@@ -169,7 +182,7 @@ public sealed class LauncherForm : Form
 
     private const string DefaultVeilnetLauncherPageUrl = "https://latticeveil.github.io/veilnet/launcher/";
     private const string DefaultVeilnetFunctionsBaseUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
-    private const string DefaultGameHashesGetUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1/game-hashes-get";
+    private const string DefaultGameHashesGetUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/rest/v1/game_hashes";
     private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
     private static readonly string VeilnetAuthDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -214,6 +227,13 @@ public sealed class LauncherForm : Form
         ComputeFailed
     }
 
+    private enum UpdateReminderChoice
+    {
+        UpdateNow,
+        Later,
+        IgnoreThisRelease
+    }
+
     public LauncherForm(Logger log, PlayerProfile profile, string? startupLinkCode = null)
     {
         _log = log;
@@ -221,8 +241,9 @@ public sealed class LauncherForm : Form
         _settings = GameSettings.LoadOrCreate(_log);
         _startupLinkCode = (startupLinkCode ?? string.Empty).Trim();
         _launcherRuntimeConfig = LauncherRuntimeConfig.Load(_log);
-        _officialBuildVerifier = new OfficialBuildVerifier(_log, GetGameHashesGetUrl());
+        _officialBuildVerifier = new OfficialBuildVerifier(_log, GetGameHashesGetUrl(), GetSupabaseAnonKey());
         _assetInstaller = new AssetPackInstaller(_log);
+        _gameReleaseUpdater = new GameReleaseUpdater(_log);
         _logFilePath = _log.LogFilePath;
         ResetLogSessionDate(_logFilePath);
         _log.Info($"Auth storage path: {VeilnetAuthPath}");
@@ -233,13 +254,15 @@ public sealed class LauncherForm : Form
             _profile.Save(_log);
         }
 
-        Text = Paths.IsDevBuild ? "[DEV] Lattice Launcher" : "Lattice Launcher";
+        Text = BuildLauncherWindowTitle();
 
         // Borderless (custom top bar).
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new DSize(820, 520);
+        ClientSize = new DSize(1120, 700);
         DoubleBuffered = true;
+        TabStop = false;
+        ApplyLauncherWindowSizing();
 
         // Use the app's icon if present.
         try
@@ -303,7 +326,8 @@ public sealed class LauncherForm : Form
         {
             var startupChecksTask = BeginStartupOnlineChecks();
             var deepLinkTask = TryConsumeStartupLinkCodeAsync();
-            await Task.WhenAll(startupChecksTask, deepLinkTask);
+            var gameUpdateTask = BeginGameUpdateCheckAsync();
+            await Task.WhenAll(startupChecksTask, deepLinkTask, gameUpdateTask);
         };
 
         _log.Info("Launcher UI ready.");
@@ -316,35 +340,23 @@ public sealed class LauncherForm : Form
         _root.RowCount = 6;
         _root.Padding = new Padding(12);
         _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
-        _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
-        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44)); // top bar
-        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28)); // assets
-        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28)); // log file
+        _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
+        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48)); // top bar
+        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 0)); // assets
+        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 0)); // log file
         _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // body
-        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84)); // buttons
+        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 124)); // buttons
         _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 6));  // bottom spacing
 
         BuildTopBar();
         _root.SetColumnSpan(_topBar, 2);
         _root.Controls.Add(_topBar, 0, 0);
 
-        _dirs.Dock = DockStyle.Fill;
-        _dirs.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        _dirs.Text = $"Assets: {Paths.AssetsDir}";
-        _root.SetColumnSpan(_dirs, 2);
-        _root.Controls.Add(_dirs, 0, 1);
-
-        _logfile.Dock = DockStyle.Fill;
-        _logfile.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        _logfile.Text = $"Log: {_log.LogFilePath}";
-        _root.SetColumnSpan(_logfile, 2);
-        _root.Controls.Add(_logfile, 0, 2);
-
         _logPanel.Dock = DockStyle.Fill;
         _logPanel.ColumnCount = 1;
         _logPanel.RowCount = 2;
         _logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        _logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        _logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
 
         _logBox.ReadOnly = true;
         _logBox.Multiline = true;
@@ -354,15 +366,16 @@ public sealed class LauncherForm : Form
         _logPanel.Controls.Add(_logBox, 0, 0);
 
         _progressHost.Dock = DockStyle.Fill;
-        _progressHost.Padding = new Padding(6, 4, 6, 6);
+        _progressHost.Padding = new Padding(6, 3, 6, 6);
 
         _progressLabel.AutoSize = false;
         _progressLabel.Dock = DockStyle.Top;
-        _progressLabel.Height = 12;
+        _progressLabel.Height = 18;
+        _progressLabel.Font = new DFont(Font.FontFamily, 9.5f, System.Drawing.FontStyle.Bold);
         _progressLabel.Text = "Idle";
 
         _progressTrack.Dock = DockStyle.Bottom;
-        _progressTrack.Height = 10;
+        _progressTrack.Height = 8;
         _progressTrack.Padding = new Padding(1);
         _progressTrack.Controls.Add(_progressFill);
         _progressTrack.Resize += (_, _) => UpdateProgressFill();
@@ -370,8 +383,25 @@ public sealed class LauncherForm : Form
         _progressFill.Dock = DockStyle.Left;
         _progressFill.Width = 0;
 
+        _onlineStatusIndicator.Size = new DSize(14, 14);
+        _onlineStatusIndicator.BackColor = DColor.Red;
+        _onlineStatusIndicator.Location = new DPoint(6, 23);
+        _onlineStatusIndicator.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+        _onlineStatusIndicator.BorderStyle = BorderStyle.None;
+        _toolTip.SetToolTip(_onlineStatusIndicator, "Online access unavailable. Offline/LAN only.");
+
+        _onlineHeader.AutoSize = false;
+        _onlineHeader.Size = new DSize(230, 18);
+        _onlineHeader.Text = "ONLINE ACCESS: OFFLINE/LAN";
+        _onlineHeader.Font = new DFont(Font.FontFamily, 9f, System.Drawing.FontStyle.Bold);
+        _onlineHeader.Location = new DPoint(26, 20);
+        _onlineHeader.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+        _onlineHeader.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+
         _progressHost.Controls.Add(_progressLabel);
         _progressHost.Controls.Add(_progressTrack);
+        _progressHost.Controls.Add(_onlineStatusIndicator);
+        _progressHost.Controls.Add(_onlineHeader);
         _logPanel.Controls.Add(_progressHost, 0, 1);
 
         _root.Controls.Add(_logPanel, 0, 3);
@@ -385,13 +415,23 @@ public sealed class LauncherForm : Form
         _right.FlowDirection = FlowDirection.TopDown;
         _right.WrapContents = false;
         _right.AutoScroll = true;
+        _right.Padding = new Padding(18, 16, 18, 16);
+        _right.Margin = new Padding(12, 0, 0, 0);
+        _right.Paint += (_, e) =>
+        {
+            var borderRect = new System.Drawing.Rectangle(0, 0, Math.Max(0, _right.ClientSize.Width - 1), Math.Max(0, _right.ClientSize.Height - 1));
+            ControlPaint.DrawBorder(e.Graphics, borderRect, DColor.White, ButtonBorderStyle.Solid);
+        };
 
-        // In-game name (shown to other players)
-        _offlineNameLabel.Text = "Username";
+        // Offline-only identity field.
+        _offlineNameLabel.Text = "OFFLINE USERNAME";
         _offlineNameLabel.AutoSize = true;
+        _offlineNameLabel.Font = new DFont(Font.FontFamily, 9.5f, System.Drawing.FontStyle.Bold);
         _right.Controls.Add(_offlineNameLabel);
 
-        _offlineNameBox.Width = 240;
+        _offlineNameBox.Width = 280;
+        _offlineNameBox.Height = 36;
+        _offlineNameBox.Font = new DFont(Font.FontFamily, 10f, System.Drawing.FontStyle.Bold);
         _offlineNameBox.Text = _profile.OfflineUsername ?? string.Empty;
         _offlineNameBox.Leave += (_, _) => SaveOfflineNameFromUi();
         _right.Controls.Add(_offlineNameBox);
@@ -407,7 +447,7 @@ public sealed class LauncherForm : Form
         UpdateOfflineNameEnabled();
 
         _keepOpenBox.Text = "Keep launcher open?";
-        _keepOpenBox.AutoSize = true;
+        _keepOpenBox.Width = 250;
         _keepOpenBox.Checked = _settings.KeepLauncherOpen;
         _keepOpenBox.CheckedChanged += (_, _) =>
         {
@@ -418,7 +458,7 @@ public sealed class LauncherForm : Form
         _right.Controls.Add(_keepOpenBox);
 
         _darkModeBox.Text = "Dark mode";
-        _darkModeBox.AutoSize = true;
+        _darkModeBox.Width = 250;
         _darkModeBox.Checked = _settings.DarkMode;
         _darkModeBox.CheckedChanged += (_, _) =>
         {
@@ -429,49 +469,24 @@ public sealed class LauncherForm : Form
         };
         _right.Controls.Add(_darkModeBox);
 
-        // Recommended button
-        _useRecommendedBtn.Text = "Use Recommended";
-        _useRecommendedBtn.AutoSize = true;
-        _useRecommendedBtn.Click += (_, _) => {
-            // Set recommended OpenGL settings
-            _settings.RendererBackend = "OpenGL";
-            _settings.LauncherRenderDistance = 16; // Recommended render distance
-            UpdateRecommendedLabel();
-            SaveLauncherSettings();
-            _log.Info($"Applied recommended settings: OpenGL renderer, 16 render distance");
-        };
-        _right.Controls.Add(_useRecommendedBtn);
-
-        // Advanced mode checkbox
-        _advancedModeBox.Text = "Advanced Mode";
-        _advancedModeBox.AutoSize = true;
-        _advancedModeBox.Checked = _settings.AdvancedMode;
-        _advancedModeBox.CheckedChanged += (_, _) => {
-            _settings.AdvancedMode = _advancedModeBox.Checked;
-            SaveLauncherSettings();
-            _log.Info($"AdvancedMode: {_settings.AdvancedMode}");
-        };
-        _right.Controls.Add(_advancedModeBox);
-
         // Recommended label - removed per user request
         // UpdateRecommendedLabel();
         // _right.Controls.Add(_recommendedLabel);
 
         BuildOnlineSection();
-
-        _right.Controls.Add(new Label { Text = "Player Model (placeholder)", AutoSize = true });
-        var modelPlaceholder = new Panel { Width = 240, Height = 140, BorderStyle = BorderStyle.FixedSingle };
-        _right.Controls.Add(modelPlaceholder);
+        UpdateIdentityModeVisuals();
 
         _root.Controls.Add(_right, 1, 3);
 
         _buttons.Dock = DockStyle.Fill;
         _buttons.FlowDirection = FlowDirection.RightToLeft;
         _buttons.WrapContents = false;
+        _buttons.Padding = new Padding(6, 4, 6, 0);
+        _buttons.Resize += (_, _) => UpdateBottomButtonLayout();
 
-        _buttons.Padding = new Padding(6, 4, 6, 4);
+        const int footerButtonWidth = 118;
 
-        ConfigureIconButton(_launchBtn, "Launch", 110, 64);
+        ConfigureIconButton(_launchBtn, "Launch", footerButtonWidth, 64);
         _toolTip.SetToolTip(_launchBtn, "Launch game");
         _launchBtn.Click += (_, _) =>
         {
@@ -479,6 +494,23 @@ public sealed class LauncherForm : Form
             var state = GetGameState();
             if (state == GameState.NotRunning)
             {
+                if (!_gameUpdateBusy && _gameUpdateCheck?.IsUpdateAvailable == true && !_gameUpdateReminderShown)
+                {
+                    _gameUpdateReminderShown = true;
+                    var choice = ShowGameUpdateReminderDialog(_gameUpdateCheck.ReleaseTitle);
+                    if (choice == UpdateReminderChoice.UpdateNow)
+                    {
+                        StartGameUpdate();
+                        return;
+                    }
+
+                    if (choice == UpdateReminderChoice.IgnoreThisRelease)
+                    {
+                        _settings.IgnoredGameReleaseTitle = _gameUpdateCheck.ReleaseTitle;
+                        SaveLauncherSettings();
+                    }
+                }
+
                 var mode = (_launchModeBox.SelectedItem as string) ?? "Online";
                 if (string.Equals(mode, "Offline", StringComparison.OrdinalIgnoreCase))
                 {
@@ -531,44 +563,78 @@ public sealed class LauncherForm : Form
         _launchModeBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _launchModeBox.Items.AddRange(new object[] { "Online", "Offline" });
         _launchModeBox.SelectedIndex = 0;
-        _launchModeBox.Width = 110;
-        _launchModeBox.Height = 32;
+        _launchModeBox.Width = 126;
+        _launchModeBox.Height = 30;
         _launchModeBox.Font = new DFont(Font.FontFamily, 8.5f, System.Drawing.FontStyle.Bold);
-        _launchModeBox.Margin = new Padding(6, 18, 6, 6);
+        _launchModeBox.Margin = Padding.Empty;
         _toolTip.SetToolTip(_launchModeBox, "Launch mode");
         _launchModeBox.SelectedIndexChanged += async (_, _) =>
         {
+            UpdateIdentityModeVisuals();
             if (IsOnlineModeSelected())
                 await BeginStartupOnlineChecks();
 
             SetLaunchButtonState(GetGameState());
         };
 
-        ConfigureIconButton(_openLogsBtn, "Logs", 96, 64);
+        ConfigureIconButton(_openLogsBtn, "Logs", footerButtonWidth, 64);
         _toolTip.SetToolTip(_openLogsBtn, "Open logs folder");
         _openLogsBtn.Click += (_, _) => OpenLogsFolder();
 
-        ConfigureIconButton(_openGameFolderBtn, "Game Folder", 110, 64);
+        ConfigureIconButton(_openGameFolderBtn, "Game Folder", footerButtonWidth, 52);
         _toolTip.SetToolTip(_openGameFolderBtn, "Open game folder");
         _openGameFolderBtn.Click += (_, _) => OpenGameFolder();
 
-        ConfigureIconButton(_saveLogsBtn, "Save Logs", 96, 64);
-        _toolTip.SetToolTip(_saveLogsBtn, "Save logs snapshot");
-        _saveLogsBtn.Click += (_, _) => SaveLogsSnapshot();
+        const int footerHostHeight = 98;
+        const int footerButtonTop = 30;
 
-        _buttons.Controls.Add(_launchBtn);
-        _buttons.Controls.Add(_launchModeBox);
-        _buttons.Controls.Add(_saveLogsBtn);
-        _buttons.Controls.Add(_openLogsBtn);
-        _buttons.Controls.Add(_openGameFolderBtn);
+        _bottomLeftHost.Width = footerButtonWidth;
+        _bottomLeftHost.Height = footerHostHeight;
+        _bottomLeftHost.Margin = Padding.Empty;
+        _bottomLeftHost.Controls.Add(_openGameFolderBtn);
+        _openGameFolderBtn.Location = new DPoint(0, footerButtonTop);
+
+        _logsHost.Width = footerButtonWidth;
+        _logsHost.Height = footerHostHeight;
+        _logsHost.Margin = Padding.Empty;
+        _logsHost.Controls.Add(_openLogsBtn);
+        _openLogsBtn.Location = new DPoint(0, footerButtonTop);
+
+        _launchModeHost.Width = footerButtonWidth;
+        _launchModeHost.Height = footerHostHeight;
+        _launchModeHost.Margin = new Padding(0, 0, 14, 0);
+        _launchModeHost.Controls.Add(_launchModeBox);
+        _launchModeHost.Controls.Add(_launchBtn);
+        _launchModeBox.Width = footerButtonWidth;
+        _launchModeBox.Location = new DPoint(0, 0);
+        _launchBtn.Location = new DPoint(0, footerButtonTop);
+
+        _buttonSpacer.Width = 0;
+        _buttonSpacer.Height = 1;
+        _buttonSpacer.Margin = Padding.Empty;
+
+        _buttons.Controls.Add(_launchModeHost);
+        _buttons.Controls.Add(_logsHost);
+        _buttons.Controls.Add(_buttonSpacer);
+        _buttons.Controls.Add(_bottomLeftHost);
+        UpdateBottomButtonLayout();
 
         _root.SetColumnSpan(_buttons, 2);
         _root.Controls.Add(_buttons, 0, 4);
 
         Controls.Add(_root);
+        DisableTabFocus(_root);
         BuildAssetPanel();
         Controls.Add(_assetPanel);
+        DisableTabFocus(_assetPanel);
         _assetPanel.BringToFront();
+    }
+
+    private static void DisableTabFocus(Control root)
+    {
+        root.TabStop = false;
+        foreach (Control child in root.Controls)
+            DisableTabFocus(child);
     }
 
     private void ConfigureIconButton(Button button, string text, int width, int height)
@@ -584,18 +650,23 @@ public sealed class LauncherForm : Form
         button.Padding = new Padding(2, 4, 2, 4);
     }
 
+    private void UpdateBottomButtonLayout()
+    {
+        if (_buttons.ClientSize.Width <= 0)
+            return;
+
+        var nonSpacerWidth = _launchModeHost.Width + _launchModeHost.Margin.Horizontal
+            + _logsHost.Width + _logsHost.Margin.Horizontal
+            + _bottomLeftHost.Width + _bottomLeftHost.Margin.Horizontal;
+        var available = _buttons.ClientSize.Width - _buttons.Padding.Horizontal - nonSpacerWidth;
+        _buttonSpacer.Width = Math.Max(0, available);
+        _buttonSpacer.BackColor = BackColor;
+    }
+
     private void BuildOnlineSection()
     {
-        // Hide the online header text - we're using the top bar indicator now
-        _onlineHeader.Text = "OFFLINE/LAN";
-        _onlineHeader.AutoSize = true;
-        _onlineHeader.Font = new DFont(Font.FontFamily, 10f, System.Drawing.FontStyle.Bold);
-        _onlineHeader.ForeColor = DColor.Red;
-        _onlineHeader.Visible = false; // Hide the text
-        _right.Controls.Add(_onlineHeader);
-
         _hubLoginBtn.Text = "LOGIN WITH EPIC";
-        _hubLoginBtn.Width = 240;
+        _hubLoginBtn.Width = 280;
         _hubLoginBtn.Height = 40;
         _hubLoginBtn.TextImageRelation = TextImageRelation.ImageBeforeText;
         _hubLoginBtn.ImageAlign = System.Drawing.ContentAlignment.MiddleLeft;
@@ -605,8 +676,9 @@ public sealed class LauncherForm : Form
         _right.Controls.Add(_hubLoginBtn);
 
         _hubGoogleBtn.Text = "LOGIN WITH VEILNET";
-        _hubGoogleBtn.Width = 240;
-        _hubGoogleBtn.Height = 40;
+        _hubGoogleBtn.Width = 280;
+        _hubGoogleBtn.Height = 48;
+        _hubGoogleBtn.Font = new DFont(Font.FontFamily, 10f, System.Drawing.FontStyle.Bold);
         _hubGoogleBtn.TextImageRelation = TextImageRelation.ImageBeforeText;
         _hubGoogleBtn.ImageAlign = System.Drawing.ContentAlignment.MiddleLeft;
         _hubGoogleBtn.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
@@ -615,7 +687,7 @@ public sealed class LauncherForm : Form
         _right.Controls.Add(_hubGoogleBtn);
 
         _hubResetBtn.Text = "RESET VEILNET LOGIN";
-        _hubResetBtn.Width = 240;
+        _hubResetBtn.Width = 280;
         _hubResetBtn.Height = 34;
         _hubResetBtn.Enabled = false;
         _hubResetBtn.Visible = false;
@@ -639,49 +711,35 @@ public sealed class LauncherForm : Form
     {
         try
         {
+            // Clear any old auth and get ready for a new link flow.
             TryClearVeilnetAuth(
                 "Starting Veilnet login flow; clearing stale local auth.",
                 clearPendingCodes: true,
                 updateStatus: false);
 
             _hubGoogleBtn.Enabled = false;
-            UpdateHubStatus("Veilnet: open browser to link...");
+            UpdateHubStatus("Veilnet: opening browser to link...");
 
+            // Open the browser to the launcher page. The user will log in,
+            // and the website will redirect to a custom protocol URL
+            // (latticeveil://link?code=...) which the OS routes back to us.
             OpenUrlInBrowser(GetVeilnetLauncherPageUrl());
-            UpdateHubStatus("Veilnet: paste your link code from the browser page.");
 
-            string? code = null;
-            if (InvokeRequired)
-            {
-                var tcs = new TaskCompletionSource<string?>();
-                BeginInvoke(new Action(() =>
-                {
-                    try { tcs.SetResult(PromptForVeilnetCode()); }
-                    catch (Exception ex) { tcs.SetException(ex); }
-                }));
-                code = await tcs.Task.ConfigureAwait(false);
-            }
-            else
-            {
-                code = PromptForVeilnetCode();
-            }
-
-            if (string.IsNullOrWhiteSpace(code))
-            {
-                BeginInvoke(new Action(() => UpdateHubStatus("Veilnet: link canceled")));
-                return;
-            }
-
-            var exchange = await LinkVeilnetWithCodeAsync(code).ConfigureAwait(false);
-            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: linked as {exchange.Username}")));
+            // The launcher now just waits. The protocol handler will receive the
+            // code and call ConsumeVeilnetLinkCodeAsync automatically.
+            UpdateHubStatus("Veilnet: check your browser to complete login.");
+            
+            // The button will be re-enabled by the ConsumeVeilnetLinkCodeAsync method
+            // upon success or failure of the link attempt.
         }
         catch (Exception ex)
         {
-            BeginInvoke(new Action(() => UpdateHubStatus($"Veilnet: {ex.Message}")));
-        }
-        finally
-        {
-            BeginInvoke(new Action(() => _hubGoogleBtn.Enabled = true));
+            // Re-enable the button on failure.
+            BeginInvoke(new Action(() =>
+            {
+                UpdateHubStatus($"Veilnet: error starting login ({ex.Message})");
+                _hubGoogleBtn.Enabled = true;
+            }));
         }
     }
 
@@ -791,6 +849,18 @@ public sealed class LauncherForm : Form
             return _launcherRuntimeConfig.VeilnetFunctionsBaseUrl;
 
         return DefaultVeilnetFunctionsBaseUrl;
+    }
+
+    private string GetSupabaseAnonKey()
+    {
+        var fromEnv = (Environment.GetEnvironmentVariable("LV_SUPABASE_ANON_KEY") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(fromEnv))
+            return fromEnv;
+
+        if (!string.IsNullOrWhiteSpace(_launcherRuntimeConfig.SupabaseAnonKey))
+            return _launcherRuntimeConfig.SupabaseAnonKey;
+
+        return DefaultSupabaseAnonKey;
     }
 
     private string GetGameHashesGetUrl()
@@ -1326,7 +1396,8 @@ public sealed class LauncherForm : Form
         var token = (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
         var hasToken = !string.IsNullOrWhiteSpace(token) && !IsPlaceholderToken(token);
         _hubGoogleBtn.Text = string.IsNullOrWhiteSpace(username) ? "LOGIN WITH VEILNET" : $"LINKED: {username}";
-        _hubResetBtn.Visible = hasToken || !string.IsNullOrWhiteSpace(username);
+        _hubGoogleBtn.Visible = IsOnlineModeSelected();
+        _hubResetBtn.Visible = IsOnlineModeSelected() && (hasToken || !string.IsNullOrWhiteSpace(username));
         _hubResetBtn.Enabled = _hubResetBtn.Visible;
     }
 
@@ -1470,15 +1541,29 @@ public sealed class LauncherForm : Form
         _topBar.Dock = DockStyle.Fill;
         _topBar.Padding = new Padding(6, 6, 6, 6);
 
-        _logoBox.Size = new DSize(32, 32);
+        _logoBox.Size = new DSize(28, 28);
         _logoBox.SizeMode = PictureBoxSizeMode.Zoom;
         _logoBox.Image = LoadEmbeddedLogo();
-        _logoBox.Location = new DPoint(6, 6);
+        _logoBox.Location = new DPoint(8, 9);
 
         _title.AutoSize = true;
-        _title.Location = new DPoint(44, 12);
-        _title.Text = (Paths.IsDevBuild ? "[DEV] " : string.Empty) + "Lattice Launcher";
-        _title.Font = new DFont(Font.FontFamily, 12f, System.Drawing.FontStyle.Bold);
+        _title.Location = new DPoint(42, 12);
+        _title.Text = BuildLauncherWindowTitle();
+        _title.Font = new DFont(Font.FontFamily, 11.25f, System.Drawing.FontStyle.Bold);
+
+        _releaseTitleLabel.AutoSize = false;
+        _releaseTitleLabel.AutoEllipsis = false;
+        _releaseTitleLabel.Font = new DFont(Font.FontFamily, 11f, System.Drawing.FontStyle.Bold);
+        _releaseTitleLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        _releaseTitleLabel.Text = "Checking release...";
+
+        _updateBtn.Text = "UPDATE";
+        _updateBtn.Width = 88;
+        _updateBtn.Height = 26;
+        _updateBtn.FlatStyle = FlatStyle.Flat;
+        _updateBtn.FlatAppearance.BorderSize = 1;
+        _updateBtn.Font = new DFont(Font.FontFamily, 8.5f, System.Drawing.FontStyle.Bold);
+        _updateBtn.Click += async (_, _) => await HandleUpdateButtonClickAsync();
 
         _closeBtn.Text = "X";
         _closeBtn.Width = 40;
@@ -1498,27 +1583,10 @@ public sealed class LauncherForm : Form
         _minBtn.Location = new DPoint(_topBar.Width - 92, 8);
         _minBtn.Click += (_, _) => WindowState = FormWindowState.Minimized;
 
-        // Online status indicator
-        _onlineStatusIndicator.Size = new DSize(12, 12);
-        _onlineStatusIndicator.BackColor = DColor.Red; // Start with offline (red)
-        _onlineStatusIndicator.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        _onlineStatusIndicator.Location = new DPoint(_topBar.Width - 138, 12);
-        _onlineStatusIndicator.BorderStyle = BorderStyle.None;
-        _toolTip.SetToolTip(_onlineStatusIndicator, "Offline/LAN");
-
-        // Online status text label
-        _onlineHeader.Size = new DSize(60, 20);
-        _onlineHeader.Text = "OFFLINE";
-        _onlineHeader.ForeColor = DColor.Red;
-        _onlineHeader.Font = new DFont(Font.FontFamily, 8f, System.Drawing.FontStyle.Bold);
-        _onlineHeader.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        _onlineHeader.Location = new DPoint(_topBar.Width - 120, 10);
-        _onlineHeader.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        _topBar.Controls.Add(_onlineHeader);
-
         _topBar.Controls.Add(_logoBox);
         _topBar.Controls.Add(_title);
-        _topBar.Controls.Add(_onlineStatusIndicator);
+        _topBar.Controls.Add(_releaseTitleLabel);
+        _topBar.Controls.Add(_updateBtn);
         _topBar.Controls.Add(_minBtn);
         _topBar.Controls.Add(_closeBtn);
 
@@ -1527,9 +1595,11 @@ public sealed class LauncherForm : Form
         {
             _closeBtn.Location = new DPoint(_topBar.Width - 46, 8);
             _minBtn.Location = new DPoint(_topBar.Width - 92, 8);
-            _onlineStatusIndicator.Location = new DPoint(_topBar.Width - 138, 12);
-            _onlineHeader.Location = new DPoint(_topBar.Width - 120, 10);
+            LayoutTopBarControls();
         };
+
+        LayoutTopBarControls();
+        UpdateGameReleaseVisuals();
 
         // Make the borderless window draggable.
         void drag(MouseEventArgs e)
@@ -1542,7 +1612,425 @@ public sealed class LauncherForm : Form
 
         _topBar.MouseDown += (_, e) => drag(e);
         _title.MouseDown += (_, e) => drag(e);
+        _releaseTitleLabel.MouseDown += (_, e) => drag(e);
         _logoBox.MouseDown += (_, e) => drag(e);
+    }
+
+    private string BuildLauncherWindowTitle()
+    {
+        return $"{(Paths.IsDevBuild ? "[DEV] " : string.Empty)}LatticeLauncher";
+    }
+
+    private void LayoutTopBarControls()
+    {
+        var labelX = _title.Right + 12;
+        var buttonX = Math.Max(labelX + 16, _topBar.Width - 188);
+        var labelWidth = Math.Max(100, buttonX - labelX - 8);
+
+        _releaseTitleLabel.Location = new DPoint(labelX, 10);
+        _releaseTitleLabel.Size = new DSize(labelWidth, 24);
+        _updateBtn.Location = new DPoint(buttonX, 9);
+        FitReleaseTitleLabelFont();
+    }
+
+    private void FitReleaseTitleLabelFont()
+    {
+        if (_releaseTitleLabel.Width <= 0)
+            return;
+
+        var text = (_releaseTitleLabel.Text ?? string.Empty).Trim();
+        if (text.Length == 0)
+            return;
+
+        var candidateSizes = new[] { 11f, 10.5f, 10f, 9.5f, 9f, 8.5f, 8f };
+        foreach (var size in candidateSizes)
+        {
+            using var font = new DFont(Font.FontFamily, size, System.Drawing.FontStyle.Bold);
+            var measured = TextRenderer.MeasureText(text, font, new DSize(int.MaxValue, 24), TextFormatFlags.NoPadding);
+            if (measured.Width <= _releaseTitleLabel.Width)
+            {
+                _releaseTitleLabel.Font = new DFont(Font.FontFamily, size, System.Drawing.FontStyle.Bold);
+                return;
+            }
+        }
+
+        _releaseTitleLabel.Font = new DFont(Font.FontFamily, 8f, System.Drawing.FontStyle.Bold);
+    }
+
+    private void UpdateGameReleaseVisuals()
+    {
+        Text = BuildLauncherWindowTitle();
+        _title.Text = BuildLauncherWindowTitle();
+
+        if (_gameUpdateBusy)
+        {
+            _releaseTitleLabel.Text = "Updating...";
+            _releaseTitleLabel.ForeColor = DColor.Gold;
+            _updateBtn.Enabled = false;
+            _toolTip.SetToolTip(_updateBtn, "Update is in progress.");
+            LayoutTopBarControls();
+            return;
+        }
+
+        if (_gameUpdateCheckInProgress)
+        {
+            _releaseTitleLabel.Text = "Checking release...";
+            _releaseTitleLabel.ForeColor = DColor.Gold;
+            _updateBtn.Enabled = false;
+            _toolTip.SetToolTip(_updateBtn, "Checking GitHub for the latest release.");
+            LayoutTopBarControls();
+            return;
+        }
+
+        if (_gameUpdateCheck?.Release != null)
+        {
+            var releaseTitle = string.IsNullOrWhiteSpace(_gameUpdateCheck.ReleaseTitle)
+                ? (_gameUpdateCheck.Release.tag_name ?? "Latest")
+                : _gameUpdateCheck.ReleaseTitle;
+            if (_gameUpdateCheck.Asset == null)
+            {
+                _releaseTitleLabel.Text = $"{releaseTitle}  NO EXE ASSET";
+                _releaseTitleLabel.ForeColor = DColor.Gold;
+                _toolTip.SetToolTip(_updateBtn, "Latest release was found, but no matching EXE asset was attached.");
+            }
+            else if (_gameUpdateCheck.IsUpdateAvailable)
+            {
+                _releaseTitleLabel.Text = $"{releaseTitle}  NEEDS UPDATE";
+                _releaseTitleLabel.ForeColor = DColor.FromArgb(255, 120, 92);
+                _toolTip.SetToolTip(_updateBtn, $"Download and apply {releaseTitle}.");
+            }
+            else
+            {
+                _releaseTitleLabel.Text = $"{releaseTitle}  UPDATED";
+                _releaseTitleLabel.ForeColor = DColor.FromArgb(88, 190, 125);
+                _toolTip.SetToolTip(_updateBtn, "Check GitHub for the latest release again.");
+            }
+
+            _updateBtn.Enabled = true;
+            LayoutTopBarControls();
+            return;
+        }
+
+        _releaseTitleLabel.Text = string.IsNullOrWhiteSpace(_gameUpdateStatusDetail)
+            ? "Release check unavailable"
+            : _gameUpdateStatusDetail;
+        _releaseTitleLabel.ForeColor = DColor.LightGray;
+        _updateBtn.Enabled = true;
+        _toolTip.SetToolTip(_updateBtn, "Retry GitHub release check.");
+        LayoutTopBarControls();
+    }
+
+    private async Task HandleUpdateButtonClickAsync()
+    {
+        if (_gameUpdateBusy || _gameUpdateCheckInProgress)
+            return;
+
+        if (_gameUpdateCheck?.IsUpdateAvailable == true)
+        {
+            StartGameUpdate();
+            return;
+        }
+
+        await BeginGameUpdateCheckAsync(manual: true);
+    }
+
+    private async Task BeginGameUpdateCheckAsync(bool manual = false)
+    {
+        if (_gameUpdateBusy || _gameUpdateCheckInProgress)
+            return;
+
+        _gameUpdateCheckInProgress = true;
+        _gameUpdateStatusDetail = "Checking GitHub release...";
+        UpdateGameReleaseVisuals();
+
+        _gameUpdateCts?.Cancel();
+        _gameUpdateCts = new CancellationTokenSource();
+
+        try
+        {
+            _gameUpdateCheck = await _gameReleaseUpdater.CheckForUpdateAsync(_gameUpdateCts.Token);
+            _gameUpdateStatusDetail = _gameUpdateCheck.StatusMessage;
+            _log.Info($"Game release check: {_gameUpdateStatusDetail}");
+
+            if (_gameUpdateCheck.IsUpdateAvailable && ShouldShowGameUpdateReminder())
+            {
+                _gameUpdateReminderShown = true;
+                var choice = ShowGameUpdateReminderDialog(_gameUpdateCheck.ReleaseTitle);
+                if (choice == UpdateReminderChoice.UpdateNow)
+                {
+                    StartGameUpdate();
+                    return;
+                }
+
+                if (choice == UpdateReminderChoice.IgnoreThisRelease)
+                {
+                    _settings.IgnoredGameReleaseTitle = _gameUpdateCheck.ReleaseTitle;
+                    SaveLauncherSettings();
+                }
+            }
+            else if (manual && !_gameUpdateCheck.IsUpdateAvailable)
+            {
+                if (_gameUpdateCheck.Asset == null && _gameUpdateCheck.Release != null)
+                {
+                    ShowGameUpdateNoticeDialog(
+                        "UPDATE CHECK INCOMPLETE",
+                        $"GitHub release found, but no matching game EXE asset was attached.\n\nRelease: {_gameUpdateCheck.ReleaseTitle}",
+                        DColor.FromArgb(230, 180, 72));
+                }
+                else
+                {
+                    ShowGameUpdateNoticeDialog(
+                        "UPDATED",
+                        $"You are already on the latest release.\n\n{_gameUpdateCheck.ReleaseTitle}",
+                        DColor.FromArgb(88, 190, 125));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _gameUpdateStatusDetail = $"Release check failed: {ex.Message}";
+            _gameUpdateCheck = null;
+            _log.Warn($"Game release check failed: {ex.Message}");
+            if (manual)
+            {
+                ShowGameUpdateNoticeDialog(
+                    "UPDATE CHECK FAILED",
+                    _gameUpdateStatusDetail,
+                    DColor.FromArgb(255, 120, 92));
+            }
+        }
+        finally
+        {
+            _gameUpdateCheckInProgress = false;
+            UpdateGameReleaseVisuals();
+        }
+    }
+
+    private bool ShouldShowGameUpdateReminder()
+    {
+        if (_gameUpdateCheck == null || !_gameUpdateCheck.IsUpdateAvailable)
+            return false;
+
+        if (_gameUpdateReminderShown)
+            return false;
+
+        return !string.Equals(
+            _settings.IgnoredGameReleaseTitle ?? string.Empty,
+            _gameUpdateCheck.ReleaseTitle ?? string.Empty,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async void StartGameUpdate()
+    {
+        if (_gameUpdateBusy || _gameUpdateCheckInProgress)
+            return;
+
+        if (GetGameState() != GameState.NotRunning)
+        {
+            ShowGameUpdateNoticeDialog(
+                "CLOSE GAME FIRST",
+                "Close the running game before applying an update.",
+                DColor.FromArgb(230, 180, 72));
+            return;
+        }
+
+        if (_assetBusy || _launching)
+        {
+            ShowGameUpdateNoticeDialog(
+                "LAUNCHER BUSY",
+                "Wait for the current launcher task to finish before updating.",
+                DColor.FromArgb(230, 180, 72));
+            return;
+        }
+
+        if (_gameUpdateCheck == null)
+        {
+            await BeginGameUpdateCheckAsync(manual: true);
+            return;
+        }
+
+        if (!_gameUpdateCheck.IsUpdateAvailable)
+        {
+            await BeginGameUpdateCheckAsync(manual: true);
+            return;
+        }
+
+        _gameUpdateBusy = true;
+        UpdateGameReleaseVisuals();
+
+        try
+        {
+            var releaseTitle = string.IsNullOrWhiteSpace(_gameUpdateCheck.ReleaseTitle)
+                ? "latest release"
+                : _gameUpdateCheck.ReleaseTitle;
+            ShowAssetPanel("Updating Game...", "Preparing download...", releaseTitle);
+
+            var progress = new Progress<float>(p =>
+            {
+                var pct = (int)Math.Round(Math.Clamp(p, 0f, 1f) * 100f);
+                _assetProgress.Value = pct;
+                _assetStatus.Text = $"Downloading update... {pct}%";
+            });
+
+            var downloadedExe = await _gameReleaseUpdater.DownloadUpdateAsync(_gameUpdateCheck, progress, CancellationToken.None);
+            _assetStatus.Text = "Scheduling replacement...";
+            _assetProgress.Value = 100;
+
+            var scriptPath = _gameReleaseUpdater.PrepareDeferredReplacement(downloadedExe, "--launcher");
+            _gameReleaseUpdater.LaunchDeferredReplacementScript(scriptPath);
+            _log.Info($"Deferred game update scheduled: {releaseTitle}");
+
+            ShowGameUpdateNoticeDialog(
+                "YOU MUST RESTART",
+                $"The update has been staged for {releaseTitle}.\n\nThe launcher will now close so the new EXE can replace the current one and restart.",
+                DColor.FromArgb(88, 190, 125));
+            BeginInvoke(new Action(Close));
+        }
+        catch (Exception ex)
+        {
+            ShowAssetError("Game update failed.", ex.Message);
+            _log.Warn($"Game update failed: {ex.Message}");
+        }
+        finally
+        {
+            _gameUpdateBusy = false;
+            UpdateGameReleaseVisuals();
+        }
+    }
+
+    private UpdateReminderChoice ShowGameUpdateReminderDialog(string releaseTitle)
+    {
+        using var dialog = new Form();
+        dialog.Text = "Update Available";
+        dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
+        dialog.StartPosition = FormStartPosition.CenterParent;
+        dialog.ClientSize = new DSize(420, 170);
+        dialog.MaximizeBox = false;
+        dialog.MinimizeBox = false;
+        dialog.ShowInTaskbar = false;
+        dialog.BackColor = _settings.DarkMode ? DColor.FromArgb(18, 18, 18) : SystemColors.Control;
+        dialog.ForeColor = _settings.DarkMode ? DColor.White : SystemColors.ControlText;
+
+        var title = new Label
+        {
+            AutoSize = false,
+            Bounds = new System.Drawing.Rectangle(16, 14, 388, 22),
+            Font = new DFont(Font.FontFamily, 10f, System.Drawing.FontStyle.Bold),
+            Text = "A new release is available."
+        };
+
+        var body = new Label
+        {
+            AutoSize = false,
+            Bounds = new System.Drawing.Rectangle(16, 44, 388, 52),
+            Text = $"Latest GitHub release: {releaseTitle}\n\nDo you want to update now?"
+        };
+
+        var updateNow = new Button
+        {
+            Text = "Update Now",
+            Bounds = new System.Drawing.Rectangle(16, 118, 116, 32),
+            DialogResult = DialogResult.Yes
+        };
+        var later = new Button
+        {
+            Text = "Later",
+            Bounds = new System.Drawing.Rectangle(146, 118, 90, 32),
+            DialogResult = DialogResult.No
+        };
+        var ignore = new Button
+        {
+            Text = "Don't Remind Me",
+            Bounds = new System.Drawing.Rectangle(250, 118, 154, 32),
+            DialogResult = DialogResult.Ignore
+        };
+
+        dialog.Controls.Add(title);
+        dialog.Controls.Add(body);
+        dialog.Controls.Add(updateNow);
+        dialog.Controls.Add(later);
+        dialog.Controls.Add(ignore);
+        dialog.AcceptButton = updateNow;
+        dialog.CancelButton = later;
+
+        if (_settings.DarkMode)
+        {
+            foreach (Control control in dialog.Controls)
+            {
+                control.BackColor = dialog.BackColor;
+                control.ForeColor = dialog.ForeColor;
+            }
+
+            ApplyButtonTheme(updateNow, DColor.FromArgb(88, 190, 125), DColor.White, DColor.FromArgb(110, 220, 150), DColor.FromArgb(76, 175, 110), DColor.FromArgb(60, 150, 95));
+            ApplyButtonTheme(later, DColor.FromArgb(38, 38, 38), DColor.White, DColor.FromArgb(90, 90, 90), DColor.FromArgb(52, 52, 52), DColor.FromArgb(30, 30, 30));
+            ApplyButtonTheme(ignore, DColor.FromArgb(110, 72, 28), DColor.White, DColor.FromArgb(170, 120, 60), DColor.FromArgb(130, 86, 34), DColor.FromArgb(90, 60, 24));
+        }
+
+        var result = dialog.ShowDialog(this);
+        return result switch
+        {
+            DialogResult.Yes => UpdateReminderChoice.UpdateNow,
+            DialogResult.Ignore => UpdateReminderChoice.IgnoreThisRelease,
+            _ => UpdateReminderChoice.Later
+        };
+    }
+
+    private void ShowGameUpdateNoticeDialog(string heading, string body, DColor accentColor)
+    {
+        using var dialog = new Form();
+        dialog.Text = heading;
+        dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
+        dialog.StartPosition = FormStartPosition.CenterParent;
+        dialog.ClientSize = new DSize(470, 210);
+        dialog.MaximizeBox = false;
+        dialog.MinimizeBox = false;
+        dialog.ShowInTaskbar = false;
+        dialog.BackColor = _settings.DarkMode ? DColor.FromArgb(18, 18, 18) : SystemColors.Control;
+        dialog.ForeColor = _settings.DarkMode ? DColor.White : SystemColors.ControlText;
+
+        var headingLabel = new Label
+        {
+            AutoSize = false,
+            Bounds = new System.Drawing.Rectangle(18, 16, 434, 32),
+            Font = new DFont(Font.FontFamily, 12f, System.Drawing.FontStyle.Bold),
+            ForeColor = accentColor,
+            Text = heading
+        };
+
+        var bodyLabel = new Label
+        {
+            AutoSize = false,
+            Bounds = new System.Drawing.Rectangle(18, 58, 434, 92),
+            Font = new DFont(Font.FontFamily, 9.5f, System.Drawing.FontStyle.Bold),
+            Text = body
+        };
+
+        var ok = new Button
+        {
+            Text = "OK",
+            Bounds = new System.Drawing.Rectangle(336, 164, 116, 32),
+            DialogResult = DialogResult.OK
+        };
+
+        dialog.Controls.Add(headingLabel);
+        dialog.Controls.Add(bodyLabel);
+        dialog.Controls.Add(ok);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = ok;
+
+        if (_settings.DarkMode)
+        {
+            foreach (Control control in dialog.Controls)
+            {
+                control.BackColor = dialog.BackColor;
+                if (!ReferenceEquals(control, headingLabel))
+                    control.ForeColor = dialog.ForeColor;
+            }
+
+            ApplyButtonTheme(ok, DColor.FromArgb(38, 38, 38), DColor.White, DColor.FromArgb(90, 90, 90), DColor.FromArgb(52, 52, 52), DColor.FromArgb(30, 30, 30));
+        }
+
+        dialog.ShowDialog(this);
     }
 
     private void BuildAssetPanel()
@@ -2306,12 +2794,11 @@ public sealed class LauncherForm : Form
 
         _log.Info($"ApplyOnlineStatusVisuals: _onlineFunctional={_onlineFunctional}");
         
-        _onlineHeader.Text = _onlineFunctional ? "ONLINE" : "OFFLINE/LAN";
-        _onlineHeader.ForeColor = _onlineFunctional ? DColor.LimeGreen : DColor.Red;
-        
-        // Update top bar indicator
+        _onlineHeader.Text = _onlineFunctional ? "ONLINE ACCESS: READY" : "ONLINE ACCESS: OFFLINE/LAN ONLY";
+        _onlineHeader.ForeColor = _onlineFunctional ? DColor.LimeGreen : DColor.FromArgb(255, 110, 110);
+
         _onlineStatusIndicator.BackColor = _onlineFunctional ? DColor.LimeGreen : DColor.Red;
-        _toolTip.SetToolTip(_onlineStatusIndicator, _onlineFunctional ? "Online" : "Offline/LAN");
+        _toolTip.SetToolTip(_onlineStatusIndicator, _onlineFunctional ? "Online access is available." : "Online access is unavailable. Offline/LAN only.");
         
         // Update username label based on online status
         UpdateUsernameLabel();
@@ -3096,20 +3583,64 @@ public sealed class LauncherForm : Form
         }
 
         _usernameLabel.Text = string.Empty;
-        _offlineNameLabel.Text = _onlineFunctional ? "Username" : "OFFLINE USERNAME";
+        _offlineNameLabel.Text = "OFFLINE USERNAME";
     }
 
     private void UpdateOfflineNameEnabled()
     {
-        _offlineNameBox.Enabled = false;
-        _offlineNameBox.ReadOnly = true;
+        var offlineMode = !IsOnlineModeSelected();
+        _offlineNameBox.Enabled = offlineMode;
+        _offlineNameBox.ReadOnly = !offlineMode;
         if (!_offlineNameBox.Focused)
             _offlineNameBox.Text = _profile.OfflineUsername ?? string.Empty;
     }
 
     private void SaveOfflineNameFromUi()
     {
-        _offlineNameBox.Text = _profile.OfflineUsername ?? string.Empty;
+        if (IsOnlineModeSelected())
+        {
+            _offlineNameBox.Text = _profile.OfflineUsername ?? string.Empty;
+            return;
+        }
+
+        var desired = Truncate(_offlineNameBox.Text, 24).Trim();
+        if (string.IsNullOrWhiteSpace(desired))
+        {
+            _offlineNameBox.Text = _profile.OfflineUsername ?? string.Empty;
+            return;
+        }
+
+        if (string.Equals(_profile.OfflineUsername ?? string.Empty, desired, StringComparison.Ordinal))
+            return;
+
+        _profile.OfflineUsername = desired;
+        _profile.Save(_log);
+        _offlineNameBox.Text = desired;
+        _log.Info($"Offline username updated: {desired}");
+    }
+
+    private void UpdateIdentityModeVisuals()
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(UpdateIdentityModeVisuals);
+            return;
+        }
+
+        var offlineMode = !IsOnlineModeSelected();
+        _offlineNameLabel.Visible = offlineMode;
+        _offlineNameBox.Visible = offlineMode;
+        _hubGoogleBtn.Visible = !offlineMode;
+        if (offlineMode)
+        {
+            _hubResetBtn.Visible = false;
+        }
+        else
+        {
+            RefreshVeilnetLoginVisuals();
+        }
+
+        UpdateOfflineNameEnabled();
     }
 
     private static string GenerateOfflineUsername()
@@ -3185,9 +3716,11 @@ public sealed class LauncherForm : Form
         var merged = GameSettings.LoadOrCreate(_log);
         merged.KeepLauncherOpen = _keepOpenBox.Checked;
         merged.DarkMode = _darkModeBox.Checked;
+        merged.IgnoredGameReleaseTitle = _settings.IgnoredGameReleaseTitle;
         merged.Save(_log);
         _settings.KeepLauncherOpen = merged.KeepLauncherOpen;
         _settings.DarkMode = merged.DarkMode;
+        _settings.IgnoredGameReleaseTitle = merged.IgnoredGameReleaseTitle;
     }
 
     private void SaveLogsSnapshot()
@@ -3431,9 +3964,7 @@ public sealed class LauncherForm : Form
             _root.BackColor = BackColor;
             _topBar.BackColor = panelBack;
             _title.ForeColor = ForeColor;
-            _dirs.ForeColor = ForeColor;
-            _logfile.ForeColor = ForeColor;
-
+            _releaseTitleLabel.BackColor = panelBack;
             foreach (Control c in _right.Controls)
             {
                 c.BackColor = BackColor;
@@ -3447,11 +3978,15 @@ public sealed class LauncherForm : Form
                 else
                     c.BackColor = BackColor;
             }
+            _bottomLeftHost.BackColor = BackColor;
+            _launchModeHost.BackColor = BackColor;
 
             _closeBtn.BackColor = DColor.FromArgb(32, 32, 32);
             _closeBtn.ForeColor = ForeColor;
             _minBtn.BackColor = DColor.FromArgb(32, 32, 32);
             _minBtn.ForeColor = ForeColor;
+            ApplyButtonTheme(_updateBtn, DColor.FromArgb(38, 38, 38), textColor, buttonBorder, buttonHover, buttonDown);
+            ApplyButtonTheme(_launchBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
 
             _logBox.BackColor = inputBack;
             _logBox.ForeColor = ForeColor;
@@ -3464,10 +3999,14 @@ public sealed class LauncherForm : Form
             _launchModeBox.ForeColor = ForeColor;
             _launchModeBox.FlatStyle = FlatStyle.Flat;
             _progressHost.BackColor = BackColor;
-            _progressLabel.ForeColor = ForeColor;
+            _progressLabel.ForeColor = DColor.FromArgb(230, 240, 230);
             _progressLabel.BackColor = BackColor;
             _progressTrack.BackColor = DColor.FromArgb(30, 30, 30);
             _progressFill.BackColor = DColor.FromArgb(88, 190, 125);
+            _onlineHeader.BackColor = BackColor;
+            _onlineStatusIndicator.BackColor = _onlineFunctional ? DColor.LimeGreen : DColor.Red;
+            _keepOpenBox.ApplyLauncherTheme(true);
+            _darkModeBox.ApplyLauncherTheme(true);
 
             _assetPanel.BackColor = DColor.FromArgb(10, 10, 10);
             _assetCard.BackColor = DColor.FromArgb(28, 28, 28);
@@ -3478,7 +4017,9 @@ public sealed class LauncherForm : Form
             _assetErrorBox.ForeColor = ForeColor;
 
             ApplyButtonTheme(_saveOfflineNameBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
+            ApplyButtonTheme(_openGameFolderBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
             ApplyButtonTheme(_hubLoginBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
+            ApplyButtonTheme(_hubGoogleBtn, DColor.FromArgb(18, 58, 42), textColor, DColor.FromArgb(58, 140, 102), DColor.FromArgb(26, 78, 56), DColor.FromArgb(14, 46, 34));
             ApplyButtonTheme(_hubResetBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
             ApplyButtonTheme(_assetCancelBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
             ApplyButtonTheme(_assetRetryBtn, buttonBack, textColor, buttonBorder, buttonHover, buttonDown);
@@ -3492,9 +4033,7 @@ public sealed class LauncherForm : Form
             _root.BackColor = BackColor;
             _topBar.BackColor = System.Drawing.SystemColors.ControlLight;
             _title.ForeColor = ForeColor;
-            _dirs.ForeColor = ForeColor;
-            _logfile.ForeColor = ForeColor;
-
+            _releaseTitleLabel.BackColor = _topBar.BackColor;
             foreach (Control c in _right.Controls)
             {
                 c.BackColor = BackColor;
@@ -3514,11 +4053,27 @@ public sealed class LauncherForm : Form
                 else
                     c.BackColor = BackColor;
             }
+            _bottomLeftHost.BackColor = BackColor;
+            _launchModeHost.BackColor = BackColor;
 
             _closeBtn.BackColor = System.Drawing.SystemColors.Control;
             _closeBtn.ForeColor = System.Drawing.SystemColors.ControlText;
             _minBtn.BackColor = System.Drawing.SystemColors.Control;
             _minBtn.ForeColor = System.Drawing.SystemColors.ControlText;
+            ApplyButtonTheme(
+                _updateBtn,
+                System.Drawing.SystemColors.ControlLight,
+                System.Drawing.SystemColors.ControlText,
+                System.Drawing.SystemColors.ControlDark,
+                System.Drawing.SystemColors.Control,
+                System.Drawing.SystemColors.ControlDark);
+            ApplyButtonTheme(
+                _launchBtn,
+                System.Drawing.SystemColors.ControlLight,
+                System.Drawing.SystemColors.ControlText,
+                System.Drawing.SystemColors.ControlDark,
+                System.Drawing.SystemColors.Control,
+                System.Drawing.SystemColors.ControlDark);
 
             _logBox.BackColor = System.Drawing.SystemColors.Window;
             _logBox.ForeColor = System.Drawing.SystemColors.WindowText;
@@ -3531,10 +4086,14 @@ public sealed class LauncherForm : Form
             _launchModeBox.ForeColor = System.Drawing.SystemColors.WindowText;
             _launchModeBox.FlatStyle = FlatStyle.Flat;
             _progressHost.BackColor = BackColor;
-            _progressLabel.ForeColor = ForeColor;
+            _progressLabel.ForeColor = DColor.FromArgb(30, 90, 60);
             _progressLabel.BackColor = BackColor;
             _progressTrack.BackColor = DColor.FromArgb(210, 210, 210);
             _progressFill.BackColor = DColor.FromArgb(86, 170, 120);
+            _onlineHeader.BackColor = BackColor;
+            _onlineStatusIndicator.BackColor = _onlineFunctional ? DColor.LimeGreen : DColor.Red;
+            _keepOpenBox.ApplyLauncherTheme(false);
+            _darkModeBox.ApplyLauncherTheme(false);
 
             _assetPanel.BackColor = DColor.FromArgb(230, 230, 230);
             _assetCard.BackColor = DColor.FromArgb(250, 250, 250);
@@ -3552,7 +4111,21 @@ public sealed class LauncherForm : Form
                 System.Drawing.SystemColors.Control,
                 System.Drawing.SystemColors.ControlDark);
             ApplyButtonTheme(
+                _openGameFolderBtn,
+                System.Drawing.SystemColors.ControlLight,
+                System.Drawing.SystemColors.ControlText,
+                System.Drawing.SystemColors.ControlDark,
+                System.Drawing.SystemColors.Control,
+                System.Drawing.SystemColors.ControlDark);
+            ApplyButtonTheme(
                 _hubLoginBtn,
+                System.Drawing.SystemColors.ControlLight,
+                System.Drawing.SystemColors.ControlText,
+                System.Drawing.SystemColors.ControlDark,
+                System.Drawing.SystemColors.Control,
+                System.Drawing.SystemColors.ControlDark);
+            ApplyButtonTheme(
+                _hubGoogleBtn,
                 System.Drawing.SystemColors.ControlLight,
                 System.Drawing.SystemColors.ControlText,
                 System.Drawing.SystemColors.ControlDark,
@@ -3593,9 +4166,27 @@ public sealed class LauncherForm : Form
         SetLaunchButtonState(GetGameState());
     }
 
+    private void ApplyLauncherWindowSizing()
+    {
+        var working = Screen.PrimaryScreen?.WorkingArea ?? new System.Drawing.Rectangle(0, 0, 1280, 720);
+        var width = Math.Min(1120, Math.Max(760, working.Width - 32));
+        var height = Math.Min(700, Math.Max(560, working.Height - 48));
+        ClientSize = new DSize(width, height);
+        MinimumSize = new DSize(Math.Min(980, working.Width), Math.Min(620, working.Height));
+        MaximumSize = new DSize(working.Width, working.Height);
+    }
+
     private void ClaimUsernameAsync()
     {
         MessageBox.Show("Username claiming has been removed. Use Veilnet login to link your online username, or edit your offline username locally.", "Not Available", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    protected override bool ProcessCmdKey(ref System.Windows.Forms.Message msg, System.Windows.Forms.Keys keyData)
+    {
+        if ((keyData & System.Windows.Forms.Keys.KeyCode) == System.Windows.Forms.Keys.Tab)
+            return true;
+
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
 

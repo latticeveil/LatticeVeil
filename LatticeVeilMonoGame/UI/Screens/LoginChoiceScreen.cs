@@ -216,12 +216,6 @@ public sealed class LoginChoiceScreen : IScreen
         if (_complete)
             return;
 
-        if (_startOptions?.HasJoinToken == true)
-        {
-            SetStatus("EPIC LOGIN REQUIRED");
-            return;
-        }
-
         _setEosClient(null);
         SetStatus("LOCAL MODE ENABLED", success: true);
         Continue(null);
@@ -235,14 +229,7 @@ public sealed class LoginChoiceScreen : IScreen
         _complete = true;
 
         _menus.Pop();
-        if (_startOptions?.HasJoinToken == true)
-        {
-            _menus.Push(new MultiplayerScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, client), _viewport);
-        }
-        else
-        {
-            _menus.Push(new MainMenuScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _window, client, _startOptions?.Offline ?? false), _viewport);
-        }
+        _menus.Push(new MainMenuScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, _window, client, _startOptions?.Offline ?? false), _viewport);
     }
 
     private void SetStatus(string message, bool success = false)

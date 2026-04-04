@@ -15,7 +15,7 @@
 
     <RootNamespace>LatticeVeilMonoGame</RootNamespace>
     <AssemblyName>LatticeVeilMonoGame</AssemblyName>
-    <Version>10.0.0</Version>
+    <Version>13.0.0</Version>
     <BuildNonce Condition="'$(BuildNonce)'==''">stable</BuildNonce>
 
     <Authors>LatticeVeil Team</Authors>
@@ -115,14 +115,9 @@
 
   <ItemGroup>
     <None Include="Defaults/**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+    <None Remove="Defaults/Assets/textures/blocks/**" />
+    <None Remove="Defaults/Assets/textures/menu/**" />
     <None Include="..\eos\eos.public.json" Link="eos.public.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\eos\eos.public.json')" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Remove="Defaults/Assets/data/**" />
-    <None Remove="Defaults/Assets/packs/**" />
-    <None Remove="Defaults/Assets/.github/**" />
-    <None Remove="Defaults/Assets/.git*" />
   </ItemGroup>
 
 </Project>

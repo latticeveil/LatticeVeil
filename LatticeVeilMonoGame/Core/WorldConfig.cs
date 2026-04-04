@@ -112,9 +112,13 @@ public sealed class WorldSizeSettings
 
 public sealed class GameplaySettings
 {
-    public bool EnableCheats { get; set; } = true;
+    public bool EnableCheats { get; set; } = false;
     public bool EnableMultipleHomes { get; set; } = true;
     public int MaxHomesPerPlayer { get; set; } = 8;
+    public bool TimeCycleEnabled { get; set; } = true;
+    public bool WeatherCycleEnabled { get; set; } = true;
+    public int TimeOfDayTicks { get; set; } = 1000;
+    public string WeatherState { get; set; } = "clear";
     public List<string> OperatorUsernames { get; set; } = new();
 }
 

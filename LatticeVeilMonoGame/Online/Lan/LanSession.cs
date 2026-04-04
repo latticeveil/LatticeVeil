@@ -29,7 +29,8 @@ public enum LanMessageType : byte
     Teleport = 13,
     HostShutdown = 14,
     PersistenceSnapshot = 15,
-    PersistenceRestore = 16
+    PersistenceRestore = 16,
+    InventoryView = 17
 }
 
 public enum LanChatKind : byte
@@ -52,6 +53,12 @@ public readonly struct LanWorldInfo
     public string WorldId { get; init; }
     public string WorldType { get; init; }
     public string Generator { get; init; }
+    public bool EnableMultipleHomes { get; init; }
+    public int MaxHomesPerPlayer { get; init; }
+    public bool TimeCycleEnabled { get; init; }
+    public bool WeatherCycleEnabled { get; init; }
+    public int TimeOfDayTicks { get; init; }
+    public string WeatherState { get; init; }
 }
 
 public readonly struct LanPlayerState
@@ -61,6 +68,7 @@ public readonly struct LanPlayerState
     public float Yaw { get; init; }
     public float Pitch { get; init; }
     public byte Status { get; init; }
+    public byte HeldBlockId { get; init; }
 }
 
 public readonly struct LanBlockSet
@@ -137,12 +145,23 @@ public readonly struct LanPlayerPersistenceSnapshot
     public long TimestampUtc { get; init; }
 }
 
+public readonly struct LanInventoryView
+{
+    public int ViewerPlayerId { get; init; }
+    public int TargetPlayerId { get; init; }
+    public byte[] HotbarIds { get; init; } // 9 slots
+    public byte[] HotbarCounts { get; init; } // 9 slots
+    public byte[] GridIds { get; init; } // 27 slots
+    public byte[] GridCounts { get; init; } // 27 slots
+    public int SelectedIndex { get; init; }
+}
+
 public interface ILanSession : IDisposable
 {
     bool IsHost { get; }
     bool IsConnected { get; }
     int LocalPlayerId { get; }
-    void SendPlayerState(Vector3 position, float yaw, float pitch, byte status);
+    void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId);
     void SendBlockSet(int x, int y, int z, byte id);
     void SendItemSpawn(LanItemSpawn item);
     void SendItemPickup(int itemId);
@@ -150,6 +169,7 @@ public interface ILanSession : IDisposable
     void SendPersistenceSnapshot(LanPlayerPersistenceSnapshot snapshot);
     bool SendPersistenceRestore(int targetPlayerId, LanPlayerPersistenceSnapshot snapshot);
     bool SendTeleport(int targetPlayerId, Vector3 position, float yaw, float pitch);
+    void SendInventoryView(LanInventoryView inventoryView);
     bool TryDequeuePlayerState(out LanPlayerState state);
     bool TryDequeueBlockSet(out LanBlockSet block);
     bool TryDequeueItemSpawn(out LanItemSpawn item);
@@ -161,6 +181,7 @@ public interface ILanSession : IDisposable
     bool TryDequeueTeleport(out LanTeleport teleport);
     bool TryDequeuePersistenceSnapshot(out LanPlayerPersistenceSnapshot snapshot);
     bool TryDequeuePersistenceRestore(out LanPlayerPersistenceSnapshot snapshot);
+    bool TryDequeueInventoryView(out LanInventoryView inventoryView);
     bool TryDequeueDisconnectReason(out string reason);
     bool KickPlayer(int targetPlayerId, string reason);
 }
@@ -180,6 +201,7 @@ public sealed class LanHostSession : ILanSession
     private readonly ConcurrentQueue<LanChunkData> _chunkData = new();
     private readonly ConcurrentQueue<bool> _worldSyncComplete = new();
     private readonly ConcurrentQueue<LanPlayerPersistenceSnapshot> _persistenceSnapshots = new();
+    private readonly ConcurrentQueue<LanInventoryView> _inventoryViews = new();
     private readonly Dictionary<int, ClientState> _clients = new();
     private readonly object _clientLock = new();
     private CancellationTokenSource? _cts;
@@ -209,7 +231,7 @@ public sealed class LanHostSession : ILanSession
         _server.Start(port);
     }
 
-    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status)
+    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId)
     {
         var state = new LanPlayerState
         {
@@ -217,7 +239,8 @@ public sealed class LanHostSession : ILanSession
             Position = position,
             Yaw = yaw,
             Pitch = pitch,
-            Status = status
+            Status = status,
+            HeldBlockId = heldBlockId
         };
         BroadcastPlayerState(state);
     }
@@ -259,6 +282,18 @@ public sealed class LanHostSession : ILanSession
         // Host does not send snapshots to itself.
     }
 
+    public void SendInventoryView(LanInventoryView inventoryView)
+    {
+        // Host sends inventory views to the requesting viewer only
+        lock (_clientLock)
+        {
+            if (_clients.TryGetValue(inventoryView.ViewerPlayerId, out var client))
+            {
+                LanWire.SendInventoryView(client, inventoryView);
+            }
+        }
+    }
+
     public bool SendPersistenceRestore(int targetPlayerId, LanPlayerPersistenceSnapshot snapshot)
     {
         if (!IsConnected || targetPlayerId <= 0)
@@ -296,6 +331,7 @@ public sealed class LanHostSession : ILanSession
         return false;
     }
     public bool TryDequeuePersistenceSnapshot(out LanPlayerPersistenceSnapshot snapshot) => _persistenceSnapshots.TryDequeue(out snapshot);
+    public bool TryDequeueInventoryView(out LanInventoryView inventoryView) => _inventoryViews.TryDequeue(out inventoryView);
     public bool TryDequeuePersistenceRestore(out LanPlayerPersistenceSnapshot snapshot)
     {
         snapshot = default;
@@ -441,6 +477,19 @@ public sealed class LanHostSession : ILanSession
                             Username = snapshot.Username ?? string.Empty,
                             Payload = snapshot.Payload ?? Array.Empty<byte>(),
                             TimestampUtc = snapshot.TimestampUtc <= 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : snapshot.TimestampUtc
+                        });
+                        break;
+                    case LanMessageType.InventoryView:
+                        var inventoryView = msg.Value.InventoryView;
+                        _inventoryViews.Enqueue(new LanInventoryView
+                        {
+                            ViewerPlayerId = inventoryView.ViewerPlayerId,
+                            TargetPlayerId = inventoryView.TargetPlayerId,
+                            SelectedIndex = inventoryView.SelectedIndex,
+                            HotbarIds = inventoryView.HotbarIds ?? Array.Empty<byte>(),
+                            HotbarCounts = inventoryView.HotbarCounts ?? Array.Empty<byte>(),
+                            GridIds = inventoryView.GridIds ?? Array.Empty<byte>(),
+                            GridCounts = inventoryView.GridCounts ?? Array.Empty<byte>()
                         });
                         break;
                 }
@@ -647,6 +696,12 @@ public sealed class LanHostSession : ILanSession
                 bw.Write(string.IsNullOrWhiteSpace(info.Generator)
                     ? WorldMeta.CanonicalGeneratorForWorldType(info.WorldType)
                     : info.Generator);
+                bw.Write(info.EnableMultipleHomes);
+                bw.Write(info.MaxHomesPerPlayer);
+                bw.Write(info.TimeCycleEnabled);
+                bw.Write(info.WeatherCycleEnabled);
+                bw.Write(info.TimeOfDayTicks);
+                bw.Write(WorldMeta.CanonicalWeatherState(info.WeatherState));
             });
         }
 
@@ -662,6 +717,7 @@ public sealed class LanHostSession : ILanSession
                 bw.Write(state.Yaw);
                 bw.Write(state.Pitch);
                 bw.Write(state.Status);
+                bw.Write(state.HeldBlockId);
             });
         }
 
@@ -729,6 +785,31 @@ public sealed class LanHostSession : ILanSession
                 var payload = snapshot.Payload ?? Array.Empty<byte>();
                 bw.Write(payload.Length);
                 bw.Write(payload);
+            });
+        }
+
+        public static void SendInventoryView(ClientState client, LanInventoryView inventoryView)
+        {
+            Write(client, bw =>
+            {
+                bw.Write((byte)LanMessageType.InventoryView);
+                bw.Write(inventoryView.ViewerPlayerId);
+                bw.Write(inventoryView.TargetPlayerId);
+                bw.Write(inventoryView.SelectedIndex);
+                
+                var hotbarIds = inventoryView.HotbarIds ?? Array.Empty<byte>();
+                var hotbarCounts = inventoryView.HotbarCounts ?? Array.Empty<byte>();
+                var gridIds = inventoryView.GridIds ?? Array.Empty<byte>();
+                var gridCounts = inventoryView.GridCounts ?? Array.Empty<byte>();
+                
+                bw.Write(hotbarIds.Length);
+                bw.Write(hotbarIds);
+                bw.Write(hotbarCounts.Length);
+                bw.Write(hotbarCounts);
+                bw.Write(gridIds.Length);
+                bw.Write(gridIds);
+                bw.Write(gridCounts.Length);
+                bw.Write(gridCounts);
             });
         }
 
@@ -857,6 +938,7 @@ public sealed class LanClientSession : ILanSession
     private readonly ConcurrentQueue<LanChunkData> _chunkData = new();
     private readonly ConcurrentQueue<bool> _worldSyncComplete = new();
     private readonly ConcurrentQueue<LanPlayerPersistenceSnapshot> _persistenceSnapshots = new();
+    private readonly ConcurrentQueue<LanInventoryView> _inventoryViews = new();
     private readonly ConcurrentQueue<LanTeleport> _teleports = new();
     private readonly ConcurrentQueue<string> _disconnectReasons = new();
     private CancellationTokenSource? _cts;
@@ -926,7 +1008,7 @@ public sealed class LanClientSession : ILanSession
         }
     }
 
-    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status)
+    public void SendPlayerState(Vector3 position, float yaw, float pitch, byte status, byte heldBlockId)
     {
         if (!IsConnected)
             return;
@@ -941,6 +1023,7 @@ public sealed class LanClientSession : ILanSession
             bw.Write(yaw);
             bw.Write(pitch);
             bw.Write(status);
+            bw.Write(heldBlockId);
         });
     }
 
@@ -973,6 +1056,7 @@ public sealed class LanClientSession : ILanSession
         snapshot = default;
         return false;
     }
+    public bool TryDequeueInventoryView(out LanInventoryView inventoryView) => _inventoryViews.TryDequeue(out inventoryView);
     public bool TryDequeuePersistenceRestore(out LanPlayerPersistenceSnapshot snapshot) => _persistenceSnapshots.TryDequeue(out snapshot);
     public bool TryDequeueDisconnectReason(out string reason)
     {
@@ -1012,6 +1096,34 @@ public sealed class LanClientSession : ILanSession
             bw.Write(normalized.Username);
             bw.Write(normalized.Payload.Length);
             bw.Write(normalized.Payload);
+        });
+    }
+
+    public void SendInventoryView(LanInventoryView inventoryView)
+    {
+        if (!IsConnected)
+            return;
+
+        Write(bw =>
+        {
+            bw.Write((byte)LanMessageType.InventoryView);
+            bw.Write(inventoryView.ViewerPlayerId);
+            bw.Write(inventoryView.TargetPlayerId);
+            bw.Write(inventoryView.SelectedIndex);
+            
+            var hotbarIds = inventoryView.HotbarIds ?? Array.Empty<byte>();
+            var hotbarCounts = inventoryView.HotbarCounts ?? Array.Empty<byte>();
+            var gridIds = inventoryView.GridIds ?? Array.Empty<byte>();
+            var gridCounts = inventoryView.GridCounts ?? Array.Empty<byte>();
+            
+            bw.Write(hotbarIds.Length);
+            bw.Write(hotbarIds);
+            bw.Write(hotbarCounts.Length);
+            bw.Write(hotbarCounts);
+            bw.Write(gridIds.Length);
+            bw.Write(gridIds);
+            bw.Write(gridCounts.Length);
+            bw.Write(gridCounts);
         });
     }
 
@@ -1117,6 +1229,9 @@ public sealed class LanClientSession : ILanSession
                     case LanMessageType.PersistenceRestore:
                         _persistenceSnapshots.Enqueue(msg.Value.PersistenceSnapshot);
                         break;
+                    case LanMessageType.InventoryView:
+                        _inventoryViews.Enqueue(msg.Value.InventoryView);
+                        break;
                     case LanMessageType.HostShutdown:
                         SetDisconnectReasonOnce(msg.Value.DisconnectReason);
                         IsConnected = false;
@@ -1201,6 +1316,7 @@ public readonly struct LanMessage
     public LanChunkData ChunkData { get; init; }
     public LanTeleport Teleport { get; init; }
     public LanPlayerPersistenceSnapshot PersistenceSnapshot { get; init; }
+    public LanInventoryView InventoryView { get; init; }
     public bool WorldSyncComplete { get; init; }
     public string? DisconnectReason { get; init; }
 }
@@ -1242,6 +1358,12 @@ public static class LanReader
                 var generator = br.BaseStream.Position < br.BaseStream.Length
                     ? br.ReadString()
                     : WorldMeta.CanonicalGeneratorForWorldType(worldType);
+                var enableMultipleHomes = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var maxHomesPerPlayer = br.BaseStream.Position < br.BaseStream.Length ? br.ReadInt32() : 8;
+                var timeCycleEnabled = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var weatherCycleEnabled = br.BaseStream.Position < br.BaseStream.Length ? br.ReadBoolean() : true;
+                var timeOfDayTicks = br.BaseStream.Position < br.BaseStream.Length ? br.ReadInt32() : 1000;
+                var weatherState = br.BaseStream.Position < br.BaseStream.Length ? br.ReadString() : "clear";
                 return new LanMessage
                 {
                     Type = type,
@@ -1258,7 +1380,13 @@ public static class LanReader
                         WorldType = WorldMeta.CanonicalWorldType(worldType),
                         Generator = string.IsNullOrWhiteSpace(generator)
                             ? WorldMeta.CanonicalGeneratorForWorldType(worldType)
-                            : generator
+                            : generator,
+                        EnableMultipleHomes = enableMultipleHomes,
+                        MaxHomesPerPlayer = Math.Clamp(maxHomesPerPlayer, 1, 32),
+                        TimeCycleEnabled = timeCycleEnabled,
+                        WeatherCycleEnabled = weatherCycleEnabled,
+                        TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(timeOfDayTicks),
+                        WeatherState = WorldMeta.CanonicalWeatherState(weatherState)
                     }
                 };
             }
@@ -1272,7 +1400,10 @@ public static class LanReader
                         Position = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                         Yaw = br.ReadSingle(),
                         Pitch = br.ReadSingle(),
-                        Status = br.ReadByte()
+                        Status = br.ReadByte(),
+                        HeldBlockId = br.BaseStream.Position < br.BaseStream.Length
+                            ? br.ReadByte()
+                            : (byte)BlockId.Air
                     }
                 };
             case LanMessageType.BlockSet:
@@ -1423,6 +1554,39 @@ public static class LanReader
                             TimestampUtc = timestampUtc,
                             Username = username,
                             Payload = snapshotPayload
+                        }
+                    };
+                }
+            case LanMessageType.InventoryView:
+                {
+                    var viewerPlayerId = br.ReadInt32();
+                    var targetPlayerId = br.ReadInt32();
+                    var selectedIndex = br.ReadInt32();
+                    
+                    var hotbarIdsLength = br.ReadInt32();
+                    var hotbarIds = hotbarIdsLength > 0 ? br.ReadBytes(hotbarIdsLength) : Array.Empty<byte>();
+                    
+                    var hotbarCountsLength = br.ReadInt32();
+                    var hotbarCounts = hotbarCountsLength > 0 ? br.ReadBytes(hotbarCountsLength) : Array.Empty<byte>();
+                    
+                    var gridIdsLength = br.ReadInt32();
+                    var gridIds = gridIdsLength > 0 ? br.ReadBytes(gridIdsLength) : Array.Empty<byte>();
+                    
+                    var gridCountsLength = br.ReadInt32();
+                    var gridCounts = gridCountsLength > 0 ? br.ReadBytes(gridCountsLength) : Array.Empty<byte>();
+
+                    return new LanMessage
+                    {
+                        Type = type,
+                        InventoryView = new LanInventoryView
+                        {
+                            ViewerPlayerId = viewerPlayerId,
+                            TargetPlayerId = targetPlayerId,
+                            SelectedIndex = selectedIndex,
+                            HotbarIds = hotbarIds,
+                            HotbarCounts = hotbarCounts,
+                            GridIds = gridIds,
+                            GridCounts = gridCounts
                         }
                     };
                 }

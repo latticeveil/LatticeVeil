@@ -203,7 +203,6 @@ public static class Program
 
             var startOptions = new GameStartOptions
             {
-                JoinToken = GetArgValue(args, "--join-token"),
                 Offline = effectiveOffline,
                 Smoke = smoke,
                 SmokeAssetsOk = smokeAssetsOk,

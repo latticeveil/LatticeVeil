@@ -5,6 +5,7 @@ namespace LatticeVeilMonoGame.Core;
 
 public static class BiomeLocateService
 {
+    private const int UnboundedCoverageRadius = 4096;
     private static readonly BiomeId[] RequiredBiomes =
     {
         BiomeId.Grasslands,
@@ -19,8 +20,9 @@ public static class BiomeLocateService
         if (meta?.Size == null)
             throw new ArgumentNullException(nameof(meta));
 
-        var width = Math.Max(1, meta.Size.Width);
-        var depth = Math.Max(1, meta.Size.Depth);
+        var finiteBounds = meta.HasFiniteWorldBounds();
+        var width = finiteBounds ? Math.Max(1, meta.Size.Width) : (UnboundedCoverageRadius * 2) + 1;
+        var depth = finiteBounds ? Math.Max(1, meta.Size.Depth) : (UnboundedCoverageRadius * 2) + 1;
         var clampedStride = Math.Clamp(stride, 8, 256);
         var points = new Dictionary<BiomeId, List<BiomeIndexPoint>>(5)
         {
@@ -36,17 +38,19 @@ public static class BiomeLocateService
         {
             foreach (var x in EnumerateAxis(width, clampedStride))
             {
-                var biome = BiomeService.GetSampleAt(meta, x, z).BiomeId;
+                var sampleX = finiteBounds ? x : x - UnboundedCoverageRadius;
+                var sampleZ = finiteBounds ? z : z - UnboundedCoverageRadius;
+                var biome = BiomeService.GetSampleAt(meta, sampleX, sampleZ).BiomeId;
                 if (biome == BiomeId.Unknown)
                     biome = BiomeId.Grasslands;
 
                 if (points.TryGetValue(biome, out var list) && list.Count < pointsPerBiomeLimit)
-                    list.Add(new BiomeIndexPoint(x, z));
+                    list.Add(new BiomeIndexPoint(sampleX, sampleZ));
             }
         }
 
-        var centerX = width / 2;
-        var centerZ = depth / 2;
+        var centerX = finiteBounds ? width / 2 : 0;
+        var centerZ = finiteBounds ? depth / 2 : 0;
         foreach (var biome in RequiredBiomes)
         {
             var anchor = FindAnchor(points[biome], centerX, centerZ);
@@ -114,8 +118,11 @@ public static class BiomeLocateService
         if (meta?.Size == null)
             return false;
 
-        originX = Math.Clamp(originX, 0, Math.Max(0, meta.Size.Width - 1));
-        originZ = Math.Clamp(originZ, 0, Math.Max(0, meta.Size.Depth - 1));
+        if (meta.HasFiniteWorldBounds())
+        {
+            originX = Math.Clamp(originX, 0, Math.Max(0, meta.Size.Width - 1));
+            originZ = Math.Clamp(originZ, 0, Math.Max(0, meta.Size.Depth - 1));
+        }
 
         if (BiomeService.GetSampleAt(meta, originX, originZ).BiomeId == target)
         {
@@ -162,8 +169,6 @@ public static class BiomeLocateService
         foundX = originX;
         foundZ = originZ;
 
-        var maxX = Math.Max(0, meta.Size.Width - 1);
-        var maxZ = Math.Max(0, meta.Size.Depth - 1);
         var bestDistSq = long.MaxValue;
         var bestX = originX;
         var bestZ = originZ;
@@ -172,7 +177,7 @@ public static class BiomeLocateService
 
         void Evaluate(int x, int z, bool ignoreRadius)
         {
-            if (x < 0 || z < 0 || x > maxX || z > maxZ)
+            if (meta.HasFiniteWorldBounds() && (x < 0 || z < 0 || x >= meta.Size.Width || z >= meta.Size.Depth))
                 return;
             if (BiomeService.GetSampleAt(meta, x, z).BiomeId != target)
                 return;
@@ -192,21 +197,39 @@ public static class BiomeLocateService
         }
 
         var stride = 32;
-        for (var z = 0; z <= maxZ; z += stride)
+        if (meta.HasFiniteWorldBounds())
         {
+            var maxX = Math.Max(0, meta.Size.Width - 1);
+            var maxZ = Math.Max(0, meta.Size.Depth - 1);
+            for (var z = 0; z <= maxZ; z += stride)
+            {
+                for (var x = 0; x <= maxX; x += stride)
+                    Evaluate(x, z, ignoreRadius: false);
+                Evaluate(maxX, z, ignoreRadius: false);
+            }
             for (var x = 0; x <= maxX; x += stride)
-                Evaluate(x, z, ignoreRadius: false);
-            Evaluate(maxX, z, ignoreRadius: false);
+                Evaluate(x, maxZ, ignoreRadius: false);
+            Evaluate(maxX, maxZ, ignoreRadius: false);
         }
-        for (var x = 0; x <= maxX; x += stride)
-            Evaluate(x, maxZ, ignoreRadius: false);
-        Evaluate(maxX, maxZ, ignoreRadius: false);
+        else
+        {
+            var searchRadius = Math.Max(512, Math.Max(16, maxRadius));
+            for (var z = originZ - searchRadius; z <= originZ + searchRadius; z += stride)
+            {
+                for (var x = originX - searchRadius; x <= originX + searchRadius; x += stride)
+                    Evaluate(x, z, ignoreRadius: false);
+            }
+        }
 
         if (!found)
         {
-            for (var z = 0; z <= maxZ; z += 8)
+            var minX = meta.HasFiniteWorldBounds() ? 0 : originX - Math.Max(1024, Math.Max(16, maxRadius) * 2);
+            var maxX = meta.HasFiniteWorldBounds() ? Math.Max(0, meta.Size.Width - 1) : originX + Math.Max(1024, Math.Max(16, maxRadius) * 2);
+            var minZ = meta.HasFiniteWorldBounds() ? 0 : originZ - Math.Max(1024, Math.Max(16, maxRadius) * 2);
+            var maxZ = meta.HasFiniteWorldBounds() ? Math.Max(0, meta.Size.Depth - 1) : originZ + Math.Max(1024, Math.Max(16, maxRadius) * 2);
+            for (var z = minZ; z <= maxZ; z += 8)
             {
-                for (var x = 0; x <= maxX; x += 8)
+                for (var x = minX; x <= maxX; x += 8)
                     Evaluate(x, z, ignoreRadius: true);
             }
         }
@@ -230,8 +253,6 @@ public static class BiomeLocateService
         foundX = centerX;
         foundZ = centerZ;
 
-        var maxX = Math.Max(0, meta.Size.Width - 1);
-        var maxZ = Math.Max(0, meta.Size.Depth - 1);
         var bestDistSq = long.MaxValue;
         var bestX = centerX;
         var bestZ = centerZ;
@@ -239,7 +260,7 @@ public static class BiomeLocateService
 
         void Evaluate(int x, int z)
         {
-            if (x < 0 || z < 0 || x > maxX || z > maxZ)
+            if (meta.HasFiniteWorldBounds() && (x < 0 || z < 0 || x >= meta.Size.Width || z >= meta.Size.Depth))
                 return;
             if (BiomeService.GetSampleAt(meta, x, z).BiomeId != target)
                 return;
@@ -317,15 +338,17 @@ public static class BiomeLocateService
         if (meta?.Size == null)
             return false;
 
-        var maxX = Math.Max(0, meta.Size.Width - 1);
-        var maxZ = Math.Max(0, meta.Size.Depth - 1);
         var bestScore = float.NegativeInfinity;
-        var bestX = maxX / 2;
-        var bestZ = maxZ / 2;
+        var bestX = 0;
+        var bestZ = 0;
+        var minX = meta.HasFiniteWorldBounds() ? 0 : -UnboundedCoverageRadius;
+        var maxX = meta.HasFiniteWorldBounds() ? Math.Max(0, meta.Size.Width - 1) : UnboundedCoverageRadius;
+        var minZ = meta.HasFiniteWorldBounds() ? 0 : -UnboundedCoverageRadius;
+        var maxZ = meta.HasFiniteWorldBounds() ? Math.Max(0, meta.Size.Depth - 1) : UnboundedCoverageRadius;
 
-        for (var z = 0; z <= maxZ; z += 8)
+        for (var z = minZ; z <= maxZ; z += 8)
         {
-            for (var x = 0; x <= maxX; x += 8)
+            for (var x = minX; x <= maxX; x += 8)
             {
                 var sample = BiomeService.GetSampleAt(meta, x, z);
                 var score = biome switch

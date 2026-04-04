@@ -48,6 +48,11 @@ public sealed class BlockIconCache : IDisposable
         return _icons.TryGetValue(key, out icon);
     }
 
+    public Texture2D? GetIfReady(BlockId id, int size, BlockModelContext context)
+    {
+        return TryGet(id, size, context, out var icon) ? icon : null;
+    }
+
     public Texture2D? GetOrCreate(BlockId id, int size, BlockModelContext context)
     {
         if (id == BlockId.Air)

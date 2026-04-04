@@ -83,6 +83,9 @@ public sealed class GameSettings
     public int CreateWorldHomesCap { get; set; } = 10;
     public bool EnableInviteLinks { get; set; } = false;
     public string SocialNotifications { get; set; } = nameof(SocialNotificationMode.On);
+    public bool IndicatorsEnabled { get; set; } = true;
+    public string NametagMode { get; set; } = "Static";
+    public float NametagFadeSeconds { get; set; } = 3f;
 
     // Performance / Derived-data cache
     // Default OFF: meshes are derived and can always be rebuilt; keeping this off avoids stale cache + slow exits.
@@ -90,12 +93,13 @@ public sealed class GameSettings
 
 
     // Launcher
-    public bool KeepLauncherOpen { get; set; } = true;
+    public bool KeepLauncherOpen { get; set; } = false;
     public bool DarkMode { get; set; } = true;
     public string RendererBackend { get; set; } = "OpenGL"; // "OpenGL" or "Vulkan"
     public int LauncherRenderDistance { get; set; } = 16; // Launcher-specific setting
     public bool AdvancedMode { get; set; } = false; // Allow override of safe caps
     public string OfficialBuildHashFilePath { get; set; } = ""; // Optional override for official hash verification target file
+    public string IgnoredGameReleaseTitle { get; set; } = "";
 
     // Audio
     public float MasterVolume { get; set; } = 1f;
@@ -110,11 +114,15 @@ public sealed class GameSettings
     // Controls
     public float MouseSensitivity { get; set; } = 0.0035f;
     public bool ReticleEnabled { get; set; } = true;
+    public bool ToggleCrouchEnabled { get; set; } = false;
+    public bool SprintLatchEnabled { get; set; } = false;
     public string ReticleStyle { get; set; } = "Dot";
     public int ReticleSize { get; set; } = 8;
     public int ReticleThickness { get; set; } = 2;
     public string ReticleColor { get; set; } = "FFFFFFC8";
     public string BlockOutlineColor { get; set; } = DefaultBlockOutlineColor;
+    public bool FlyingOutlineEnabled { get; set; } = true;
+    public string FlyingOutlineColor { get; set; } = DefaultFlyingOutlineColor;
     public Dictionary<string, Keys> Keybinds { get; set; } = new()
     {
         ["MoveUp"] = Keys.W,
@@ -123,6 +131,8 @@ public sealed class GameSettings
         ["MoveRight"] = Keys.D,
         ["Jump"] = Keys.Space,
         ["Crouch"] = Keys.LeftShift,
+        ["Sprint"] = Keys.LeftControl,
+        ["FlyDescend"] = Keys.LeftShift,
         ["Inventory"] = Keys.E,
         ["DropItem"] = Keys.Q,
         ["GiveItem"] = Keys.F,
@@ -180,16 +190,19 @@ public sealed class GameSettings
         s.MasterVolume = Clamp01(s.MasterVolume);
         s.MusicVolume = Clamp01(s.MusicVolume);
         s.SfxVolume = Clamp01(s.SfxVolume);
-        s.GuiScale = ClampRange(s.GuiScale, 0.75f, 2.0f);
+        s.GuiScale = ClampRange(s.GuiScale, 0.75f, 1.0f);
         s.Brightness = ClampRange(s.Brightness, 0.5f, 1.5f);
         s.FieldOfView = Math.Clamp(s.FieldOfView, 60, 110);
         s.RenderDistanceChunks = Math.Clamp(s.RenderDistanceChunks, RenderDistanceMin, EngineRenderDistanceMax);
         s.CreateWorldHomesCap = Math.Clamp(s.CreateWorldHomesCap, 1, 64);
         s.ParticlePreset = NormalizeParticlePreset(s.ParticlePreset);
         s.SocialNotifications = NormalizeSocialNotifications(s.SocialNotifications);
+        s.NametagMode = NormalizeNametagMode(s.NametagMode);
+        s.NametagFadeSeconds = ClampRange(s.NametagFadeSeconds, 0.5f, 12f);
         s.MouseSensitivity = ClampRange(s.MouseSensitivity, 0.0005f, 0.01f);
         s.QualityPreset = NormalizeQuality(s.QualityPreset);
         s.OfficialBuildHashFilePath = (s.OfficialBuildHashFilePath ?? string.Empty).Trim();
+        s.IgnoredGameReleaseTitle = (s.IgnoredGameReleaseTitle ?? string.Empty).Trim();
         s.AudioInputDeviceId ??= "";
 
         s.AudioOutputDeviceId ??= "";
@@ -200,6 +213,7 @@ public sealed class GameSettings
         s.ReticleThickness = Math.Clamp(s.ReticleThickness, ReticleThicknessMin, ReticleThicknessMax);
         s.ReticleColor = NormalizeHexColor(s.ReticleColor, DefaultReticleColor);
         s.BlockOutlineColor = NormalizeHexColor(s.BlockOutlineColor, DefaultBlockOutlineColor);
+        s.FlyingOutlineColor = NormalizeHexColor(s.FlyingOutlineColor, DefaultFlyingOutlineColor);
 
         EnsureKeybinds(s);
 
@@ -214,6 +228,7 @@ public sealed class GameSettings
     private const int ReticleThicknessMax = 6;
     private const string DefaultReticleColor = "FFFFFFC8";
     private const string DefaultBlockOutlineColor = "C8DCE678";
+    private const string DefaultFlyingOutlineColor = "FF8A8AC8";
 
     private static string NormalizeQuality(string? value)
     {
@@ -240,6 +255,16 @@ public sealed class GameSettings
         }
 
         return nameof(SocialNotificationMode.On);
+    }
+
+    private static string NormalizeNametagMode(string? value)
+    {
+        var mode = (value ?? string.Empty).Trim();
+        if (mode.Equals("off", StringComparison.OrdinalIgnoreCase))
+            return "Off";
+        if (mode.Equals("fade", StringComparison.OrdinalIgnoreCase))
+            return "Fade";
+        return "Static";
     }
 
     public SocialNotificationMode GetSocialNotificationMode()
