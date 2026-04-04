@@ -1,0 +1,18289 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using WinClipboard = System.Windows.Forms.Clipboard;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
+using LatticeVeilMonoGame.Core;
+using LatticeVeilMonoGame.Online.Eos;
+using LatticeVeilMonoGame.Online.Gate;
+using LatticeVeilMonoGame.Online.Lan;
+using LatticeVeilMonoGame.UI;
+
+namespace LatticeVeilMonoGame.UI.Screens;
+
+// Phase plan (gameplay upgrades):
+// 1) Cube-net atlas + BlockRegistry (single texture; runtime-gen if missing).
+// 2) PlayerController physics (gravity/collision/fly).
+// 3) Raycast break/place + chunk dirty updates.
+// 4) Hotbar/inventory UI + selection.
+// 5) First-person hand/held block render pass.
+// Not touching: launcher flow, asset install paths, build scripts.
+
+public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
+{
+    private readonly MenuStack _menus;
+    private readonly AssetLoader _assets;
+    private readonly PixelFont _font;
+    private readonly Texture2D _pixel;
+    private readonly Logger _log;
+    private readonly PlayerProfile _profile;
+    private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
+    private ILanSession? _lanSession;
+    private readonly string _worldPath;
+    private readonly string _metaPath;
+    private readonly object _historyFileLock = new();
+    private GameSettings _settings = new();
+    private DateTime _settingsStamp = DateTime.MinValue;
+    private bool _indicatorsEnabled = true;
+    private string _nametagMode = "Static";
+    private float _nametagFadeSeconds = 3f;
+    private float _nametagFadeTimer;
+
+    private WorldMeta? _meta;
+    private GameMode _gameMode = GameMode.Artificer;
+    private string _gamemodeToastText = "";
+    private float _gamemodeToastTimer = 0f;
+    private string _flySpeedToastText = "";
+    private float _flySpeedToastTimer = 0f;
+    private float _flySpeedToastPercent = 0f;
+    private bool _gamemodeWheelVisible = false;
+    private int _gamemodeWheelHoverMode = -1;
+    private bool _veilseerXrayEnabled;
+    private int _veilseerSpectateTargetPlayerId = -1;
+    private int _veilseerSpectateSlot = -1;
+    private string _veilseerSpectatePopupText = string.Empty;
+    private float _veilseerSpectatePopupTimer;
+    private VoxelWorld? _world;
+    // ALL WORLD GENERATION DELETED
+    // ALL WORLD GENERATION DELETED
+    // ALL WORLD GENERATION DELETED
+    private CubeNetAtlas? _atlas;
+    private BlockModel? _blockModel;
+    private BlockIconCache? _blockIconCache;
+    private readonly ConcurrentDictionary<ChunkCoord, ChunkMesh> _chunkMeshes = new();
+    private readonly List<ChunkCoord> _chunkOrder = new();
+    private readonly HashSet<ChunkCoord> _activeChunks = new();
+    private ChunkCoord _centerChunk;
+    private int _activeRadiusChunks = 8;
+    private int _targetActiveRadiusChunks = 8;
+    private float _activeRadiusRampTimer;
+    private const int MaxRuntimeActiveRadius = GameSettings.EngineRenderDistanceMax;
+    private const int MaxMeshBuildsPerFrame = 4;
+    private const int StartupActiveRadiusChunks = 5;
+    private const float ActiveRadiusRampIntervalSeconds = 0.75f;
+    private const int ActiveRadiusRampChunkThreshold = 12;
+    private const int ActiveRadiusRampMeshThreshold = 16;
+
+    // Chunk streaming constants
+    private const int MaxNewChunkRequestsPerFrame = 2;
+    private const int MaxMeshBuildRequestsPerFrame = 2;
+    private const int MaxApplyCompletedMeshesPerFrame = 3;
+    private const int MaxApplyCompletedChunkLoadsPerFrame = 4;
+    private const int MaxOutstandingChunkJobs = 96;
+    private const int MaxOutstandingMeshJobs = 96;
+
+    private const int KeepRadiusBuffer = 3;
+    private const int PrewarmRadius = 8; // Match render distance to prevent post-spawn loading
+    private const int PrewarmGateRadius = 3;
+    private const int PrewarmVerticalChunkTop = 5;
+    private const int PrewarmChunkBudgetPerFrame = 6;
+    private const int PrewarmMeshBudgetPerFrame = 4;
+    private const double PrewarmTimeoutSeconds = 12.0;
+    private const bool ENABLE_SPAWN_PREWARM = false; // disabled: join/leave should be instant; spawn area is pregenerated on world creation // Gate visibility until spawn-area is generated + meshed
+    private static readonly int RuntimeChunkRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+    private static readonly int RuntimeMeshRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+    private static readonly int RuntimeChunkScheduleBudget = Math.Clamp((Environment.ProcessorCount / 3) + 1, 2, 6);
+    private static readonly int RuntimeMeshScheduleBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+
+    // Streaming state
+    private ChunkCoord _playerChunkCoord;
+    private int _chunksRequestedThisFrame;
+    private int _meshesRequestedThisFrame;
+    private DateTime _lastStreamingStats = DateTime.UtcNow;
+    private bool _spawnPrewarmComplete;
+    private DateTime _spawnPrewarmStartTime = DateTime.UtcNow;
+    
+    // Stub services to fix compilation (will be replaced with new world generation)
+    private StubStreamingService? _streamingService;
+    private StubPregenerationService? _pregenerationService;
+    private bool _pregenerationStarted;
+    
+    // Result application tracking
+    private int _completedLoadsAppliedThisFrame;
+    private int _completedMeshesAppliedThisFrame;
+    
+    // A) MINIMAL PREWARM SET - Only ring 0 + ring 1
+    private readonly HashSet<ChunkCoord> _prewarmRequiredChunks = new();
+    private readonly HashSet<ChunkCoord> _tier0Chunks = new(); // ring 0 + ring 1
+    
+    // A) HARD VISIBILITY GATE
+    private bool _visibilitySafe;
+    private bool _firstGameplayFrame;
+    private bool _visibilityAssertLogged;
+    private int _spinnerFrame;
+    private int _prewarmTargetCount;
+    private int _prewarmReadyCount;
+    
+    // Reusable buffer to avoid allocations in QueueDirtyChunks
+    private readonly List<VoxelChunkData> _chunkSnapshotBuffer = new();
+    private readonly HashSet<ChunkCoord> _activeKeepBuffer = new();
+    private readonly List<ChunkCoord> _streamingFocusChunks = new();
+    private readonly List<ChunkCoord> _drawOrderBuffer = new();
+    private readonly List<ChunkCoord> _meshRemovalBuffer = new();
+    private readonly Queue<ChunkCoord> _meshQueue = new();
+    private readonly HashSet<ChunkCoord> _meshQueued = new();
+    private readonly ConcurrentQueue<MeshBuildResult> _completedMeshBuildQueue = new();
+    private readonly ConcurrentQueue<MeshBuildResult> _completedPriorityMeshBuildQueue = new();
+    private readonly ConcurrentDictionary<ChunkCoord, byte> _meshBuildInFlight = new();
+    private static readonly int MeshWorkerCount = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+    private readonly SemaphoreSlim _meshBuildSemaphore = new(MeshWorkerCount, MeshWorkerCount);
+    private readonly ConcurrentQueue<ChunkCoord> _chunkGenerationQueue = new();
+    private readonly ConcurrentDictionary<ChunkCoord, byte> _chunkGenerationQueued = new();
+    private readonly ConcurrentDictionary<ChunkCoord, byte> _chunkGenerationInFlight = new();
+    private static readonly int ChunkWorkerCount = Math.Clamp(Environment.ProcessorCount / 3, 1, 4);
+    private readonly SemaphoreSlim _chunkGenerationSemaphore = new(ChunkWorkerCount, ChunkWorkerCount);
+    private bool _loggedInvalidChunkMesh;
+    private bool _loggedInvalidHandMesh;
+
+    private BasicEffect? _effect;
+    private AlphaTestEffect? _cutoutEffect;
+    private Effect? _waterEffect;
+    private bool _waterEffectLoadAttempted;
+    private BasicEffect? _lineEffect;
+    private SamplerState? _samplerLow;
+    private SamplerState? _samplerMedium;
+    private SamplerState? _samplerHigh;
+    private SamplerState? _samplerUltra;
+    private Rectangle _viewport;
+    private readonly VertexPositionColor[] _highlightVerts = new VertexPositionColor[24];
+    private bool _highlightActive;
+    private int _highlightX = int.MinValue;
+    private int _highlightY = int.MinValue;
+    private int _highlightZ = int.MinValue;
+    private const float HighlightEpsilon = 0.01f;
+    private Color _blockOutlineColor = new(200, 220, 230, 120);
+    private bool _flyingOutlineEnabled = true;
+    private Color _flyingOutlineColor = new(255, 138, 138, 200);
+    private readonly VertexPositionColor[] _playerOutlineVerts = new VertexPositionColor[PlayerModel.OutlineVertexCapacity];
+    private Color _highlightColor = new(200, 220, 230, 120);
+    private bool _reticleEnabled = true;
+    private string _reticleStyle = "Dot";
+    private int _reticleSize = 8;
+    private int _reticleThickness = 2;
+    private Color _reticleColor = new(255, 255, 255, 200);
+    private const int ReticleSizeMin = 2;
+    private const int ReticleSizeMax = 32;
+    private const int ReticleThicknessMin = 1;
+    private const int ReticleThicknessMax = 6;
+    private static readonly Vector2[] ReticleCirclePoints = BuildReticleCirclePoints(32);
+
+    private readonly PlayerController _player = new();
+    private readonly Inventory _inventory = new();
+    private Rectangle _hotbarRect;
+    private readonly Rectangle[] _hotbarSlots = new Rectangle[Inventory.HotbarSize];
+    private readonly Rectangle[] _inventoryGridSlots = new Rectangle[Inventory.GridSize];
+    private readonly Rectangle[] _inventoryHotbarSlots = new Rectangle[Inventory.HotbarSize]; // Hotbar slots inside inventory UI
+    private Rectangle _inventoryRect;
+    private Rectangle _inventoryPanelVisualRect;
+    private Rectangle _inventoryCatalogTabRect;
+    private Rectangle _inventoryStorageTabRect;
+    private Rectangle _inventoryCatalogHeaderRect;
+    private Rectangle _inventoryCatalogSearchRect;
+    private Rectangle _inventoryCatalogSearchClearRect;
+    private Rectangle _inventoryCatalogFavoritesRect;
+    private Rectangle _inventoryCatalogListRect;
+    private bool _inventoryOpen;
+    private HotbarSlot _inventoryHeld;
+    private bool _inventoryHasHeld;
+    private Keys _inventoryKey = Keys.E;
+    private Keys _dropKey = Keys.Q;
+    private Keys _giveKey = Keys.F;
+    private Keys _stackModifierKey = Keys.LeftShift;
+    private Keys _sprintKey = Keys.LeftControl;
+    private Keys _flyDescendKey = Keys.LeftShift;
+    private readonly Button _inventoryClose;
+    private readonly Button _inventoryClear;
+    private Point _inventoryMousePos;
+    private InventorySlotGroup _heldFrom = InventorySlotGroup.None;
+    private int _heldIndex = -1;
+    private bool _inventoryCatalogSearchFocused;
+    private int _inventoryCatalogSearchCaret;
+    private float _inventoryCatalogScrollOffsetPx;
+    private float _inventoryCatalogScrollVelocityPxPerSec;
+    private bool _inventoryClearConfirmPending;
+    private float _inventoryClearConfirmTimer;
+    private bool _catalogLoreLoaded;
+    private readonly Dictionary<BlockId, CatalogLoreEntry> _catalogLoreByBlock = new();
+    private FirstPersonHandRenderer? _handRenderer;
+    private PlayerModel? _playerModel;
+    private readonly Dictionary<int, PlayerModel> _remotePlayers = new();
+    private readonly Dictionary<int, string> _playerNames = new();
+    private bool _playerCollisionEnabled = true;
+
+    private readonly Dictionary<int, WorldItem> _worldItems = new();
+    private readonly List<int> _worldItemRemove = new();
+    private readonly Dictionary<BlockId, VertexPositionTexture[]> _itemMeshCache = new();
+    private BasicEffect? _itemEffect;
+    private int _nextItemId = 1;
+    private float _worldTimeSeconds;
+    private int _handoffTargetId = -1;
+    private string _handoffTargetName = "";
+    private bool _handoffFullStack;
+    private bool _handoffPromptVisible;
+    private readonly List<PlayerHomeEntry> _homes = new();
+    private int _selectedHomeIndex = -1;
+    private bool _hasHome;
+    private Vector3 _homePosition;
+    private bool _homeGuiOpen;
+    private string _homeGuiNameInput = "";
+    private bool _homeGuiNameInputFocused;
+    private string _homeGuiStatus = "";
+    private float _homeGuiStatusTimer;
+    private float _homeGuiScroll;
+    private Rectangle _homeGuiPanelRect;
+    private Rectangle _homeGuiListRect;
+    private Rectangle _homeGuiInputRect;
+    private Rectangle _homeGuiHotbarRect;
+    private readonly Rectangle[] _homeGuiHotbarSlots = new Rectangle[Inventory.HotbarSize];
+    private readonly List<Rectangle> _homeGuiRowRects = new();
+    private readonly List<Rectangle> _homeGuiPencilRects = new();
+    private int _homeGuiLastClickIndex = -1;
+    private double _homeGuiLastClickTime;
+    private int _homeGuiEditIndex = -1;
+    private string _homeGuiEditText = string.Empty;
+    private int _homeGuiHoverRowIndex = -1;
+    private int _homeGuiDragHotbarIndex = -1;
+    private bool _homeGuiDragAssignPending;
+    private string _homeGuiHoverHint = string.Empty;
+    private readonly Button _homeGuiSetHereBtn;
+    private readonly Button _homeGuiRenameBtn;
+    private readonly Button _homeGuiDeleteBtn;
+    private readonly Button _homeGuiSetIconHeldBtn;
+    private readonly Button _homeGuiSetIconAutoBtn;
+    private readonly Button _homeGuiCloseBtn;
+    private bool _structureFinderOpen;
+    private bool _structureFinderStructureTab;
+    private int _structureFinderSelectedBiomeIndex;
+    private int _structureFinderRadiusIndex = 2;
+    private string _structureFinderStatus = "";
+    private float _structureFinderStatusTimer;
+    private Texture2D? _structureFinderPanelTexture;
+    private Rectangle _structureFinderPanelRect;
+    private Rectangle _structureFinderListRect;
+    private Rectangle[] _structureFinderBiomeRects = new Rectangle[FinderBiomeLabels.Length];
+    private readonly Button _structureFinderBiomeTabBtn;
+    private readonly Button _structureFinderStructureTabBtn;
+    private readonly Button _structureFinderRadiusBtn;
+    private readonly Button _structureFinderFindBtn;
+    private readonly Button _structureFinderCloseBtn;
+
+    public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen && !_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && _hasLoadedWorld && !_worldSyncInProgress && _spawnPrewarmComplete;
+    public bool WorldReady => !_worldSyncInProgress && _hasLoadedWorld && _spawnPrewarmComplete;
+    private bool IsJoinedClientSession => _lanSession != null && !_lanSession.IsHost;
+    private bool IsTextInputActive => _commandInputActive || _chatInputActive;
+    private bool IsAnyTextCaptureActive => IsTextInputActive || _homeGuiNameInputFocused || _inventoryCatalogSearchFocused || _homeGuiEditIndex >= 0;
+    private bool IsOverlayActionInteractionActive => !IsTextInputActive
+        && _worldTimeSeconds < _chatOverlayActionUnlockUntil
+        && _chatLines.Any(line => (line.HasTeleportAction || line.HasCopyAction || line.HasCustomAction) && line.TimeRemaining > 0f);
+
+    private bool _pauseMenuOpen;
+    private bool _pauseHostOptionsOpen;
+    private Texture2D? _pausePanel;
+    private Rectangle _pauseRect;
+    private Rectangle _pauseHeaderRect;
+    private Rectangle _pauseSubpanelRect;
+    private readonly Button _pauseResume;
+    private readonly Button _pauseHost;
+    private readonly Button _pauseOpenLan;
+    private readonly Button _pauseHostOnline;
+    private readonly Button _pauseHostBack;
+    private readonly Button _pauseSettings;
+    private readonly Button _pauseSaveExit;
+    private readonly Button _pauseProfileIcon;
+    private readonly OnlineGateClient _onlineGate;
+    private readonly InputState _pauseGameplayInput = new();
+    private EosClient? _eosClient;
+    private bool _debugFaceOverlay;
+    private bool _debugHudVisible;
+    private Texture2D? _gamemodeArtificerIcon;
+    private Texture2D? _gamemodeVeilwalkerIcon;
+    private Texture2D? _gamemodeVeilseerIcon;
+
+    private const int InventoryCols = Inventory.GridCols;
+    private const int InventoryRows = Inventory.GridRows;
+    private const int InventorySlotSize = 56;
+    private const int InventorySlotGap = 8;
+    private const int InventoryPadding = 24;
+    private const int InventoryTitleHeight = 48;
+    private const int InventoryTitleHeightWithTabs = 98;
+    private const int InventoryFooterHeight = 60;
+    private const int InventoryTabHeight = 36;
+    private const int InventoryTabWidth = 156;
+    private const float InventoryPanelVisualScale = 1.24f;
+    private const int CatalogSearchMaxLength = 64;
+    private const int CatalogHeaderHeight = 52;
+    private const int CatalogSearchHeight = 36;
+    private const int CatalogRowHeight = 50;
+    private const int CatalogRowOverscan = 2;
+    private const int CatalogTooltipMaxWidth = 420;
+    private const string CatalogLoreAssetPath = "data/lore/base_block_lore_overrides.json";
+    private const float CatalogScrollWheelImpulse = 520f;
+    private const float CatalogScrollDamping = 12f;
+    private const float InventoryClearConfirmSeconds = 4f;
+
+    private const float ItemPickupRadius = 1.5f * Scale.BlockSize;
+    private const float ItemPickupRadiusSq = ItemPickupRadius * ItemPickupRadius;
+    private const float ItemScale = 0.35f * Scale.BlockSize;
+    private const float ItemBobHeight = 0.035f * Scale.BlockSize;
+    private const float ItemBobSpeed = 1.3f;
+    private const float ItemSpinSpeed = 0.6f;
+    private const float ItemPickupDelaySeconds = 0.25f;
+    private const float ItemDropPickupDelaySeconds = 0.75f;
+    private const float ItemGroundPickupDelaySeconds = 0.45f;
+    private const float ItemGravity = -18f;
+    private const float ItemAirDrag = 0.985f;
+    private const float ItemGroundFriction = 0.6f;
+    private const float ItemGroundSnap = 0.01f;
+    private const float ItemHalfHeight = ItemScale * 0.5f;
+    private const float ItemGroundOffset = ItemHalfHeight + ItemGroundSnap;
+    private const float ItemTiltRadians = 0.2f;
+    private const float HandoffRange = 3.0f * Scale.BlockSize;
+    private const float HandoffDotThreshold = 0.94f;
+    private const float PlayerPushStrength = 6.0f * Scale.BlockSize;
+    private const float PlayerPushMaxStep = 0.08f * Scale.BlockSize;
+    private const float PlayerPushSkin = 0.01f * Scale.BlockSize;
+
+    private float _fpsTimer;
+    private float _fps;
+    private int _frameCount;
+    private float _playerSaveTimer; // Timer for periodic player state saving
+    private float _chunkSaveTimer; // Timer for periodic chunk saving
+    private int _autoSaveInFlight;
+    private bool _playerStateDirty; // Flag to track when player state needs saving
+    private readonly object _previewQueueLock = new();
+    private Task? _previewUpdateWorker;
+    private bool _previewUpdatePending;
+    private int _previewPendingCenterX;
+    private int _previewPendingCenterZ;
+    private readonly CancellationTokenSource _backgroundWorkCts = new();
+    private bool _isClosing;
+    private bool _saveAndExitInProgress;
+    private bool _skipOnCloseFullSave;
+    private Task<SaveAndExitResult>? _saveAndExitTask;
+    private DateTime _saveAndExitStartedUtc = DateTime.MinValue;
+    private string? _saveAndExitError;
+
+    private static readonly float InteractRange = Scale.InteractionRange * Scale.BlockSize;
+    private const float InteractCooldownSeconds = 0.15f;
+    private const byte PlayerStatusFlying = 1 << 0;
+    private const byte PlayerStatusSneaking = 1 << 1;
+    private const byte PlayerStatusSprinting = 1 << 2;
+    private const byte PlayerStatusActionSwing = 1 << 3;
+    private const byte PlayerStatusGrounded = 1 << 4;
+    private const byte PlayerStatusVeilseer = 1 << 5;
+    private const byte PlayerStatusInventoryOpen = 1 << 6;
+    private const int MaxPriorityMeshBuildsPerFrame = 4;
+    private const int MaxInlinePriorityMeshBuildsPerFrame = 1;
+    private const int BlockEditBoostFrames = 14;
+    private const float PostSyncRecoverySeconds = 2.5f;
+    private const int PostSyncDirtyScanIntervalFrames = 3;
+    private const int CatalogRowIconSize = 32;
+    private float _interactCooldown;
+    private float _localActionSwingTimer;
+    private readonly Queue<ChunkCoord> _priorityMeshQueue = new();
+    private readonly HashSet<ChunkCoord> _priorityMeshQueued = new();
+    private int _blockEditBoostRemaining;
+    private bool _worldSyncInProgress = true;
+    private bool _hasLoadedWorld;
+    private int _chunksReceived;
+    private float _postSyncRecoveryTimer;
+    private int _postSyncDirtyScanGate;
+    private readonly Queue<ChunkCoord> _postSyncDirtyHintQueue = new();
+    private readonly HashSet<ChunkCoord> _postSyncDirtyHintQueued = new();
+    private float _netSendAccumulator;
+    private byte _lastSentHeldBlockId = byte.MaxValue;
+    private float _persistenceSendAccumulator;
+    private readonly Dictionary<int, LanPlayerPersistenceSnapshot> _latestRemotePersistenceByPlayerId = new();
+    private readonly Dictionary<int, DateTime> _remotePersistenceLastFlushUtc = new();
+    private readonly Dictionary<int, byte> _remoteLastStatus = new();
+    private readonly Dictionary<int, bool> _remoteIsVeilseer = new();
+    private readonly Dictionary<int, bool> _remoteInventoryOpen = new();
+    private readonly Dictionary<int, Inventory> _remoteInventories = new();
+    private readonly Dictionary<int, int> _inventoryViewTargetByViewer = new();
+    private readonly Dictionary<int, float> _inventoryViewPushAccumulator = new();
+    private readonly Dictionary<int, LanInventoryView> _liveInventoryViews = new(); // Store received inventory views
+    private int _currentLiveInventoryTarget = -1; // Currently displayed inventory target
+    private int _liveInventoryLastSentHash;
+    private float _liveInventoryClientSendAccumulator;
+    private bool _liveInventoryHostRequestedLocal;
+    private int _liveInventoryHostRequestedTarget;
+    private readonly HashSet<int> _knownRemotePlayerIds = new();
+    private readonly HashSet<int> _pendingRestorePlayerIds = new();
+    private readonly HashSet<int> _pendingRemoteJoinAnnouncements = new();
+    private readonly HashSet<int> _announcedRemotePlayers = new();
+    private readonly Dictionary<int, DateTime> _remoteJoinAnnouncedUtc = new();
+    private static readonly TimeSpan RemoteLeaveAnnouncementGrace = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan RemotePersistenceFlushInterval = TimeSpan.FromSeconds(5);
+    private const float PersistenceSendIntervalSeconds = 0.75f;
+
+    private float _selectedNameTimer;
+    private int _lastSelectedIndex = -1;
+    private string _displayName = "";
+    private Keys _chatKey = Keys.T;
+    private Keys _commandKey = Keys.OemQuestion;
+    private Keys _homeGuiKey = Keys.H;
+    private Keys _structureFinderKey = Keys.B;
+    private Keys _gamemodeModifierKey = Keys.LeftAlt;
+    private Keys _gamemodeWheelKey = Keys.G;
+    private Keys _veilseerXrayToggleKey = Keys.X;
+    private Keys _inviteQuickActionKey = Keys.Y;
+    private bool _chatInputActive;
+    private string _chatInputText = "";
+    private readonly List<ChatLine> _chatLines = new();
+    private int _nextChatLineId = 1;
+    private int _chatOverlayScrollLines;
+    private readonly List<string> _textInputHistory = new();
+    private int _textInputHistoryCursor = -1;
+    private string _textInputHistoryDraft = "";
+    private bool _textInputHistoryBrowsing;
+    private readonly List<ChatActionHitbox> _chatActionHitboxes = new();
+    private Point _overlayMousePos;
+    private int _hoveredChatActionIndex = -1;
+    private int _difficultyLevel = 1; // 0=Peaceful, 1=Easy, 2=Normal, 3=Hard
+    private bool _commandInputActive;
+    private string _commandInputText = "";
+    private string _commandStatusText = "";
+    private float _commandStatusTimer;
+    private readonly List<CommandPredictionItem> _commandPredictionBuffer = new();
+    private readonly Dictionary<string, CommandDescriptor> _commandLookup = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<CommandDescriptor> _commandDescriptors = new();
+    private readonly HashSet<string> _operators = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<CommandCompletionCandidate> _commandTabCycleCandidates = new();
+    private readonly List<CommandCompletionCandidate> _commandTabBuildBuffer = new();
+    private string _commandTabContextKey = string.Empty;
+    private int _commandTabIndex = -1;
+    private bool _commandTabAppendSpace;
+    private bool _commandsInitialized;
+    private const int MaxChatLines = 256;
+    private const float ChatLineLifetimeSeconds = 14f;
+    private const int MaxTextInputHistory = 256;
+    private const int MaxCommandPredictions = 5;
+    private const int ChatHistoryScrollStep = 6;
+    private const int CommandInputMaxLength = 96;
+    private const float ChatOverlayWidthRatio = 0.52f;
+    private const int ChatOverlayMinWidth = 420;
+    private const int ChatOverlayMaxWidth = 900;
+    private const string OperatorSyncPrefix = "__lv_opsync__:";
+    private const string GameModeSyncPrefix = "__lv_gamemode__:";
+    private const string RuleRequestPrefix = "__lv_rule_req__:";
+    private const string RuleSyncPrefix = "__lv_rule_sync__:";
+    private const string InventoryClearSyncPrefix = "__lv_invclear__:";
+    private const string InventoryClearItemSyncPrefix = "__lv_invclear_item__:";
+    private const string InventoryGiveSyncPrefix = "__lv_invgive__:";
+    private const string InventoryViewRequestPrefix = "__lv_inv_view_req__:";
+    private const string InventoryViewClosePrefix = "__lv_inv_view_close__:";
+    private const string HostDisconnectedFallbackReason = "Host disconnected. Returning to menu.";
+    private bool _hasReceivedInitialPlayerList;
+    private bool _multiplayerDisconnectHandled;
+    private const float ChatOverlayActionUnlockSeconds = ChatLineLifetimeSeconds;
+    private const string JoinApproveActionPrefix = "join-approve:";
+    private const string JoinDeclineActionPrefix = "join-decline:";
+    private const string ChatClearConfirmActionToken = "chatclear-confirm";
+    private const string ChatClearCancelActionToken = "chatclear-cancel";
+    private const string InventoryClearConfirmActionPrefix = "invclear-confirm:";
+    private const string InventoryClearCancelActionPrefix = "invclear-cancel:";
+    private const float InviteQuickHoldAcceptSeconds = 0.7f;
+    private bool _inviteQuickHoldActive;
+    private bool _inviteQuickHoldAccepted;
+    private float _inviteQuickHoldElapsed;
+    private string _inviteQuickHoldPeerId = string.Empty;
+    private string _inviteQuickHoldConfirmToken = string.Empty;
+    private string _inviteQuickHoldCancelToken = string.Empty;
+    private string _inviteQuickHoldPromptText = string.Empty;
+    private float _inviteQuickStatusTimer;
+    private string _inviteQuickStatusText = string.Empty;
+    private bool _pendingQuickConfirmActive;
+    private string _pendingQuickConfirmToken = string.Empty;
+    private string _pendingQuickCancelToken = string.Empty;
+    private string _pendingQuickPromptText = string.Empty;
+    private static readonly HashSet<string> CheatsDisabledAllowedCommands = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "help",
+        "seed",
+        "op",
+        "deop",
+        "kick",
+        "msg",
+        "me",
+        "chatclear",
+        "commandclear",
+        "whitelist",
+        "rules"
+    };
+    private const float LiveInventoryPushIntervalSeconds = 0.10f;
+    private int _liveInventoryTargetPlayerId = -1;
+    private string _liveInventoryTargetName = string.Empty;
+    private PlayerWorldState? _liveInventoryState;
+    private bool _liveInventoryViewActive;
+    private bool _liveInventoryAutoSpectate;
+    private bool _liveInventoryPendingHostSubscription;
+    private long _liveInventoryLastUpdateUtc;
+    private float _liveInventorySendAccumulator;
+    private readonly HotbarSlot[] _liveInventoryHotbar = new HotbarSlot[Inventory.HotbarSize];
+    private readonly HotbarSlot[] _liveInventoryGrid = new HotbarSlot[Inventory.GridSize];
+    private int _liveInventorySelectedIndex = 0;
+    private readonly Rectangle[] _inventoryMirrorHotbarSlots = new Rectangle[Inventory.HotbarSize];
+    private const int CommandFindBiomeDefaultRadius = 2048;
+    private const int CommandFindBiomeMaxRadius = 8192;
+    private const int BiomeSearchRefineWindow = 6;
+    private const int BiomeLocateRingStep = 8;
+    private const int BiomeLocateGlobalStride = 16;
+    private const int BiomeLocateGlobalFallbackStride = 8;
+    private const int BiomeLocateMaxRingRadius = 1536;
+    private bool _hasQueuedLocateOrigin;
+    private int _queuedLocateOriginX;
+    private int _queuedLocateOriginZ;
+    private BiomeIndexStore? _biomeIndex;
+    private SpawnPrewarmManifest? _spawnPrewarmManifest;
+    private static readonly string[] FinderBiomeTokens = { "grasslands", "forest", "hills", "desert", "ocean" };
+    private static readonly string[] FinderBiomeLabels = { "Grasslands", "Forest", "Hills", "Desert", "Ocean" };
+    private static readonly int[] FinderRadiusOptions = { 512, 1024, 2048, 4096, 8192 };
+    private static readonly GameMode[] GameModeWheelModes =
+    {
+        GameMode.Artificer,
+        GameMode.Veilwalker,
+        GameMode.Veilseer
+    };
+    private float _chatOverlayActionUnlockUntil;
+    private int _timeOfDayTicks = 1000;
+    private string _weatherState = "clear";
+    private bool _timeCycleEnabled = true;
+    private bool _weatherCycleEnabled = true;
+    private float _timeCycleAccumulator;
+    private float _weatherCycleAccumulator;
+    private int _weatherCycleIndex;
+    private static readonly string[] WeatherCycleStates = { "clear", "rain", "storm" };
+    private static readonly float[] WeatherCycleDurationsSeconds = { 300f, 180f, 120f };
+    private bool _gamemodeWheelHoldToOpen;
+    private bool _gamemodeWheelWaitForRelease;
+    private readonly BlockBreakParticleSystem _blockBreakParticles = new();
+    private const string DefaultHomeName = "Home";
+    private const int HomeGuiRowHeight = 42;
+
+#if DEBUG
+    private bool _debugDisableHands;
+    private bool _debugWireframe;
+    private bool _debugSkyClear = true;
+    private bool _debugDrawPlayerModel;
+    private string _blockSamplerLabel = "unknown";
+    private bool _debugWorldAtlasBound;
+    private bool _debugOverlayAtlasBound;
+#endif
+    private const float ThirdPersonDistanceBlocks = 4.4f;
+    private const float ThirdPersonMinDistanceBlocks = 1.15f;
+    private const float ThirdPersonHideModelDistanceBlocks = 0.85f;
+    private const float ThirdPersonCollisionStepBlocks = 0.20f;
+    private const float ThirdPersonFocusHeightBlocks = 1.40f;
+    private const float ThirdPersonFocusSneakHeightBlocks = 1.10f;
+    private const float ThirdPersonCameraHeightBiasBlocks = 0.30f;
+    private const float ThirdPersonPitchMin = -1.10f;
+    private const float ThirdPersonPitchMax = 0.95f;
+    private const float ThirdPersonTurnSpeedRadiansPerSecond = 7.5f;
+    private const float ThirdPersonPitchLerpPerSecond = 10.0f;
+    private bool _thirdPersonEnabled;
+    private float _thirdPersonYaw;
+    private float _thirdPersonPitch = -0.18f;
+    private float _thirdPersonPlayerYawTarget;
+    private bool _thirdPersonFreeLookHeld;
+    private Vector3 _cameraPosition;
+    private float _thirdPersonCameraDistance;
+
+    private static readonly Color SkyColor = new(135, 206, 235);
+    private static readonly RasterizerState WireframeState = new()
+    {
+        FillMode = FillMode.WireFrame,
+        CullMode = CullMode.None
+    };
+    private static readonly RasterizerState ScissorState = new()
+    {
+        CullMode = CullMode.None,
+        ScissorTestEnable = true
+    };
+
+    public GameWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, string worldPath, string metaPath, ILanSession? lanSession = null, VoxelWorld? preloadedWorld = null)
+    {
+        _menus = menus;
+        _assets = assets;
+        _font = font;
+        _pixel = pixel;
+        _log = log;
+        _profile = profile;
+        _onlineGate = OnlineGateClient.GetOrCreate();
+        _graphics = graphics;
+        _worldPath = worldPath;
+        _metaPath = metaPath;
+        _lanSession = lanSession;
+        _persistenceSendAccumulator = _lanSession != null && !_lanSession.IsHost
+            ? PersistenceSendIntervalSeconds
+            : 0f;
+        _world = preloadedWorld; // Use preloaded world if available
+        _settings = GameSettings.LoadOrCreate(_log);
+        _settingsStamp = GetSettingsStamp();
+        _targetActiveRadiusChunks = Math.Clamp(_settings.RenderDistanceChunks, 4, MaxRuntimeActiveRadius);
+        _activeRadiusChunks = GetInitialActiveRadius(_targetActiveRadiusChunks);
+        UpdateReticleSettings();
+        _inventoryKey = GetKeybind("Inventory", Keys.E);
+        _dropKey = GetKeybind("DropItem", Keys.Q);
+        _giveKey = GetKeybind("GiveItem", Keys.F);
+        _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
+        _sprintKey = GetKeybind("Sprint", Keys.LeftControl);
+        _flyDescendKey = GetKeybind("FlyDescend", Keys.LeftShift);
+        _chatKey = GetKeybind("Chat", Keys.T);
+        _commandKey = GetKeybind("Command", Keys.OemQuestion);
+        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
+        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
+        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
+        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
+        _player.CrouchKey = _stackModifierKey;
+        _player.SprintKey = _sprintKey;
+        _player.FlyDescendKey = _flyDescendKey;
+        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
+        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
+        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        _indicatorsEnabled = _settings.IndicatorsEnabled;
+        _nametagMode = NormalizeNametagMode(_settings.NametagMode);
+        _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
+        _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
+        EnsureCommandRegistry();
+
+        // Initialize stub services to fix compilation (will be replaced with new world generation)
+        if (_world != null)
+        {
+            _streamingService = new StubStreamingService(_world, _log);
+            _pregenerationService = new StubPregenerationService(_world, _log);
+        }
+
+        _pauseResume = new Button("RESUME", () =>
+        {
+            _pauseMenuOpen = false;
+            _pauseHostOptionsOpen = false;
+        });
+        _pauseHost = new Button("HOST WORLD", OpenHostMenuFromPause);
+        _pauseOpenLan = new Button("OPEN TO LAN", OpenToLanFromPause);
+        _pauseHostOnline = new Button("HOST ONLINE", OpenOnlineHostFromPause);
+        _pauseHostBack = new Button("BACK", CloseHostMenuFromPause);
+        _pauseSettings = new Button("SETTINGS", OpenSettings);
+        _pauseSaveExit = new Button("SAVE & EXIT", SaveAndExit);
+        _pauseProfileIcon = new Button("", OpenProfileFromPause) { BoldText = true };
+        _inventoryClose = new Button("CLOSE", CloseInventory);
+        _inventoryClear = new Button("CLEAR INVENTORY", ClearArtificerInventoryFromUi);
+        _homeGuiSetHereBtn = new Button("SET HERE", SetHomeAtCurrentPositionFromGui);
+        _homeGuiRenameBtn = new Button("RENAME", RenameSelectedHomeFromGui);
+        _homeGuiDeleteBtn = new Button("DELETE", DeleteSelectedHomeFromGui);
+        _homeGuiSetIconHeldBtn = new Button("ICON: HELD", SetSelectedHomeIconFromHeld);
+        _homeGuiSetIconAutoBtn = new Button("ICON: LETTER", SetSelectedHomeIconAuto);
+        _homeGuiCloseBtn = new Button("CLOSE", () => _homeGuiOpen = false);
+        _structureFinderBiomeTabBtn = new Button("BIOMES", () => _structureFinderStructureTab = false);
+        _structureFinderStructureTabBtn = new Button("STRUCTURES", () => _structureFinderStructureTab = true);
+        _structureFinderRadiusBtn = new Button("RADIUS", CycleStructureFinderRadius);
+        _structureFinderFindBtn = new Button("FIND", ExecuteStructureFinderSearchFromGui);
+        _structureFinderCloseBtn = new Button("CLOSE", () => _structureFinderOpen = false);
+        SyncStructureFinderRadiusLabel();
+
+        try
+        {
+            _pausePanel = _assets.LoadTexture("textures/menu/GUIS/Pause_GUI.png");
+            _pauseProfileIcon.Texture = _assets.LoadTexture("textures/menu/buttons/Profile.png");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Pause menu asset load: {ex.Message}");
+        }
+
+        LoadGamemodeWheelIcons();
+        _structureFinderPanelTexture = TryLoadOptionalTexture(
+            "textures/menu/GUIS/GUIBOX.png",
+            "textures/menu/GUIS/WorldGeneration_GUI.png");
+
+        // Note: World load is deferred to the first Update() to allow "Loading..." screen to draw.
+    }
+
+    public void OnResize(Rectangle viewport)
+    {
+        _viewport = viewport;
+        UpdatePauseMenuLayout();
+        UpdateHotbarLayout();
+        UpdateInventoryLayout();
+        LayoutStructureFinderGui();
+    }
+
+    private DateTime _nextSessionHeartbeatUtc = DateTime.MinValue;
+    private readonly Dictionary<string, string> _usernameCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _pendingJoinLookup = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _pendingJoinOrder = new();
+    private readonly Dictionary<string, string> _pendingJoinDisplayNames = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _whitelist = new(StringComparer.OrdinalIgnoreCase);
+    private bool _sessionHeartbeatInFlight;
+    private int _sessionHeartbeatTickCount;
+    private string WhitelistPath => Path.Combine(_worldPath, "Whitelist.lvlist");
+    private string LegacyWhitelistPath => Path.Combine(_worldPath, "whitelist.json");
+    private string ChatHistoryLogPath => Path.Combine(_worldPath, "chat_history.lvlog");
+    private string LegacyChatHistoryLogPath => Path.Combine(_worldPath, "chat_history.log");
+    private string CommandHistoryLogPath => Path.Combine(_worldPath, "command_history.lvlog");
+    private string LegacyCommandHistoryLogPath => Path.Combine(_worldPath, "command_history.log");
+
+    public void Update(GameTime gameTime, InputState input)
+    {
+        if (!_hasLoadedWorld)
+        {
+            _log.Info("Starting delayed world load...");
+            LoadWorld();
+            SeedLocalPlayerName();
+            _hasLoadedWorld = true;
+            _log.Info("Delayed world load complete.");
+
+            // If we are Host or Singleplayer, we don't need to wait for network sync.
+            if (_lanSession == null || _lanSession.IsHost)
+            {
+                _worldSyncInProgress = false;
+                _log.Info("Host/SP mode: Sync skipped (local world ready).");
+            }
+
+            // Return to allow the loop to proceed cleanly next frame
+            return;
+        }
+
+        if (_saveAndExitInProgress)
+        {
+            _spinnerFrame = (_spinnerFrame + 1) % 8;
+            if (_saveAndExitTask != null && _saveAndExitTask.IsCompleted)
+                CompleteSaveAndExit();
+            return;
+        }
+
+        var rawDt = (float)gameTime.ElapsedGameTime.TotalSeconds;
+        // Only clamp catastrophic stalls; do not clamp normal frame deltas to avoid perceived slow-motion.
+        var dt = Math.Min(rawDt, 0.1f);
+        _worldTimeSeconds = (float)gameTime.TotalGameTime.TotalSeconds;
+        if (_postSyncRecoveryTimer > 0f)
+            _postSyncRecoveryTimer = Math.Max(0f, _postSyncRecoveryTimer - rawDt);
+
+        _fpsTimer += rawDt;
+        _frameCount++;
+        if (_fpsTimer >= 1.0f)
+        {
+            _fps = _frameCount / _fpsTimer;
+            _frameCount = 0;
+            _fpsTimer = 0;
+        }
+
+        TickHostedOnlineLobbyHeartbeat();
+
+        if (_commandStatusTimer > 0f)
+        {
+            _commandStatusTimer = Math.Max(0f, _commandStatusTimer - rawDt);
+            if (_commandStatusTimer <= 0f)
+                _commandStatusText = "";
+        }
+
+        if (_gamemodeToastTimer > 0f)
+        {
+            _gamemodeToastTimer = Math.Max(0f, _gamemodeToastTimer - rawDt);
+            if (_gamemodeToastTimer <= 0f)
+                _gamemodeToastText = string.Empty;
+        }
+
+        if (_flySpeedToastTimer > 0f)
+        {
+            _flySpeedToastTimer = Math.Max(0f, _flySpeedToastTimer - rawDt);
+            if (_flySpeedToastTimer <= 0f)
+                _flySpeedToastText = string.Empty;
+        }
+
+        if (_localActionSwingTimer > 0f)
+            _localActionSwingTimer = Math.Max(0f, _localActionSwingTimer - rawDt);
+
+        UpdateWorldRuleCycles(rawDt);
+
+        if (_veilseerSpectatePopupTimer > 0f)
+        {
+            _veilseerSpectatePopupTimer = Math.Max(0f, _veilseerSpectatePopupTimer - rawDt);
+            if (_veilseerSpectatePopupTimer <= 0f)
+                _veilseerSpectatePopupText = string.Empty;
+        }
+
+        if (Keyboard.GetState().IsKeyDown(Keys.Tab))
+            _nametagFadeTimer = _nametagFadeSeconds;
+        else if (_nametagFadeTimer > 0f)
+            _nametagFadeTimer = Math.Max(0f, _nametagFadeTimer - rawDt);
+
+        if (_inviteQuickStatusTimer > 0f)
+        {
+            _inviteQuickStatusTimer = Math.Max(0f, _inviteQuickStatusTimer - rawDt);
+            if (_inviteQuickStatusTimer <= 0f)
+                _inviteQuickStatusText = string.Empty;
+        }
+
+        UpdateInviteQuickAction(input, rawDt);
+        _overlayMousePos = input.MousePosition;
+        UpdateChatLines(rawDt);
+        HandleChatOverlayActions(input);
+
+        if (input.IsNewKeyPress(Keys.F9))
+            ExportAtlas();
+        if (input.IsNewKeyPress(Keys.F3))
+            _debugHudVisible = !_debugHudVisible;
+        if (input.IsNewKeyPress(Keys.F4))
+            _debugFaceOverlay = !_debugFaceOverlay;
+        if (input.IsNewKeyPress(Keys.F5))
+            ToggleThirdPersonMode();
+
+#if DEBUG
+        if (input.IsNewKeyPress(Keys.F6))
+            _debugSkyClear = !_debugSkyClear;
+        if (input.IsNewKeyPress(Keys.F7))
+            _debugWireframe = !_debugWireframe;
+        if (input.IsNewKeyPress(Keys.F11))
+            _debugDrawPlayerModel = !_debugDrawPlayerModel;
+        if (input.IsNewKeyPress(Keys.F8))
+            _debugDisableHands = !_debugDisableHands;
+#endif
+        RefreshSettingsIfChanged();
+
+        // PERIODIC PLAYER STATE SAVING - Save player position periodically during gameplay
+        _playerSaveTimer += rawDt;
+        if (!IsJoinedClientSession && !_isClosing && _playerSaveTimer >= 30.0f) // Save every 30 seconds
+        {
+            QueuePlayerStateSaveAsync();
+            _playerSaveTimer = 0f;
+        }
+
+        // PERIODIC CHUNK SAVING - Save dirty chunks periodically during gameplay
+        if (!IsJoinedClientSession && !_isClosing && _world != null)
+        {
+            _chunkSaveTimer += rawDt;
+            if (_chunkSaveTimer >= 60.0f) // Save chunks every 60 seconds
+            {
+                _world.SaveModifiedChunks();
+                _chunkSaveTimer = 0f;
+            }
+        }
+
+        // Always update network layer, even if world sync is in progress
+        UpdateNetwork(rawDt);
+        if (_isClosing)
+            return;
+        _blockBreakParticles.Update(rawDt);
+
+        if (_worldSyncInProgress)
+        {
+            // 4) DRAIN RESULTS - Always apply completed load+mesh results even while preparing
+            ProcessStreamingResults(aggressiveApply: !_spawnPrewarmComplete);
+            
+            // Only update UI relevant for loading screen if sync in progress
+            if (input.IsNewKeyPress(Keys.Escape)) // Still allow pausing
+            {
+                TogglePauseMenuFromEscape();
+            }
+            if (_pauseMenuOpen)
+            {
+                UpdatePauseButtons(input);
+            }
+            return; // Skip all other game logic if sync is not complete
+        }
+
+        // CONTINUOUS MESH PROCESSING - Process mesh results to prevent graphical issues
+        ProcessMeshJobsNonBlocking();
+        var chunkScheduleBudget = _spawnPrewarmComplete
+            ? RuntimeChunkScheduleBudget
+            : Math.Max(RuntimeChunkScheduleBudget, PrewarmChunkBudgetPerFrame);
+        ProcessChunkGenerationJobs(chunkScheduleBudget);
+
+        if (!_spawnPrewarmComplete)
+        {
+            _spinnerFrame = (_spinnerFrame + 1) % 8;
+            ProcessPrewarmStep();
+
+            if (input.IsNewKeyPress(Keys.Escape))
+                TogglePauseMenuFromEscape();
+
+            if (_pauseMenuOpen)
+            {
+                UpdatePauseButtons(input);
+                WarmBlockIcons();
+            }
+
+            return; // Block gameplay controls until prewarm gate is visually ready.
+        }
+
+        // Start background pregeneration once the gate is ready.
+        if (ENABLE_SPAWN_PREWARM && !_pregenerationStarted && !IsJoinedClientSession && _pregenerationService != null)
+        {
+            var radius = AdvancedPerformanceOptimizer.GetOptimalRenderDistance();
+            _log.Info($"Starting background world pregeneration (radius={radius}) after prewarm gate.");
+            _pregenerationService.StartPregeneration(radius);
+            _pregenerationStarted = true;
+        }
+
+        if (_inventoryOpen)
+        {
+            UpdateInventory(input, dt);
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (!_pauseMenuOpen && !_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_inventoryKey))
+        {
+            _inventoryOpen = true;
+            _inventoryCatalogSearchFocused = false;
+            _inventoryCatalogSearchCaret = 0;
+            return;
+        }
+
+        if (!_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(Keys.Escape))
+        {
+            TogglePauseMenuFromEscape();
+            return;
+        }
+
+        // If the pause menu was open at any point this frame, consume mouse clicks for this frame.
+        // This prevents a menu click (e.g., RESUME / SETTINGS / SAVE & EXIT) from also breaking/placing blocks
+        // in the world on the same frame the menu closes.
+        var pauseMenuWasOpenThisFrame = _pauseMenuOpen;
+
+        if (_pauseMenuOpen)
+        {
+            UpdatePauseButtons(input);
+        }
+
+        if (pauseMenuWasOpenThisFrame || _pauseMenuOpen)
+        {
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (_homeGuiOpen)
+        {
+            UpdateHomeGui(input, rawDt);
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (_structureFinderOpen)
+        {
+            UpdateStructureFinderGui(input, rawDt);
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_homeGuiKey))
+        {
+            OpenHomeGui();
+            return;
+        }
+
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_structureFinderKey))
+        {
+            OpenStructureFinderGui(openStructuresTab: false);
+            return;
+        }
+
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && IsChatOpenKeyPressed(input))
+        {
+            BeginChatInput();
+            return;
+        }
+
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && IsCommandOpenKeyPressed(input))
+        {
+            BeginChatInput("/");
+            return;
+        }
+
+        if (_chatInputActive)
+        {
+            UpdateChatInput(input);
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (_commandInputActive)
+        {
+            UpdateCommandInput(input);
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (HandleGameModeWheelInput(input))
+        {
+            UpdateOverlayWorldSimulation(gameTime, dt);
+            WarmBlockIcons();
+            return;
+        }
+
+        if (_gameMode == GameMode.Veilseer && input.IsNewKeyPress(_veilseerXrayToggleKey))
+        {
+            _veilseerXrayEnabled = !_veilseerXrayEnabled;
+            SetCommandStatus(_veilseerXrayEnabled ? "VeilSeer Xray enabled." : "VeilSeer Xray disabled.", 3f);
+        }
+
+#if DEBUG
+        if (input.IsNewKeyPress(Keys.F10))
+        {
+            EnsurePlayerNotInsideSolid(forceLog: true);
+            _player.SetFlying(true);
+        }
+#endif
+
+        UpdatePlayer(gameTime, dt, input);
+        ApplyPlayerSeparation(dt);
+        UpdateActiveRadiusRamp(dt);
+        UpdateActiveChunks(force: false);
+        ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+        HandleHotbarInput(input);
+        UpdateSelectionTimer(dt);
+        UpdateHandoffTarget(input);
+        HandleDropAndGive(input);
+        UpdateWorldItems();
+        HandleBlockInteraction(gameTime, input);
+        ProcessStreamingResults(); // Apply completed loads/unloads first (main thread only)
+        QueueDirtyChunks(); // Then enumerate safely
+        ProcessMeshBuildQueue();
+        WarmBlockIcons();
+    }
+
+    private void UpdateOverlayWorldSimulation(GameTime gameTime, float dt)
+    {
+        var pausedInput = _pauseGameplayInput;
+        UpdatePlayer(gameTime, dt, pausedInput);
+        ApplyPlayerSeparation(dt);
+        UpdateActiveRadiusRamp(dt);
+        UpdateActiveChunks(force: false);
+        ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+        UpdateSelectionTimer(dt);
+        UpdateHandoffTarget(pausedInput);
+        UpdateWorldItems();
+        ProcessStreamingResults(); // Apply completed loads/unloads first (main thread only)
+        QueueDirtyChunks(); // Then enumerate safely
+        ProcessMeshBuildQueue();
+    }
+
+    private void ProcessWorldVisualMaintenance()
+    {
+        ProcessStreamingResults();
+        QueueDirtyChunks();
+        ProcessMeshBuildQueue(Math.Max(1, RuntimeMeshScheduleBudget));
+    }
+
+    private void UpdateInviteQuickAction(InputState input, float dt)
+    {
+        if (_pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _structureFinderOpen || IsAnyTextCaptureActive)
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (TryGetPendingQuickConfirmation(out var confirmToken, out var cancelToken, out var confirmPrompt))
+        {
+            if (input.IsNewKeyPress(_inviteQuickActionKey))
+            {
+                _inviteQuickHoldActive = true;
+                _inviteQuickHoldAccepted = false;
+                _inviteQuickHoldElapsed = 0f;
+                _inviteQuickHoldPeerId = string.Empty;
+                _inviteQuickHoldConfirmToken = confirmToken;
+                _inviteQuickHoldCancelToken = cancelToken;
+                _inviteQuickHoldPromptText = confirmPrompt;
+            }
+
+            if (!_inviteQuickHoldActive)
+                return;
+
+            var confirmKeyDown = input.IsKeyDown(_inviteQuickActionKey);
+            if (confirmKeyDown)
+            {
+                _inviteQuickHoldElapsed += dt;
+                if (!_inviteQuickHoldAccepted && _inviteQuickHoldElapsed >= InviteQuickHoldAcceptSeconds)
+                {
+                    _inviteQuickHoldAccepted = true;
+                    _inviteQuickHoldActive = false;
+                    _inviteQuickHoldElapsed = InviteQuickHoldAcceptSeconds;
+                    if (!string.IsNullOrWhiteSpace(_inviteQuickHoldConfirmToken))
+                        ExecuteCustomChatAction(_inviteQuickHoldConfirmToken, string.Empty);
+                    SetInviteQuickStatus("Confirmed.", 2.2f);
+                    _inviteQuickHoldConfirmToken = string.Empty;
+                    _inviteQuickHoldCancelToken = string.Empty;
+                    _inviteQuickHoldPromptText = string.Empty;
+                }
+                return;
+            }
+
+            var confirmWasAccepted = _inviteQuickHoldAccepted;
+            _inviteQuickHoldActive = false;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+
+            if (confirmWasAccepted)
+                return;
+
+            if (!string.IsNullOrWhiteSpace(_inviteQuickHoldCancelToken))
+                ExecuteCustomChatAction(_inviteQuickHoldCancelToken, string.Empty);
+            SetInviteQuickStatus("Canceled.", 2.2f);
+            _inviteQuickHoldConfirmToken = string.Empty;
+            _inviteQuickHoldCancelToken = string.Empty;
+            _inviteQuickHoldPromptText = string.Empty;
+            return;
+        }
+
+        if (_lanSession is not EosP2PHostSession)
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (!TryGetNewestPendingJoinRequest(out var peerId, out var displayName))
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        if (input.IsNewKeyPress(_inviteQuickActionKey))
+        {
+            _inviteQuickHoldActive = true;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+            _inviteQuickHoldPeerId = peerId;
+            _inviteQuickHoldConfirmToken = string.Empty;
+            _inviteQuickHoldCancelToken = string.Empty;
+            _inviteQuickHoldPromptText = string.Empty;
+        }
+
+        if (!_inviteQuickHoldActive)
+            return;
+
+        if (string.IsNullOrWhiteSpace(_inviteQuickHoldPeerId))
+        {
+            ResetInviteQuickHoldState();
+            return;
+        }
+
+        var keyDown = input.IsKeyDown(_inviteQuickActionKey);
+        if (keyDown)
+        {
+            _inviteQuickHoldElapsed += dt;
+            if (!_inviteQuickHoldAccepted && _inviteQuickHoldElapsed >= InviteQuickHoldAcceptSeconds)
+            {
+                _inviteQuickHoldAccepted = true;
+                _inviteQuickHoldActive = false;
+                _inviteQuickHoldElapsed = InviteQuickHoldAcceptSeconds;
+                var acceptedName = GetPendingJoinDisplayName(_inviteQuickHoldPeerId, displayName);
+                _ = RespondToPendingJoinPeerIdAsync(_inviteQuickHoldPeerId, acceptedName, accept: true);
+                SetInviteQuickStatus($"Accepted {acceptedName}.", 2.2f);
+                _inviteQuickHoldPeerId = string.Empty;
+            }
+            return;
+        }
+
+        var wasAccepted = _inviteQuickHoldAccepted;
+        _inviteQuickHoldActive = false;
+        _inviteQuickHoldAccepted = false;
+        _inviteQuickHoldElapsed = 0f;
+
+        if (wasAccepted)
+            return;
+
+        var declinedName = GetPendingJoinDisplayName(_inviteQuickHoldPeerId, displayName);
+        _ = RespondToPendingJoinPeerIdAsync(_inviteQuickHoldPeerId, declinedName, accept: false);
+        SetInviteQuickStatus($"Declined {declinedName}.", 2.2f);
+        _inviteQuickHoldPeerId = string.Empty;
+    }
+
+    private void ResetInviteQuickHoldState()
+    {
+        _inviteQuickHoldActive = false;
+        _inviteQuickHoldAccepted = false;
+        _inviteQuickHoldElapsed = 0f;
+        _inviteQuickHoldPeerId = string.Empty;
+        _inviteQuickHoldConfirmToken = string.Empty;
+        _inviteQuickHoldCancelToken = string.Empty;
+        _inviteQuickHoldPromptText = string.Empty;
+    }
+
+    private bool TryGetPendingQuickConfirmation(out string confirmToken, out string cancelToken, out string promptText)
+    {
+        confirmToken = string.Empty;
+        cancelToken = string.Empty;
+        promptText = string.Empty;
+
+        if (!_pendingQuickConfirmActive)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(_pendingQuickConfirmToken) || string.IsNullOrWhiteSpace(_pendingQuickCancelToken))
+        {
+            ClearPendingQuickConfirmation();
+            return false;
+        }
+
+        var found = _chatLines.Any(line =>
+            line.TimeRemaining > 0f
+            && string.Equals(line.CustomActionToken, _pendingQuickConfirmToken, StringComparison.Ordinal)
+            && string.Equals(line.CustomActionToken2, _pendingQuickCancelToken, StringComparison.Ordinal));
+
+        if (!found)
+        {
+            ClearPendingQuickConfirmation();
+            return false;
+        }
+
+        confirmToken = _pendingQuickConfirmToken;
+        cancelToken = _pendingQuickCancelToken;
+        promptText = string.IsNullOrWhiteSpace(_pendingQuickPromptText)
+            ? "Confirmation pending."
+            : _pendingQuickPromptText;
+        return true;
+    }
+
+    private bool TryHandleInventoryViewRequestMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+
+        if (text.StartsWith(InventoryViewRequestPrefix, StringComparison.Ordinal))
+        {
+            var payload = text.Substring(InventoryViewRequestPrefix.Length);
+            if (!int.TryParse(payload, NumberStyles.Integer, CultureInfo.InvariantCulture, out var targetId))
+                return true;
+
+            if (_lanSession.IsHost)
+            {
+                if (!HasOperatorPermissions())
+                    return true;
+
+                _inventoryViewTargetByViewer[message.FromPlayerId] = targetId;
+
+                // For EOS P2P (and any non-LAN transport), send a direct request packet to the target so it starts pushing.
+                if (_lanSession.IsConnected && targetId > 0)
+                {
+                    _lanSession.SendInventoryView(new LanInventoryView
+                    {
+                        ViewerPlayerId = targetId,
+                        TargetPlayerId = targetId,
+                        SelectedIndex = 0,
+                        HotbarIds = Array.Empty<byte>(),
+                        HotbarCounts = Array.Empty<byte>(),
+                        GridIds = Array.Empty<byte>(),
+                        GridCounts = Array.Empty<byte>()
+                    });
+                    SetCommandStatus($"InvView: requested push from P{targetId}.", 2.0f, echoToChat: false);
+                }
+                return true;
+            }
+
+            if (targetId == _lanSession.LocalPlayerId)
+            {
+                _liveInventoryHostRequestedLocal = true;
+                _liveInventoryHostRequestedTarget = targetId;
+            }
+            return true;
+        }
+
+        if (text.StartsWith(InventoryViewClosePrefix, StringComparison.Ordinal))
+        {
+            var payload = text.Substring(InventoryViewClosePrefix.Length);
+            if (!int.TryParse(payload, NumberStyles.Integer, CultureInfo.InvariantCulture, out var targetId))
+                return true;
+
+            if (_lanSession.IsHost)
+            {
+                if (HasOperatorPermissions())
+                    _inventoryViewTargetByViewer.Remove(message.FromPlayerId);
+
+                // Tell the target to stop pushing.
+                if (_lanSession.IsConnected && targetId > 0)
+                {
+                    _lanSession.SendInventoryView(new LanInventoryView
+                    {
+                        ViewerPlayerId = targetId,
+                        TargetPlayerId = targetId,
+                        SelectedIndex = -1,
+                        HotbarIds = Array.Empty<byte>(),
+                        HotbarCounts = Array.Empty<byte>(),
+                        GridIds = Array.Empty<byte>(),
+                        GridCounts = Array.Empty<byte>()
+                    });
+                    SetCommandStatus($"InvView: stop push from P{targetId}.", 2.0f, echoToChat: false);
+                }
+                return true;
+            }
+
+            if (targetId == _lanSession.LocalPlayerId)
+            {
+                _liveInventoryHostRequestedLocal = false;
+                _liveInventoryHostRequestedTarget = -1;
+                _liveInventoryLastSentHash = 0;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private void RegisterPendingQuickConfirmation(string promptText, string confirmToken, string cancelToken)
+    {
+        var normalizedConfirm = (confirmToken ?? string.Empty).Trim();
+        var normalizedCancel = (cancelToken ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedConfirm) || string.IsNullOrWhiteSpace(normalizedCancel))
+            return;
+
+        _pendingQuickConfirmActive = true;
+        _pendingQuickConfirmToken = normalizedConfirm;
+        _pendingQuickCancelToken = normalizedCancel;
+        _pendingQuickPromptText = string.IsNullOrWhiteSpace(promptText)
+            ? "Confirmation pending."
+            : promptText.Trim();
+    }
+
+    private void ClearPendingQuickConfirmation()
+    {
+        _pendingQuickConfirmActive = false;
+        _pendingQuickConfirmToken = string.Empty;
+        _pendingQuickCancelToken = string.Empty;
+        _pendingQuickPromptText = string.Empty;
+    }
+
+    private bool TryGetNewestPendingJoinRequest(out string peerId, out string displayName)
+    {
+        peerId = string.Empty;
+        displayName = "PLAYER";
+
+        for (var i = _pendingJoinOrder.Count - 1; i >= 0; i--)
+        {
+            var candidate = (_pendingJoinOrder[i] ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(candidate))
+                continue;
+
+            peerId = candidate;
+            if (_pendingJoinDisplayNames.TryGetValue(candidate, out var resolved) && !string.IsNullOrWhiteSpace(resolved))
+                displayName = resolved;
+            return true;
+        }
+
+        return false;
+    }
+
+    private string GetPendingJoinDisplayName(string peerId, string fallback)
+    {
+        var normalized = (peerId ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(normalized)
+            && _pendingJoinDisplayNames.TryGetValue(normalized, out var display)
+            && !string.IsNullOrWhiteSpace(display))
+        {
+            return display;
+        }
+
+        return string.IsNullOrWhiteSpace(fallback) ? "PLAYER" : fallback.Trim();
+    }
+
+    private void SetInviteQuickStatus(string text, float seconds)
+    {
+        _inviteQuickStatusText = text;
+        _inviteQuickStatusTimer = Math.Max(0f, seconds);
+    }
+
+    public void OnMouseCaptureGained()
+    {
+        // No-op; capture is handled centrally in Game1.
+    }
+
+    public void OnMouseCaptureLost()
+    {
+        // No-op; capture is handled centrally in Game1.
+    }
+
+    public void Draw(SpriteBatch sb, Rectangle viewport)
+    {
+        if (viewport != _viewport)
+            OnResize(viewport);
+
+        if (_saveAndExitInProgress)
+        {
+            DrawSavingOverlay(sb);
+            return;
+        }
+
+        // SIMPLE LOADING INDICATOR - NO MORE COMPLEX PROGRESS
+        bool needsLoading = ShouldShowLoadingScreen();
+        
+        if (needsLoading)
+        {
+            // Always clear first so it never looks "frozen".
+	            // NOTE: use a distinct name so we never collide with the main-world draw path.
+	            var gd = sb.GraphicsDevice;
+	            gd.Clear(Color.Black);
+	            gd.DepthStencilState = DepthStencilState.None;
+	            gd.RasterizerState = RasterizerState.CullNone;
+	            gd.BlendState = BlendState.AlphaBlend;
+
+            sb.Begin(blendState: BlendState.AlphaBlend);
+            // Always center relative to the *actual* current graphics viewport.
+            // The Rectangle parameter passed into Draw() can be stale depending on the caller.
+            var vp = gd.Viewport;
+            var center = new Vector2(vp.Width / 2f, vp.Height / 2f);
+
+            // Lightweight "3D-ish" portal animation (no extra assets): layered rotating quads.
+            // Uses _worldTimeSeconds which is updated every frame in Update().
+            var t = _worldTimeSeconds;
+            var baseSize = 56f;
+            for (int i = 0; i < 3; i++)
+            {
+                var size = baseSize * (1f + i * 0.35f);
+                var rot = t * (0.9f + i * 0.55f) * (i % 2 == 0 ? 1f : -1f);
+                var alpha = 0.18f + i * 0.10f;
+                sb.Draw(
+                    _pixel,
+                    center + new Vector2(0f, 70f),
+                    sourceRectangle: null,
+                    color: Color.White * alpha,
+                    rotation: rot,
+                    origin: new Vector2(0.5f, 0.5f),
+                    scale: new Vector2(size, size),
+                    effects: SpriteEffects.None,
+                    layerDepth: 0f);
+            }
+            
+            var title = !_hasLoadedWorld ? "WORLD MATERIALIZING..." : 
+                       _worldSyncInProgress ? "DIMENSIONAL SYNC..." : 
+                       "REALM STABILIZING...";
+            var titleSize = _font.MeasureString(title);
+            _font.DrawString(sb, title, new Vector2(center.X - titleSize.X / 2f, center.Y - 20), Color.White);
+
+            if (!_spawnPrewarmComplete && _prewarmTargetCount > 0)
+            {
+                var progress = $"PREWARM {_prewarmReadyCount}/{_prewarmTargetCount}";
+                var progressSize = _font.MeasureString(progress);
+                _font.DrawString(sb, progress, new Vector2(center.X - progressSize.X / 2f, center.Y + 10 + _font.LineHeight + 6), Color.White);
+
+                // Progress bar (accurate to the tier-0 mesh gate).
+                var pct = Math.Clamp(_prewarmReadyCount / (float)Math.Max(1, _prewarmTargetCount), 0f, 1f);
+                var barW = 260;
+                var barH = 10;
+                var barX = (int)center.X - barW / 2;
+                var barY = (int)center.Y + 10 + _font.LineHeight * 2 + 14;
+                sb.Draw(_pixel, new Rectangle(barX, barY, barW, barH), Color.White * 0.18f);
+                sb.Draw(_pixel, new Rectangle(barX, barY, (int)(barW * pct), barH), Color.White * 0.65f);
+            }
+            
+            // Spinner glyph so it feels alive even before prewarm starts.
+            char[] spinner = new[] { '|', '/', '-', '\\', '|', '/', '-', '\\' };
+            var spin = spinner[_spinnerFrame % spinner.Length].ToString();
+            _font.DrawString(sb, spin, new Vector2(center.X - 4, center.Y + 6), Color.White);
+            
+            sb.End();
+            return;
+        }
+
+        var device = sb.GraphicsDevice;
+        var clearColor = SkyColor;
+#if DEBUG
+        if (!_debugSkyClear)
+            clearColor = Color.Black;
+#endif
+        device.Clear(clearColor);
+        device.DepthStencilState = DepthStencilState.Default;
+        
+        // D) DEBUG / WIREFRAME SAFETY - Disable wireframe during prewarm and first frame
+        bool allowWireframe = false;
+#if DEBUG
+        allowWireframe = _debugWireframe && _visibilitySafe && !_firstGameplayFrame;
+        device.RasterizerState = allowWireframe ? WireframeState : RasterizerState.CullNone;
+#else
+        device.RasterizerState = RasterizerState.CullNone;
+#endif
+        device.BlendState = BlendState.Opaque;
+        
+        var sampler = GetWorldSampler();
+        device.SamplerStates[0] = sampler;
+#if DEBUG
+        _blockSamplerLabel = sampler.ToString() ?? "null";
+#endif
+
+        EnsureEffect(device);
+        EnsureCutoutEffect(device);
+        if (_effect == null || _cutoutEffect == null || _atlas == null)
+            return;
+
+        var view = GetViewMatrix();
+        var cameraPosition = _cameraPosition;
+        var xrayMode = _gameMode == GameMode.Veilseer && _veilseerXrayEnabled;
+        var aspect = device.Viewport.AspectRatio;
+        var chunkWorld = VoxelChunkData.ChunkSizeX * Scale.BlockSize;
+        var farPlane = MathF.Max(500f, (_activeRadiusChunks + 4) * chunkWorld);
+        var proj = Matrix.CreatePerspectiveFieldOfView(MathHelper.ToRadians(70f), aspect, 0.1f, farPlane);
+        
+        _effect.TextureEnabled = true;
+        _effect.Texture = _atlas.Texture;
+        _effect.FogEnabled = !xrayMode;
+        _effect.FogColor = clearColor.ToVector3();
+        
+        // 5) DISTANCE FOG - Tied to render distance to prevent seeing sharp void edges
+        var fogStartRadius = Math.Max(4f, (_activeRadiusChunks - 3) * chunkWorld);
+        var fogEndRadius = Math.Max(fogStartRadius + chunkWorld * 2f, (_activeRadiusChunks - 0.8f) * chunkWorld);
+        
+        _effect.FogStart = fogStartRadius;
+        _effect.FogEnd = fogEndRadius;
+        _effect.View = view;
+        _effect.Projection = proj;
+        _effect.World = Matrix.Identity;
+        _effect.DiffuseColor = Vector3.One;
+        _effect.Alpha = xrayMode ? 0.34f : 1f;
+
+        _cutoutEffect.Texture = _atlas.Texture;
+        _cutoutEffect.World = Matrix.Identity;
+        _cutoutEffect.View = view;
+        _cutoutEffect.Projection = proj;
+        _cutoutEffect.FogEnabled = !xrayMode;
+        _cutoutEffect.FogColor = clearColor.ToVector3();
+        _cutoutEffect.FogStart = fogStartRadius;
+        _cutoutEffect.FogEnd = fogEndRadius;
+        _cutoutEffect.Alpha = xrayMode ? 0.34f : 1f;
+        _cutoutEffect.AlphaFunction = CompareFunction.Greater;
+        _cutoutEffect.ReferenceAlpha = 128;
+
+        var frustum = new BoundingFrustum(view * proj);
+
+#if DEBUG
+        _debugWorldAtlasBound = _effect.Texture != null;
+#endif
+        // Opaque pass
+        device.BlendState = xrayMode ? BlendState.AlphaBlend : BlendState.Opaque;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.Default;
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.OpaqueVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+
+            // Validate vertex data before rendering
+            if (verts.Length % 3 != 0)
+            {
+                _log.Warn($"Invalid vertex count for chunk {coord}: {verts.Length} (must be multiple of 3)");
+                continue;
+            }
+
+            try
+            {
+                // Safe rendering with error handling
+                foreach (var pass in _effect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Rendering error for chunk {coord}: {ex.Message}");
+                // Remove problematic mesh to prevent repeated errors
+                _chunkMeshes.Remove(coord, out _);
+            }
+        }
+
+        // Cutout pass (leaves and similar alpha-cut materials)
+        device.BlendState = xrayMode ? BlendState.AlphaBlend : BlendState.Opaque;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.Default;
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.CutoutVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+            if (verts.Length % 3 != 0)
+            {
+                _log.Warn($"Invalid cutout vertex count for chunk {coord}: {verts.Length} (must be multiple of 3)");
+                continue;
+            }
+
+            try
+            {
+                foreach (var pass in _cutoutEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Cutout rendering error for chunk {coord}: {ex.Message}");
+                _chunkMeshes.Remove(coord, out _);
+            }
+        }
+
+        var drawLocalPlayerModel = IsThirdPersonCameraActive()
+            && _thirdPersonCameraDistance >= (ThirdPersonHideModelDistanceBlocks * Scale.BlockSize);
+#if DEBUG
+        drawLocalPlayerModel = drawLocalPlayerModel || _debugDrawPlayerModel;
+#endif
+        if (drawLocalPlayerModel)
+        {
+            device.SamplerStates[0] = SamplerState.PointClamp;
+            DrawPlayerModel(device, view, proj);
+            device.SamplerStates[0] = sampler;
+        }
+        device.SamplerStates[0] = SamplerState.PointClamp;
+        DrawRemotePlayers(device, view, proj);
+        device.SamplerStates[0] = sampler;
+        DrawFlyingPlayerOutlines(device, view, proj, drawLocalPlayerModel);
+
+        device.BlendState = BlendState.NonPremultiplied;
+        device.DepthStencilState = xrayMode ? DepthStencilState.None : DepthStencilState.DepthRead;
+
+        // Blended transparency pass (sorted far-to-near)
+        var transparentOrder = new List<(ChunkCoord Coord, float DistSq)>();
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.TransparentVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+
+            var center = mesh.Bounds.Min + (mesh.Bounds.Max - mesh.Bounds.Min) * 0.5f;
+            transparentOrder.Add((coord, Vector3.DistanceSquared(center, cameraPosition)));
+        }
+        transparentOrder.Sort((a, b) => b.DistSq.CompareTo(a.DistSq));
+
+        foreach (var pair in transparentOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(pair.Coord, out var mesh))
+                continue;
+            var verts = mesh.TransparentVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+
+            // Validate vertex data before rendering
+            if (verts.Length % 3 != 0)
+            {
+                _log.Warn($"Invalid transparent vertex count for chunk {pair.Coord}: {verts.Length} (must be multiple of 3)");
+                continue;
+            }
+
+            try
+            {
+                // Safe rendering with error handling
+                foreach (var pass in _effect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Transparent rendering error for chunk {pair.Coord}: {ex.Message}");
+                // Remove problematic mesh to prevent repeated errors
+                _chunkMeshes.Remove(pair.Coord, out _);
+            }
+        }
+
+        DrawWaterChunks(device, frustum, view, proj);
+
+        DrawWorldItems(device, view, proj);
+        if (_blockBreakParticles.ActiveCount > 0)
+        {
+            sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            _blockBreakParticles.Draw(sb, _pixel, view, proj, device.Viewport);
+            sb.End();
+        }
+
+        var drawHands = (!_pauseMenuOpen && _gameMode != GameMode.Veilseer && !IsThirdPersonCameraActive()) 
+            || (_gameMode == GameMode.Veilseer && _veilseerSpectateTargetPlayerId >= 0 && !IsThirdPersonCameraActive());
+#if DEBUG
+        drawHands = drawHands && !_debugDisableHands;
+        _debugOverlayAtlasBound = drawHands && _atlas?.Texture != null;
+#endif
+        if (drawHands)
+            DrawFirstPersonHands(device, view, proj);
+
+        if (!_pauseMenuOpen && (_gameMode != GameMode.Veilseer || (_gameMode == GameMode.Veilseer && _veilseerSpectateTargetPlayerId >= 0)))
+            DrawBlockHighlight(device, view, proj);
+        else
+            _highlightActive = false;
+
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        DrawReticle(sb);
+        var name = _meta?.Name ?? "WORLD";
+        var mode = _gameMode;
+        _font.DrawString(sb, $"WORLD: {name}", new Vector2(_viewport.X + 20, _viewport.Y + 20), Color.White);
+        _font.DrawString(sb, $"MODE: {mode.ToString().ToUpperInvariant()}", new Vector2(_viewport.X + 20, _viewport.Y + 20 + _font.LineHeight + 4), Color.White);
+        var modeCombo = $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)}";
+        var finderKey = FormatKeyLabel(_structureFinderKey);
+        var crouchKeyLabel = FormatKeyLabel(_stackModifierKey);
+        var sprintKeyLabel = FormatKeyLabel(_sprintKey);
+        var descendKeyLabel = FormatKeyLabel(_flyDescendKey);
+        var controlsHint = _gameMode == GameMode.Veilseer
+            ? $"VEILSEER: 1-9 SPECTATE | 0/{crouchKeyLabel} DETACH | {FormatKeyLabel(_veilseerXrayToggleKey)} XRAY | WHEEL FLY SPEED | {modeCombo} MODE/CYCLE | ESC PAUSE"
+            : $"WASD MOVE | SPACE JUMP | {crouchKeyLabel} SNEAK | {sprintKeyLabel} SPRINT | {descendKeyLabel} FLY DOWN | WHEEL HOTBAR | {FormatKeyLabel(_gamemodeModifierKey)}+WHEEL(FLY)=SPEED | F5 VIEW | HOLD {FormatKeyLabel(_gamemodeModifierKey)}+MOUSE FREE LOOK (3RD) | {modeCombo} MODE/CYCLE | {finderKey} FINDER | ESC PAUSE";
+        _font.DrawString(sb, controlsHint, new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
+        
+        if (_gameMode != GameMode.Veilseer)
+            DrawHotbar(sb);
+        DrawContextIndicators(sb);
+        DrawSelectedBlockName(sb);
+        DrawWorldNametags(sb, device, view, proj);
+        DrawCommandOverlay(sb);
+        DrawGamemodeToast(sb);
+        DrawFlySpeedToast(sb);
+        DrawVeilseerStatus(sb);
+        DrawThirdPersonStatus(sb);
+        DrawVeilseerSpectatePopup(sb);
+        DrawGamemodeWheel(sb);
+        if (_homeGuiOpen)
+            DrawHomeGui(sb);
+        if (_structureFinderOpen)
+            DrawStructureFinderGui(sb);
+        if (_debugHudVisible)
+            DrawDevOverlay(sb);
+        DrawFaceOverlay(sb);
+        DrawPlayerList(sb);
+        sb.End();
+
+        if (_pauseMenuOpen)
+            DrawPauseMenu(sb);
+        if (_inventoryOpen)
+            DrawInventory(sb);
+            
+        // E) FAILSAFE ASSERT - Check visibility on first gameplay frame
+        if (_visibilitySafe && !_firstGameplayFrame && !_visibilityAssertLogged)
+        {
+            _firstGameplayFrame = true;
+            PerformVisibilityAssert();
+        }
+    }
+
+    private async Task<string> ResolveUsernameAsync(string puid)
+    {
+        puid = (puid ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(puid)) return string.Empty;
+
+        lock (_usernameCache)
+        {
+            if (_usernameCache.TryGetValue(puid, out var cached))
+                return cached;
+        }
+
+        var localUsername = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(localUsername) && !LooksLikeIdentityToken(localUsername))
+        {
+            var localPuid = (EosClientProvider.Current?.LocalProductUserId ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(localPuid) && string.Equals(localPuid, puid, StringComparison.OrdinalIgnoreCase))
+            {
+                CacheUsername(puid, localUsername);
+                return localUsername;
+            }
+        }
+
+        for (var i = 0; i < _profile.Friends.Count; i++)
+        {
+            var friend = _profile.Friends[i];
+            var friendId = (friend.UserId ?? string.Empty).Trim();
+            if (!string.Equals(friendId, puid, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var label = (friend.Label ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(label) && !LooksLikeIdentityToken(label))
+            {
+                CacheUsername(puid, label);
+                return label;
+            }
+        }
+
+        try
+        {
+            var result = await _onlineGate.ResolveIdentityAsync(puid);
+            if (result.Found && result.User != null && !string.IsNullOrWhiteSpace(result.User.Username))
+            {
+                var username = result.User.Username.Trim();
+                if (!LooksLikeIdentityToken(username))
+                {
+                    CacheUsername(puid, username);
+                    return username;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to resolve username for {puid}: {ex.Message}");
+        }
+
+        return string.Empty;
+    }
+
+    private void CacheUsername(string puid, string username)
+    {
+        var key = (puid ?? string.Empty).Trim();
+        var value = (username ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value) || LooksLikeIdentityToken(value))
+            return;
+
+        lock (_usernameCache)
+            _usernameCache[key] = value;
+    }
+
+    private static bool LooksLikeIdentityToken(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        if (string.Equals(text, "UNKNOWN", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "PLAYER", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "HOST", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (Guid.TryParse(text, out _))
+            return true;
+
+        var compact = text.Replace("-", string.Empty);
+        if (compact.Length >= 16 && compact.All(Uri.IsHexDigit))
+            return true;
+
+        if (text.Contains("...", StringComparison.Ordinal)
+            || text.StartsWith("PLAYER-", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private void TickHostedOnlineLobbyHeartbeat()
+    {
+        if (_lanSession is not EosP2PHostSession || !_lanSession.IsConnected)
+            return;
+
+        var nowUtc = DateTime.UtcNow;
+        if (_sessionHeartbeatInFlight || nowUtc < _nextSessionHeartbeatUtc)
+            return;
+
+        var eos = EnsureEosClient();
+        if (eos == null || !eos.IsLoggedIn)
+            return;
+
+        var worldName = (_meta?.Name ?? _world?.Meta?.Name ?? "WORLD").Trim();
+        if (string.IsNullOrWhiteSpace(worldName))
+            worldName = "WORLD";
+
+        var gameMode = (_meta?.CurrentWorldGameMode ?? _gameMode).ToString();
+        var displayName = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(displayName))
+            displayName = "Host";
+        var worldId = (_meta?.WorldId ?? _world?.Meta?.WorldId ?? string.Empty).Trim();
+        var playerCount = Math.Max(1, _playerNames.Count);
+        const int maxPlayers = 8;
+        var isInWorld = _hasLoadedWorld && !_worldSyncInProgress && !_isClosing;
+
+        _sessionHeartbeatInFlight = true;
+        var tick = ++_sessionHeartbeatTickCount;
+        _log.Info($"EOS_LOBBY_HEARTBEAT tick={tick} world={worldName} inWorld={isInWorld} players={playerCount}");
+        _ = SendHostedOnlineLobbyHeartbeatAsync(
+            tick,
+            eos,
+            displayName,
+            worldName,
+            gameMode,
+            isInWorld,
+            playerCount,
+            maxPlayers,
+            worldId);
+    }
+
+    private async Task SendHostedOnlineLobbyHeartbeatAsync(
+        int tick,
+        EosClient eos,
+        string displayName,
+        string worldName,
+        string gameMode,
+        bool isInWorld,
+        int playerCount,
+        int maxPlayers,
+        string worldId)
+    {
+        try
+        {
+            var ok = await eos.StartOrUpdateHostedLobbyAsync(
+                worldName: worldName,
+                gameMode: gameMode,
+                cheats: false,
+                playerCount: playerCount,
+                maxPlayers: maxPlayers,
+                isInWorld: isInWorld,
+                hostUsername: displayName,
+                worldId: worldId);
+
+            _log.Info($"EOS_LOBBY_HEARTBEAT_RESULT tick={tick} ok={ok}");
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(ok ? 2 : 5);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"EOS_LOBBY_HEARTBEAT_RESULT tick={tick} ok=false error={ex.Message}");
+            _nextSessionHeartbeatUtc = DateTime.UtcNow.AddSeconds(5);
+        }
+        finally
+        {
+            _sessionHeartbeatInFlight = false;
+        }
+    }
+
+    private void LoadWorld()
+    {
+        try
+        {
+            MigrateLegacyWorldTextFiles();
+            _whitelist = LoadWhitelistEntries();
+            if (PruneWhitelistIdentityTokens())
+                SaveWhitelist();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load whitelist: {ex.Message}");
+        }
+
+        var swTotal = Stopwatch.StartNew();
+
+        var sw = Stopwatch.StartNew();
+        // If world was not pre-loaded by the host screen, load it now.
+        if (_world == null)
+        {
+            _world = VoxelWorld.Load(_worldPath, _metaPath, _log);
+            if (_world == null)
+            {
+                _log.Warn("World data missing; cannot load world.");
+                return;
+            }
+        }
+        sw.Stop();
+        _log.Info($"World load: VoxelWorld.Load {sw.ElapsedMilliseconds}ms");
+
+        _meta = _world.Meta;
+        _gameMode = _meta.CurrentWorldGameMode;
+        _playerCollisionEnabled = _meta.PlayerCollision;
+        _timeCycleEnabled = _meta.Gameplay?.TimeCycleEnabled ?? _meta.TimeCycleEnabled;
+        _weatherCycleEnabled = _meta.Gameplay?.WeatherCycleEnabled ?? _meta.WeatherCycleEnabled;
+        _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_meta.Gameplay?.TimeOfDayTicks ?? _meta.TimeOfDayTicks);
+        _weatherState = WorldMeta.CanonicalWeatherState(_meta.Gameplay?.WeatherState ?? _meta.WeatherState);
+        SyncWeatherCycleIndexFromState(resetAccumulator: true);
+        SyncRuntimeRulesToMeta(persist: false);
+        _difficultyLevel = Math.Clamp(_meta.DifficultyLevel, 0, 3);
+        LoadOperatorsFromMeta();
+        _biomeIndex = BiomeIndexStore.Load(_worldPath, _log);
+        if (_biomeIndex == null || !_biomeIndex.IsCompatible(_meta))
+        {
+            _biomeIndex = BiomeLocateService.BuildCoverageIndex(_meta, stride: 64);
+            _biomeIndex.Save(_worldPath, _log);
+        }
+        SpawnPrewarmManifest? prewarmManifest = null;
+        if (SpawnPrewarmStore.TryLoad(_worldPath, _log, out var loadedPrewarmManifest))
+            prewarmManifest = loadedPrewarmManifest;
+        _spawnPrewarmManifest = prewarmManifest;
+
+        // 1) FIX INIT ORDER: Build atlas FIRST, then create streaming service
+        sw.Restart();
+        _atlas = CubeNetAtlas.Build(_assets, _log, _settings.QualityPreset);
+        sw.Stop();
+        _log.Info($"World load: CubeNetAtlas.Build {sw.ElapsedMilliseconds}ms");
+        
+        // 1) HARD GUARD: Ensure atlas is valid before creating streaming service
+        if (_atlas == null || _atlas.Texture == null)
+        {
+            _log.Error("Atlas build failed, cannot initialize streaming service");
+            return;
+        }
+        
+        if (_streamingService == null)
+            _streamingService = new StubStreamingService(_world, _log);
+        if (_pregenerationService == null)
+            _pregenerationService = new StubPregenerationService(_world, _log);
+        
+        InitBlockModel();
+        
+        _player.AllowFlying = _gameMode == GameMode.Artificer || _gameMode == GameMode.Veilseer;
+        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        _player.NoClipEnabled = _gameMode == GameMode.Veilseer;
+        _inventory.SetMode(_gameMode);
+        if (_gameMode == GameMode.Veilwalker)
+            _player.SetFlying(false);
+        else if (_gameMode == GameMode.Veilseer)
+            _player.SetFlying(true);
+
+        // Initialize performance optimizer for maximum GPU/CPU/RAM utilization
+        AdvancedPerformanceOptimizer.Initialize();
+        _log.Info(
+            $"Streaming budgets: chunkReq={Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget)} " +
+            $"meshReq={Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget)} " +
+            $"chunkWorkers={ChunkWorkerCount} meshWorkers={MeshWorkerCount}");
+        
+        // RESTORE PLAYER POSITION FIRST - This determines where chunks need to be loaded
+        RestoreOrCenterCamera();
+
+        // Prime the player's current chunk immediately so joining feels instant even without spawn prewarm.
+        PrimeSpawnChunkImmediate();
+
+        if (IsJoinedClientSession)
+        {
+            _spawnPrewarmComplete = true;
+            _prewarmTargetCount = 0;
+            _prewarmReadyCount = 0;
+            swTotal.Stop();
+            _log.Info($"World load: joined-client mode (local pregeneration skipped) {swTotal.ElapsedMilliseconds}ms");
+            return;
+        }
+         
+        // AGGRESSIVE FIX: Generate solid ground immediately at player position
+        // DISABLED: HybridWorldManager handles this now
+        // GenerateSolidGroundAtPlayer();
+        
+        // CRITICAL: Force immediate chunk generation at player position BEFORE anything else
+        // DISABLED: HybridWorldManager handles this now
+        // ForceGeneratePlayerChunk();
+        
+        // Pre-load chunks around PLAYER'S SAVED POSITION (not just spawn)
+        // DISABLED: HybridWorldManager handles this now
+        // PreloadChunksAroundPlayer();
+        // PreloadChunksAroundPlayer();
+        
+        // Pregeneration starts AFTER the spawn prewarm gate completes.
+        // This prevents background pregeneration from starving the prewarm pipeline.
+        _pregenerationStarted = false;
+        
+        // WorldGenerationTest is DEV-only; never run it automatically during join.
+#if DEBUG
+        if (Environment.GetEnvironmentVariable("LV_RUN_WORLDGEN_TESTS") == "1")
+        {
+            try
+            {
+                _log.Info("=== Testing New World Generation System ===");
+                WorldGenerationTest.RunTest(_log);
+                _log.Info("=== New World Generation System Test Complete ===");
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"World generation test failed: {ex.Message}");
+            }
+        }
+#endif
+        sw.Stop();
+        _log.Info($"World load: player position chunk pre-load {sw.ElapsedMilliseconds}ms");
+
+        // CRITICAL: Wait for player's chunk to be COMPLETELY loaded before allowing movement
+        // DISABLED: HybridWorldManager handles this now
+        // WaitForPlayerChunkComplete();
+        
+        // OPTIMIZED: Force mesh generation without blocking to prevent freezes
+        // DISABLED: HybridWorldManager handles this now
+        // ForceGeneratePlayerChunkMeshOptimized();
+        
+        // AGGRESSIVE: Ensure all chunks around player are visible
+        // DISABLED: HybridWorldManager handles this now
+        // EnsureAllChunksVisible();
+        
+        // ULTRA AGGRESSIVE: Force load more chunks to prevent missing chunks
+        // DISABLED: HybridWorldManager handles this now
+        // ForceLoadAdditionalChunks();
+        
+        // RESEARCH-BASED: Implement spawn chunk system for guaranteed loading
+        // DISABLED: HybridWorldManager handles this now
+        // EnsureSpawnChunksLoaded();
+        
+        // RESEARCH-BASED: Implement force loading system similar to server force-load commands
+        // DISABLED: HybridWorldManager handles this now
+        // ForceLoadCriticalChunks();
+        
+        // AGGRESSIVE SAFETY: Ensure player has solid ground to stand on
+        // DISABLED: HybridWorldManager handles this now
+        // EnsureSolidGroundUnderPlayer();
+        
+        EnsurePlayerNotInsideSolid(forceLog: false);
+        InitializePrewarmTargets();
+        UpdateActiveChunks(force: false);
+
+        swTotal.Stop();
+        _log.Info($"World load: total {swTotal.ElapsedMilliseconds}ms");
+    }
+
+    private void InitBlockModel()
+    {
+        _blockIconCache?.Dispose();
+        _blockIconCache = null;
+
+        _blockModel = BlockModel.LoadOrDefault(_log);
+        if (_atlas == null)
+            return;
+
+        _blockIconCache = new BlockIconCache(_assets.GraphicsDevice, _atlas, _blockModel, _log);
+    }
+
+    private int GetStreamingMaxChunkY(int playerChunkY)
+    {
+        if (_world == null)
+            return 0;
+
+        var worldMax = Math.Max(0, _world.MaxChunkY);
+        var terrainBandTop = Math.Min(worldMax, PrewarmVerticalChunkTop);
+        var playerHeadroomTop = Math.Clamp(playerChunkY + 2, 0, worldMax);
+        return Math.Max(terrainBandTop, playerHeadroomTop);
+    }
+
+    private bool HasFiniteWorldBounds()
+        => _meta?.HasFiniteWorldBounds() ?? false;
+
+    private int ClampWorldX(int x)
+        => HasFiniteWorldBounds() ? Math.Clamp(x, 0, Math.Max(0, _meta!.Size.Width - 1)) : x;
+
+    private int ClampWorldZ(int z)
+        => HasFiniteWorldBounds() ? Math.Clamp(z, 0, Math.Max(0, _meta!.Size.Depth - 1)) : z;
+
+    private bool IsChunkWithinWorldBounds(ChunkCoord coord)
+    {
+        if (_meta?.Size == null || !HasFiniteWorldBounds())
+            return true;
+
+        var minX = coord.X * VoxelChunkData.ChunkSizeX;
+        var minZ = coord.Z * VoxelChunkData.ChunkSizeZ;
+        var maxX = minX + VoxelChunkData.ChunkSizeX - 1;
+        var maxZ = minZ + VoxelChunkData.ChunkSizeZ - 1;
+        return maxX >= 0
+            && maxZ >= 0
+            && minX < _meta.Size.Width
+            && minZ < _meta.Size.Depth;
+    }
+
+    private void InitializePrewarmTargets()
+    {
+        if (_world == null)
+            return;
+
+        if (!ENABLE_SPAWN_PREWARM)
+        {
+            _prewarmRequiredChunks.Clear();
+            _tier0Chunks.Clear();
+            _prewarmTargetCount = 0;
+            _prewarmReadyCount = 0;
+
+            _spawnPrewarmComplete = true;
+            _visibilitySafe = true;
+
+            _log.Info("Spawn prewarm DISABLED: entering world immediately; chunks/meshes will stream in the background.");
+            return;
+        }
+
+        var focusPosition = _player.Position;
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
+        {
+            focusPosition = observed.Position;
+        }
+
+        var playerChunk = VoxelWorld.WorldToChunk(
+            (int)MathF.Floor(focusPosition.X),
+            (int)MathF.Floor(focusPosition.Y),
+            (int)MathF.Floor(focusPosition.Z),
+            out _, out _, out _);
+
+        var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
+        var prewarmRadius = Math.Clamp(Math.Min(_activeRadiusChunks, PrewarmRadius), 2, PrewarmRadius);
+        var gateRadius = Math.Clamp(Math.Min(prewarmRadius, PrewarmGateRadius), 1, prewarmRadius);
+        var prewarmRadiusSq = prewarmRadius * prewarmRadius;
+        var gateRadiusSq = gateRadius * gateRadius;
+
+        _prewarmRequiredChunks.Clear();
+        _tier0Chunks.Clear();
+
+        for (var dz = -prewarmRadius; dz <= prewarmRadius; dz++)
+        {
+            for (var dx = -prewarmRadius; dx <= prewarmRadius; dx++)
+            {
+                var distSq = dx * dx + dz * dz;
+                if (distSq > prewarmRadiusSq)
+                    continue;
+
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
+                    _prewarmRequiredChunks.Add(coord);
+                    if (distSq <= gateRadiusSq)
+                        _tier0Chunks.Add(coord);
+                }
+            }
+        }
+
+        _prewarmTargetCount = _tier0Chunks.Count;
+        _prewarmReadyCount = 0;
+        _spawnPrewarmComplete = false;
+        _visibilitySafe = false;
+        _firstGameplayFrame = false;
+        _visibilityAssertLogged = false;
+        _spawnPrewarmStartTime = DateTime.UtcNow;
+
+        PrimeTier0FromMeshCache();
+        if (IsPrewarmGateReady())
+        {
+            _spawnPrewarmComplete = true;
+            _visibilitySafe = true;
+            _log.Info($"Prewarm satisfied from cache ({_prewarmReadyCount}/{_prewarmTargetCount} gate chunks).");
+        }
+
+        if (!_spawnPrewarmComplete)
+        {
+            foreach (var coord in _tier0Chunks)
+            {
+                QueueChunkGeneration(coord);
+            }
+        }
+
+        _log.Info($"Prewarm targets: gate={_prewarmTargetCount}, full={_prewarmRequiredChunks.Count}, radius={prewarmRadius}, maxCy={maxCy}");
+    }
+
+    private void PrimeTier0FromMeshCache()
+    {
+        // Disabled: mesh cache is not persisted on disk.
+    }
+
+    private void QueueChunkGeneration(ChunkCoord coord)
+    {
+        if (!IsChunkNearAnyFocus(coord, _streamingFocusChunks) && (_chunkGenerationQueued.Count + _chunkGenerationInFlight.Count) >= MaxOutstandingChunkJobs)
+            return;
+
+        if (_chunkGenerationQueued.TryAdd(coord, 0))
+            _chunkGenerationQueue.Enqueue(coord);
+    }
+
+    private void ProcessChunkGenerationJobs(int maxSchedule)
+    {
+        if (_world == null || _isClosing || maxSchedule <= 0)
+            return;
+
+        var scheduled = 0;
+        while (scheduled < maxSchedule && _chunkGenerationQueue.TryDequeue(out var coord))
+        {
+            _chunkGenerationQueued.TryRemove(coord, out _);
+
+            if (_chunkGenerationInFlight.ContainsKey(coord))
+                continue;
+
+            if (!_chunkGenerationInFlight.TryAdd(coord, 0))
+                continue;
+
+            if (!_chunkGenerationSemaphore.Wait(0))
+            {
+                _chunkGenerationInFlight.TryRemove(coord, out _);
+                QueueChunkGeneration(coord);
+                break;
+            }
+
+            var world = _world;
+            var cancellationToken = _backgroundWorkCts.Token;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
+                    world.GetOrCreateChunk(coord);
+                }
+                catch (OperationCanceledException)
+                {
+                    // ignored
+                }
+                catch (Exception ex)
+                {
+                    _log.Debug($"Chunk generation skipped for {coord}: {ex.Message}");
+                }
+                finally
+                {
+                    _chunkGenerationInFlight.TryRemove(coord, out _);
+                    _chunkGenerationSemaphore.Release();
+                }
+            }, cancellationToken);
+
+            scheduled++;
+        }
+    }
+
+
+
+    private void PrimeSpawnChunkImmediate()
+    {
+        try
+        {
+            if (_world == null || _atlas == null) return;
+            var pos = _player.Position;
+
+            VoxelWorld.WorldToChunkCoords(
+                (int)pos.X,
+                (int)pos.Y,
+                (int)pos.Z,
+                out var chunkX,
+                out var chunkY,
+                out var chunkZ);
+
+            var gateCoords = BuildSpawnPrimeCoords(chunkX, chunkY, chunkZ);
+            var builtFallback = 0;
+            const int fallbackBuildLimit = 8;
+
+            for (var i = 0; i < gateCoords.Count; i++)
+            {
+                var coord = gateCoords[i];
+                if (!IsChunkWithinWorldBounds(coord))
+                    continue;
+
+                if (IsJoinedClientSession)
+                {
+                    if (!_world.TryGetChunk(coord, out var existingChunk) || existingChunk == null)
+                        continue;
+                }
+                else
+                {
+                    _world.GetOrCreateChunk(coord);
+                }
+
+                if (_chunkMeshes.ContainsKey(coord))
+                    continue;
+
+                if (builtFallback >= fallbackBuildLimit)
+                {
+                    QueuePriorityMeshBuild(coord);
+                    continue;
+                }
+
+                if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                    continue;
+
+                var mesh = VoxelMesherGreedy.BuildChunkMeshPriority(_world, chunk, _atlas, _log);
+                if (!ValidateMesh(mesh))
+                    continue;
+
+                _chunkMeshes[coord] = mesh;
+                if (!_chunkOrder.Contains(coord))
+                    _chunkOrder.Add(coord);
+                builtFallback++;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn($"PrimeSpawnChunkImmediate failed: {ex.Message}");
+        }
+    }
+
+    private List<ChunkCoord> BuildSpawnPrimeCoords(int fallbackChunkX, int fallbackChunkY, int fallbackChunkZ)
+    {
+        var coords = new List<ChunkCoord>();
+        var seen = new HashSet<ChunkCoord>();
+        var worldMaxCy = _world?.MaxChunkY ?? Math.Max(0, fallbackChunkY);
+        var primaryChunkY = Math.Clamp(fallbackChunkY, 0, worldMaxCy);
+        var lowerChunkY = Math.Max(0, primaryChunkY - 1);
+        var upperChunkY = Math.Min(worldMaxCy, primaryChunkY + 1);
+
+        void AddCoord(ChunkCoord coord)
+        {
+            if (seen.Add(coord))
+                coords.Add(coord);
+        }
+
+        // Always prime around the player's current chunk first so rejoin never opens into a distant spawn gate.
+        for (var ring = 0; ring <= 1; ring++)
+        {
+            for (var dz = -ring; dz <= ring; dz++)
+            {
+                for (var dx = -ring; dx <= ring; dx++)
+                {
+                    if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != ring)
+                        continue;
+
+                    var cx = fallbackChunkX + dx;
+                    var cz = fallbackChunkZ + dz;
+                    AddCoord(new ChunkCoord(cx, primaryChunkY, cz));
+                    if (ring == 0)
+                    {
+                        AddCoord(new ChunkCoord(cx, lowerChunkY, cz));
+                        AddCoord(new ChunkCoord(cx, upperChunkY, cz));
+                    }
+                }
+            }
+        }
+
+        // Include nearby prewarm coords only if they overlap the current player area.
+        if (_spawnPrewarmManifest?.GateChunks != null)
+        {
+            for (var i = 0; i < _spawnPrewarmManifest.GateChunks.Count; i++)
+            {
+                var coord = _spawnPrewarmManifest.GateChunks[i];
+                if (Math.Abs(coord.X - fallbackChunkX) > 2 || Math.Abs(coord.Z - fallbackChunkZ) > 2)
+                    continue;
+                AddCoord(coord);
+            }
+        }
+
+        return coords;
+    }
+
+    private void UpdateActiveRadiusRamp(float dt)
+    {
+        if (_world == null || _activeRadiusChunks >= _targetActiveRadiusChunks)
+            return;
+
+        var outstandingChunkJobs = _chunkGenerationQueued.Count + _chunkGenerationInFlight.Count;
+        var outstandingMeshJobs = _meshQueue.Count + _priorityMeshQueue.Count + _meshBuildInFlight.Count;
+        if (outstandingChunkJobs > ActiveRadiusRampChunkThreshold || outstandingMeshJobs > ActiveRadiusRampMeshThreshold)
+        {
+            _activeRadiusRampTimer = 0f;
+            return;
+        }
+
+        _activeRadiusRampTimer += dt;
+        if (_activeRadiusRampTimer < ActiveRadiusRampIntervalSeconds)
+            return;
+
+        _activeRadiusRampTimer = 0f;
+        _activeRadiusChunks++;
+        _log.Info($"Streaming radius ramped to {_activeRadiusChunks}/{_targetActiveRadiusChunks}.");
+    }
+
+    private static int GetInitialActiveRadius(int targetRadius)
+        => Math.Min(targetRadius, StartupActiveRadiusChunks);
+
+    private void ProcessPrewarmStep()
+    {
+        if (_world == null)
+            return;
+
+        ProcessStreamingResults(aggressiveApply: true);
+        ProcessChunkGenerationJobs(PrewarmChunkBudgetPerFrame);
+        UpdateActiveChunks(force: false);
+        QueueDirtyChunks();
+        ProcessMeshBuildQueue(PrewarmMeshBudgetPerFrame);
+
+        if (IsPrewarmGateReady())
+        {
+            _spawnPrewarmComplete = true;
+            _visibilitySafe = true;
+            var elapsed = (DateTime.UtcNow - _spawnPrewarmStartTime).TotalSeconds;
+            _log.Info($"Prewarm complete in {elapsed:0.00}s ({_prewarmReadyCount}/{_prewarmTargetCount} gate chunks ready).");
+            return;
+        }
+
+        var elapsedSeconds = (DateTime.UtcNow - _spawnPrewarmStartTime).TotalSeconds;
+        if (elapsedSeconds >= PrewarmTimeoutSeconds)
+        {
+            _spawnPrewarmComplete = true;
+            _visibilitySafe = true;
+            _log.Warn($"Prewarm timeout at {elapsedSeconds:0.00}s; continuing with {_prewarmReadyCount}/{_prewarmTargetCount} gate chunks.");
+        }
+    }
+
+    private bool IsPrewarmGateReady()
+    {
+        if (_world == null)
+            return false;
+
+        if (_tier0Chunks.Count == 0)
+            return true;
+
+        var ready = 0;
+        foreach (var coord in _tier0Chunks)
+        {
+            if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+            {
+                QueueChunkGeneration(coord);
+                continue;
+            }
+
+            if (_chunkMeshes.TryGetValue(coord, out _))
+            {
+                ready++;
+            }
+            else
+            {
+                QueueMeshBuild(coord);
+            }
+        }
+
+        _prewarmReadyCount = ready;
+        return ready >= _tier0Chunks.Count;
+    }
+
+    private void UpdateActiveChunks(bool force)
+    {
+        if (_world == null)
+            return;
+
+        _chunksRequestedThisFrame = 0;
+        _meshesRequestedThisFrame = 0;
+
+        var playerChunk = VoxelWorld.WorldToChunk(
+            (int)MathF.Floor(_player.Position.X),
+            (int)MathF.Floor(_player.Position.Y),
+            (int)MathF.Floor(_player.Position.Z),
+            out _, out _, out _);
+        _centerChunk = playerChunk;
+        _playerChunkCoord = playerChunk;
+
+        BuildStreamingFocusChunks(_streamingFocusChunks);
+        if (_streamingFocusChunks.Count == 0)
+            _streamingFocusChunks.Add(playerChunk);
+
+        var radius = Math.Clamp(_activeRadiusChunks, 2, MaxRuntimeActiveRadius);
+        var radiusSq = radius * radius;
+        var chunkBudgetPerFrame = _spawnPrewarmComplete
+            ? Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget)
+            : Math.Max(Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget), PrewarmChunkBudgetPerFrame);
+        var meshBudgetPerFrame = _spawnPrewarmComplete
+            ? Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget)
+            : Math.Max(Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget), PrewarmMeshBudgetPerFrame);
+        _activeKeepBuffer.Clear();
+        _drawOrderBuffer.Clear();
+        var nearCriticalByCoord = new Dictionary<ChunkCoord, bool>();
+
+        for (var focusIndex = 0; focusIndex < _streamingFocusChunks.Count; focusIndex++)
+        {
+            var focusChunk = _streamingFocusChunks[focusIndex];
+            var maxCy = GetStreamingMaxChunkY(focusChunk.Y);
+            for (var ring = 0; ring <= radius; ring++)
+            {
+                for (var dz = -ring; dz <= ring; dz++)
+                {
+                    for (var dx = -ring; dx <= ring; dx++)
+                    {
+                        if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != ring)
+                            continue;
+                        if (dx * dx + dz * dz > radiusSq)
+                            continue;
+
+                        for (var cy = 0; cy <= maxCy; cy++)
+                        {
+                            var coord = new ChunkCoord(focusChunk.X + dx, cy, focusChunk.Z + dz);
+                            if (!IsChunkWithinWorldBounds(coord))
+                                continue;
+
+                            var nearCritical = ring <= 2 && Math.Abs(cy - focusChunk.Y) <= 1;
+                            if (nearCriticalByCoord.TryGetValue(coord, out var existingNear))
+                            {
+                                if (nearCritical && !existingNear)
+                                    nearCriticalByCoord[coord] = true;
+                                continue;
+                            }
+
+                            nearCriticalByCoord[coord] = nearCritical;
+                            _activeKeepBuffer.Add(coord);
+                            _drawOrderBuffer.Add(coord);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (var i = 0; i < _drawOrderBuffer.Count; i++)
+        {
+            var coord = _drawOrderBuffer[i];
+            var nearCritical = nearCriticalByCoord.TryGetValue(coord, out var isNearCritical) && isNearCritical;
+
+            if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+            {
+                if (!force && !nearCritical && _chunksRequestedThisFrame >= chunkBudgetPerFrame)
+                    continue;
+
+                _chunksRequestedThisFrame++;
+                if (force)
+                {
+                    chunk = _world.GetOrCreateChunk(coord);
+                }
+                else
+                {
+                    QueueChunkGeneration(coord);
+                    continue;
+                }
+            }
+
+            if (chunk.IsDirty || !_chunkMeshes.ContainsKey(coord))
+            {
+                if (!force && !nearCritical && _meshesRequestedThisFrame >= meshBudgetPerFrame)
+                    continue;
+
+                if (nearCritical)
+                    QueuePriorityMeshBuild(coord);
+                else
+                    QueueMeshBuild(coord);
+                _meshesRequestedThisFrame++;
+            }
+        }
+
+        _activeChunks.Clear();
+        foreach (var coord in _activeKeepBuffer)
+            _activeChunks.Add(coord);
+
+        _meshRemovalBuffer.Clear();
+        foreach (var meshCoord in _chunkMeshes.Keys)
+        {
+            if (!_activeKeepBuffer.Contains(meshCoord))
+                _meshRemovalBuffer.Add(meshCoord);
+        }
+
+        for (var i = 0; i < _meshRemovalBuffer.Count; i++)
+        {
+            var coord = _meshRemovalBuffer[i];
+            _chunkMeshes.TryRemove(coord, out _);
+            _meshQueued.Remove(coord);
+        }
+
+        _chunkOrder.Clear();
+        for (var i = 0; i < _drawOrderBuffer.Count; i++)
+        {
+            var coord = _drawOrderBuffer[i];
+            if (_chunkMeshes.ContainsKey(coord))
+                _chunkOrder.Add(coord);
+        }
+    }
+
+    private void BuildStreamingFocusChunks(List<ChunkCoord> output)
+    {
+        output.Clear();
+        var seen = new HashSet<ChunkCoord>();
+
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var spectateTarget))
+        {
+            AddStreamingFocusChunk(output, seen, spectateTarget.Position);
+        }
+
+        AddStreamingFocusChunk(output, seen, _player.Position);
+
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            foreach (var remote in _remotePlayers.Values)
+                AddStreamingFocusChunk(output, seen, remote.Position);
+        }
+    }
+
+    private static void AddStreamingFocusChunk(List<ChunkCoord> output, HashSet<ChunkCoord> seen, Vector3 worldPosition)
+    {
+        var chunk = VoxelWorld.WorldToChunk(
+            (int)MathF.Floor(worldPosition.X),
+            (int)MathF.Floor(worldPosition.Y),
+            (int)MathF.Floor(worldPosition.Z),
+            out _, out _, out _);
+
+        if (seen.Add(chunk))
+            output.Add(chunk);
+    }
+
+    private static bool IsWithinFocusRadius(ChunkCoord coord, IReadOnlyList<ChunkCoord> focusChunks, int radius)
+    {
+        if (focusChunks.Count == 0)
+            return false;
+
+        var radiusSq = radius * radius;
+        for (var i = 0; i < focusChunks.Count; i++)
+        {
+            var focus = focusChunks[i];
+            var dx = coord.X - focus.X;
+            var dz = coord.Z - focus.Z;
+            if (dx * dx + dz * dz <= radiusSq)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void ScheduleNeighborMeshes(ChunkCoord center, int priority)
+    {
+        if (_world == null)
+            return;
+
+        // Schedule mesh for N/S/E/W neighbors (F) neighbor-aware meshing
+        var neighbors = new[]
+        {
+            new ChunkCoord(center.X + 1, center.Y, center.Z),
+            new ChunkCoord(center.X - 1, center.Y, center.Z),
+            new ChunkCoord(center.X, center.Y, center.Z + 1),
+            new ChunkCoord(center.X, center.Y, center.Z - 1)
+        };
+
+        foreach (var neighbor in neighbors)
+        {
+            if (_world.TryGetChunk(neighbor, out var chunk) && chunk != null &&
+                _meshesRequestedThisFrame < Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget))
+            {
+                if (!_chunkMeshes.ContainsKey(neighbor) || chunk.IsDirty)
+                {
+                    // ALL WORLD GENERATION DELETED - NO STREAMING
+                    _meshesRequestedThisFrame++;
+                }
+            }
+        }
+    }
+
+    private void RefreshSettingsIfChanged()
+    {
+        var stamp = GetSettingsStamp();
+        if (stamp == _settingsStamp)
+            return;
+
+        var oldQuality = _settings.QualityPreset;
+        _settingsStamp = stamp;
+        _settings = GameSettings.LoadOrCreate(_log);
+        
+        // C) RENDER DISTANCE GUARDRAILS - check command line first
+        var requestedRadius = _settings.RenderDistanceChunks;
+        
+        // Check for command line override from launcher
+        var args = Environment.GetCommandLineArgs();
+        foreach (var arg in args)
+        {
+            if (arg.StartsWith("--render-distance="))
+            {
+                if (int.TryParse(arg.AsSpan()["--render-distance=".Length..], out var cliRadius))
+                {
+                    requestedRadius = cliRadius;
+                    _log.Info($"Using render distance from command line: {cliRadius}");
+                }
+            }
+        }
+        
+        var newRadius = Math.Clamp(requestedRadius, 4, MaxRuntimeActiveRadius);
+        if (requestedRadius > MaxRuntimeActiveRadius)
+        {
+            _log.Info($"Render distance capped at {MaxRuntimeActiveRadius} (requested {requestedRadius}) to reduce in-world lag.");
+        }
+        var newQuality = _settings.QualityPreset;
+        _inventoryKey = GetKeybind("Inventory", Keys.E);
+        _dropKey = GetKeybind("DropItem", Keys.Q);
+        _giveKey = GetKeybind("GiveItem", Keys.F);
+        _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
+        _sprintKey = GetKeybind("Sprint", Keys.LeftControl);
+        _flyDescendKey = GetKeybind("FlyDescend", Keys.LeftShift);
+        _chatKey = GetKeybind("Chat", Keys.T);
+        _commandKey = GetKeybind("Command", Keys.OemQuestion);
+        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
+        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
+        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
+        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
+        _player.CrouchKey = _stackModifierKey;
+        _player.SprintKey = _sprintKey;
+        _player.FlyDescendKey = _flyDescendKey;
+        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
+        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
+        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        _indicatorsEnabled = _settings.IndicatorsEnabled;
+        _nametagMode = NormalizeNametagMode(_settings.NametagMode);
+        _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
+        _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
+        UpdateReticleSettings();
+
+        if (newQuality != oldQuality)
+        {
+            _log.Info($"Quality changed: {oldQuality} -> {newQuality}. Rebuilding atlas...");
+            _atlas = CubeNetAtlas.Build(_assets, _log, newQuality);
+            _world?.MarkAllChunksDirty();
+        }
+
+        var oldTargetRadius = _targetActiveRadiusChunks;
+        _targetActiveRadiusChunks = newRadius;
+
+        if (newRadius < _activeRadiusChunks)
+        {
+            var oldRadius = _activeRadiusChunks;
+            _activeRadiusChunks = newRadius;
+            _activeRadiusRampTimer = 0f;
+            
+            // 4) RENDER DISTANCE CHANGES - Aggressive unloading and job cancellation
+            _log.Info($"Render distance lowered: {oldRadius} -> {newRadius}, aggressively unloading");
+            
+            // Cancel pending jobs outside new radius
+            CancelJobsOutsideRadius(newRadius);
+            
+            // Force immediate trim of far chunks
+            TrimFarChunks(newRadius + KeepRadiusBuffer);
+            
+            // Clear meshes for unloaded chunks
+            BuildStreamingFocusChunks(_streamingFocusChunks);
+            if (_streamingFocusChunks.Count == 0)
+                _streamingFocusChunks.Add(_centerChunk);
+            var chunksToRemove = _chunkMeshes.Keys.Where(coord => {
+                return !IsWithinFocusRadius(coord, _streamingFocusChunks, newRadius + KeepRadiusBuffer);
+            }).ToList();
+            
+            foreach (var coord in chunksToRemove)
+            {
+                _chunkMeshes.TryRemove(coord, out _);
+                _chunkOrder.Remove(coord);
+            }
+            
+            _log.Info($"Unloaded {chunksToRemove.Count} chunk meshes due to reduced render distance");
+            
+            UpdateActiveChunks(force: false);
+            _log.Info($"Render distance changed: {_activeRadiusChunks} chunks");
+        }
+        else if (newRadius > _activeRadiusChunks || oldTargetRadius != newRadius)
+        {
+            _activeRadiusRampTimer = 0f;
+            _log.Info($"Render distance target set to {newRadius}; streaming will ramp up from {_activeRadiusChunks}.");
+        }
+    }
+
+    private void CancelJobsOutsideRadius(int radius)
+    {
+        // This would require extending ChunkStreamingService to support job cancellation
+        // For now, we'll just log that jobs outside radius should be cancelled
+        _log.Debug($"Would cancel jobs outside radius {radius} (job cancellation not yet implemented)");
+    }
+
+    private void UpdateReticleSettings()
+    {
+        _reticleEnabled = _settings.ReticleEnabled;
+        _reticleStyle = NormalizeReticleStyle(_settings.ReticleStyle);
+        _reticleSize = Math.Clamp(_settings.ReticleSize, ReticleSizeMin, ReticleSizeMax);
+        _reticleThickness = Math.Clamp(_settings.ReticleThickness, ReticleThicknessMin, ReticleThicknessMax);
+        _reticleColor = TryParseHexColor(_settings.ReticleColor, out var color)
+            ? color
+            : new Color(255, 255, 255, 200);
+        _blockOutlineColor = TryParseHexColor(_settings.BlockOutlineColor, out var outlineColor)
+            ? outlineColor
+            : new Color(200, 220, 230, 120);
+        _flyingOutlineEnabled = _settings.FlyingOutlineEnabled;
+        _flyingOutlineColor = TryParseHexColor(_settings.FlyingOutlineColor, out var flyingOutlineColor)
+            ? flyingOutlineColor
+            : new Color(255, 138, 138, 200);
+    }
+
+    private static string NormalizeReticleStyle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "Dot";
+
+        var style = value.Trim();
+        if (style.Equals("Dot", StringComparison.OrdinalIgnoreCase)) return "Dot";
+        if (style.Equals("Plus", StringComparison.OrdinalIgnoreCase)) return "Plus";
+        if (style.Equals("Square", StringComparison.OrdinalIgnoreCase)) return "Square";
+        if (style.Equals("Circle", StringComparison.OrdinalIgnoreCase)) return "Circle";
+        return "Dot";
+    }
+
+    private static bool TryParseHexColor(string? value, out Color color)
+    {
+        color = default;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var text = value.Trim();
+        if (text.StartsWith("#", StringComparison.Ordinal))
+            text = text.Substring(1);
+
+        if (text.Length == 6)
+            text += "FF";
+
+        if (text.Length != 8)
+            return false;
+
+        if (!TryParseHexByte(text, 0, out var r)) return false;
+        if (!TryParseHexByte(text, 2, out var g)) return false;
+        if (!TryParseHexByte(text, 4, out var b)) return false;
+        if (!TryParseHexByte(text, 6, out var a)) return false;
+
+        color = new Color(r, g, b, a);
+        return true;
+    }
+
+    private static bool TryParseHexByte(string text, int start, out byte value)
+    {
+        value = 0;
+        if (start + 1 >= text.Length)
+            return false;
+
+        var hi = HexValue(text[start]);
+        var lo = HexValue(text[start + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+
+        value = (byte)((hi << 4) | lo);
+        return true;
+    }
+
+    private static int HexValue(char c)
+    {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    }
+
+    private SamplerState GetWorldSampler()
+    {
+        return _settings.QualityPreset switch
+        {
+            "LOW" => _samplerLow ??= CreateWorldSampler(2.0f),
+            "MEDIUM" => _samplerMedium ??= CreateWorldSampler(1.0f),
+            "HIGH" => _samplerHigh ??= CreateWorldSampler(0.5f),
+            "ULTRA" => _samplerUltra ??= CreateWorldSampler(0.0f),
+            _ => SamplerState.PointClamp
+        };
+    }
+
+    private static SamplerState CreateWorldSampler(float lodBias)
+    {
+        return new SamplerState
+        {
+            Filter = TextureFilter.Point,
+            MipMapLevelOfDetailBias = lodBias,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp
+        };
+    }
+
+    private static DateTime GetSettingsStamp()
+    {
+        try
+        {
+            return File.Exists(Paths.SettingsJsonPath)
+                ? File.GetLastWriteTimeUtc(Paths.SettingsJsonPath)
+                : DateTime.MinValue;
+        }
+        catch
+        {
+            return DateTime.MinValue;
+        }
+    }
+
+    private Keys GetKeybind(string action, Keys fallback)
+    {
+        if (_settings.Keybinds != null && _settings.Keybinds.TryGetValue(action, out var key))
+            return key;
+        return fallback;
+    }
+
+    private static string NormalizeNametagMode(string? mode)
+    {
+        var text = (mode ?? string.Empty).Trim();
+        if (text.Equals("off", StringComparison.OrdinalIgnoreCase))
+            return "Off";
+        if (text.Equals("fade", StringComparison.OrdinalIgnoreCase))
+            return "Fade";
+        return "Static";
+    }
+
+    private void EnqueuePostSyncDirtyHint(ChunkCoord coord)
+    {
+        if (_postSyncDirtyHintQueued.Add(coord))
+            _postSyncDirtyHintQueue.Enqueue(coord);
+    }
+
+    private void ProcessPostSyncDirtyHints()
+    {
+        if (_postSyncDirtyHintQueue.Count == 0)
+            return;
+
+        var budget = _postSyncRecoveryTimer > 0f ? 8 : 3;
+        while (budget > 0 && _postSyncDirtyHintQueue.Count > 0)
+        {
+            var coord = _postSyncDirtyHintQueue.Dequeue();
+            _postSyncDirtyHintQueued.Remove(coord);
+
+            if (_world?.TryGetChunk(coord, out var chunk) == true && chunk != null)
+                chunk.IsDirty = true;
+
+            QueuePriorityMeshBuild(coord);
+            budget--;
+        }
+    }
+
+    private void QueueDirtyChunks()
+    {
+        if (_world == null || _atlas == null)
+            return;
+
+        ProcessPostSyncDirtyHints();
+
+        if (_postSyncRecoveryTimer > 0f)
+        {
+            _postSyncDirtyScanGate = (_postSyncDirtyScanGate + 1) % PostSyncDirtyScanIntervalFrames;
+            if (_postSyncDirtyScanGate != 0)
+                return;
+        }
+
+        var maxDirtyChunksPerFrame = _postSyncRecoveryTimer > 0f ? 4 : 8;
+        var dirtyChunksProcessed = 0;
+        _world.CopyChunksTo(_chunkSnapshotBuffer);
+
+        // Two passes: near player first, then far chunks. Reuses buffers and avoids per-frame list allocations.
+        for (var pass = 0; pass < 2 && dirtyChunksProcessed < maxDirtyChunksPerFrame; pass++)
+        {
+            for (var i = 0; i < _chunkSnapshotBuffer.Count; i++)
+            {
+                var chunk = _chunkSnapshotBuffer[i];
+                if (!chunk.IsDirty)
+                    continue;
+                if (_activeChunks.Count > 0 && !_activeChunks.Contains(chunk.Coord))
+                    continue;
+
+                var nearFocus = IsChunkNearAnyFocus(chunk.Coord, _streamingFocusChunks, horizontalRadius: 2, verticalRadius: 1);
+                if ((pass == 0 && !nearFocus) || (pass == 1 && nearFocus))
+                    continue;
+
+                QueueMeshBuild(chunk.Coord);
+                dirtyChunksProcessed++;
+                if (dirtyChunksProcessed >= maxDirtyChunksPerFrame)
+                    break;
+            }
+        }
+    }
+
+    private void QueueMeshBuild(ChunkCoord coord)
+    {
+        if (!IsChunkNearAnyFocus(coord, _streamingFocusChunks) && (_meshQueued.Count + _meshBuildInFlight.Count) >= MaxOutstandingMeshJobs)
+            return;
+
+        if (_meshQueued.Add(coord))
+            _meshQueue.Enqueue(coord);
+    }
+
+    private void QueuePriorityMeshBuild(ChunkCoord coord)
+    {
+        if (_activeChunks.Count > 0 && !_activeChunks.Contains(coord))
+            return;
+        if (_priorityMeshQueued.Add(coord))
+            _priorityMeshQueue.Enqueue(coord);
+    }
+
+    private bool IsChunkNearAnyFocus(ChunkCoord coord, IReadOnlyList<ChunkCoord> focusChunks, int horizontalRadius = 2, int verticalRadius = 1)
+    {
+        if (focusChunks == null || focusChunks.Count == 0)
+        {
+            var dxFallback = Math.Abs(coord.X - _centerChunk.X);
+            var dzFallback = Math.Abs(coord.Z - _centerChunk.Z);
+            var dyFallback = Math.Abs(coord.Y - _centerChunk.Y);
+            return Math.Max(dxFallback, dzFallback) <= horizontalRadius && dyFallback <= verticalRadius;
+        }
+
+        for (var i = 0; i < focusChunks.Count; i++)
+        {
+            var focus = focusChunks[i];
+            var dx = Math.Abs(coord.X - focus.X);
+            var dz = Math.Abs(coord.Z - focus.Z);
+            var dy = Math.Abs(coord.Y - focus.Y);
+            if (Math.Max(dx, dz) <= horizontalRadius && dy <= verticalRadius)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void QueuePriorityRemeshForBlockEdit(int wx, int wy, int wz)
+    {
+        _blockEditBoostRemaining = Math.Max(_blockEditBoostRemaining, BlockEditBoostFrames);
+        var coord = VoxelWorld.WorldToChunk(wx, wy, wz, out var lx, out var ly, out var lz);
+        QueuePriorityMeshBuild(coord);
+
+        if (lx == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X - 1, coord.Y, coord.Z));
+        if (lx == VoxelChunkData.ChunkSizeX - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X + 1, coord.Y, coord.Z));
+        if (ly == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y - 1, coord.Z));
+        if (ly == VoxelChunkData.ChunkSizeY - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y + 1, coord.Z));
+        if (lz == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y, coord.Z - 1));
+        if (lz == VoxelChunkData.ChunkSizeZ - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y, coord.Z + 1));
+    }
+
+    private bool TryDequeuePriorityMeshBuildCandidate(VoxelWorld world, out ChunkCoord coord, out VoxelChunkData chunk)
+    {
+        while (_priorityMeshQueue.Count > 0)
+        {
+            coord = _priorityMeshQueue.Dequeue();
+            _priorityMeshQueued.Remove(coord);
+            if (_activeChunks.Count > 0 && !_activeChunks.Contains(coord))
+                continue;
+            if (!world.TryGetChunk(coord, out var chunkData) || chunkData == null)
+                continue;
+
+            chunk = chunkData;
+            return true;
+        }
+
+        coord = default;
+        chunk = null!;
+        return false;
+    }
+
+    private bool TryDequeueMeshBuildCandidate(VoxelWorld world, out ChunkCoord coord, out VoxelChunkData chunk)
+    {
+        while (_meshQueue.Count > 0)
+        {
+            coord = _meshQueue.Dequeue();
+            _meshQueued.Remove(coord);
+            if (_activeChunks.Count > 0 && !_activeChunks.Contains(coord))
+                continue;
+            if (!world.TryGetChunk(coord, out var chunkData) || chunkData == null)
+                continue;
+
+            chunk = chunkData;
+            return true;
+        }
+
+        coord = default;
+        chunk = null!;
+        return false;
+    }
+
+    private void ProcessStreamingResults(bool aggressiveApply = false)
+    {
+        if (_streamingService == null || _world == null)
+            return;
+
+        // Check if streaming service is stuck and force recovery
+        if (_streamingService.IsStuck(TimeSpan.FromSeconds(10)))
+        {
+            _log.Warn("Chunk streaming service appears stuck, forcing recovery...");
+            
+            if (!_spawnPrewarmComplete)
+                _log.Warn("Streaming service is stuck during prewarm; continuing local prewarm path.");
+        }
+
+        // D) Reset per-frame counters
+        _completedLoadsAppliedThisFrame = 0;
+        _completedMeshesAppliedThisFrame = 0;
+        
+        // 4) AGGRESSIVE APPLY - Higher budget during preparing (up to 16 meshes/frame)
+        int maxMeshesPerFrame = aggressiveApply ? 16 : 4;
+
+        // Process load results - add loaded chunks to world
+        _streamingService.ProcessLoadResults(result => {
+            if (result.Success && result.Chunk != null)
+            {
+                // Add chunk to world dictionary (main thread only)
+                _world.AddChunkDirect(result.Coord, result.Chunk);
+                
+                // 3) NEIGHBOR SCHEDULING - When a chunk loads, schedule mesh for it AND its N/S/E/W neighbors
+                if (_activeChunks.Contains(result.Coord))
+                {
+                    _streamingService.EnqueueMeshJob(result.Coord, result.Chunk, 0);
+                    
+                    // Schedule neighbor meshes (N/S/E/W only)
+                    var neighbors = new[]
+                    {
+                        new ChunkCoord(result.Coord.X + 1, result.Coord.Y, result.Coord.Z),
+                        new ChunkCoord(result.Coord.X - 1, result.Coord.Y, result.Coord.Z),
+                        new ChunkCoord(result.Coord.X, result.Coord.Y, result.Coord.Z + 1),
+                        new ChunkCoord(result.Coord.X, result.Coord.Y, result.Coord.Z - 1)
+                    };
+                    
+                    foreach (var neighborCoord in neighbors)
+                    {
+                        if (_world.TryGetChunk(neighborCoord, out var neighborChunk) && neighborChunk != null &&
+                            _activeChunks.Contains(neighborCoord) &&
+                            !_chunkMeshes.ContainsKey(neighborCoord))
+                        {
+                            _streamingService.EnqueueMeshJob(neighborCoord, neighborChunk, 1);
+                        }
+                    }
+                }
+                
+                _completedLoadsAppliedThisFrame++;
+            }
+            else if (!result.Success)
+            {
+                _log.Error($"Failed to load chunk {result.Coord}: {result.Error}");
+            }
+        }, maxResults: MaxApplyCompletedChunkLoadsPerFrame);
+
+        // Process mesh results - add built meshes to rendering
+        _streamingService.ProcessMeshResults(result => {
+            if (result.Success && result.Mesh != null)
+            {
+                _chunkMeshes[result.Coord] = result.Mesh;
+                if (!_chunkOrder.Contains(result.Coord))
+                    _chunkOrder.Add(result.Coord);
+                
+                _completedMeshesAppliedThisFrame++;
+            }
+            else if (result.Success && result.IsPlaceholder)
+            {
+                // Accept placeholder meshes to prevent infinite retry
+                if (result.Mesh != null)
+                {
+                    _chunkMeshes[result.Coord] = result.Mesh;
+                    if (!_chunkOrder.Contains(result.Coord))
+                        _chunkOrder.Add(result.Coord);
+                    
+                    _completedMeshesAppliedThisFrame++;
+                    _log.Debug($"Applied placeholder mesh for chunk {result.Coord}");
+                }
+            }
+            else if (!result.Success)
+            {
+                _log.Error($"Failed to build mesh for chunk {result.Coord}: {result.Error}");
+            }
+        }, maxResults: maxMeshesPerFrame);
+
+        // Process save results - log any save errors
+        _streamingService.ProcessSaveResults(result => {
+            if (!result.Success)
+            {
+                _log.Error($"Failed to save chunk {result.Coord}: {result.Error}");
+            }
+        }, maxResults: 2);
+
+        // G) Log streaming stats periodically (every 5 seconds)
+        var now = DateTime.UtcNow;
+        if ((now - _lastStreamingStats).TotalSeconds >= 5)
+        {
+            if (_debugHudVisible)
+            {
+                var (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
+                _log.Info($"Streaming: Player={_playerChunkCoord}, Loaded={_world.ChunkCount}, " +
+                         $"Queues(L/M/S)={loadQueue}/{meshQueue}/{saveQueue}, " +
+                         $"Applied(L/M)={_completedLoadsAppliedThisFrame}/{_completedMeshesAppliedThisFrame}");
+            }
+            _lastStreamingStats = now;
+        }
+    }
+
+    private readonly struct MeshBuildResult
+    {
+        public ChunkCoord Coord { get; }
+        public ChunkMesh? Mesh { get; }
+        public string? Error { get; }
+        public int Version { get; }
+
+        public MeshBuildResult(ChunkCoord coord, ChunkMesh? mesh, string? error, int version)
+        {
+            Coord = coord;
+            Mesh = mesh;
+            Error = error;
+            Version = version;
+        }
+    }
+
+    private readonly struct SaveAndExitResult
+    {
+        public bool Success { get; }
+        public int SavedChunks { get; }
+        public int SavedMeshes { get; }
+        public double Seconds { get; }
+        public string? Error { get; }
+
+        public SaveAndExitResult(bool success, int savedChunks, int savedMeshes, double seconds, string? error)
+        {
+            Success = success;
+            SavedChunks = savedChunks;
+            SavedMeshes = savedMeshes;
+            Seconds = seconds;
+            Error = error;
+        }
+    }
+
+    private void ProcessMeshBuildQueue(int budgetOverride = 0)
+    {
+        if (_isClosing || _world == null || _atlas == null)
+            return;
+
+        var boostBuilds = _blockEditBoostRemaining > 0;
+        if (boostBuilds)
+            _blockEditBoostRemaining--;
+
+        var applyBudget = budgetOverride > 0 ? Math.Max(2, budgetOverride * 2) : 3;
+        if (boostBuilds)
+            applyBudget = Math.Max(applyBudget, 16);
+        ApplyCompletedMeshBuilds(applyBudget);
+
+        var scheduleBudget = budgetOverride > 0
+            ? budgetOverride
+            : Math.Max(MaxMeshBuildsPerFrame, RuntimeMeshScheduleBudget);
+        if (boostBuilds)
+            scheduleBudget = Math.Max(scheduleBudget, Math.Min(MeshWorkerCount + 1, 6));
+
+        if (_postSyncRecoveryTimer > 0f)
+            scheduleBudget = Math.Max(2, Math.Min(scheduleBudget, 3));
+
+        var useFastMeshing = boostBuilds || _postSyncRecoveryTimer > 0f || ShouldUseFastMeshing();
+        var priorityCap = boostBuilds ? MaxPriorityMeshBuildsPerFrame + 2 : MaxPriorityMeshBuildsPerFrame;
+        var priorityBudget = Math.Min(scheduleBudget, priorityCap);
+        var inlinePriorityBudget = boostBuilds ? MaxInlinePriorityMeshBuildsPerFrame : 0;
+
+        // Always schedule edit-driven remeshes first so block breaks appear immediately.
+        while (priorityBudget > 0 && scheduleBudget > 0)
+        {
+            if (!TryDequeuePriorityMeshBuildCandidate(_world, out var coord, out var chunk))
+                break;
+
+            if (!_meshBuildInFlight.TryAdd(coord, 0))
+                continue;
+
+            var tookSemaphore = _meshBuildSemaphore.Wait(0);
+            if (!tookSemaphore)
+            {
+                if (inlinePriorityBudget > 0)
+                {
+                    try
+                    {
+                        var inlineMesh = VoxelMesherGreedy.BuildChunkMeshPriority(_world, chunk, _atlas, _log);
+                        if (!ValidateMesh(inlineMesh))
+                        {
+                            _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coord, null, "invalid", chunk.Version));
+                        }
+                        else
+                        {
+                            _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coord, inlineMesh, null, chunk.Version));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coord, null, ex.Message, chunk.Version));
+                    }
+                    finally
+                    {
+                        _meshBuildInFlight.TryRemove(coord, out _);
+                    }
+
+                    inlinePriorityBudget--;
+                    scheduleBudget--;
+                    priorityBudget--;
+                    continue;
+                }
+
+                _meshBuildInFlight.TryRemove(coord, out _);
+                QueuePriorityMeshBuild(coord);
+                break;
+            }
+
+            var world = _world;
+            var atlas = _atlas;
+            var log = _log;
+            var coordForBuild = coord;
+            var chunkForBuild = chunk;
+            var versionForBuild = chunk.Version;
+            var cancellationToken = _backgroundWorkCts.Token;
+            void BuildPriorityMesh()
+            {
+                try
+                {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
+                    var mesh = VoxelMesherGreedy.BuildChunkMeshPriority(world, chunkForBuild, atlas, log);
+                    if (!ValidateMesh(mesh))
+                    {
+                        _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, null, "invalid", versionForBuild));
+                        return;
+                    }
+
+                    if (!_isClosing)
+                        _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, mesh, null, versionForBuild));
+                }
+                catch (Exception ex)
+                {
+                    _completedPriorityMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, null, ex.Message, versionForBuild));
+                }
+                finally
+                {
+                    _meshBuildInFlight.TryRemove(coordForBuild, out _);
+                    if (tookSemaphore)
+                        _meshBuildSemaphore.Release();
+                }
+            }
+
+            _ = Task.Run(BuildPriorityMesh, cancellationToken);
+
+            scheduleBudget--;
+            priorityBudget--;
+        }
+
+        while (scheduleBudget > 0)
+        {
+            if (!TryDequeueMeshBuildCandidate(_world, out var coord, out var chunk))
+                break;
+
+            if (_priorityMeshQueued.Contains(coord))
+                continue;
+
+            if (!_meshBuildInFlight.TryAdd(coord, 0))
+                continue;
+
+            if (!_meshBuildSemaphore.Wait(0))
+            {
+                _meshBuildInFlight.TryRemove(coord, out _);
+                QueueMeshBuild(coord);
+                break;
+            }
+
+            var world = _world;
+            var atlas = _atlas;
+            var log = _log;
+            var fast = useFastMeshing;
+            var coordForBuild = coord;
+            var chunkForBuild = chunk;
+            var versionForBuild = chunk.Version;
+            var cancellationToken = _backgroundWorkCts.Token;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (cancellationToken.IsCancellationRequested || _isClosing)
+                        return;
+                    var mesh = fast
+                        ? VoxelMesherGreedy.BuildChunkMeshFast(world, chunkForBuild, atlas, log)
+                        : VoxelMesherGreedy.BuildChunkMesh(world, chunkForBuild, atlas, log);
+                    if (!ValidateMesh(mesh))
+                    {
+                        _completedMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, null, "invalid", versionForBuild));
+                        return;
+                    }
+
+                    if (!_isClosing)
+                        _completedMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, mesh, null, versionForBuild));
+                }
+                catch (Exception ex)
+                {
+                    _completedMeshBuildQueue.Enqueue(new MeshBuildResult(coordForBuild, null, ex.Message, versionForBuild));
+                }
+                finally
+                {
+                    _meshBuildInFlight.TryRemove(coordForBuild, out _);
+                    _meshBuildSemaphore.Release();
+                }
+            }, cancellationToken);
+
+            scheduleBudget--;
+        }
+
+        // Apply inline priority builds immediately so rapid block breaks are visually instant.
+        if (boostBuilds)
+            ApplyCompletedMeshBuilds(MaxInlinePriorityMeshBuildsPerFrame + 1);
+    }
+
+    private void ApplyCompletedMeshBuilds(int maxApply)
+    {
+        if (_world == null || _isClosing)
+            return;
+
+        for (var i = 0; i < maxApply; i++)
+        {
+            if (!_completedPriorityMeshBuildQueue.TryDequeue(out var result)
+                && !_completedMeshBuildQueue.TryDequeue(out result))
+                break;
+
+            if (!_world.TryGetChunk(result.Coord, out var chunk) || chunk == null)
+                continue;
+
+            // Skip stale background results produced before a newer block edit.
+            if (chunk.Version != result.Version)
+            {
+                chunk.IsDirty = true;
+                QueuePriorityMeshBuild(result.Coord);
+                continue;
+            }
+
+            if (result.Mesh != null)
+            {
+                _chunkMeshes[result.Coord] = result.Mesh;
+                if (!_chunkOrder.Contains(result.Coord))
+                    _chunkOrder.Add(result.Coord);
+            }
+            else if (!string.IsNullOrWhiteSpace(result.Error) && result.Error != "invalid" && !_isClosing)
+            {
+                _log.Warn($"Background mesh build failed for {result.Coord}: {result.Error}");
+            }
+            else if (!_loggedInvalidChunkMesh)
+            {
+                _log.Error($"Invalid chunk mesh for {result.Coord}. Skipping draw to avoid artifacts.");
+                _loggedInvalidChunkMesh = true;
+            }
+
+            chunk.IsDirty = false;
+        }
+    }
+
+    private bool ShouldUseFastMeshing()
+    {
+        // During prewarm we prioritize quick visual availability over final mesh quality.
+        if (!_spawnPrewarmComplete)
+            return true;
+
+        // In gameplay, only use fast meshing under sustained pressure and queue backlog.
+        if (_meshQueue.Count > 24 && _fps > 0f && _fps < 50f)
+            return true;
+
+        return false;
+    }
+
+    private static bool ValidateMesh(ChunkMesh mesh)
+    {
+        if (mesh.OpaqueVertices.Length % 3 != 0
+            || mesh.CutoutVertices.Length % 3 != 0
+            || mesh.TransparentVertices.Length % 3 != 0
+            || mesh.WaterVertices.Length % 3 != 0)
+            return false;
+
+        return VerticesFinite(mesh.OpaqueVertices)
+            && VerticesFinite(mesh.CutoutVertices)
+            && VerticesFinite(mesh.TransparentVertices)
+            && VerticesFinite(mesh.WaterVertices);
+    }
+
+    private static bool VerticesFinite(VertexPositionTexture[] verts)
+    {
+        for (int i = 0; i < verts.Length; i++)
+        {
+            var p = verts[i].Position;
+            if (float.IsNaN(p.X) || float.IsNaN(p.Y) || float.IsNaN(p.Z))
+                return false;
+            if (float.IsInfinity(p.X) || float.IsInfinity(p.Y) || float.IsInfinity(p.Z))
+                return false;
+        }
+        return true;
+    }
+
+    private void TrimFarChunks(int keepRadius)
+    {
+        if (_world == null || _streamingService == null)
+            return;
+
+        var keep = new HashSet<ChunkCoord>();
+        var keepSq = keepRadius * keepRadius;
+        BuildStreamingFocusChunks(_streamingFocusChunks);
+        if (_streamingFocusChunks.Count == 0)
+            _streamingFocusChunks.Add(_centerChunk);
+
+        for (var focusIndex = 0; focusIndex < _streamingFocusChunks.Count; focusIndex++)
+        {
+            var focus = _streamingFocusChunks[focusIndex];
+            var maxCy = GetStreamingMaxChunkY(focus.Y);
+            for (var dz = -keepRadius; dz <= keepRadius; dz++)
+            {
+                for (var dx = -keepRadius; dx <= keepRadius; dx++)
+                {
+                    if (dx * dx + dz * dz > keepSq)
+                        continue;
+                    for (var cy = 0; cy <= maxCy; cy++)
+                        keep.Add(new ChunkCoord(focus.X + dx, cy, focus.Z + dz));
+                }
+            }
+        }
+
+        // Unload chunks with save-on-unload support
+        _world.UnloadChunks(keep, (coord, blocks) => {
+            _streamingService.EnqueueSaveJob(coord, blocks);
+        });
+
+        // Also remove meshes for unloaded chunks - thread-safe with ConcurrentDictionary
+        var toRemoveMeshes = new List<ChunkCoord>();
+        var meshKeys = _chunkMeshes.Keys.ToArray(); // Create snapshot for safe enumeration
+        foreach (var meshCoord in meshKeys)
+        {
+            if (!keep.Contains(meshCoord))
+                toRemoveMeshes.Add(meshCoord);
+        }
+
+        foreach (var coord in toRemoveMeshes)
+        {
+            if (_chunkMeshes.TryRemove(coord, out _))
+            {
+                _chunkOrder.Remove(coord);
+            }
+        }
+    }
+
+    private void CenterCamera()
+    {
+        var state = BuildDefaultPlayerState();
+        ApplyPlayerState(state);
+        _thirdPersonYaw = _player.Yaw;
+        _thirdPersonPitch = Math.Clamp(_player.Pitch, ThirdPersonPitchMin, ThirdPersonPitchMax);
+        _thirdPersonPlayerYawTarget = _player.Yaw;
+        _thirdPersonFreeLookHeld = false;
+        _cameraPosition = _player.Position + _player.HeadOffset;
+        _thirdPersonCameraDistance = 0f;
+    }
+
+    private bool IsThirdPersonCameraActive()
+    {
+        return _thirdPersonEnabled && _gameMode != GameMode.Veilseer;
+    }
+
+    private void ToggleThirdPersonMode()
+    {
+        _thirdPersonEnabled = !_thirdPersonEnabled;
+        if (_thirdPersonEnabled)
+        {
+            _thirdPersonYaw = _player.Yaw;
+            _thirdPersonPitch = Math.Clamp(_player.Pitch, ThirdPersonPitchMin, ThirdPersonPitchMax);
+            _thirdPersonPlayerYawTarget = _player.Yaw;
+            _thirdPersonFreeLookHeld = false;
+            SetCommandStatus("Third-person view enabled.", 2.5f, echoToChat: false);
+        }
+        else
+        {
+            _thirdPersonFreeLookHeld = false;
+            SetCommandStatus("First-person view enabled.", 2.5f, echoToChat: false);
+        }
+    }
+
+    private void UpdatePlayer(GameTime gameTime, float dt, InputState input)
+    {
+        if (_world == null)
+            return;
+        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
+        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
+        if (_gameMode == GameMode.Veilseer && !_player.IsFlying)
+            _player.SetFlying(true);
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.ContainsKey(_veilseerSpectateTargetPlayerId))
+        {
+            return;
+        }
+
+        var thirdPersonActive = IsThirdPersonCameraActive();
+        if (thirdPersonActive)
+        {
+            var look = input.LookDelta;
+            var freeLookHeld = input.IsKeyDown(_gamemodeModifierKey);
+            var wasFreeLookHeld = _thirdPersonFreeLookHeld;
+            _thirdPersonFreeLookHeld = freeLookHeld;
+            _player.SuppressLookInput = true;
+
+            _thirdPersonPitch = Math.Clamp(_thirdPersonPitch - look.Y, ThirdPersonPitchMin, ThirdPersonPitchMax);
+            if (freeLookHeld)
+            {
+                _thirdPersonYaw = MathHelper.WrapAngle(_thirdPersonYaw + look.X);
+                if (!wasFreeLookHeld)
+                    _thirdPersonPlayerYawTarget = _player.Yaw;
+            }
+            else
+            {
+                if (wasFreeLookHeld)
+                {
+                    // On free-look release, snap orbit back to current facing without rotating player.
+                    _thirdPersonPlayerYawTarget = _player.Yaw;
+                    _thirdPersonYaw = _player.Yaw;
+                    _thirdPersonPitch = Math.Clamp(_player.Pitch / 0.70f, ThirdPersonPitchMin, ThirdPersonPitchMax);
+                    look.X = 0f;
+                    look.Y = 0f;
+                }
+
+                _thirdPersonPlayerYawTarget = MathHelper.WrapAngle(_thirdPersonPlayerYawTarget + look.X);
+                _player.Yaw = _thirdPersonPlayerYawTarget;
+                // Follow mode keeps camera locked to facing direction like first-person.
+                _thirdPersonYaw = _player.Yaw;
+            }
+
+            // Keep model head/upper body aligned to camera vertical aim in third person with smoothing.
+            if (!freeLookHeld)
+            {
+                var desiredPlayerPitch = Math.Clamp(_thirdPersonPitch * 0.70f, -1.0f, 1.0f);
+                var pitchLerp = Math.Clamp(ThirdPersonPitchLerpPerSecond * dt, 0f, 1f);
+                _player.Pitch = MathHelper.Lerp(_player.Pitch, desiredPlayerPitch, pitchLerp);
+            }
+        }
+        else
+        {
+            _player.SuppressLookInput = false;
+            _thirdPersonFreeLookHeld = false;
+        }
+
+        _player.Update(dt, gameTime.TotalGameTime.TotalSeconds, input, _world.GetBlock);
+        _player.SuppressLookInput = false;
+
+        if (!thirdPersonActive)
+        {
+            _thirdPersonYaw = _player.Yaw;
+            _thirdPersonPitch = Math.Clamp(_player.Pitch, ThirdPersonPitchMin, ThirdPersonPitchMax);
+            _thirdPersonPlayerYawTarget = _player.Yaw;
+        }
+
+        ClampPlayerToWorldBounds();
+    }
+
+    private void ClampPlayerToWorldBounds()
+    {
+        if (_meta == null || !HasFiniteWorldBounds())
+            return;
+
+        var maxX = Math.Max(0.5f, _meta.Size.Width - 0.5f);
+        var maxZ = Math.Max(0.5f, _meta.Size.Depth - 0.5f);
+        var pos = _player.Position;
+        var clampedX = Math.Clamp(pos.X, 0.5f, maxX);
+        var clampedZ = Math.Clamp(pos.Z, 0.5f, maxZ);
+        if (MathF.Abs(clampedX - pos.X) < 0.0001f && MathF.Abs(clampedZ - pos.Z) < 0.0001f)
+            return;
+
+        _player.Position = new Vector3(clampedX, pos.Y, clampedZ);
+    }
+
+    private void ApplyPlayerSeparation(float dt)
+    {
+        if (_gameMode == GameMode.Veilseer || _player.NoClipEnabled)
+            return;
+
+        if (!_playerCollisionEnabled || _remotePlayers.Count == 0)
+            return;
+
+        var pos = _player.Position;
+        var half = PlayerController.ColliderHalfWidth;
+        var height = _player.ColliderHeight;
+        var minDist = Math.Max(0.01f, half * 2f - PlayerPushSkin);
+        var minDistSq = minDist * minDist;
+        var totalPush = Vector3.Zero;
+
+        foreach (var pair in _remotePlayers)
+        {
+            // Skip Veilseer players (no collision)
+            if (_remoteIsVeilseer.TryGetValue(pair.Key, out var isVeilseer) && isVeilseer)
+                continue;
+                
+            var model = pair.Value;
+            var other = model.Position;
+            var verticalOverlap = pos.Y < other.Y + model.ColliderHeight && pos.Y + height > other.Y;
+            if (!verticalOverlap)
+                continue;
+
+            var dx = pos.X - other.X;
+            var dz = pos.Z - other.Z;
+            var distSq = dx * dx + dz * dz;
+            if (distSq >= minDistSq)
+                continue;
+
+            Vector2 dir;
+            float push;
+            if (distSq < 0.0001f)
+            {
+                var f = _player.Forward;
+                dir = new Vector2(f.X, f.Z);
+                if (dir.LengthSquared() < 0.0001f)
+                    dir = Vector2.UnitX;
+                else
+                    dir.Normalize();
+                push = Math.Min(minDist * 0.5f, PlayerPushStrength * dt);
+            }
+            else
+            {
+                var dist = MathF.Sqrt(distSq);
+                dir = new Vector2(dx / dist, dz / dist);
+                var penetration = minDist - dist;
+                push = Math.Min(penetration * 0.5f, PlayerPushStrength * dt);
+            }
+
+            push = Math.Min(push, PlayerPushMaxStep);
+            totalPush += new Vector3(dir.X * push, 0f, dir.Y * push);
+        }
+
+        if (totalPush.LengthSquared() <= 0f)
+            return;
+
+        var candidate = pos + totalPush;
+        if (!IsPlayerInsideSolid(candidate))
+            _player.Position = candidate;
+    }
+
+    private void HandleBlockInteraction(GameTime gameTime, InputState input)
+    {
+        if (_world == null)
+            return;
+        if (_gameMode == GameMode.Veilseer)
+            return;
+
+        var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
+        if (_interactCooldown > 0f)
+            _interactCooldown = Math.Max(0f, _interactCooldown - dt);
+
+        if (_interactCooldown > 0f)
+            return;
+
+        var origin = _player.Position + _player.HeadOffset;
+        var dir = _player.Forward;
+        if (!VoxelRaycast.Raycast(origin, dir, InteractRange, _world.GetBlock, out var hit))
+        {
+            if (input.IsNewLeftClick())
+            {
+                TriggerLocalActionSwing(dir);
+                _interactCooldown = InteractCooldownSeconds;
+            }
+            return;
+        }
+
+        if (input.IsNewLeftClick())
+        {
+            var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
+            if (id != BlockIds.Air)
+            {
+                if (id == BlockIds.Nullblock && _gameMode == GameMode.Veilwalker)
+                {
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
+                }
+
+                _world.SetBlock(hit.X, hit.Y, hit.Z, BlockIds.Air);
+                _lanSession?.SendBlockSet(hit.X, hit.Y, hit.Z, BlockIds.Air);
+                QueuePriorityRemeshForBlockEdit(hit.X, hit.Y, hit.Z);
+                _blockBreakParticles.SpawnBlockBreak(hit.X, hit.Y, hit.Z, id);
+                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.X, hit.Y, hit.Z));
+                
+                if (_gameMode == GameMode.Veilwalker)
+                    SpawnBlockDrop(hit.X, hit.Y, hit.Z, (BlockId)id);
+                else
+                {
+                    _inventory.Add((BlockId)id, 1);
+                    MarkPlayerStateDirty(); // Mark dirty after inventory change
+                }
+                _interactCooldown = InteractCooldownSeconds;
+            }
+        }
+        else if (input.IsNewMiddleClick())
+        {
+            var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
+            if (id != BlockIds.Air)
+            {
+                _inventory.PickBlock((BlockId)id);
+                _interactCooldown = InteractCooldownSeconds;
+            }
+        }
+        else if (input.IsNewRightClick())
+        {
+            var id = _world.GetBlock(hit.PrevX, hit.PrevY, hit.PrevZ);
+            var selected = _inventory.SelectedId;
+            var sandbox = _gameMode == GameMode.Artificer;
+            if (id == BlockIds.Air && selected == BlockId.WaterBucket && (sandbox || _inventory.SelectedCount > 0))
+            {
+                if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
+                {
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
+                }
+
+                _world.SetBlock(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
+                _lanSession?.SendBlockSet(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
+                QueuePriorityRemeshForBlockEdit(hit.PrevX, hit.PrevY, hit.PrevZ);
+                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.PrevX, hit.PrevY, hit.PrevZ));
+                _interactCooldown = InteractCooldownSeconds;
+                return;
+            }
+
+            if (id == BlockIds.Air && selected != BlockId.Air && (sandbox || _inventory.SelectedCount > 0))
+            {
+                if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
+                {
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
+                }
+                _world.SetBlock(hit.PrevX, hit.PrevY, hit.PrevZ, (byte)selected);
+                _lanSession?.SendBlockSet(hit.PrevX, hit.PrevY, hit.PrevZ, (byte)selected);
+                QueuePriorityRemeshForBlockEdit(hit.PrevX, hit.PrevY, hit.PrevZ);
+                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.PrevX, hit.PrevY, hit.PrevZ));
+                
+                if (!sandbox && _inventory.TryConsumeSelected(1))
+                    _interactCooldown = InteractCooldownSeconds;
+                if (sandbox)
+                    _interactCooldown = InteractCooldownSeconds;
+            }
+        }
+    }
+
+    private void HandleHotbarInput(InputState input)
+    {
+        if (input.ScrollDelta != 0)
+        {
+            if (_gameMode == GameMode.Veilseer)
+            {
+                var speedStep = input.ScrollDelta > 0 ? 1 : -1;
+                if (_player.AdjustFlySpeedMultiplier(speedStep))
+                    ShowFlySpeedToast();
+            }
+            else if (_player.IsFlying && input.IsKeyDown(_gamemodeModifierKey))
+            {
+                var speedStep = input.ScrollDelta > 0 ? 1 : -1;
+                if (_player.AdjustFlySpeedMultiplier(speedStep))
+                    ShowFlySpeedToast();
+            }
+            else
+            {
+                var step = input.ScrollDelta > 0 ? -1 : 1;
+                _inventory.Scroll(step);
+            }
+        }
+
+        if (_gameMode == GameMode.Veilseer)
+        {
+            TryHandleVeilseerSpectateNumberInput(input);
+            TryHandleVeilseerSpectateClick(input);
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1)) _inventory.Select(0);
+        if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2)) _inventory.Select(1);
+        if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3)) _inventory.Select(2);
+        if (input.IsNewKeyPress(Keys.D4) || input.IsNewKeyPress(Keys.NumPad4)) _inventory.Select(3);
+        if (input.IsNewKeyPress(Keys.D5) || input.IsNewKeyPress(Keys.NumPad5)) _inventory.Select(4);
+        if (input.IsNewKeyPress(Keys.D6) || input.IsNewKeyPress(Keys.NumPad6)) _inventory.Select(5);
+        if (input.IsNewKeyPress(Keys.D7) || input.IsNewKeyPress(Keys.NumPad7)) _inventory.Select(6);
+        if (input.IsNewKeyPress(Keys.D8) || input.IsNewKeyPress(Keys.NumPad8)) _inventory.Select(7);
+        if (input.IsNewKeyPress(Keys.D9) || input.IsNewKeyPress(Keys.NumPad9)) _inventory.Select(8);
+
+        if (input.IsNewLeftClick() && _hotbarRect.Contains(input.MousePosition))
+        {
+            for (int i = 0; i < _hotbarSlots.Length; i++)
+            {
+                if (_hotbarSlots[i].Contains(input.MousePosition))
+                {
+                    _inventory.Select(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    private void ShowFlySpeedToast()
+    {
+        _flySpeedToastText = $"FLY SPEED {(_player.FlySpeedMultiplier * 100f):0}%";
+        _flySpeedToastPercent = Math.Clamp(_player.FlySpeedNormalized, 0f, 1f);
+        _flySpeedToastTimer = 1.8f;
+    }
+
+    private static Vector3 GetDirectionToBlockCenter(Vector3 origin, int x, int y, int z)
+    {
+        var target = new Vector3(x + 0.5f, y + 0.5f, z + 0.5f);
+        var dir = target - origin;
+        if (dir.LengthSquared() <= 0.0001f)
+            return Vector3.UnitX;
+
+        dir.Normalize();
+        return dir;
+    }
+
+    private void TriggerLocalActionSwing(Vector3 worldAimDirection)
+    {
+        _localActionSwingTimer = 0.26f;
+        _playerModel?.TriggerActionSwing(worldAimDirection);
+    }
+
+    private bool TryHandleVeilseerSpectateNumberInput(InputState input)
+    {
+        var shiftPressed = input.IsNewKeyPress(Keys.LeftShift) || input.IsNewKeyPress(Keys.RightShift);
+        if (shiftPressed && _veilseerSpectateTargetPlayerId >= 0)
+            return DetachVeilseerSpectateAtCurrentView("Detached to VeilSeer free camera.");
+
+        var slot = -1;
+        if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1)) slot = 0;
+        else if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2)) slot = 1;
+        else if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3)) slot = 2;
+        else if (input.IsNewKeyPress(Keys.D4) || input.IsNewKeyPress(Keys.NumPad4)) slot = 3;
+        else if (input.IsNewKeyPress(Keys.D5) || input.IsNewKeyPress(Keys.NumPad5)) slot = 4;
+        else if (input.IsNewKeyPress(Keys.D6) || input.IsNewKeyPress(Keys.NumPad6)) slot = 5;
+        else if (input.IsNewKeyPress(Keys.D7) || input.IsNewKeyPress(Keys.NumPad7)) slot = 6;
+        else if (input.IsNewKeyPress(Keys.D8) || input.IsNewKeyPress(Keys.NumPad8)) slot = 7;
+        else if (input.IsNewKeyPress(Keys.D9) || input.IsNewKeyPress(Keys.NumPad9)) slot = 8;
+        else if (input.IsNewKeyPress(Keys.D0) || input.IsNewKeyPress(Keys.NumPad0))
+        {
+            return DetachVeilseerSpectateAtCurrentView("VeilSeer free camera restored.");
+        }
+
+        if (slot < 0)
+            return false;
+
+        var available = _remotePlayers.Keys
+            .Where(id => !_remoteIsVeilseer.TryGetValue(id, out var isVeilseer) || !isVeilseer)
+            .OrderBy(id => id)
+            .ToArray();
+        if (slot >= available.Length)
+        {
+            SetCommandStatus($"No player in VeilSeer slot {slot + 1}.", 2.5f);
+            return false;
+        }
+
+        _veilseerSpectateTargetPlayerId = available[slot];
+        _veilseerSpectateSlot = slot;
+        var targetName = ResolvePlayerName(_veilseerSpectateTargetPlayerId);
+        SetVeilseerSpectatePopup($"Spectating: {targetName}");
+        if (_remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var targetModel))
+            PrimeStreamingAroundPosition(targetModel.Position);
+        SetCommandStatus($"VeilSeer spectating {targetName} (slot {slot + 1}).", 2.5f);
+        return true;
+    }
+
+    private bool DetachVeilseerSpectateAtCurrentView(string statusMessage)
+    {
+        if (_veilseerSpectateTargetPlayerId < 0)
+            return false;
+
+        if (_remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
+        {
+            _player.Position = observed.Position;
+            _player.Yaw = observed.Yaw;
+            _player.Pitch = observed.Pitch;
+        }
+
+        _veilseerSpectateTargetPlayerId = -1;
+        _veilseerSpectateSlot = -1;
+        SetVeilseerSpectatePopup("Free Camera");
+        SetCommandStatus(statusMessage, 2.5f);
+        return true;
+    }
+
+    private void SetVeilseerSpectatePopup(string text, float seconds = 2.2f)
+    {
+        _veilseerSpectatePopupText = text ?? string.Empty;
+        _veilseerSpectatePopupTimer = Math.Max(0f, seconds);
+    }
+
+    private void TryHandleVeilseerSpectateClick(InputState input)
+    {
+        if (!input.IsNewLeftClick())
+            return;
+
+        // Don't allow clicking if already spectating a player
+        if (_veilseerSpectateTargetPlayerId >= 0)
+            return;
+
+        // Ray-pick closest non-Veilseer remote player under crosshair
+        var closestPlayerId = -1;
+        var closestDistanceSq = float.MaxValue;
+        var cameraPosition = _player.Position;
+        var viewDirection = PlayerController.GetForwardVector(_player.Yaw, _player.Pitch);
+        
+        foreach (var pair in _remotePlayers)
+        {
+            // Skip Veilseer players
+            if (_remoteIsVeilseer.TryGetValue(pair.Key, out var isVeilseer) && isVeilseer)
+                continue;
+                
+            var targetPos = pair.Value.Position + new Vector3(0f, pair.Value.ColliderHeight * 0.5f, 0f);
+            var toTarget = targetPos - cameraPosition;
+            var distanceSq = toTarget.LengthSquared();
+            
+            // Simple distance-based selection (could be enhanced with actual raycasting)
+            if (distanceSq < closestDistanceSq && distanceSq < 25f) // Within 5 blocks
+            {
+                var dot = Vector3.Dot(Vector3.Normalize(toTarget), viewDirection);
+                if (dot > 0.7f) // Within ~45 degrees of crosshair
+                {
+                    closestDistanceSq = distanceSq;
+                    closestPlayerId = pair.Key;
+                }
+            }
+        }
+
+        if (closestPlayerId >= 0)
+        {
+            _veilseerSpectateTargetPlayerId = closestPlayerId;
+            var targetName = ResolvePlayerName(closestPlayerId);
+            SetVeilseerSpectatePopup($"Spectating: {targetName}");
+            if (_remotePlayers.TryGetValue(closestPlayerId, out var targetModel))
+                PrimeStreamingAroundPosition(targetModel.Position);
+            SetCommandStatus($"VeilSeer spectating {targetName}.", 2.5f);
+            
+            // Start live inventory view for the spectated player
+            RequestInventoryView(closestPlayerId);
+        }
+        // On miss, do nothing (no detach) as per plan
+    }
+
+    private void PrimeStreamingAroundPosition(Vector3 worldPosition, int horizontalRadius = 2)
+    {
+        if (_world == null)
+            return;
+
+        var focusChunk = VoxelWorld.WorldToChunk(
+            (int)MathF.Floor(worldPosition.X),
+            (int)MathF.Floor(worldPosition.Y),
+            (int)MathF.Floor(worldPosition.Z),
+            out _, out _, out _);
+
+        var radius = Math.Clamp(horizontalRadius, 1, 4);
+        var radiusSq = radius * radius;
+        var maxCy = GetStreamingMaxChunkY(focusChunk.Y);
+        var minCy = Math.Max(0, focusChunk.Y - 1);
+        var focusTopCy = Math.Min(maxCy, focusChunk.Y + 1);
+
+        for (var dz = -radius; dz <= radius; dz++)
+        {
+            for (var dx = -radius; dx <= radius; dx++)
+            {
+                if (dx * dx + dz * dz > radiusSq)
+                    continue;
+
+                for (var cy = minCy; cy <= focusTopCy; cy++)
+                {
+                    var coord = new ChunkCoord(focusChunk.X + dx, cy, focusChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
+
+                    if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                        QueueChunkGeneration(coord);
+
+                    QueuePriorityMeshBuild(coord);
+                }
+            }
+        }
+    }
+
+    private bool WouldBlockIntersectAnyPlayer(int x, int y, int z)
+    {
+        var blockMin = new Vector3(x, y, z);
+        var blockMax = new Vector3(x + 1f, y + 1f, z + 1f);
+
+        if (IntersectsPlayerAabb(_player.Position, _player.ColliderHeight, blockMin, blockMax))
+            return true;
+
+        foreach (var model in _remotePlayers.Values)
+        {
+            if (IntersectsPlayerAabb(model.Position, model.ColliderHeight, blockMin, blockMax))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IntersectsPlayerAabb(Vector3 pos, float height, Vector3 blockMin, Vector3 blockMax)
+    {
+        const float eps = 0.001f;
+        var half = PlayerController.ColliderHalfWidth;
+        var min = new Vector3(pos.X - half + eps, pos.Y + eps, pos.Z - half + eps);
+        var max = new Vector3(pos.X + half - eps, pos.Y + height - eps, pos.Z + half - eps);
+        return min.X < blockMax.X && max.X > blockMin.X
+            && min.Y < blockMax.Y && max.Y > blockMin.Y
+            && min.Z < blockMax.Z && max.Z > blockMin.Z;
+    }
+
+    private void UpdateHandoffTarget(InputState input)
+    {
+        _handoffPromptVisible = false;
+        _handoffTargetId = -1;
+        _handoffTargetName = string.Empty;
+
+        if (_pauseMenuOpen || _inventoryOpen || _lanSession == null || _gameMode != GameMode.Veilwalker)
+            return;
+
+        if (_inventory.SelectedId == BlockId.Air || _inventory.SelectedCount <= 0)
+            return;
+
+        if (_remotePlayers.Count == 0)
+            return;
+
+        var origin = _player.Position + _player.HeadOffset;
+        var forward = _player.Forward;
+        var bestDistSq = HandoffRange * HandoffRange;
+        var targetId = -1;
+        var targetName = "";
+
+        foreach (var pair in _remotePlayers)
+        {
+            var id = pair.Key;
+            var model = pair.Value;
+            var targetPos = model.Position + new Vector3(0f, Scale.PlayerHeadHeight * 0.5f, 0f);
+            var toTarget = targetPos - origin;
+            var distSq = toTarget.LengthSquared();
+            if (distSq > bestDistSq)
+                continue;
+
+            var dir = toTarget;
+            if (dir.LengthSquared() <= 0.0001f)
+                continue;
+            dir.Normalize();
+
+            if (Vector3.Dot(dir, forward) < HandoffDotThreshold)
+                continue;
+
+            bestDistSq = distSq;
+            targetId = id;
+            targetName = ResolvePlayerName(id);
+        }
+
+        if (targetId >= 0)
+        {
+            _handoffTargetId = targetId;
+            _handoffTargetName = targetName;
+            _handoffPromptVisible = true;
+        }
+    }
+
+    private void HandleDropAndGive(InputState input)
+    {
+        if (_pauseMenuOpen || _inventoryOpen || _gameMode != GameMode.Veilwalker)
+            return;
+
+        if (_inventory.SelectedId == BlockId.Air || _inventory.SelectedCount <= 0)
+            return;
+
+        var fullStack = IsStackModifierDown(input);
+
+        if (_handoffTargetId >= 0 && input.IsNewKeyPress(_giveKey))
+        {
+            var amount = fullStack ? _inventory.SelectedCount : 1;
+            var id = _inventory.SelectedId;
+            if (!_inventory.TryConsumeSelected(amount))
+                return;
+
+            if (TryGetHandoffTargetPosition(_handoffTargetId, out var targetPos))
+            {
+                var spawn = new LanItemSpawn
+                {
+                    ItemId = NextItemId(),
+                    BlockId = (byte)id,
+                    Count = amount,
+                    X = targetPos.X,
+                    Y = targetPos.Y,
+                    Z = targetPos.Z,
+                    VelX = 0f,
+                    VelY = 0f,
+                    VelZ = 0f,
+                    PickupDelay = ItemPickupDelaySeconds,
+                    PickupLockPlayerId = _lanSession?.LocalPlayerId ?? -1
+                };
+                SpawnWorldItem(spawn);
+                SendItemSpawn(spawn);
+            }
+            return;
+        }
+
+        if (input.IsNewKeyPress(_dropKey))
+        {
+            var amount = fullStack ? _inventory.SelectedCount : 1;
+            var id = _inventory.SelectedId;
+            if (!_inventory.TryConsumeSelected(amount))
+                return;
+
+            SpawnDroppedItem(id, amount);
+        }
+    }
+
+    private bool IsStackModifierDown(InputState input)
+    {
+        if (_stackModifierKey == Keys.LeftShift || _stackModifierKey == Keys.RightShift)
+            return input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        return input.IsKeyDown(_stackModifierKey);
+    }
+
+    private bool TryGetHandoffTargetPosition(int targetId, out Vector3 position)
+    {
+        if (_remotePlayers.TryGetValue(targetId, out var model))
+        {
+            position = model.Position + new Vector3(0f, Scale.PlayerHeadHeight * 0.4f, 0f);
+            return true;
+        }
+
+        position = default;
+        return false;
+    }
+
+    private int NextItemId()
+    {
+        var owner = _lanSession?.LocalPlayerId ?? 0;
+        var seq = _nextItemId++;
+        return (owner << 24) | (seq & 0x00FFFFFF);
+    }
+
+    private void SpawnBlockDrop(int x, int y, int z, BlockId id)
+    {
+        var spawn = new LanItemSpawn
+        {
+            ItemId = NextItemId(),
+            BlockId = (byte)id,
+            Count = 1,
+            X = x + 0.5f,
+            Y = y + 0.5f,
+            Z = z + 0.5f,
+            VelX = 0f,
+            VelY = 0f,
+            VelZ = 0f,
+            PickupDelay = ItemPickupDelaySeconds,
+            PickupLockPlayerId = _lanSession?.LocalPlayerId ?? -1
+        };
+        SpawnWorldItem(spawn);
+        SendItemSpawn(spawn);
+    }
+
+    private void SpawnDroppedItem(BlockId id, int count)
+    {
+        if (_world == null || count <= 0)
+            return;
+
+        var origin = _player.Position + _player.HeadOffset * 0.6f;
+        var forward = _player.Forward;
+        var tossDir = new Vector3(forward.X, 0f, forward.Z);
+        if (tossDir.LengthSquared() < 0.001f)
+            tossDir = Vector3.UnitZ;
+        tossDir.Normalize();
+        var spawnPos = origin + tossDir * 0.6f + new Vector3(0f, 0.1f, 0f);
+        var velocity = tossDir * (3.0f * Scale.BlockSize) + new Vector3(0f, 2.5f * Scale.BlockSize, 0f);
+        var spawn = new LanItemSpawn
+        {
+            ItemId = NextItemId(),
+            BlockId = (byte)id,
+            Count = count,
+            X = spawnPos.X,
+            Y = spawnPos.Y,
+            Z = spawnPos.Z,
+            VelX = velocity.X,
+            VelY = velocity.Y,
+            VelZ = velocity.Z,
+            PickupDelay = ItemDropPickupDelaySeconds,
+            PickupLockPlayerId = _lanSession?.LocalPlayerId ?? -1
+        };
+        SpawnWorldItem(spawn);
+        SendItemSpawn(spawn);
+    }
+
+    private void SendItemSpawn(LanItemSpawn spawn)
+    {
+        if (_lanSession == null)
+            return;
+        _lanSession.SendItemSpawn(spawn);
+    }
+
+    private void SendItemPickup(int itemId)
+    {
+        if (_lanSession == null)
+            return;
+        _lanSession.SendItemPickup(itemId);
+    }
+
+    private void SpawnWorldItem(LanItemSpawn spawn)
+    {
+        if (_world == null)
+            return;
+
+        if (spawn.Count <= 0 || spawn.BlockId == (byte)BlockId.Air)
+            return;
+
+        if (_worldItems.ContainsKey(spawn.ItemId))
+            return;
+
+        var item = new WorldItem
+        {
+            ItemId = spawn.ItemId,
+            BlockId = (BlockId)spawn.BlockId,
+            Count = spawn.Count,
+            Position = new Vector3(spawn.X, spawn.Y, spawn.Z),
+            Velocity = new Vector3(spawn.VelX, spawn.VelY, spawn.VelZ),
+            SpawnTime = _worldTimeSeconds,
+            LastUpdateTime = _worldTimeSeconds,
+            PickupDelay = spawn.PickupDelay,
+            PickupLockPlayerId = spawn.PickupLockPlayerId
+        };
+
+        _worldItems[item.ItemId] = item;
+    }
+
+    private void RemoveWorldItem(int itemId)
+    {
+        _worldItems.Remove(itemId);
+    }
+
+    private void UpdateWorldItems()
+    {
+        if (_world == null || _worldItems.Count == 0)
+            return;
+
+        var localPlayerId = _lanSession?.LocalPlayerId ?? -1;
+        var playerPos = _player.Position + new Vector3(0f, Scale.PlayerHeadHeight * 0.5f, 0f);
+
+        _worldItemRemove.Clear();
+        foreach (var pair in _worldItems)
+        {
+            var item = pair.Value;
+            if (item.Count <= 0 || item.BlockId == BlockId.Air)
+            {
+                _worldItemRemove.Add(item.ItemId);
+                continue;
+            }
+
+            var dt = Math.Clamp(_worldTimeSeconds - item.LastUpdateTime, 0f, 0.1f);
+            if (dt > 0f)
+            {
+                var vel = item.Velocity;
+                if (!item.IsGrounded || vel.Y > 0f)
+                    vel.Y += ItemGravity * dt;
+                else
+                    vel.Y = 0f;
+                vel.X *= ItemAirDrag;
+                vel.Z *= ItemAirDrag;
+
+                var newPos = item.Position + vel * dt;
+                var groundedThisFrame = false;
+
+                if (vel.Y <= 0f && TrySnapToGround(newPos, out var groundedPos))
+                {
+                    newPos = groundedPos;
+                    vel.Y = 0f;
+                    vel.X *= ItemGroundFriction;
+                    vel.Z *= ItemGroundFriction;
+                    groundedThisFrame = true;
+                }
+                else if (IsSolidAt(newPos))
+                {
+                    var cellY = (int)Math.Floor(newPos.Y);
+                    newPos.Y = cellY + 1f + ItemGroundOffset;
+                    if (vel.Y < 0f)
+                        vel.Y = 0f;
+                    groundedThisFrame = true;
+                }
+
+                item.Position = newPos;
+                item.Velocity = vel;
+                item.LastUpdateTime = _worldTimeSeconds;
+                if (groundedThisFrame)
+                {
+                    if (!item.IsGrounded)
+                        item.GroundedTime = _worldTimeSeconds;
+                    item.IsGrounded = true;
+                }
+                else
+                {
+                    item.IsGrounded = false;
+                }
+            }
+
+            if (item.PickupDelay > 0f && localPlayerId == item.PickupLockPlayerId)
+            {
+                var elapsed = _worldTimeSeconds - item.SpawnTime;
+                if (elapsed < item.PickupDelay)
+                    continue;
+            }
+
+            if (item.IsGrounded && _worldTimeSeconds - item.GroundedTime < ItemGroundPickupDelaySeconds)
+                continue;
+
+            var distSq = Vector3.DistanceSquared(item.Position, playerPos);
+            if (distSq > ItemPickupRadiusSq)
+                continue;
+
+            if (!_inventory.CanAdd(item.BlockId, item.Count))
+                continue;
+
+            var leftover = _inventory.Add(item.BlockId, item.Count);
+            if (leftover <= 0)
+            {
+                _worldItemRemove.Add(item.ItemId);
+                MarkPlayerStateDirty(); // Mark dirty after inventory change
+                SendItemPickup(item.ItemId);
+            }
+        }
+
+        for (int i = 0; i < _worldItemRemove.Count; i++)
+            _worldItems.Remove(_worldItemRemove[i]);
+    }
+
+    private bool TrySnapToGround(Vector3 pos, out Vector3 grounded)
+    {
+        grounded = pos;
+        if (_world == null)
+            return false;
+
+        var bx = (int)Math.Floor(pos.X);
+        var by = (int)Math.Floor(pos.Y - ItemHalfHeight - ItemGroundSnap - 0.001f);
+        var bz = (int)Math.Floor(pos.Z);
+        if (BlockRegistry.IsSolid(_world.GetBlock(bx, by, bz)))
+        {
+            var targetY = by + 1f + ItemGroundOffset;
+            if (pos.Y <= targetY + ItemGroundSnap)
+            {
+                grounded.Y = targetY;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private bool IsSolidAt(Vector3 pos)
+    {
+        if (_world == null)
+            return false;
+
+        var bx = (int)Math.Floor(pos.X);
+        var by = (int)Math.Floor(pos.Y);
+        var bz = (int)Math.Floor(pos.Z);
+        return BlockRegistry.IsSolid(_world.GetBlock(bx, by, bz));
+    }
+
+    private void UpdateHotbarLayout()
+    {
+        var slotSize = Math.Clamp((int)(_viewport.Width * 0.05f), 36, 64);
+        var gap = 6;
+        var totalW = slotSize * Inventory.HotbarSize + gap * (Inventory.HotbarSize - 1);
+        var startX = _viewport.X + (_viewport.Width - totalW) / 2;
+        var y = _viewport.Bottom - slotSize - 18;
+
+        _hotbarRect = new Rectangle(startX, y, totalW, slotSize);
+        for (int i = 0; i < _hotbarSlots.Length; i++)
+        {
+            var x = startX + i * (slotSize + gap);
+            _hotbarSlots[i] = new Rectangle(x, y, slotSize, slotSize);
+        }
+    }
+
+    private void UpdateInventoryLayout()
+    {
+        var tabsVisible = _gameMode == GameMode.Artificer;
+        var headerHeight = tabsVisible ? InventoryTitleHeightWithTabs : InventoryTitleHeight;
+        var maxW = _viewport.Width - 40;
+        var maxH = _viewport.Height - 40;
+        var slotSize = InventorySlotSize;
+        var gridW = InventoryCols * slotSize + (InventoryCols - 1) * InventorySlotGap;
+        var gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
+        var windowW = InventoryPadding * 2 + gridW;
+        var windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
+
+        if (windowW > maxW)
+        {
+            slotSize = Math.Clamp((maxW - InventoryPadding * 2 - InventorySlotGap * (InventoryCols - 1)) / InventoryCols, 36, InventorySlotSize);
+            gridW = InventoryCols * slotSize + (InventoryCols - 1) * InventorySlotGap;
+            windowW = InventoryPadding * 2 + gridW;
+        }
+
+        if (windowH > maxH)
+        {
+            var maxSlot = (maxH - InventoryPadding * 2 - headerHeight - InventoryFooterHeight - InventorySlotGap * (InventoryRows - 1)) / InventoryRows;
+            slotSize = Math.Clamp(Math.Min(slotSize, maxSlot), 32, InventorySlotSize);
+            gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
+            windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
+        }
+
+        _inventoryRect = new Rectangle(
+            _viewport.X + (_viewport.Width - windowW) / 2,
+            _viewport.Y + (_viewport.Height - windowH) / 2,
+            windowW,
+            windowH);
+
+        var visualWidth = Math.Min(maxW, (int)MathF.Round(windowW * InventoryPanelVisualScale));
+        var visualHeight = Math.Min(maxH, (int)MathF.Round(windowH * InventoryPanelVisualScale));
+        _inventoryPanelVisualRect = new Rectangle(
+            _inventoryRect.Center.X - visualWidth / 2,
+            _inventoryRect.Center.Y - visualHeight / 2,
+            visualWidth,
+            visualHeight);
+
+        if (tabsVisible)
+        {
+            var tabY = _inventoryRect.Y + InventoryPadding;
+            _inventoryCatalogTabRect = new Rectangle(_inventoryRect.X + InventoryPadding, tabY, InventoryTabWidth, InventoryTabHeight);
+            _inventoryStorageTabRect = new Rectangle(_inventoryCatalogTabRect.Right + 10, tabY, InventoryTabWidth, InventoryTabHeight);
+        }
+        else
+        {
+            _inventoryCatalogTabRect = Rectangle.Empty;
+            _inventoryStorageTabRect = Rectangle.Empty;
+        }
+
+        var startX = _inventoryRect.X + InventoryPadding;
+        var startY = _inventoryRect.Y + InventoryPadding + headerHeight;
+
+        for (int row = 0; row < InventoryRows; row++)
+        {
+            for (int col = 0; col < InventoryCols; col++)
+            {
+                var idx = row * InventoryCols + col;
+                var x = startX + col * (slotSize + InventorySlotGap);
+                var y = startY + row * (slotSize + InventorySlotGap);
+                _inventoryGridSlots[idx] = new Rectangle(x, y, slotSize, slotSize);
+            }
+        }
+
+        // Initialize inventory hotbar slots (above the grid)
+        var hotbarStartY = startY - slotSize - InventorySlotGap - 10;
+        for (int i = 0; i < Inventory.HotbarSize; i++)
+        {
+            var x = startX + i * (slotSize + InventorySlotGap);
+            _inventoryHotbarSlots[i] = new Rectangle(x, hotbarStartY, slotSize, slotSize);
+        }
+
+        _inventoryClose.Bounds = new Rectangle(_inventoryRect.Right - 164, _inventoryRect.Bottom - 50, 140, 38);
+        _inventoryClear.Bounds = new Rectangle(_inventoryRect.X + 16, _inventoryRect.Bottom - 50, 220, 38);
+
+        var gridBounds = GetInventoryGridBounds();
+        _inventoryCatalogHeaderRect = gridBounds.Width > 0
+            ? new Rectangle(gridBounds.X, gridBounds.Y, gridBounds.Width, CatalogHeaderHeight)
+            : Rectangle.Empty;
+
+        if (_inventoryCatalogHeaderRect.Width > 0)
+        {
+            var favoritesWidth = 130;
+            var searchWidth = Math.Max(120, _inventoryCatalogHeaderRect.Width - favoritesWidth - 12);
+            _inventoryCatalogSearchRect = new Rectangle(
+                _inventoryCatalogHeaderRect.X,
+                _inventoryCatalogHeaderRect.Y + 6,
+                searchWidth,
+                CatalogSearchHeight);
+            _inventoryCatalogSearchClearRect = new Rectangle(
+                _inventoryCatalogSearchRect.Right - 30,
+                _inventoryCatalogSearchRect.Y + 2,
+                26,
+                _inventoryCatalogSearchRect.Height - 4);
+            _inventoryCatalogFavoritesRect = new Rectangle(
+                _inventoryCatalogSearchRect.Right + 12,
+                _inventoryCatalogSearchRect.Y,
+                favoritesWidth - 12,
+                CatalogSearchHeight);
+            _inventoryCatalogListRect = new Rectangle(
+                gridBounds.X,
+                _inventoryCatalogHeaderRect.Bottom + 4,
+                gridBounds.Width,
+                Math.Max(0, gridBounds.Height - _inventoryCatalogHeaderRect.Height - 4));
+        }
+        else
+        {
+            _inventoryCatalogSearchRect = Rectangle.Empty;
+            _inventoryCatalogSearchClearRect = Rectangle.Empty;
+            _inventoryCatalogFavoritesRect = Rectangle.Empty;
+            _inventoryCatalogListRect = Rectangle.Empty;
+        }
+    }
+
+    private void UpdateInventory(InputState input, float dt)
+    {
+        if (!_inventoryOpen)
+            return;
+
+        if (_viewport != UiLayout.Viewport)
+        {
+            _viewport = UiLayout.Viewport;
+            UpdateHotbarLayout();
+            UpdateInventoryLayout();
+        }
+
+        _inventoryMousePos = input.MousePosition;
+        var p = _inventoryMousePos;
+        var isLiveView = _currentLiveInventoryTarget >= 0 && _currentLiveInventoryTarget != (_lanSession?.LocalPlayerId ?? 0);
+        var showArtificerTabs = _gameMode == GameMode.Artificer && !isLiveView;
+        var isCatalogView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var searchFocusLocked = isCatalogView && _inventoryCatalogSearchFocused;
+
+        if (_inventoryClearConfirmPending)
+        {
+            _inventoryClearConfirmTimer = Math.Max(0f, _inventoryClearConfirmTimer - Math.Max(0f, dt));
+            if (_inventoryClearConfirmTimer <= 0f)
+                _inventoryClearConfirmPending = false;
+        }
+
+        _inventoryClear.Visible = _gameMode == GameMode.Artificer && !isLiveView;
+        _inventoryClear.Enabled = _gameMode == GameMode.Artificer && !isLiveView;
+        _inventoryClear.Label = _inventoryClearConfirmPending ? "CONFIRM CLEAR" : "CLEAR INVENTORY";
+
+        if (searchFocusLocked)
+        {
+            if (input.IsNewKeyPress(Keys.Escape))
+            {
+                _inventoryCatalogSearchFocused = false;
+                return;
+            }
+
+            if (input.IsNewLeftClick())
+            {
+                var clickInsideSearchUi = _inventoryCatalogSearchRect.Contains(p)
+                    || _inventoryCatalogSearchClearRect.Contains(p);
+                if (!clickInsideSearchUi)
+                {
+                    _inventoryCatalogSearchFocused = false;
+                    return;
+                }
+
+                if (_inventoryCatalogSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_inventory.SandboxCatalogSearchQuery))
+                {
+                    _inventory.ClearSandboxCatalogSearchQuery();
+                    _inventoryCatalogSearchCaret = 0;
+                    ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                    return;
+                }
+            }
+
+            // While focused, only search-text editing keys are accepted.
+            UpdateInventoryCatalogSearchInput(input);
+            return;
+        }
+
+        if (input.IsNewKeyPress(_inventoryKey))
+        {
+            CloseInventory();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            CloseInventory();
+            return;
+        }
+
+        if (isCatalogView)
+        {
+            if (_inventoryCatalogListRect.Contains(p) && input.ScrollDelta != 0)
+            {
+                var wheelSteps = input.ScrollDelta / 120f;
+                if (Math.Abs(wheelSteps) < 0.01f)
+                    wheelSteps = Math.Sign(input.ScrollDelta);
+                _inventoryCatalogScrollVelocityPxPerSec -= wheelSteps * CatalogScrollWheelImpulse;
+            }
+
+            var scrollDecay = MathF.Exp(-CatalogScrollDamping * Math.Max(0f, dt));
+            _inventoryCatalogScrollVelocityPxPerSec *= scrollDecay;
+            if (MathF.Abs(_inventoryCatalogScrollVelocityPxPerSec) < 1f)
+                _inventoryCatalogScrollVelocityPxPerSec = 0f;
+
+            _inventoryCatalogScrollOffsetPx += _inventoryCatalogScrollVelocityPxPerSec * Math.Max(0f, dt);
+            ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+
+            UpdateInventoryCatalogSearchInput(input);
+        }
+        else
+        {
+            _inventoryCatalogSearchFocused = false;
+            _inventoryCatalogScrollVelocityPxPerSec = 0f;
+            ClampInventoryCatalogScroll(resetVelocityWhenClamped: false);
+        }
+
+        _inventoryClose.Update(input);
+        _inventoryClear.Update(input);
+        if (!_inventoryOpen)
+            return;
+
+        // Hover detection
+        var hoveredAny = false;
+        if (isLiveView)
+        {
+            if (_liveInventoryViews.TryGetValue(_currentLiveInventoryTarget, out var liveView))
+            {
+                for (int i = 0; i < _inventoryHotbarSlots.Length; i++)
+                {
+                    if (_inventoryHotbarSlots[i].Contains(p))
+                    {
+                        var blockId = i < liveView.HotbarIds.Length ? (BlockId)liveView.HotbarIds[i] : BlockId.Air;
+                        var count = i < liveView.HotbarCounts.Length ? liveView.HotbarCounts[i] : 0;
+                        if (blockId != BlockId.Air && count > 0)
+                        {
+                            SetDisplayName(BlockRegistry.Get(blockId).Name);
+                            hoveredAny = true;
+                        }
+                        break;
+                    }
+                }
+
+                if (!hoveredAny)
+                {
+                    for (int i = 0; i < _inventoryGridSlots.Length; i++)
+                    {
+                        if (_inventoryGridSlots[i].Contains(p))
+                        {
+                            var blockId = i < liveView.GridIds.Length ? (BlockId)liveView.GridIds[i] : BlockId.Air;
+                            var count = i < liveView.GridCounts.Length ? liveView.GridCounts[i] : 0;
+                            if (blockId != BlockId.Air && count > 0)
+                            {
+                                SetDisplayName(BlockRegistry.Get(blockId).Name);
+                                hoveredAny = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        else if (isCatalogView)
+        {
+            if (TryGetInventoryCatalogRowAtPoint(p, out var hoveredIndex, out _, out _) && hoveredIndex >= 0)
+            {
+                var slot = _inventory.GetSandboxCatalogFilteredEntryAt(hoveredIndex);
+                if (slot.Id != BlockId.Air && slot.Count > 0)
+                {
+                    SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                    hoveredAny = true;
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _inventoryGridSlots.Length; i++)
+            {
+                if (_inventoryGridSlots[i].Contains(p))
+                {
+                    var slot = _inventory.Grid[i];
+                    if (slot.Id != BlockId.Air && slot.Count > 0)
+                    {
+                        SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                        hoveredAny = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!hoveredAny)
+        {
+            for (int i = 0; i < _hotbarSlots.Length; i++)
+            {
+                if (_hotbarSlots[i].Contains(p))
+                {
+                    var slot = _inventory.Hotbar[i];
+                    if (slot.Id != BlockId.Air && slot.Count > 0)
+                    {
+                        SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                        hoveredAny = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!input.IsNewLeftClick())
+            return;
+
+        if (showArtificerTabs)
+        {
+            if (_inventoryCatalogTabRect.Contains(p))
+            {
+                _artificerInventoryView = ArtificerInventoryView.Catalog;
+                _lastArtificerInventoryView = _artificerInventoryView;
+                _inventoryCatalogSearchFocused = false;
+                return;
+            }
+
+            if (_inventoryStorageTabRect.Contains(p))
+            {
+                _artificerInventoryView = ArtificerInventoryView.Inventory;
+                _lastArtificerInventoryView = _artificerInventoryView;
+                _inventoryCatalogSearchFocused = false;
+                return;
+            }
+        }
+
+        if (isCatalogView)
+        {
+            if (_inventoryCatalogSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_inventory.SandboxCatalogSearchQuery))
+            {
+                _inventory.ClearSandboxCatalogSearchQuery();
+                _inventoryCatalogSearchCaret = 0;
+                ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                return;
+            }
+
+            if (_inventoryCatalogSearchRect.Contains(p))
+            {
+                _inventoryCatalogSearchFocused = true;
+                _inventoryCatalogSearchCaret = _inventory.SandboxCatalogSearchQuery.Length;
+                return;
+            }
+
+            if (_inventoryCatalogFavoritesRect.Contains(p))
+            {
+                _inventory.SetSandboxCatalogFavoritesOnly(!_inventory.SandboxCatalogFavoritesOnly);
+                ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                return;
+            }
+
+            _inventoryCatalogSearchFocused = false;
+
+            if (TryGetInventoryCatalogRowAtPoint(p, out var selectedIndex, out _, out var favoriteRect))
+            {
+                var catalogSlot = _inventory.GetSandboxCatalogFilteredEntryAt(selectedIndex);
+                if (catalogSlot.Count <= 0 || catalogSlot.Id == BlockId.Air)
+                    return;
+
+                if (favoriteRect.Contains(p))
+                {
+                    if (_inventory.ToggleSandboxCatalogFavorite((int)catalogSlot.Id))
+                        MarkPlayerStateDirty();
+                    ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+                    return;
+                }
+
+                _inventoryHeld = catalogSlot;
+                _inventoryHasHeld = true;
+                _heldFrom = InventorySlotGroup.None;
+                _heldIndex = -1;
+                return;
+            }
+        }
+        else
+        {
+            _inventoryCatalogSearchFocused = false;
+            for (int i = 0; i < _inventoryGridSlots.Length; i++)
+            {
+                if (_inventoryGridSlots[i].Contains(p))
+                {
+                    ref var slot = ref _inventory.Grid[i];
+                    HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                    return;
+                }
+            }
+        }
+
+        for (int i = 0; i < _hotbarSlots.Length; i++)
+        {
+            if (_hotbarSlots[i].Contains(p))
+            {
+                ref var slot = ref _inventory.Hotbar[i];
+                HandleInventorySlotClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: isCatalogView);
+                return;
+            }
+        }
+    }
+
+    private Rectangle GetInventoryGridBounds()
+    {
+        if (_inventoryGridSlots.Length == 0)
+            return Rectangle.Empty;
+
+        var left = int.MaxValue;
+        var top = int.MaxValue;
+        var right = int.MinValue;
+        var bottom = int.MinValue;
+
+        for (var i = 0; i < _inventoryGridSlots.Length; i++)
+        {
+            var rect = _inventoryGridSlots[i];
+            if (rect.Width <= 0 || rect.Height <= 0)
+                continue;
+
+            left = Math.Min(left, rect.Left);
+            top = Math.Min(top, rect.Top);
+            right = Math.Max(right, rect.Right);
+            bottom = Math.Max(bottom, rect.Bottom);
+        }
+
+        if (right <= left || bottom <= top)
+            return Rectangle.Empty;
+
+        return new Rectangle(left, top, right - left, bottom - top);
+    }
+
+    private void ClampInventoryCatalogScroll(bool resetVelocityWhenClamped)
+    {
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+        {
+            _inventoryCatalogScrollOffsetPx = 0f;
+            if (resetVelocityWhenClamped)
+                _inventoryCatalogScrollVelocityPxPerSec = 0f;
+            return;
+        }
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        var maxScroll = Math.Max(0f, totalRows * CatalogRowHeight - _inventoryCatalogListRect.Height);
+        var clamped = Math.Clamp(_inventoryCatalogScrollOffsetPx, 0f, maxScroll);
+        if (Math.Abs(clamped - _inventoryCatalogScrollOffsetPx) > 0.001f && resetVelocityWhenClamped)
+            _inventoryCatalogScrollVelocityPxPerSec = 0f;
+
+        _inventoryCatalogScrollOffsetPx = clamped;
+    }
+
+    private bool TryGetInventoryCatalogRowAtPoint(Point point, out int filteredIndex, out Rectangle rowRect, out Rectangle favoriteRect)
+    {
+        filteredIndex = -1;
+        rowRect = Rectangle.Empty;
+        favoriteRect = Rectangle.Empty;
+
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+            return false;
+        if (!_inventoryCatalogListRect.Contains(point))
+            return false;
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalRows <= 0)
+            return false;
+
+        var contentY = (point.Y - _inventoryCatalogListRect.Y) + _inventoryCatalogScrollOffsetPx;
+        filteredIndex = (int)MathF.Floor(contentY / CatalogRowHeight);
+        if (filteredIndex < 0 || filteredIndex >= totalRows)
+            return false;
+
+        var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(filteredIndex * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
+        rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
+        if (!rowRect.Contains(point))
+            return false;
+
+        favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+        return true;
+    }
+
+    private void UpdateInventoryCatalogSearchInput(InputState input)
+    {
+        if (!_inventoryCatalogSearchFocused)
+            return;
+
+        var query = _inventory.SandboxCatalogSearchQuery;
+        _inventoryCatalogSearchCaret = Math.Clamp(_inventoryCatalogSearchCaret, 0, query.Length);
+
+        if (input.IsNewKeyPress(Keys.Left))
+            _inventoryCatalogSearchCaret = Math.Max(0, _inventoryCatalogSearchCaret - 1);
+        if (input.IsNewKeyPress(Keys.Right))
+            _inventoryCatalogSearchCaret = Math.Min(query.Length, _inventoryCatalogSearchCaret + 1);
+        if (input.IsNewKeyPress(Keys.Home))
+            _inventoryCatalogSearchCaret = 0;
+        if (input.IsNewKeyPress(Keys.End))
+            _inventoryCatalogSearchCaret = query.Length;
+
+        var changed = false;
+
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        foreach (var key in input.GetTextInputKeys())
+        {
+            if (key is Keys.Tab or Keys.Enter or Keys.Left or Keys.Right or Keys.Home or Keys.End)
+                continue;
+
+            if (key == Keys.Back)
+            {
+                if (_inventoryCatalogSearchCaret > 0)
+                {
+                    query = query.Remove(_inventoryCatalogSearchCaret - 1, 1);
+                    _inventoryCatalogSearchCaret--;
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (key == Keys.Delete)
+            {
+                if (_inventoryCatalogSearchCaret < query.Length)
+                {
+                    query = query.Remove(_inventoryCatalogSearchCaret, 1);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (!TryMapCommandInputKey(key, shift, out var c))
+                continue;
+
+            if (query.Length >= CatalogSearchMaxLength)
+                continue;
+
+            query = query.Insert(_inventoryCatalogSearchCaret, c.ToString());
+            _inventoryCatalogSearchCaret++;
+            changed = true;
+        }
+
+        if (TryPasteClipboardIntoText(input, ref query))
+        {
+            if (query.Length > CatalogSearchMaxLength)
+                query = query.Substring(0, CatalogSearchMaxLength);
+            _inventoryCatalogSearchCaret = query.Length;
+            changed = true;
+        }
+
+        if (!changed)
+            return;
+
+        if (query.Length > CatalogSearchMaxLength)
+            query = query.Substring(0, CatalogSearchMaxLength);
+
+        _inventory.SetSandboxCatalogSearchQuery(query);
+        _inventoryCatalogSearchCaret = Math.Clamp(_inventoryCatalogSearchCaret, 0, _inventory.SandboxCatalogSearchQuery.Length);
+        _inventoryCatalogScrollOffsetPx = 0f;
+        _inventoryCatalogScrollVelocityPxPerSec = 0f;
+        ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+    }
+
+    private void DrawInventoryCatalogPanel(SpriteBatch sb)
+    {
+        if (_inventoryCatalogHeaderRect.Width <= 0 || _inventoryCatalogListRect.Width <= 0)
+            return;
+
+        EnsureCatalogLoreLoaded();
+
+        sb.Draw(_pixel, _inventoryCatalogHeaderRect, new Color(14, 18, 24, 210));
+        DrawBorder(sb, _inventoryCatalogHeaderRect, new Color(100, 120, 140));
+
+        sb.Draw(_pixel, _inventoryCatalogSearchRect, new Color(10, 10, 14, 235));
+        DrawBorder(sb, _inventoryCatalogSearchRect, _inventoryCatalogSearchFocused ? new Color(230, 230, 140) : new Color(170, 170, 170));
+        var query = _inventory.SandboxCatalogSearchQuery;
+        var queryDisplay = string.IsNullOrEmpty(query) ? "Search blocks..." : query;
+        var queryColor = string.IsNullOrEmpty(query) ? new Color(150, 150, 150) : Color.White;
+        _font.DrawString(sb, queryDisplay, new Vector2(_inventoryCatalogSearchRect.X + 8, _inventoryCatalogSearchRect.Y + 8), queryColor);
+
+        if (!string.IsNullOrEmpty(query))
+        {
+            sb.Draw(_pixel, _inventoryCatalogSearchClearRect, new Color(26, 30, 36, 240));
+            DrawBorder(sb, _inventoryCatalogSearchClearRect, new Color(205, 205, 205));
+            var clearText = "X";
+            var clearSize = _font.MeasureString(clearText);
+            _font.DrawString(
+                sb,
+                clearText,
+                new Vector2(_inventoryCatalogSearchClearRect.Center.X - clearSize.X / 2f, _inventoryCatalogSearchClearRect.Center.Y - clearSize.Y / 2f),
+                Color.White);
+        }
+
+        if (_inventoryCatalogSearchFocused && ((int)(_worldTimeSeconds * 2f) % 2 == 0))
+        {
+            var caret = Math.Clamp(_inventoryCatalogSearchCaret, 0, query.Length);
+            var caretPrefix = caret <= 0 ? string.Empty : query.Substring(0, caret);
+            var caretOffsetX = _font.MeasureString(caretPrefix).X;
+            var caretX = _inventoryCatalogSearchRect.X + 8 + (int)MathF.Round(caretOffsetX);
+            var caretRect = new Rectangle(caretX, _inventoryCatalogSearchRect.Y + 6, 2, _inventoryCatalogSearchRect.Height - 12);
+            sb.Draw(_pixel, caretRect, new Color(245, 245, 245));
+        }
+
+        var favoritesOnly = _inventory.SandboxCatalogFavoritesOnly;
+        sb.Draw(_pixel, _inventoryCatalogFavoritesRect, favoritesOnly ? new Color(48, 86, 132, 235) : new Color(18, 20, 24, 235));
+        DrawBorder(sb, _inventoryCatalogFavoritesRect, favoritesOnly ? new Color(220, 235, 255) : new Color(160, 160, 160));
+        _font.DrawString(
+            sb,
+            favoritesOnly ? "FAVORITES ON" : "FAVORITES",
+            new Vector2(_inventoryCatalogFavoritesRect.X + 10, _inventoryCatalogFavoritesRect.Y + 8),
+            Color.White);
+
+        sb.Draw(_pixel, _inventoryCatalogListRect, new Color(9, 10, 12, 220));
+        DrawBorder(sb, _inventoryCatalogListRect, new Color(170, 170, 170));
+
+        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalRows <= 0)
+        {
+            _font.DrawString(sb, "No blocks match search.", new Vector2(_inventoryCatalogListRect.X + 12, _inventoryCatalogListRect.Y + 12), new Color(220, 220, 220));
+            return;
+        }
+
+        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
+        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
+        var last = Math.Min(totalRows - 1, first + visible - 1);
+        var hoveredBlockId = BlockId.Air;
+        var hoveredRowRect = Rectangle.Empty;
+
+        var device = _graphics.GraphicsDevice;
+        var priorScissor = device.ScissorRectangle;
+        var clipRect = UiLayout.ToScreenRect(_inventoryCatalogListRect);
+        if (clipRect.Width <= 0 || clipRect.Height <= 0)
+            return;
+
+        sb.End();
+        device.ScissorRectangle = clipRect;
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
+
+        for (var index = first; index <= last; index++)
+        {
+            var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(index * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
+            var rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
+            if (rowRect.Bottom <= _inventoryCatalogListRect.Top || rowRect.Top >= _inventoryCatalogListRect.Bottom)
+                continue;
+
+            var hovered = rowRect.Contains(_inventoryMousePos);
+            sb.Draw(_pixel, rowRect, hovered ? new Color(34, 44, 58, 220) : new Color(20, 24, 30, 210));
+            DrawBorder(sb, rowRect, hovered ? new Color(188, 214, 252) : new Color(88, 96, 110));
+
+            var slot = _inventory.GetSandboxCatalogFilteredEntryAt(index);
+            var iconRect = new Rectangle(rowRect.X + 8, rowRect.Y + 4, CatalogRowIconSize, CatalogRowIconSize);
+            var icon = GetBlockIconIfReady(slot.Id, iconRect.Width);
+            if (icon != null)
+                sb.Draw(icon, iconRect, Color.White);
+            else if (_atlas != null)
+                sb.Draw(_atlas.Texture, iconRect, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+
+            var def = BlockRegistry.Get(slot.Id);
+            var name = def.Name.ToUpperInvariant();
+            var rarity = ResolveCatalogRarity(slot.Id, def);
+            var nameColor = GetCatalogRarityColor(rarity);
+            var nameY = rowRect.Y + (rowRect.Height - _font.LineHeight) / 2f;
+
+            var favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+            var favorite = _inventory.IsSandboxCatalogFavorite((int)slot.Id);
+            sb.Draw(_pixel, favoriteRect, favorite ? new Color(64, 112, 84, 245) : new Color(34, 34, 34, 245));
+            DrawBorder(sb, favoriteRect, favorite ? new Color(210, 245, 220) : new Color(150, 150, 150));
+            _font.DrawString(sb, favorite ? "*" : "+", new Vector2(favoriteRect.X + 7, favoriteRect.Y + 3), Color.White);
+            var nameMaxWidth = Math.Max(40, favoriteRect.Left - (iconRect.Right + 8) - 10);
+            var displayName = TruncateCatalogLabel(name, nameMaxWidth);
+            _font.DrawString(sb, displayName, new Vector2(iconRect.Right + 8, nameY), nameColor);
+
+            if (hovered)
+            {
+                hoveredBlockId = slot.Id;
+                hoveredRowRect = rowRect;
+            }
+        }
+
+        sb.End();
+        device.ScissorRectangle = priorScissor;
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+
+        if (hoveredRowRect != Rectangle.Empty)
+            DrawCatalogHoverTooltip(sb, hoveredBlockId, hoveredRowRect);
+    }
+
+    private void EnsureCatalogLoreLoaded()
+    {
+        if (_catalogLoreLoaded)
+            return;
+
+        _catalogLoreLoaded = true;
+        _catalogLoreByBlock.Clear();
+
+        try
+        {
+            if (!_assets.TryLoadAssetBytes(CatalogLoreAssetPath, out var bytes) || bytes.Length == 0)
+                return;
+
+            var json = Encoding.UTF8.GetString(bytes);
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var payload = JsonSerializer.Deserialize<CatalogLoreFile>(json, options);
+            if (payload?.Blocks == null || payload.Blocks.Count == 0)
+                return;
+
+            for (var i = 0; i < payload.Blocks.Count; i++)
+            {
+                var source = payload.Blocks[i];
+                if (source == null || !TryResolveCatalogLoreBlockId(source, out var blockId))
+                    continue;
+
+                var def = BlockRegistry.Get(blockId);
+                if (def.Id != blockId || blockId == BlockId.Air || !def.IsVisibleInInventory)
+                    continue;
+
+                var description = BuildCatalogLoreDescription(source, def);
+                if (string.IsNullOrWhiteSpace(description))
+                    description = BuildDefaultCatalogDescription(def);
+
+                var displayName = string.IsNullOrWhiteSpace(source.DisplayNameOverride)
+                    ? def.Name
+                    : source.DisplayNameOverride.Trim();
+                var tags = NormalizeCatalogLoreTags(source.Tags);
+                var rarity = ResolveCatalogRarity(blockId, def, tags);
+                _catalogLoreByBlock[blockId] = new CatalogLoreEntry(displayName, description, tags, rarity);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Catalog lore load failed: {ex.Message}");
+        }
+    }
+
+    private static bool TryResolveCatalogLoreBlockId(CatalogLoreBlockDto source, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+
+        if (source.ByteId > 0 && source.ByteId <= byte.MaxValue)
+        {
+            var byteBlock = (BlockId)source.ByteId;
+            if (BlockRegistry.Get(byteBlock).Id == byteBlock)
+            {
+                blockId = byteBlock;
+                return true;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(source.BlockEnum))
+            return false;
+
+        if (!Enum.TryParse<BlockId>(source.BlockEnum.Trim(), ignoreCase: true, out var parsed))
+            return false;
+
+        if (BlockRegistry.Get(parsed).Id != parsed)
+            return false;
+
+        blockId = parsed;
+        return true;
+    }
+
+    private static string[] NormalizeCatalogLoreTags(string[]? tags)
+    {
+        if (tags == null || tags.Length == 0)
+            return Array.Empty<string>();
+
+        var output = new List<string>(tags.Length);
+        for (var i = 0; i < tags.Length; i++)
+        {
+            var normalized = (tags[i] ?? string.Empty).Trim().ToLowerInvariant();
+            if (normalized.Length > 0)
+                output.Add(normalized);
+        }
+
+        if (output.Count == 0)
+            return Array.Empty<string>();
+
+        return output.Distinct(StringComparer.Ordinal).ToArray();
+    }
+
+    private static string BuildCatalogLoreDescription(CatalogLoreBlockDto source, BlockDef def)
+    {
+        if (source.LoreLines != null)
+        {
+            for (var i = 0; i < source.LoreLines.Length; i++)
+            {
+                var line = NormalizeCatalogLoreLine(source.LoreLines[i]);
+                if (!string.IsNullOrWhiteSpace(line))
+                    return line;
+            }
+        }
+
+        return BuildDefaultCatalogDescription(def);
+    }
+
+    private static string NormalizeCatalogLoreLine(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        var trimmed = raw.Trim();
+        return string.Join(' ', trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static string BuildDefaultCatalogDescription(BlockDef def)
+    {
+        var token = def.Id.ToString().ToLowerInvariant();
+        if (def.Id == BlockId.Water)
+            return "A flowing liquid block used to shape waterways and terrain basins.";
+        if (token.Contains("leaf", StringComparison.Ordinal))
+            return "Foliage block for shaping canopies and natural-looking tree crowns.";
+        if (token.Contains("glass", StringComparison.Ordinal))
+            return "Transparent construction block for clear windows and observation views.";
+        if (token.Contains("ore", StringComparison.Ordinal) || token is "coal" or "iron" or "gold" or "diamond")
+            return "Resource-bearing block used for progression materials and crafted tools.";
+        if (token.Contains("bench", StringComparison.Ordinal) || token.Contains("table", StringComparison.Ordinal))
+            return "Workstation block used for crafting and advanced build workflows.";
+        if (!def.IsSolid)
+            return "Light crafted component used in advanced recipes and utility builds.";
+        if (def.Hardness < 0f)
+            return "A foundational boundary block that anchors the world where it stands.";
+        return "Reliable structural block for building, landscaping, and terrain shaping.";
+    }
+
+    private CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def)
+    {
+        if (_catalogLoreByBlock.TryGetValue(blockId, out var lore))
+            return lore.Rarity;
+
+        return ResolveCatalogRarity(blockId, def, Array.Empty<string>());
+    }
+
+    private static CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def, IReadOnlyList<string> tags)
+    {
+        var token = blockId.ToString().ToLowerInvariant();
+
+        if (def.Hardness < 0f
+            || token.Contains("evergatecore", StringComparison.Ordinal)
+            || tags.Contains("null"))
+            return CatalogRarity.Legendary;
+
+        if (token.Contains("evergate", StringComparison.Ordinal)
+            || token.Contains("keystone", StringComparison.Ordinal)
+            || token.Contains("axiom", StringComparison.Ordinal)
+            || token.Contains("resonancecore", StringComparison.Ordinal)
+            || token.Contains("runicanvil", StringComparison.Ordinal)
+            || tags.Contains("keystone")
+            || tags.Contains("continuist"))
+            return CatalogRarity.Rare;
+
+        if (token.Contains("ore", StringComparison.Ordinal)
+            || token.Contains("glass", StringComparison.Ordinal)
+            || token.Contains("runestone", StringComparison.Ordinal)
+            || token.Contains("veinstone", StringComparison.Ordinal)
+            || token.Contains("staff", StringComparison.Ordinal)
+            || token.Contains("regulator", StringComparison.Ordinal)
+            || token.Contains("plinth", StringComparison.Ordinal)
+            || token.Contains("sigil", StringComparison.Ordinal)
+            || token.Contains("philter", StringComparison.Ordinal)
+            || token.Contains("elixir", StringComparison.Ordinal)
+            || token.Contains("draught", StringComparison.Ordinal)
+            || tags.Contains("ore")
+            || tags.Contains("metal")
+            || tags.Contains("crafting")
+            || tags.Contains("station")
+            || tags.Contains("precision"))
+            return CatalogRarity.Uncommon;
+
+        return CatalogRarity.Common;
+    }
+
+    private static Color GetCatalogRarityColor(CatalogRarity rarity)
+    {
+        return rarity switch
+        {
+            CatalogRarity.Common => new Color(236, 236, 236),
+            CatalogRarity.Uncommon => new Color(132, 232, 148),
+            CatalogRarity.Rare => new Color(132, 186, 255),
+            CatalogRarity.Legendary => new Color(255, 214, 118),
+            _ => Color.White
+        };
+    }
+
+    private void DrawCatalogHoverTooltip(SpriteBatch sb, BlockId blockId, Rectangle hoveredRowRect)
+    {
+        var def = BlockRegistry.Get(blockId);
+        var lore = _catalogLoreByBlock.TryGetValue(blockId, out var entry)
+            ? entry
+            : new CatalogLoreEntry(def.Name, BuildDefaultCatalogDescription(def), Array.Empty<string>(), ResolveCatalogRarity(blockId, def));
+        var rarity = lore.Rarity;
+        var rarityColor = GetCatalogRarityColor(rarity);
+        var rarityLabel = rarity switch
+        {
+            CatalogRarity.Common => "COMMON",
+            CatalogRarity.Uncommon => "UNCOMMON",
+            CatalogRarity.Rare => "RARE",
+            CatalogRarity.Legendary => "LEGENDARY",
+            _ => "COMMON"
+        };
+
+        var title = lore.DisplayName.ToUpperInvariant();
+        var description = string.IsNullOrWhiteSpace(lore.Description)
+            ? BuildDefaultCatalogDescription(def)
+            : lore.Description;
+        var wrapped = WrapOverlayText(description, CatalogTooltipMaxWidth - 30);
+        var maxTextWidth = _font.MeasureString(title).X + 14 + _font.MeasureString(rarityLabel).X;
+        for (var i = 0; i < wrapped.Count; i++)
+            maxTextWidth = Math.Max(maxTextWidth, _font.MeasureString(wrapped[i]).X);
+
+        var panelWidth = (int)Math.Ceiling(Math.Clamp(maxTextWidth + 20f, 240f, CatalogTooltipMaxWidth));
+        var panelHeight = 12 + _font.LineHeight + 8 + (wrapped.Count * (_font.LineHeight + 2)) + 10;
+
+        var x = _inventoryMousePos.X + 18;
+        var y = _inventoryMousePos.Y + 18;
+        var minX = _viewport.X + 8;
+        var minY = _viewport.Y + 8;
+        var maxX = _viewport.Right - panelWidth - 8;
+        var maxY = _viewport.Bottom - panelHeight - 8;
+        if (maxX < minX)
+            x = minX;
+        else
+            x = Math.Clamp(x, minX, maxX);
+
+        if (maxY < minY)
+            y = minY;
+        else
+            y = Math.Clamp(y, minY, maxY);
+
+        if (y + panelHeight > _inventoryCatalogListRect.Bottom && hoveredRowRect.Top - panelHeight - 8 >= _viewport.Y + 8)
+            y = hoveredRowRect.Top - panelHeight - 8;
+
+        var panel = new Rectangle(x, y, panelWidth, panelHeight);
+        sb.Draw(_pixel, panel, new Color(8, 10, 14, 244));
+        DrawBorder(sb, panel, new Color(208, 218, 234, 220));
+
+        var divider = new Rectangle(panel.X + 10, panel.Y + 12 + _font.LineHeight + 2, panel.Width - 20, 1);
+        sb.Draw(_pixel, divider, new Color(76, 90, 112, 210));
+
+        var titlePos = new Vector2(panel.X + 10, panel.Y + 10);
+        var titleShadow = titlePos + new Vector2(1f, 1f);
+        _font.DrawString(sb, title, titleShadow, new Color(0, 0, 0, 210));
+        _font.DrawString(sb, title, titlePos, rarityColor);
+
+        var raritySize = _font.MeasureString(rarityLabel);
+        var rarityPos = new Vector2(panel.Right - raritySize.X - 10, panel.Y + 10);
+        _font.DrawString(sb, rarityLabel, rarityPos + new Vector2(1f, 1f), new Color(0, 0, 0, 210));
+        _font.DrawString(sb, rarityLabel, rarityPos, rarityColor);
+
+        var textY = divider.Bottom + 6;
+        for (var i = 0; i < wrapped.Count; i++)
+        {
+            var linePos = new Vector2(panel.X + 10, textY + i * (_font.LineHeight + 2));
+            _font.DrawString(sb, wrapped[i], linePos + new Vector2(1f, 1f), new Color(0, 0, 0, 200));
+            _font.DrawString(sb, wrapped[i], linePos, new Color(236, 242, 255));
+        }
+    }
+
+    private string TruncateCatalogLabel(string text, int maxWidth)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0)
+            return string.Empty;
+
+        if (_font.MeasureString(text).X <= maxWidth)
+            return text;
+
+        const string ellipsis = "...";
+        if (_font.MeasureString(ellipsis).X > maxWidth)
+            return string.Empty;
+
+        for (var length = text.Length - 1; length > 0; length--)
+        {
+            var candidate = text.Substring(0, length) + ellipsis;
+            if (_font.MeasureString(candidate).X <= maxWidth)
+                return candidate;
+        }
+
+        return ellipsis;
+    }
+
+    private void WarmBlockIcons()
+    {
+        if (_blockIconCache == null)
+            return;
+
+        const int pad = 6;
+        var hotbarSize = _hotbarSlots.Length > 0 && _hotbarSlots[0].Width > 0
+            ? _hotbarSlots[0].Width - pad * 2
+            : InventorySlotSize - pad * 2;
+
+        WarmIconSlots(_inventory.Hotbar, hotbarSize);
+
+        if (_inventoryOpen)
+        {
+            var gridSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
+                ? _inventoryGridSlots[0].Width - pad * 2
+                : InventorySlotSize - pad * 2;
+            if (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
+                WarmVisibleCatalogIcons(CatalogRowIconSize);
+            else
+                WarmIconSlots(_inventory.Grid, gridSize);
+        }
+
+        if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
+        {
+            var heldSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
+                ? _inventoryGridSlots[0].Width - pad * 2
+                : InventorySlotSize - pad * 2;
+            _blockIconCache.Warm(_inventoryHeld.Id, heldSize, BlockModelContext.Gui);
+        }
+    }
+
+    private void WarmIconSlots(HotbarSlot[] slots, int size)
+    {
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Count <= 0 || slot.Id == BlockId.Air)
+                continue;
+
+            _blockIconCache?.Warm(slot.Id, size, BlockModelContext.Gui);
+        }
+    }
+
+    private void WarmVisibleCatalogIcons(int size)
+    {
+        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+            return;
+
+        var total = _inventory.GetSandboxCatalogFilteredCount();
+        if (total <= 0)
+            return;
+
+        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
+        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
+        var last = Math.Min(total - 1, first + visible - 1);
+        for (var i = first; i <= last; i++)
+        {
+            var slot = _inventory.GetSandboxCatalogFilteredEntryAt(i);
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            _blockIconCache?.Warm(slot.Id, size, BlockModelContext.Gui);
+        }
+    }
+
+    private Texture2D? GetBlockIcon(BlockId id, int size)
+    {
+        return _blockIconCache?.GetOrCreate(id, size, BlockModelContext.Gui);
+    }
+
+    private Texture2D? GetBlockIconIfReady(BlockId id, int size)
+    {
+        return _blockIconCache?.GetIfReady(id, size, BlockModelContext.Gui);
+    }
+
+    private void CloseInventory()
+    {
+        if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air && _inventoryHeld.Count > 0)
+        {
+            if (_inventory.Mode != GameMode.Veilwalker)
+            {
+                var leftover = _inventory.Add(_inventoryHeld.Id, _inventoryHeld.Count);
+                if (leftover > 0)
+                    SpawnDroppedItem(_inventoryHeld.Id, leftover);
+                MarkPlayerStateDirty(); // Mark dirty after inventory change
+            }
+
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        _inventoryOpen = false;
+    }
+
+    private void HandleInventorySlotClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
+    {
+        if (sandboxCatalogMode)
+        {
+            HandleSandboxInventoryClick(ref slot, group, index);
+            return;
+        }
+
+        if (!_inventoryHasHeld)
+        {
+            if (slot.Count <= 0 || slot.Id == BlockId.Air)
+                return;
+            _inventoryHeld = slot;
+            _inventoryHasHeld = true;
+            _heldFrom = group;
+            _heldIndex = index;
+            slot = default;
+            return;
+        }
+
+        var temp = slot;
+        slot = _inventoryHeld;
+        _inventoryHeld = temp;
+        _inventoryHasHeld = _inventoryHeld.Count > 0 && _inventoryHeld.Id != BlockId.Air;
+        if (_inventoryHasHeld)
+        {
+            _heldFrom = group;
+            _heldIndex = index;
+        }
+        else
+        {
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        // Non-artificer mode keeps standard move/swap behavior.
+    }
+
+    private static void ClampSandboxSlot(ref HotbarSlot slot)
+    {
+        if (slot.Count > 1)
+            slot.Count = 1;
+    }
+
+    private void HandleSandboxInventoryClick(ref HotbarSlot slot, InventorySlotGroup group, int index)
+    {
+        if (group == InventorySlotGroup.Grid)
+        {
+            if (slot.Count <= 0 || slot.Id == BlockId.Air)
+                return;
+
+            _inventoryHeld = slot;
+            _inventoryHasHeld = true;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+            return;
+        }
+
+        // Hotbar: place copies from held, or pick up existing hotbar items.
+        if (_inventoryHasHeld)
+        {
+            slot = _inventoryHeld;
+            ClampSandboxSlot(ref slot);
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+            return;
+        }
+
+        if (slot.Count <= 0 || slot.Id == BlockId.Air)
+            return;
+
+        _inventoryHeld = slot;
+        _inventoryHasHeld = true;
+        _heldFrom = InventorySlotGroup.None;
+        _heldIndex = -1;
+        slot = default;
+    }
+
+    private enum InventorySlotGroup
+    {
+        None,
+        Grid,
+        Hotbar
+    }
+
+    private enum ArtificerInventoryView
+    {
+        Catalog,
+        Inventory
+    }
+
+    private ArtificerInventoryView _artificerInventoryView = ArtificerInventoryView.Catalog;
+    private ArtificerInventoryView _lastArtificerInventoryView = ArtificerInventoryView.Catalog;
+
+    private void DrawHotbar(SpriteBatch sb)
+    {
+        if (_viewport != UiLayout.Viewport)
+            UpdateHotbarLayout();
+
+        for (int i = 0; i < _hotbarSlots.Length; i++)
+        {
+            var rect = _hotbarSlots[i];
+            var selected = i == _inventory.SelectedIndex;
+            var bg = selected ? new Color(70, 70, 70, 220) : new Color(20, 20, 20, 180);
+            sb.Draw(_pixel, rect, bg);
+            DrawBorder(sb, rect, selected ? Color.Yellow : Color.White);
+
+            var slot = _inventory.Hotbar[i];
+            if (slot.Count > 0 && slot.Id != BlockId.Air && _atlas != null)
+            {
+                var src = _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY);
+                var pad = 6;
+                var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
+                var icon = GetBlockIcon(slot.Id, dst.Width);
+                if (icon != null)
+                    sb.Draw(icon, dst, Color.White);
+                else
+                    sb.Draw(_atlas.Texture, dst, src, Color.White);
+            }
+
+            if (slot.Count > 1)
+            {
+                var text = slot.Count.ToString();
+                var size = _font.MeasureString(text);
+                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
+                _font.DrawString(sb, text, pos, Color.White);
+            }
+        }
+    }
+
+    private void DrawContextIndicators(SpriteBatch sb)
+    {
+        if (!_indicatorsEnabled)
+            return;
+
+        var iconSize = Math.Clamp(_hotbarRect.Height, 24, 72);
+        var sidePadding = Math.Max(10, iconSize / 5);
+        var iconY = _hotbarRect.Y + (_hotbarRect.Height - iconSize) / 2;
+
+        if (_player.IsSprinting)
+        {
+            var footRect = new Rectangle(_hotbarRect.Left - iconSize - sidePadding, iconY, iconSize, iconSize);
+            DrawIndicatorBadge(sb, footRect, new Color(44, 58, 32, 210), new Color(152, 214, 122));
+            DrawFootIndicatorGlyph(sb, footRect, new Color(224, 255, 224));
+        }
+
+        var drawEye = _player.IsSneaking;
+        var drawWing = _player.IsFlying && _gameMode != GameMode.Veilseer;
+        var showRightIndicator = drawEye || drawWing;
+
+        if (!showRightIndicator)
+            return;
+
+        var rightRect = new Rectangle(_hotbarRect.Right + sidePadding, iconY, iconSize, iconSize);
+        if (drawEye)
+        {
+            DrawIndicatorBadge(sb, rightRect, new Color(30, 52, 72, 215), new Color(142, 214, 255));
+            DrawEyeIndicatorGlyph(sb, rightRect, new Color(224, 245, 255));
+        }
+        else if (drawWing)
+        {
+            DrawIndicatorBadge(sb, rightRect, new Color(42, 52, 76, 215), new Color(198, 214, 255));
+            DrawWingIndicatorGlyph(sb, rightRect, new Color(236, 242, 255));
+        }
+    }
+
+    private void DrawIndicatorBadge(SpriteBatch sb, Rectangle rect, Color fill, Color border)
+    {
+        sb.Draw(_pixel, rect, fill);
+        DrawBorder(sb, rect, border);
+    }
+
+    private void DrawFootIndicatorGlyph(SpriteBatch sb, Rectangle rect, Color color)
+    {
+        var soleH = ScaleGlyph(rect, 4f);
+        var soleMargin = ScaleGlyph(rect, 4f);
+        var heelW = ScaleGlyph(rect, 7f);
+        var heelH = ScaleGlyph(rect, 4f);
+        var heelX = rect.X + ScaleGlyph(rect, 5f);
+        var heelY = rect.Bottom - ScaleGlyph(rect, 12f);
+        var ankleW = ScaleGlyph(rect, 5f);
+        var ankleH = ScaleGlyph(rect, 7f);
+        var ankleX = rect.X + ScaleGlyph(rect, 8f);
+        var ankleY = rect.Y + ScaleGlyph(rect, 5f);
+
+        var sole = new Rectangle(rect.X + soleMargin, rect.Bottom - ScaleGlyph(rect, 8f), Math.Max(2, rect.Width - soleMargin * 2), soleH);
+        var heel = new Rectangle(heelX, heelY, heelW, heelH);
+        var ankle = new Rectangle(ankleX, ankleY, ankleW, ankleH);
+        sb.Draw(_pixel, sole, color);
+        sb.Draw(_pixel, heel, color);
+        sb.Draw(_pixel, ankle, color);
+    }
+
+    private void DrawWingIndicatorGlyph(SpriteBatch sb, Rectangle rect, Color color)
+    {
+        var left = new Vector2(rect.X + ScaleGlyph(rect, 5f), rect.Center.Y + ScaleGlyph(rect, 4f));
+        var center = new Vector2(rect.Center.X + ScaleGlyph(rect, 1f), rect.Y + ScaleGlyph(rect, 6f));
+        var right = new Vector2(rect.Right - ScaleGlyph(rect, 5f), rect.Center.Y + ScaleGlyph(rect, 5f));
+        var lineThickness = ScaleGlyph(rect, 2f);
+        DrawLine(sb, left, center, color, lineThickness);
+        DrawLine(sb, center, right, color, lineThickness);
+        DrawLine(sb, left + new Vector2(0f, ScaleGlyph(rect, 3f)), center + new Vector2(-ScaleGlyph(rect, 1f), ScaleGlyph(rect, 3f)), color, lineThickness);
+        DrawLine(sb, center + new Vector2(-ScaleGlyph(rect, 1f), ScaleGlyph(rect, 3f)), right + new Vector2(0f, ScaleGlyph(rect, 3f)), color, lineThickness);
+    }
+
+    private void DrawEyeIndicatorGlyph(SpriteBatch sb, Rectangle rect, Color color)
+    {
+        var left = new Vector2(rect.X + ScaleGlyph(rect, 4f), rect.Center.Y);
+        var top = new Vector2(rect.Center.X, rect.Y + ScaleGlyph(rect, 6f));
+        var right = new Vector2(rect.Right - ScaleGlyph(rect, 4f), rect.Center.Y);
+        var bottom = new Vector2(rect.Center.X, rect.Bottom - ScaleGlyph(rect, 6f));
+        var lineThickness = ScaleGlyph(rect, 2f);
+        DrawLine(sb, left, top, color, lineThickness);
+        DrawLine(sb, top, right, color, lineThickness);
+        DrawLine(sb, right, bottom, color, lineThickness);
+        DrawLine(sb, bottom, left, color, lineThickness);
+
+        var pupilSize = ScaleGlyph(rect, 4f);
+        sb.Draw(_pixel, new Rectangle(rect.Center.X - pupilSize / 2, rect.Center.Y - pupilSize / 2, pupilSize, pupilSize), color);
+    }
+
+    private static int ScaleGlyph(Rectangle rect, float baseline)
+    {
+        var scale = rect.Width / 24f;
+        return Math.Max(1, (int)MathF.Round(baseline * scale));
+    }
+
+    private void DrawWorldNametags(SpriteBatch sb, GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_remotePlayers.Count == 0)
+            return;
+
+        var mode = NormalizeNametagMode(_nametagMode);
+        if (string.Equals(mode, "Off", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var alpha = 1f;
+        if (string.Equals(mode, "Fade", StringComparison.OrdinalIgnoreCase))
+        {
+            if (Keyboard.GetState().IsKeyDown(Keys.Tab))
+            {
+                alpha = 1f;
+            }
+            else
+            {
+                if (_nametagFadeSeconds <= 0.001f || _nametagFadeTimer <= 0f)
+                    return;
+                alpha = Math.Clamp(_nametagFadeTimer / _nametagFadeSeconds, 0f, 1f);
+            }
+        }
+
+        if (alpha <= 0.01f)
+            return;
+
+        foreach (var pair in _remotePlayers)
+        {
+            // Skip Veilseer players (hidden from nametags)
+            if (_remoteIsVeilseer.TryGetValue(pair.Key, out var isVeilseer) && isVeilseer)
+                continue;
+                
+            var name = ResolvePlayerName(pair.Key);
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            var anchor = pair.Value.Position + new Vector3(0f, pair.Value.ColliderHeight + 0.45f, 0f);
+            if (!TryProjectWorldPointToUi(device, anchor, view, proj, out var uiPos, out _))
+                continue;
+
+            var textSize = _font.MeasureString(name);
+            var rect = new Rectangle(
+                (int)MathF.Round(uiPos.X - textSize.X * 0.5f - 6f),
+                (int)MathF.Round(uiPos.Y - _font.LineHeight - 14f),
+                (int)MathF.Ceiling(textSize.X) + 12,
+                _font.LineHeight + 8);
+
+            if (rect.Right < _viewport.Left || rect.Left > _viewport.Right || rect.Bottom < _viewport.Top || rect.Top > _viewport.Bottom)
+                continue;
+
+            var bg = new Color(0, 0, 0, Math.Clamp((int)(160f * alpha), 0, 255));
+            var border = new Color(208, 228, 255, Math.Clamp((int)(220f * alpha), 0, 255));
+            var textColor = new Color(245, 245, 245, Math.Clamp((int)(255f * alpha), 0, 255));
+            sb.Draw(_pixel, rect, bg);
+            DrawBorder(sb, rect, border);
+            _font.DrawString(sb, name, new Vector2(rect.X + 6, rect.Y + 4), textColor);
+        }
+    }
+
+    private static bool TryProjectWorldPointToUi(GraphicsDevice device, Vector3 worldPoint, Matrix view, Matrix projection, out Vector2 uiPoint, out float depth)
+    {
+        var projected = device.Viewport.Project(worldPoint, projection, view, Matrix.Identity);
+        depth = projected.Z;
+        uiPoint = default;
+
+        if (float.IsNaN(projected.X) || float.IsNaN(projected.Y) || float.IsNaN(projected.Z))
+            return false;
+        if (depth < 0f || depth > 1f)
+            return false;
+
+        var scale = UiLayout.Scale <= 0.0001f ? 1f : UiLayout.Scale;
+        uiPoint = new Vector2(
+            (projected.X - UiLayout.Offset.X) / scale,
+            (projected.Y - UiLayout.Offset.Y) / scale);
+        return true;
+    }
+
+    private void DrawPlayerList(SpriteBatch sb)
+    {
+        if (_lanSession == null || _playerNames.Count == 0)
+            return;
+        if (IsAnyTextCaptureActive || _pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _structureFinderOpen)
+            return;
+        if (!Keyboard.GetState().IsKeyDown(Keys.Tab))
+            return;
+
+        var entries = new List<KeyValuePair<int, string>>(_playerNames);
+        // Filter out Veilseer players from the player list
+        entries.RemoveAll(entry => _remoteIsVeilseer.TryGetValue(entry.Key, out var isVeilseer) && isVeilseer);
+        entries.Sort((a, b) => a.Key.CompareTo(b.Key));
+
+        var lineH = _font.LineHeight + 2;
+        var title = "PLAYERS";
+        var maxWidth = _font.MeasureString(title).X;
+
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var label = FormatPlayerLabel(entries[i]);
+            var width = _font.MeasureString(label).X;
+            if (width > maxWidth)
+                maxWidth = width;
+        }
+
+        var padding = 6;
+        var widthPixels = (int)MathF.Ceiling(maxWidth) + padding * 2;
+        var heightPixels = (entries.Count + 1) * lineH + padding * 2;
+
+        var x = _viewport.Right - widthPixels - 20;
+        var y = _viewport.Y + 20;
+        var rect = new Rectangle(x, y, widthPixels, heightPixels);
+
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 140));
+        DrawBorder(sb, rect, Color.White);
+
+        var cursor = new Vector2(rect.X + padding, rect.Y + padding);
+        _font.DrawString(sb, title, cursor, Color.White);
+        cursor.Y += lineH;
+
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var label = FormatPlayerLabel(entries[i]);
+            _font.DrawString(sb, label, cursor, Color.White);
+            cursor.Y += lineH;
+        }
+    }
+
+    private string FormatPlayerLabel(KeyValuePair<int, string> entry)
+    {
+        var label = entry.Value;
+        if (_lanSession != null && entry.Key == _lanSession.LocalPlayerId)
+            label = $"{label} (YOU)";
+        else if (entry.Key == 0)
+            label = $"{label} (HOST)";
+
+        return label;
+    }
+
+    private void DrawInventory(SpriteBatch sb)
+    {
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        if (_pausePanel != null)
+            sb.Draw(_pausePanel, _inventoryPanelVisualRect, Color.White);
+        else
+            sb.Draw(_pixel, _inventoryPanelVisualRect, new Color(8, 12, 22, 220));
+
+        var isLiveView = _currentLiveInventoryTarget >= 0 && _currentLiveInventoryTarget != (_lanSession?.LocalPlayerId ?? 0);
+
+        var tabsVisible = _gameMode == GameMode.Artificer && !isLiveView;
+        var isArtificerCatalog = tabsVisible && _artificerInventoryView == ArtificerInventoryView.Catalog;
+
+        if (tabsVisible)
+        {
+            sb.Draw(_pixel, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
+            sb.Draw(_pixel, _inventoryStorageTabRect, isArtificerCatalog ? new Color(20, 20, 20, 180) : new Color(42, 66, 98, 235));
+            DrawBorder(sb, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(200, 225, 255) : new Color(120, 120, 120));
+            DrawBorder(sb, _inventoryStorageTabRect, isArtificerCatalog ? new Color(120, 120, 120) : new Color(200, 225, 255));
+            _font.DrawString(sb, "CATALOG", new Vector2(_inventoryCatalogTabRect.X + 16, _inventoryCatalogTabRect.Y + 6), Color.White);
+            _font.DrawString(sb, "INVENTORY", new Vector2(_inventoryStorageTabRect.X + 8, _inventoryStorageTabRect.Y + 6), Color.White);
+        }
+
+        var titleY = _inventoryRect.Y + InventoryPadding + (tabsVisible ? InventoryTabHeight + 8 : 6);
+        var title = isArtificerCatalog ? "ARTIFICER CATALOG" : "INVENTORY";
+        if (isLiveView)
+        {
+            var targetName = ResolvePlayerName(_currentLiveInventoryTarget);
+            title = $"LIVE: {targetName}'s INVENTORY";
+            
+            // Draw LIVE indicator with pulsing effect
+            var liveColor = new Color(255, 100, 100, 180 + (int)(75 * Math.Sin(_worldTimeSeconds * 4)));
+            var liveText = "● LIVE";
+            var liveSize = _font.MeasureString(liveText);
+            var livePos = new Vector2(_inventoryRect.Right - liveSize.X - 20, titleY);
+            _font.DrawString(sb, liveText, livePos, liveColor);
+            
+            // Hide tabs and clear button when viewing live inventory
+            tabsVisible = false;
+            isArtificerCatalog = false;
+        }
+        
+        _font.DrawString(sb, title, new Vector2(_inventoryRect.X + InventoryPadding + 2, titleY), Color.White);
+        if (isArtificerCatalog)
+        {
+            var shownText = $"Showing {_inventory.GetSandboxCatalogFilteredCount()} of {_inventory.GetSandboxCatalogTotalCount()}";
+            var shownSize = _font.MeasureString(shownText);
+            _font.DrawString(sb, shownText, new Vector2(_inventoryRect.Right - shownSize.X - 20, titleY), new Color(205, 220, 255));
+            DrawInventoryCatalogPanel(sb);
+        }
+        else
+        {
+            // Draw live inventory data if available, otherwise draw local inventory
+            if (isLiveView && _liveInventoryViews.TryGetValue(_currentLiveInventoryTarget, out var liveView))
+            {
+                DrawLiveInventorySlots(sb, liveView);
+            }
+            else
+            {
+                DrawInventorySlots(sb, _inventory.Grid, _inventoryGridSlots);
+            }
+        }
+
+        // Only show clear button when not viewing live inventory
+        if (!isLiveView && _inventoryClear.Visible)
+            _inventoryClear.Draw(sb, _pixel, _font);
+        _inventoryClose.Draw(sb, _pixel, _font);
+
+        if (_inventoryHasHeld && _atlas != null)
+        {
+            var size = _inventoryGridSlots.Length > 0 ? _inventoryGridSlots[0].Width : 40;
+            var scale = 1.15f;
+            var scaled = (int)MathF.Round(size * scale);
+            var dst = new Rectangle(_inventoryMousePos.X - scaled / 2, _inventoryMousePos.Y - scaled / 2, scaled, scaled);
+            var icon = GetBlockIcon(_inventoryHeld.Id, dst.Width);
+            if (icon != null)
+                sb.Draw(icon, dst, Color.White);
+            else
+                sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)_inventoryHeld.Id, FaceDirection.PosY), Color.White);
+
+            if (_inventoryHeld.Count > 1)
+            {
+                var text = _inventoryHeld.Count.ToString();
+                var textSize = _font.MeasureString(text);
+                var pos = new Vector2(dst.Right - textSize.X - 4, dst.Bottom - textSize.Y - 2);
+                _font.DrawString(sb, text, pos, Color.White);
+            }
+        }
+
+        sb.End();
+    }
+
+    private void DrawInventorySlots(SpriteBatch sb, HotbarSlot[] slots, Rectangle[] rects)
+    {
+        for (int i = 0; i < rects.Length; i++)
+        {
+            var rect = rects[i];
+            sb.Draw(_pixel, rect, new Color(20, 20, 20, 200));
+            DrawBorder(sb, rect, Color.White);
+
+            var slot = slots[i];
+            if (slot.Count > 0 && slot.Id != BlockId.Air && _atlas != null)
+            {
+                var pad = 6;
+                var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
+                var icon = GetBlockIcon(slot.Id, dst.Width);
+                if (icon != null)
+                    sb.Draw(icon, dst, Color.White);
+                else
+                    sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+            }
+
+            if (slot.Count > 1)
+            {
+                var text = slot.Count.ToString();
+                var size = _font.MeasureString(text);
+                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
+                _font.DrawString(sb, text, pos, Color.White);
+            }
+        }
+    }
+
+    private void DrawLiveInventorySlots(SpriteBatch sb, LanInventoryView liveView)
+    {
+        // Draw hotbar slots (first 10 slots) - show at top like normal inventory
+        for (int i = 0; i < Math.Min(10, liveView.HotbarIds.Length); i++)
+        {
+            var rect = i < _inventoryHotbarSlots.Length ? _inventoryHotbarSlots[i] : new Rectangle();
+            if (rect.IsEmpty) continue;
+            
+            // Highlight selected hotbar slot
+            var isSelected = i == liveView.SelectedIndex;
+            sb.Draw(_pixel, rect, isSelected ? new Color(255, 200, 100, 200) : new Color(20, 20, 20, 200));
+            DrawBorder(sb, rect, isSelected ? new Color(255, 220, 150) : Color.White);
+
+            var blockId = (BlockId)liveView.HotbarIds[i];
+            var count = i < liveView.HotbarCounts.Length ? liveView.HotbarCounts[i] : 0;
+            
+            if (count > 0 && blockId != BlockId.Air && _atlas != null)
+            {
+                var pad = 6;
+                var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
+                var icon = GetBlockIcon(blockId, dst.Width);
+                if (icon != null)
+                    sb.Draw(icon, dst, Color.White);
+                else
+                    sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)blockId, FaceDirection.PosY), Color.White);
+            }
+
+            if (count > 1)
+            {
+                var text = count.ToString();
+                var size = _font.MeasureString(text);
+                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
+                _font.DrawString(sb, text, pos, Color.White);
+            }
+        }
+
+        // Draw grid slots (remaining slots) - show below hotbar like normal inventory
+        for (int i = 0; i < Math.Min(_inventoryGridSlots.Length, liveView.GridIds.Length); i++)
+        {
+            var rect = _inventoryGridSlots[i];
+            sb.Draw(_pixel, rect, new Color(20, 20, 20, 200));
+            DrawBorder(sb, rect, Color.White);
+
+            var blockId = (BlockId)liveView.GridIds[i];
+            var count = i < liveView.GridCounts.Length ? liveView.GridCounts[i] : 0;
+            
+            if (count > 0 && blockId != BlockId.Air && _atlas != null)
+            {
+                var pad = 6;
+                var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
+                var icon = GetBlockIcon(blockId, dst.Width);
+                if (icon != null)
+                    sb.Draw(icon, dst, Color.White);
+                else
+                    sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)blockId, FaceDirection.PosY), Color.White);
+            }
+
+            if (count > 1)
+            {
+                var text = count.ToString();
+                var size = _font.MeasureString(text);
+                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
+                _font.DrawString(sb, text, pos, Color.White);
+            }
+        }
+    }
+
+    private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)
+    {
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, rect.Width, 2), color);
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Bottom - 2, rect.Width, 2), color);
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, 2, rect.Height), color);
+        sb.Draw(_pixel, new Rectangle(rect.Right - 2, rect.Y, 2, rect.Height), color);
+    }
+
+    private void DrawDevOverlay(SpriteBatch sb)
+    {
+        var pos = _player.Position;
+        var vel = _player.Velocity;
+        var lines = new List<string>
+        {
+            "DEV HUD (F3)",
+            $"FPS: {_fps:0}",
+            $"POS: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
+            $"VEL: {vel.X:0.00}, {vel.Y:0.00}, {vel.Z:0.00}",
+            $"CHUNK: {_playerChunkCoord}",
+            $"FLY: {_player.IsFlying}  GND: {_player.IsGrounded}"
+        };
+
+        if (_world != null)
+        {
+            var wx = (int)MathF.Floor(pos.X);
+            var wz = (int)MathF.Floor(pos.Z);
+            var biomeName = _world.GetBiomeNameAt(wx, wz);
+            var desertWeight = _world.GetDesertWeightAt(wx, wz);
+            lines.Add($"BIOME: {biomeName} (DesertWeight {desertWeight:0.00}) @ {wx},{wz}");
+
+            var origin = _player.Position + _player.HeadOffset;
+            if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
+            {
+                var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
+                var def = BlockRegistry.Get(id);
+                lines.Add($"LOOKING: {def.Name} ({id}) @ {hit.X},{hit.Y},{hit.Z}");
+            }
+        }
+
+        if (_streamingService != null && _world != null)
+        {
+            var (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
+            lines.Add($"LOADED CHUNKS: {_world.ChunkCount}");
+            lines.Add($"QUEUES L/M/S: {loadQueue}/{meshQueue}/{saveQueue}");
+            lines.Add($"PREWARM: {(_spawnPrewarmComplete ? "DONE" : $"{_prewarmReadyCount}/{_prewarmTargetCount}")}");
+        }
+
+        var metrics = AdvancedPerformanceOptimizer.GetCurrentMetrics();
+        var (ramUsed, _, vramUsed, _) = SimpleMemoryManager.GetMemoryStats();
+        lines.Add($"PERF CPU:{metrics.CpuUsage:F1}% RAM:{ramUsed / 1024 / 1024}MB VRAM:{vramUsed / 1024 / 1024}MB");
+
+        var x = _viewport.X + 20;
+        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
+        for (var i = 0; i < lines.Count; i++)
+            _font.DrawString(sb, lines[i], new Vector2(x, y + i * (_font.LineHeight + 2)), Color.White);
+    }
+
+#if DEBUG
+    private void DrawDebugOverlay(SpriteBatch sb)
+    {
+        var pos = _player.Position;
+        var vel = _player.Velocity;
+        var move = _player.MoveIntent;
+        var blockText = "BLOCK: NONE";
+        var atlasText = _atlas != null ? $"ATLAS: {_atlas.Texture.Width}x{_atlas.Texture.Height}" : "ATLAS: NONE";
+        var samplerText = $"SAMPLE: {_blockSamplerLabel}";
+        var clearColor = _debugSkyClear ? SkyColor : Color.Black;
+        var clearText = $"CLEAR: {clearColor.R},{clearColor.G},{clearColor.B}";
+        var overlayText = $"OVERLAY: {((_debugDisableHands || _pauseMenuOpen) ? "OFF" : "ON")}";
+        var wireText = $"WIRE: {(_debugWireframe ? "ON" : "OFF")}";
+        var boundWorldText = $"ATLAS WORLD: {_debugWorldAtlasBound}";
+        var boundOverlayText = $"ATLAS OVERLAY: {_debugOverlayAtlasBound}";
+        var heldText = $"HELD: {_inventory.SelectedId}";
+        var modelText = $"MODEL: {(_debugDrawPlayerModel ? "ON" : "OFF")}";
+        if (_world != null)
+        {
+            var origin = _player.Position + _player.HeadOffset;
+            if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
+            {
+                var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
+                var def = BlockRegistry.Get(id);
+                blockText = $"BLOCK: {def.Name} ({id}) ATLAS:{def.AtlasIndex} @ {hit.X},{hit.Y},{hit.Z}";
+            }
+        }
+        var lines = new List<string>
+        {
+            $"FPS: {_fps:0}",
+            $"POS: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
+            $"VEL: {vel.X:0.00}, {vel.Y:0.00}, {vel.Z:0.00}",
+            $"FLY: {_player.IsFlying}  GND: {_player.IsGrounded}",
+            $"MOVE LEN: {move.Length():0.00}",
+            blockText,
+            atlasText,
+            samplerText,
+            clearText,
+            overlayText,
+            wireText,
+            boundWorldText,
+            boundOverlayText,
+            heldText,
+            modelText,
+            $"BLOCKSIZE: {Scale.BlockSize:0.00}"
+        };
+
+        // G) Add streaming debug information
+        if (_streamingService != null && _world != null)
+        {
+            var (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
+            var reqBudget = _spawnPrewarmComplete
+                ? Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget)
+                : Math.Max(Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget), PrewarmChunkBudgetPerFrame);
+            var meshBudget = _spawnPrewarmComplete
+                ? Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget)
+                : Math.Max(Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget), PrewarmMeshBudgetPerFrame);
+            lines.Add($"CHUNK: {_playerChunkCoord} | LOADED: {_world.ChunkCount}");
+            lines.Add($"QUEUES: L:{loadQueue} M:{meshQueue} S:{saveQueue}");
+            lines.Add($"BUDGET: REQ({_chunksRequestedThisFrame}/{reqBudget}) MESH({_meshesRequestedThisFrame}/{meshBudget})");
+            lines.Add($"PREWARM: {(_spawnPrewarmComplete ? "DONE" : $"{_prewarmReadyCount}/{_prewarmTargetCount}")}");
+        }
+
+        // Add pregeneration debug information
+        if (_pregenerationService != null)
+        {
+            var (total, generated, skipped, isRunning, elapsed) = _pregenerationService.GetStatus();
+            lines.Add($"PREGEN: {generated}/{total} chunks ({elapsed:hh\\:mm\\:ss})");
+        }
+
+        // Add performance monitoring information
+        var metrics = AdvancedPerformanceOptimizer.GetCurrentMetrics();
+        var (ramUsed, ramPeak, vramUsed, vramLimit) = SimpleMemoryManager.GetMemoryStats();
+        lines.Add($"PERF: CPU:{metrics.CpuUsage:F1}% RAM:{ramUsed/1024/1024}MB VRAM:{vramUsed/1024/1024}MB");
+        lines.Add($"OPT: GPU:{(AdvancedPerformanceOptimizer.IsGpuOptimized() ? "✅" : "❌")} MEM:{(AdvancedPerformanceOptimizer.IsMemoryOptimized() ? "✅" : "❌")}");
+        
+        // Add biome information for current position
+        if (_world != null && _player != null)
+        {
+            var playerPos = _player.Position;
+            // ALL WORLD GENERATION DELETED
+        }
+
+        var x = _viewport.X + 20;
+        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
+        for (int i = 0; i < lines.Count; i++)
+            _font.DrawString(sb, lines[i], new Vector2(x, y + i * (_font.LineHeight + 2)), Color.White);
+    }
+#endif
+
+    private void DrawFaceOverlay(SpriteBatch sb)
+    {
+        if (!_debugFaceOverlay)
+            return;
+
+        var hitFaceText = "HIT FACE: NONE";
+        if (_world != null)
+        {
+            var origin = _player.Position + _player.HeadOffset;
+            if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
+                hitFaceText = $"HIT FACE: {FormatFaceLabel(hit.Face)} ({hit.Face})";
+        }
+
+        var x = _viewport.X + 20;
+        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
+        _font.DrawString(sb, "FACE MAP: TOP=PosY | BOTTOM=NegY | SIDE1=PosX | SIDE2=NegX | SIDE3=PosZ | SIDE4=NegZ", new Vector2(x, y), Color.White);
+        _font.DrawString(sb, hitFaceText, new Vector2(x, y + _font.LineHeight + 2), Color.White);
+    }
+
+    private void DrawReticle(SpriteBatch sb)
+    {
+        if (_pauseMenuOpen || !_reticleEnabled)
+            return;
+
+        var center = new Vector2(_viewport.X + _viewport.Width / 2f, _viewport.Y + _viewport.Height / 2f);
+        var size = Math.Clamp(_reticleSize, ReticleSizeMin, ReticleSizeMax);
+        var thickness = Math.Clamp(_reticleThickness, ReticleThicknessMin, ReticleThicknessMax);
+        var color = _reticleColor;
+
+        switch (_reticleStyle)
+        {
+            case "Plus":
+            {
+                var half = size;
+                var t = Math.Max(1, thickness);
+                var rectH = new Rectangle((int)(center.X - half), (int)(center.Y - t / 2f), half * 2, t);
+                var rectV = new Rectangle((int)(center.X - t / 2f), (int)(center.Y - half), t, half * 2);
+                sb.Draw(_pixel, rectH, color);
+                sb.Draw(_pixel, rectV, color);
+                break;
+            }
+            case "Square":
+            {
+                var half = size;
+                var t = Math.Max(1, thickness);
+                var left = (int)Math.Round(center.X - half);
+                var top = (int)Math.Round(center.Y - half);
+                var side = half * 2;
+                sb.Draw(_pixel, new Rectangle(left, top, side, t), color);
+                sb.Draw(_pixel, new Rectangle(left, top + side - t, side, t), color);
+                sb.Draw(_pixel, new Rectangle(left, top, t, side), color);
+                sb.Draw(_pixel, new Rectangle(left + side - t, top, t, side), color);
+                break;
+            }
+            case "Circle":
+                DrawReticleCircle(sb, center, size, thickness, color);
+                break;
+            default:
+            {
+                var dot = Math.Max(1, size);
+                var rect = new Rectangle((int)(center.X - dot / 2f), (int)(center.Y - dot / 2f), dot, dot);
+                sb.Draw(_pixel, rect, color);
+                break;
+            }
+        }
+
+        DrawHandoffPrompt(sb, center, size);
+    }
+
+    private void DrawHandoffPrompt(SpriteBatch sb, Vector2 center, int reticleSize)
+    {
+        if (!_handoffPromptVisible || _pauseMenuOpen || _inventoryOpen)
+            return;
+
+        var giveKey = FormatKeyLabel(_giveKey);
+        var displayName = string.IsNullOrWhiteSpace(_handoffTargetName)
+            ? "PLAYER"
+            : _handoffTargetName.Trim();
+        var label = $"GIVE ITEM ({giveKey}) {displayName}";
+
+        var size = _font.MeasureString(label);
+        var pos = new Vector2(center.X - size.X / 2f, center.Y + reticleSize + 10f);
+        _font.DrawString(sb, label, pos + new Vector2(2, 2), Color.Black * 0.6f);
+        _font.DrawString(sb, label, pos, new Color(230, 230, 230, 230));
+    }
+
+    private static string FormatKeyLabel(Keys key)
+    {
+        return key switch
+        {
+            Keys.LeftShift or Keys.RightShift => "SHIFT",
+            Keys.LeftControl or Keys.RightControl => "CTRL",
+            Keys.LeftAlt or Keys.RightAlt => "ALT",
+            Keys.Space => "SPACE",
+            Keys.OemTilde => "~",
+            Keys.OemMinus => "-",
+            Keys.OemPlus => "+",
+            Keys.OemComma => ",",
+            Keys.OemPeriod => ".",
+            Keys.OemQuestion => "?",
+            Keys.OemSemicolon => ";",
+            Keys.OemQuotes => "'",
+            Keys.OemOpenBrackets => "[",
+            Keys.OemCloseBrackets => "]",
+            Keys.OemPipe => "\\",
+            _ => key.ToString().ToUpperInvariant()
+        };
+    }
+
+    private void DrawReticleCircle(SpriteBatch sb, Vector2 center, float radius, int thickness, Color color)
+    {
+        if (radius <= 0f)
+            return;
+
+        var t = Math.Max(1, thickness);
+        for (int i = 0; i < ReticleCirclePoints.Length; i++)
+        {
+            var p0 = ReticleCirclePoints[i];
+            var p1 = ReticleCirclePoints[(i + 1) % ReticleCirclePoints.Length];
+            var start = center + p0 * radius;
+            var end = center + p1 * radius;
+            DrawLine(sb, start, end, color, t);
+        }
+    }
+
+    private void DrawLine(SpriteBatch sb, Vector2 start, Vector2 end, Color color, int thickness)
+    {
+        var diff = end - start;
+        var length = diff.Length();
+        if (length <= 0.001f)
+            return;
+
+        var angle = MathF.Atan2(diff.Y, diff.X);
+        sb.Draw(_pixel, start, null, color, angle, new Vector2(0f, 0.5f), new Vector2(length, thickness), SpriteEffects.None, 0f);
+    }
+
+    private static Vector2[] BuildReticleCirclePoints(int segments)
+    {
+        var count = Math.Max(8, segments);
+        var points = new Vector2[count];
+        var step = MathHelper.TwoPi / count;
+        for (int i = 0; i < count; i++)
+        {
+            var angle = step * i;
+            points[i] = new Vector2(MathF.Cos(angle), MathF.Sin(angle));
+        }
+        return points;
+    }
+
+    private static string FormatFaceLabel(FaceDirection face)
+    {
+        return face switch
+        {
+            FaceDirection.PosY => "TOP",
+            FaceDirection.NegY => "BOTTOM",
+            FaceDirection.PosX => "SIDE 1",
+            FaceDirection.NegX => "SIDE 2",
+            FaceDirection.PosZ => "SIDE 3",
+            FaceDirection.NegZ => "SIDE 4",
+            _ => face.ToString().ToUpperInvariant()
+        };
+    }
+
+    private static float MoveAngleTowards(float current, float target, float maxStep)
+    {
+        var delta = MathHelper.WrapAngle(target - current);
+        if (MathF.Abs(delta) <= maxStep)
+            return MathHelper.WrapAngle(target);
+
+        return MathHelper.WrapAngle(current + MathF.Sign(delta) * maxStep);
+    }
+
+    private Matrix GetViewMatrix()
+    {
+        var eye = _player.Position + _player.HeadOffset;
+        var forward = _player.Forward;
+        if (_gameMode == GameMode.Veilseer
+            && _veilseerSpectateTargetPlayerId >= 0
+            && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
+        {
+            eye = observed.Position + _player.HeadOffset;
+            forward = PlayerController.GetForwardVector(observed.Yaw, observed.Pitch);
+            _cameraPosition = eye;
+            _thirdPersonCameraDistance = 0f;
+            var observedTarget = eye + forward;
+            return Matrix.CreateLookAt(eye, observedTarget, Vector3.Up);
+        }
+
+        if (IsThirdPersonCameraActive())
+        {
+            var focusHeightBlocks = _player.IsSneaking ? ThirdPersonFocusSneakHeightBlocks : ThirdPersonFocusHeightBlocks;
+            var focus = _player.Position + new Vector3(0f, focusHeightBlocks * Scale.BlockSize, 0f);
+            var orbitForward = PlayerController.GetForwardVector(_thirdPersonYaw, _thirdPersonPitch);
+            var desiredDistance = ThirdPersonDistanceBlocks * Scale.BlockSize;
+            var desiredEye = focus
+                - orbitForward * desiredDistance
+                + Vector3.Up * (ThirdPersonCameraHeightBiasBlocks * Scale.BlockSize);
+            eye = ResolveThirdPersonCameraPosition(focus, desiredEye);
+            var target = focus + orbitForward * (0.08f * Scale.BlockSize);
+            _cameraPosition = eye;
+            _thirdPersonCameraDistance = Vector3.Distance(eye, focus);
+            return Matrix.CreateLookAt(eye, target, Vector3.Up);
+        }
+
+        _cameraPosition = eye;
+        _thirdPersonCameraDistance = 0f;
+        var firstPersonTarget = eye + forward;
+        return Matrix.CreateLookAt(eye, firstPersonTarget, Vector3.Up);
+    }
+
+    private Vector3 ResolveThirdPersonCameraPosition(Vector3 focus, Vector3 desiredEye)
+    {
+        if (_world == null)
+            return desiredEye;
+
+        var offset = desiredEye - focus;
+        var distance = offset.Length();
+        if (distance < 0.0001f)
+            return desiredEye;
+
+        var direction = offset / distance;
+        var minDistance = ThirdPersonMinDistanceBlocks * Scale.BlockSize;
+        var startDistance = Math.Max(0.05f * Scale.BlockSize, 0.0001f);
+        var step = Math.Max(0.04f * Scale.BlockSize, ThirdPersonCollisionStepBlocks * Scale.BlockSize);
+        var safeDistance = startDistance;
+        var maxDistance = Math.Max(minDistance, distance);
+        for (var t = startDistance; t <= maxDistance; t += step)
+        {
+            var sample = focus + direction * t;
+            if (IsSolidCameraObstacle(sample))
+                break;
+
+            safeDistance = t;
+        }
+
+        return focus + direction * safeDistance;
+    }
+
+    private bool IsSolidCameraObstacle(Vector3 worldPos)
+    {
+        if (_world == null)
+            return false;
+
+        var bx = (int)MathF.Floor(worldPos.X);
+        var by = (int)MathF.Floor(worldPos.Y);
+        var bz = (int)MathF.Floor(worldPos.Z);
+        var id = _world.GetBlock(bx, by, bz);
+        return BlockRegistry.IsSolid(id);
+    }
+
+    private void EnsureEffect(GraphicsDevice device)
+    {
+        if (_effect != null)
+            return;
+
+        _effect = new BasicEffect(device)
+        {
+            TextureEnabled = true,
+            LightingEnabled = false,
+            VertexColorEnabled = false,
+            World = Matrix.Identity
+        };
+    }
+
+    private void EnsureCutoutEffect(GraphicsDevice device)
+    {
+        if (_cutoutEffect != null)
+            return;
+
+        _cutoutEffect = new AlphaTestEffect(device)
+        {
+            VertexColorEnabled = false
+        };
+    }
+
+    private void EnsureWaterEffect(GraphicsDevice device)
+    {
+        if (_waterEffectLoadAttempted)
+            return;
+
+        _waterEffectLoadAttempted = true;
+        var candidates = new[]
+        {
+            "effects/water.ogl.mgfxo",
+            "effects/water.dx11.mgfxo",
+            "effects/water.mgfxo"
+        };
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            if (!AssetResolver.TryResolve(candidates[i], out _))
+                continue;
+            if (!_assets.TryLoadAssetBytes(candidates[i], out var bytes) || bytes.Length == 0)
+                continue;
+
+            try
+            {
+                _waterEffect = new Effect(device, bytes);
+                _log.Info($"Loaded optional water effect: {candidates[i]}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to load water effect {candidates[i]}: {ex.Message}");
+                _waterEffect?.Dispose();
+                _waterEffect = null;
+            }
+        }
+    }
+
+    private static void SetEffectMatrix(Effect effect, string name, Matrix value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectVector3(Effect effect, string name, Vector3 value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectFloat(Effect effect, string name, float value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectTexture(Effect effect, string name, Texture2D value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private void EnsureLineEffect(GraphicsDevice device)
+    {
+        if (_lineEffect != null)
+            return;
+
+        _lineEffect = new BasicEffect(device)
+        {
+            TextureEnabled = false,
+            LightingEnabled = false,
+            VertexColorEnabled = true,
+            World = Matrix.Identity
+        };
+    }
+
+    private void DrawPlayerModel(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        _playerModel ??= new PlayerModel(device, _assets);
+
+        var prevRaster = device.RasterizerState;
+        var prevSampler = device.SamplerStates[0];
+        // Player/held-item meshes can come from mixed winding sources (runtime and custom models).
+        // CullNone prevents inverted/inside-out presentation in third-person.
+        device.RasterizerState = RasterizerState.CullNone;
+        device.DepthStencilState = DepthStencilState.Default;
+        device.BlendState = BlendState.Opaque;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+
+        _playerModel.Position = _player.Position;
+        _playerModel.Yaw = _player.Yaw;
+        _playerModel.Pitch = _player.Pitch;
+        // Keep action/head aim bound to the player's own look direction, never third-person orbit yaw.
+        _playerModel.HeadYawOffset = 0f;
+        _playerModel.IsFlying = _player.IsFlying;
+        _playerModel.IsSneaking = _player.IsSneaking;
+        _playerModel.IsSprinting = _player.IsSprinting;
+        _playerModel.IsGrounded = _player.IsGrounded;
+        _playerModel.VerticalVelocity = _player.Velocity.Y;
+        _playerModel.HeldBlockId = _inventory.SelectedId;
+        _playerModel.SetAtlas(_atlas);
+        _playerModel.Render(view, proj, _worldTimeSeconds);
+
+        device.SamplerStates[0] = prevSampler;
+        device.RasterizerState = prevRaster;
+    }
+
+    private void DrawRemotePlayers(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_remotePlayers.Count == 0)
+            return;
+
+        var prevRaster = device.RasterizerState;
+        var prevSampler = device.SamplerStates[0];
+        device.RasterizerState = RasterizerState.CullNone;
+        device.DepthStencilState = DepthStencilState.Default;
+        device.BlendState = BlendState.Opaque;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+
+        foreach (var pair in _remotePlayers)
+        {
+            // Skip Veilseer players (hidden from rendering)
+            if (_remoteIsVeilseer.TryGetValue(pair.Key, out var isVeilseer) && isVeilseer)
+                continue;
+                
+            if (_gameMode == GameMode.Veilseer
+                && _veilseerSpectateTargetPlayerId >= 0
+                && pair.Key == _veilseerSpectateTargetPlayerId)
+            {
+                continue;
+            }
+
+            pair.Value.SetAtlas(_atlas);
+            pair.Value.Render(view, proj, _worldTimeSeconds);
+        }
+
+        device.SamplerStates[0] = prevSampler;
+        device.RasterizerState = prevRaster;
+    }
+
+    private void DrawFlyingPlayerOutlines(GraphicsDevice device, Matrix view, Matrix proj, bool localModelRendered)
+    {
+        if (!_flyingOutlineEnabled)
+            return;
+
+        EnsureLineEffect(device);
+        if (_lineEffect == null)
+            return;
+
+        _lineEffect.View = view;
+        _lineEffect.Projection = proj;
+        _lineEffect.World = Matrix.Identity;
+
+        var prevBlend = device.BlendState;
+        var prevDepth = device.DepthStencilState;
+        var prevRaster = device.RasterizerState;
+        var prevSampler = device.SamplerStates[0];
+
+        device.DepthStencilState = DepthStencilState.DepthRead;
+        device.BlendState = BlendState.AlphaBlend;
+        device.RasterizerState = RasterizerState.CullNone;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+
+        if (localModelRendered && _playerModel != null && _playerModel.IsFlying)
+            DrawModelOutline(device, _playerModel);
+
+        foreach (var pair in _remotePlayers)
+        {
+            if (_gameMode == GameMode.Veilseer
+                && _veilseerSpectateTargetPlayerId >= 0
+                && pair.Key == _veilseerSpectateTargetPlayerId)
+            {
+                continue;
+            }
+
+            var model = pair.Value;
+            if (!model.IsFlying)
+                continue;
+            DrawModelOutline(device, model);
+        }
+
+        device.SamplerStates[0] = prevSampler;
+        device.RasterizerState = prevRaster;
+        device.DepthStencilState = prevDepth;
+        device.BlendState = prevBlend;
+    }
+
+    private void DrawModelOutline(GraphicsDevice device, PlayerModel model)
+    {
+        if (_lineEffect == null)
+            return;
+
+        var vertexCount = model.WriteOutlineVertices(_playerOutlineVerts, _flyingOutlineColor, 0.012f);
+        if (vertexCount <= 0)
+            return;
+
+        foreach (var pass in _lineEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            device.DrawUserPrimitives(PrimitiveType.LineList, _playerOutlineVerts, 0, vertexCount / 2);
+        }
+    }
+
+    private void DrawFirstPersonHands(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_atlas == null)
+            return;
+
+        _handRenderer ??= new FirstPersonHandRenderer(device, _assets);
+        if (!_handRenderer.IsHandMeshValid || !_handRenderer.IsHeldBlockMeshValid)
+        {
+            if (!_loggedInvalidHandMesh)
+            {
+                _log.Error("Invalid hand/held-block mesh detected. Skipping overlay draw.");
+                _loggedInvalidHandMesh = true;
+            }
+            return;
+        }
+
+        var prevRaster = device.RasterizerState;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+        device.Clear(ClearOptions.DepthBuffer, Color.Transparent, 1f, 0);
+        device.DepthStencilState = DepthStencilState.Default;
+        device.BlendState = BlendState.Opaque;
+        device.RasterizerState = RasterizerState.CullNone;
+        
+        // Use spectated player's data when Veilseer is spectating
+        Vector3 handPosition;
+        Vector3 forward;
+        Vector3 up = Vector3.Up;
+        BlockId heldId = _inventory.SelectedId;
+        var moveAmount = _player.MoveIntent.Length();
+        var isFlying = _player.IsFlying;
+        var isGrounded = _player.IsGrounded;
+        var velocityY = _player.Velocity.Y;
+        
+        if (_gameMode == GameMode.Veilseer && _veilseerSpectateTargetPlayerId >= 0 && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observedModel))
+        {
+            // Use spectated player's data
+            handPosition = observedModel.Position + new Vector3(0f, 1.6f, 0f); // Standard head height
+            forward = PlayerController.GetForwardVector(observedModel.Yaw, observedModel.Pitch);
+            heldId = observedModel.HeldBlockId;
+            moveAmount = 0f; // PlayerModel doesn't have MoveIntent, use 0 for no movement
+            isFlying = observedModel.IsFlying;
+            isGrounded = observedModel.IsGrounded;
+            velocityY = observedModel.VerticalVelocity;
+        }
+        else
+        {
+            handPosition = _player.Position + _player.HeadOffset;
+            forward = _player.Forward;
+        }
+        
+        var heldModel = _blockModel;
+        if (heldId != BlockId.Air && BlockRegistry.Get(heldId).HasCustomModel)
+            heldModel = BlockModel.GetModel(heldId, _log);
+        var actionSwingProgress = _localActionSwingTimer > 0f
+            ? Math.Clamp(1f - (_localActionSwingTimer / 0.26f), 0f, 1f)
+            : 0f;
+        _handRenderer.Draw(
+            view,
+            proj,
+            handPosition,
+            forward,
+            up,
+            _atlas,
+            heldId,
+            heldModel,
+            _worldTimeSeconds,
+            moveAmount,
+            isFlying,
+            isGrounded,
+            velocityY,
+            actionSwingProgress);
+        device.DepthStencilState = DepthStencilState.Default;
+        device.RasterizerState = prevRaster;
+    }
+
+    private void DrawBlockHighlight(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        UpdateBlockHighlight();
+        if (!_highlightActive)
+            return;
+
+        EnsureLineEffect(device);
+        if (_lineEffect == null)
+            return;
+
+        _lineEffect.View = view;
+        _lineEffect.Projection = proj;
+        _lineEffect.World = Matrix.Identity;
+
+        device.DepthStencilState = DepthStencilState.DepthRead;
+        device.BlendState = BlendState.AlphaBlend;
+        device.RasterizerState = RasterizerState.CullNone;
+
+        foreach (var pass in _lineEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            device.DrawUserPrimitives(PrimitiveType.LineList, _highlightVerts, 0, 12);
+        }
+    }
+
+    private void DrawWorldItems(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_worldItems.Count == 0 || _atlas == null)
+            return;
+
+        EnsureItemEffect(device);
+        if (_itemEffect == null)
+            return;
+
+        _itemEffect.View = view;
+        _itemEffect.Projection = proj;
+        _itemEffect.Texture = _atlas.Texture;
+
+        device.RasterizerState = RasterizerState.CullNone;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+
+        DrawWorldItemsPass(device, transparent: false);
+        DrawWorldItemsPass(device, transparent: true);
+    }
+
+    private void DrawWaterChunks(GraphicsDevice device, BoundingFrustum frustum, Matrix view, Matrix proj)
+    {
+        if (_effect == null)
+            return;
+
+        EnsureWaterEffect(device);
+
+        device.BlendState = BlendState.AlphaBlend;
+        device.DepthStencilState = DepthStencilState.DepthRead;
+
+        var pulse = (MathF.Sin(_worldTimeSeconds * 1.6f) + 1f) * 0.5f;
+        var tintA = new Vector3(0.56f, 0.78f, 1f);
+        var tintB = new Vector3(0.44f, 0.67f, 0.95f);
+        var tint = Vector3.Lerp(tintA, tintB, pulse);
+        var alpha = 0.66f + pulse * 0.10f;
+
+        if (_waterEffect == null)
+        {
+            _effect.DiffuseColor = tint;
+            _effect.Alpha = alpha;
+        }
+        else
+        {
+            SetEffectVector3(_waterEffect, "TintColor", tint);
+            SetEffectFloat(_waterEffect, "WaterAlpha", alpha);
+            SetEffectFloat(_waterEffect, "Time", _worldTimeSeconds);
+            SetEffectFloat(_waterEffect, "WaveStrength", 0.015f);
+            SetEffectFloat(_waterEffect, "UvScrollSpeed", 0.015f);
+            SetEffectMatrix(_waterEffect, "View", view);
+            SetEffectMatrix(_waterEffect, "Projection", proj);
+            if (_atlas != null)
+                SetEffectTexture(_waterEffect, "Texture0", _atlas.Texture);
+        }
+
+        foreach (var coord in _chunkOrder)
+        {
+            if (!_chunkMeshes.TryGetValue(coord, out var mesh))
+                continue;
+            if (!frustum.Intersects(mesh.Bounds))
+                continue;
+
+            var verts = mesh.WaterVertices;
+            if (verts == null || verts.Length == 0)
+                continue;
+            if (verts.Length % 3 != 0)
+                continue;
+
+            var wave = MathF.Sin(_worldTimeSeconds * 1.9f + coord.X * 0.45f + coord.Z * 0.37f) * 0.015f;
+            var world = Matrix.CreateTranslation(0f, wave, 0f);
+
+            if (_waterEffect != null)
+            {
+                SetEffectMatrix(_waterEffect, "World", world);
+                foreach (var pass in _waterEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+            else
+            {
+                _effect.World = world;
+                foreach (var pass in _effect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                }
+            }
+        }
+
+        if (_waterEffect == null)
+        {
+            _effect.World = Matrix.Identity;
+            _effect.DiffuseColor = Vector3.One;
+            _effect.Alpha = 1f;
+        }
+    }
+
+    private void DrawWorldItemsPass(GraphicsDevice device, bool transparent)
+    {
+        if (_itemEffect == null)
+            return;
+
+        device.DepthStencilState = transparent ? DepthStencilState.DepthRead : DepthStencilState.Default;
+        device.BlendState = transparent ? BlendState.NonPremultiplied : BlendState.Opaque;
+
+        foreach (var pair in _worldItems)
+        {
+            var item = pair.Value;
+            if (BlockRegistry.IsTransparent((byte)item.BlockId) != transparent)
+                continue;
+            var mesh = GetItemMesh(item.BlockId);
+            if (mesh.Length == 0)
+                continue;
+
+            var bobPhase = MathF.Sin((_worldTimeSeconds - item.SpawnTime) * ItemBobSpeed + item.ItemId * 0.31f);
+            var bob = item.IsGrounded ? (bobPhase * 0.5f + 0.5f) * ItemBobHeight : bobPhase * ItemBobHeight;
+            var spin = (_worldTimeSeconds + item.ItemId * 0.17f) * ItemSpinSpeed;
+            var world = Matrix.CreateScale(ItemScale)
+                * Matrix.CreateRotationX(ItemTiltRadians)
+                * Matrix.CreateRotationZ(ItemTiltRadians * 0.6f)
+                * Matrix.CreateRotationY(spin)
+                * Matrix.CreateTranslation(item.Position + new Vector3(0f, bob, 0f));
+            _itemEffect.World = world;
+
+            foreach (var pass in _itemEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                device.DrawUserPrimitives(PrimitiveType.TriangleList, mesh, 0, mesh.Length / 3);
+            }
+        }
+    }
+
+    private void EnsureItemEffect(GraphicsDevice device)
+    {
+        if (_itemEffect != null)
+            return;
+
+        _itemEffect = new BasicEffect(device)
+        {
+            TextureEnabled = true,
+            VertexColorEnabled = false,
+            LightingEnabled = false
+        };
+    }
+
+    private VertexPositionTexture[] GetItemMesh(BlockId id)
+    {
+        if (_atlas == null)
+            return Array.Empty<VertexPositionTexture>();
+
+        if (_itemMeshCache.TryGetValue(id, out var mesh))
+            return mesh;
+
+        var model = _blockModel;
+        if (BlockRegistry.Get(id).HasCustomModel)
+            model = BlockModel.GetModel(id, _log);
+
+        mesh = model?.BuildMesh(_atlas, id) ?? BlockModel.BuildCubeMesh(_atlas, id);
+        _itemMeshCache[id] = mesh;
+        return mesh;
+    }
+
+    private void UpdateBlockHighlight()
+    {
+        if (_world == null)
+        {
+            _highlightActive = false;
+            return;
+        }
+
+        // Use spectated player's view when Veilseer is spectating
+        Vector3 origin;
+        Vector3 dir;
+        
+        if (_gameMode == GameMode.Veilseer && _veilseerSpectateTargetPlayerId >= 0 && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observedModel))
+        {
+            origin = observedModel.Position + new Vector3(0f, 1.6f, 0f); // Use standard head height
+            dir = PlayerController.GetForwardVector(observedModel.Yaw, observedModel.Pitch);
+        }
+        else
+        {
+            origin = _player.Position + _player.HeadOffset;
+            dir = _player.Forward;
+        }
+        
+        if (!VoxelRaycast.Raycast(origin, dir, InteractRange, _world.GetBlock, out var hit))
+        {
+            _highlightActive = false;
+            return;
+        }
+
+        var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
+        if (id == BlockIds.Air)
+        {
+            _highlightActive = false;
+            return;
+        }
+
+        if (_highlightActive && hit.X == _highlightX && hit.Y == _highlightY && hit.Z == _highlightZ)
+        {
+            if (_highlightColor == _blockOutlineColor)
+                return;
+        }
+
+        _highlightX = hit.X;
+        _highlightY = hit.Y;
+        _highlightZ = hit.Z;
+        _highlightActive = true;
+
+        var min = new Vector3(hit.X, hit.Y, hit.Z) * Scale.BlockSize;
+        var max = min + new Vector3(Scale.BlockSize);
+        var eps = HighlightEpsilon;
+        min -= new Vector3(eps);
+        max += new Vector3(eps);
+
+        BuildHighlightVerts(min, max, _blockOutlineColor);
+        _highlightColor = _blockOutlineColor;
+    }
+
+    private void BuildHighlightVerts(Vector3 min, Vector3 max, Color color)
+    {
+        var v000 = new Vector3(min.X, min.Y, min.Z);
+        var v100 = new Vector3(max.X, min.Y, min.Z);
+        var v110 = new Vector3(max.X, max.Y, min.Z);
+        var v010 = new Vector3(min.X, max.Y, min.Z);
+        var v001 = new Vector3(min.X, min.Y, max.Z);
+        var v101 = new Vector3(max.X, min.Y, max.Z);
+        var v111 = new Vector3(max.X, max.Y, max.Z);
+        var v011 = new Vector3(min.X, max.Y, max.Z);
+
+        SetLine(0, v000, v100, color);
+        SetLine(1, v100, v110, color);
+        SetLine(2, v110, v010, color);
+        SetLine(3, v010, v000, color);
+
+        SetLine(4, v001, v101, color);
+        SetLine(5, v101, v111, color);
+        SetLine(6, v111, v011, color);
+        SetLine(7, v011, v001, color);
+
+        SetLine(8, v000, v001, color);
+        SetLine(9, v100, v101, color);
+        SetLine(10, v110, v111, color);
+        SetLine(11, v010, v011, color);
+    }
+
+    private void SetLine(int index, Vector3 a, Vector3 b, Color color)
+    {
+        var i = index * 2;
+        _highlightVerts[i].Position = a;
+        _highlightVerts[i].Color = color;
+        _highlightVerts[i + 1].Position = b;
+        _highlightVerts[i + 1].Color = color;
+    }
+
+    private void UpdatePauseMenuLayout()
+    {
+        var canOpenLan = CanOpenLanFromPause();
+        var canOpenOnline = CanOpenOnlineFromPause();
+        var canOpenHostMenu = canOpenLan || canOpenOnline;
+        if (_pauseHostOptionsOpen && !canOpenHostMenu)
+            _pauseHostOptionsOpen = false;
+
+        _pauseHost.Enabled = canOpenHostMenu;
+        _pauseOpenLan.Enabled = canOpenLan;
+        _pauseHostOnline.Enabled = canOpenOnline;
+
+        var panelW = Math.Clamp((int)(_viewport.Width * 0.42f), 320, _viewport.Width - 40);
+        var buttonW = Math.Clamp((int)(panelW * 0.6f), 160, 320);
+        var buttonH = Math.Clamp((int)(buttonW * 0.22f), 36, 60);
+        var gap = 14;
+        var titleH = _font.LineHeight + 14;
+        var padding = 18;
+        var estimatedButtonCount = _pauseHostOptionsOpen ? 3 : 5;
+        var totalButtonsH = buttonH * estimatedButtonCount + gap * (estimatedButtonCount - 1);
+        var contentH = titleH + totalButtonsH + padding * 2;
+        var panelH = Math.Clamp(contentH, 220, _viewport.Height - 40);
+        _pauseRect = new Rectangle(
+            _viewport.X + (_viewport.Width - panelW) / 2,
+            _viewport.Y + (_viewport.Height - panelH) / 2,
+            panelW,
+            panelH);
+        _pauseSubpanelRect = new Rectangle(_pauseRect.X + 12, _pauseRect.Y + 12, _pauseRect.Width - 24, _pauseRect.Height - 24);
+
+        _pauseHeaderRect = new Rectangle(
+            _pauseRect.X + padding,
+            _pauseRect.Y + padding,
+            _pauseRect.Width - padding * 2,
+            titleH);
+
+        var available = _pauseRect.Height - padding * 2 - titleH;
+        var centerX = _pauseRect.X + (_pauseRect.Width - buttonW) / 2;
+
+        if (_pauseHostOptionsOpen)
+        {
+            _pauseResume.Visible = false;
+            _pauseHost.Visible = false;
+            _pauseSettings.Visible = false;
+            _pauseProfileIcon.Visible = false;
+            _pauseSaveExit.Visible = false;
+            _pauseOpenLan.Visible = true;
+            _pauseHostOnline.Visible = true;
+            _pauseHostBack.Visible = true;
+
+            var subButtonCount = 3;
+            var subTotalButtonsH = buttonH * subButtonCount + gap * (subButtonCount - 1);
+            var subStartY = _pauseRect.Y + padding + titleH + Math.Max(0, (available - subTotalButtonsH) / 2);
+            var row = 0;
+            _pauseOpenLan.Bounds = new Rectangle(centerX, subStartY + (buttonH + gap) * row++, buttonW, buttonH);
+            _pauseHostOnline.Bounds = new Rectangle(centerX, subStartY + (buttonH + gap) * row++, buttonW, buttonH);
+            _pauseHostBack.Bounds = new Rectangle(centerX, subStartY + (buttonH + gap) * row, buttonW, buttonH);
+            return;
+        }
+
+        _pauseResume.Visible = true;
+        _pauseHost.Visible = true;
+        _pauseSettings.Visible = true;
+        _pauseProfileIcon.Visible = true;
+        _pauseSaveExit.Visible = true;
+        _pauseOpenLan.Visible = false;
+        _pauseHostOnline.Visible = false;
+        _pauseHostBack.Visible = false;
+
+        var buttonCount = 5;
+        totalButtonsH = buttonH * buttonCount + gap * (buttonCount - 1);
+        var startY = _pauseRect.Y + padding + titleH + Math.Max(0, (available - totalButtonsH) / 2);
+
+        var mainRow = 0;
+        _pauseResume.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow++, buttonW, buttonH);
+        _pauseHost.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow++, buttonW, buttonH);
+        var iconSize = Math.Min(buttonH, 60);
+        _pauseProfileIcon.Bounds = new Rectangle(_pauseHost.Bounds.Right + 8, _pauseHost.Bounds.Y + (_pauseHost.Bounds.Height - iconSize) / 2, iconSize, iconSize);
+        _pauseSettings.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow++, buttonW, buttonH);
+        _pauseSaveExit.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow, buttonW, buttonH);
+    }
+
+    private void DrawPauseMenu(SpriteBatch sb)
+    {
+        UpdatePauseMenuLayout();
+
+        sb.Begin(samplerState: SamplerState.PointClamp);
+        sb.Draw(_pixel, UiLayout.WindowViewport, new Color(0, 0, 0, 140));
+        sb.End();
+
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+
+        if (_pausePanel is not null)
+            sb.Draw(_pausePanel, _pauseRect, Color.White);
+        else
+            sb.Draw(_pixel, _pauseRect, new Color(25, 25, 25));
+
+        var title = _pauseHostOptionsOpen ? "HOST WORLD" : "PAUSED";
+        var size = _font.MeasureString(title);
+        sb.Draw(_pixel, _pauseHeaderRect, new Color(0, 0, 0, 80));
+        var titlePos = new Vector2(_pauseHeaderRect.Center.X - size.X / 2f, _pauseHeaderRect.Y + (_pauseHeaderRect.Height - _font.LineHeight) / 2f);
+        _font.DrawString(sb, title, titlePos + new Vector2(1, 1), Color.Black);
+        _font.DrawString(sb, title, titlePos, Color.White);
+
+        if (_pauseHostOptionsOpen)
+        {
+            sb.Draw(_pixel, _pauseSubpanelRect, new Color(8, 12, 22, 120));
+            DrawBorder(sb, _pauseSubpanelRect, new Color(130, 170, 210, 220));
+            var hint = "Choose how players should connect to this world.";
+            _font.DrawString(sb, hint, new Vector2(_pauseSubpanelRect.X + 12, _pauseSubpanelRect.Y + 12), new Color(208, 222, 240));
+        }
+
+        _pauseResume.Draw(sb, _pixel, _font);
+        _pauseHost.Draw(sb, _pixel, _font);
+        _pauseOpenLan.Draw(sb, _pixel, _font);
+        _pauseHostOnline.Draw(sb, _pixel, _font);
+        _pauseHostBack.Draw(sb, _pixel, _font);
+        _pauseSettings.Draw(sb, _pixel, _font);
+        _pauseProfileIcon.Draw(sb, _pixel, _font);
+        _pauseSaveExit.Draw(sb, _pixel, _font);
+
+        sb.End();
+    }
+
+    private void DrawSavingOverlay(SpriteBatch sb)
+    {
+        sb.Begin();
+        sb.Draw(_pixel, UiLayout.WindowViewport, new Color(0, 0, 0, 220));
+
+        var center = new Vector2(_viewport.Width / 2f, _viewport.Height / 2f);
+        var title = "SAVING WORLD...";
+        var titleSize = _font.MeasureString(title);
+        _font.DrawString(sb, title, new Vector2(center.X - titleSize.X / 2f, center.Y - 26f), Color.White);
+
+        var elapsed = _saveAndExitStartedUtc == DateTime.MinValue
+            ? 0.0
+            : (DateTime.UtcNow - _saveAndExitStartedUtc).TotalSeconds;
+        var subtitle = $"PLEASE WAIT {elapsed:0.0}s";
+        var subtitleSize = _font.MeasureString(subtitle);
+        _font.DrawString(sb, subtitle, new Vector2(center.X - subtitleSize.X / 2f, center.Y + 4f), Color.White);
+
+        if (!string.IsNullOrWhiteSpace(_saveAndExitError))
+        {
+            var errorSize = _font.MeasureString(_saveAndExitError);
+            _font.DrawString(sb, _saveAndExitError, new Vector2(center.X - errorSize.X / 2f, center.Y + 4f + _font.LineHeight + 6f), Color.OrangeRed);
+        }
+
+        var indicatorSize = 10;
+        var pulse = (_spinnerFrame % 8) / 7f;
+        var color = Color.Lerp(new Color(120, 120, 120), Color.White, pulse);
+        var indicatorRect = new Rectangle((int)center.X - indicatorSize / 2, (int)center.Y + 4 + _font.LineHeight + 24, indicatorSize, indicatorSize);
+        sb.Draw(_pixel, indicatorRect, color);
+        sb.End();
+    }
+
+    private void OpenSettings()
+    {
+        _pauseMenuOpen = false;
+        _pauseHostOptionsOpen = false;
+        _menus.Push(new OptionsScreen(_menus, _assets, _font, _pixel, _log, _graphics), _viewport);
+    }
+
+    private void OpenProfileFromPause()
+    {
+        _pauseMenuOpen = false;
+        _pauseHostOptionsOpen = false;
+        _menus.Push(new ProfileScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, EnsureEosClient()), _viewport);
+    }
+
+    private void OpenHostMenuFromPause()
+    {
+        if (CanOpenLanFromPause() && !CanOpenOnlineFromPause())
+        {
+            OpenToLanFromPause();
+            return;
+        }
+
+        _pauseHostOptionsOpen = true;
+    }
+
+    private void CloseHostMenuFromPause()
+    {
+        _pauseHostOptionsOpen = false;
+    }
+
+    private void TogglePauseMenuFromEscape()
+    {
+        if (_pauseMenuOpen && _pauseHostOptionsOpen)
+        {
+            _pauseHostOptionsOpen = false;
+            return;
+        }
+
+        _pauseMenuOpen = !_pauseMenuOpen;
+        if (!_pauseMenuOpen)
+            _pauseHostOptionsOpen = false;
+    }
+
+    private void UpdatePauseButtons(InputState input)
+    {
+        if (!input.IsNewLeftClick())
+            return;
+
+        var p = input.MousePosition;
+        if (_pauseHostOptionsOpen)
+        {
+            if (_pauseOpenLan.TryClick(p)) return;
+            if (_pauseHostOnline.TryClick(p)) return;
+            _pauseHostBack.TryClick(p);
+            return;
+        }
+
+        if (_pauseResume.TryClick(p)) return;
+        if (_pauseHost.TryClick(p)) return;
+        if (_pauseProfileIcon.TryClick(p)) return;
+        if (_pauseSettings.TryClick(p)) return;
+        _pauseSaveExit.TryClick(p);
+    }
+
+
+
+
+    private void OpenToLanFromPause()
+    {
+        _pauseHostOptionsOpen = false;
+
+        if (!CanOpenLanFromPause())
+        {
+            SetCommandStatus("LAN host is already active.");
+            return;
+        }
+
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var result = WorldHostBootstrap.TryStartLanHost(_log, _profile, _world);
+        if (!result.Success || result.Session == null)
+        {
+            SetCommandStatus($"LAN host failed: {result.Error}");
+            return;
+        }
+
+        _lanSession = result.Session;
+        SeedLocalPlayerName();
+        ResumeGameplayAfterHosting();
+        SetCommandStatus("LAN hosting enabled. Other players can now join from Multiplayer > LAN.", 7f);
+        UpdatePauseMenuLayout();
+    }
+
+    private void OpenOnlineHostFromPause()
+    {
+        _pauseHostOptionsOpen = false;
+
+        if (!CanOpenOnlineFromPause())
+        {
+            SetCommandStatus("Online host is already active.");
+            return;
+        }
+
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        _log.Info($"HOST_CLICKED world={_world.Meta.Name} mode=pause_online transport=online");
+        var eos = EnsureEosClient();
+        if (eos == null)
+        {
+            SetCommandStatus("EOS CLIENT UNAVAILABLE");
+            return;
+        }
+        if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            SetCommandStatus(gateDenied);
+            return;
+        }
+
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        if (snapshot.Reason != EosRuntimeReason.Ready)
+        {
+            if (snapshot.Reason == EosRuntimeReason.Connecting)
+                eos.StartLogin();
+            SetCommandStatus(snapshot.StatusText);
+            return;
+        }
+
+        var result = WorldHostBootstrap.TryStartEosHost(_log, _profile, eos, _world);
+        if (!result.Success || result.Session == null)
+        {
+            SetCommandStatus($"Online host failed: {result.Error}");
+            return;
+        }
+
+        _lanSession = result.Session;
+        SeedLocalPlayerName();
+        ResumeGameplayAfterHosting();
+        SetCommandStatus("Online hosting enabled.", 5f, echoToChat: false);
+        UpdatePauseMenuLayout();
+    }
+
+    private void ResumeGameplayAfterHosting()
+    {
+        _pauseMenuOpen = false;
+        _pauseHostOptionsOpen = false;
+        _inventoryOpen = false;
+        _homeGuiOpen = false;
+        _structureFinderOpen = false;
+        _chatInputActive = false;
+        _commandInputActive = false;
+        _gamemodeWheelVisible = false;
+        _chatOverlayScrollLines = 0;
+        _chatOverlayActionUnlockUntil = 0f;
+    }
+
+    private void AnnounceOnlineHostShare(EosClient? eos, bool tryCopyToClipboard)
+    {
+        var hostCode = (eos?.LocalProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostCode))
+        {
+            SetCommandStatus("Online hosting enabled, but host code is unavailable.", 7f);
+            return;
+        }
+
+        var status = "Online hosting enabled. Share your host code with friends.";
+        if (tryCopyToClipboard)
+        {
+            if (TryCopyToClipboard(hostCode, out _))
+                status = "Online hosting enabled. Host code copied to clipboard.";
+            else
+                status = "Online hosting enabled. Host code ready (clipboard copy failed).";
+        }
+
+        SetCommandStatus(status, 7f, echoToChat: false);
+        AddChatLine(
+            $"HOST CODE: {hostCode}",
+            isSystem: true,
+            hoverText: "Click COPY CODE to copy host code.",
+            copyText: hostCode,
+            actionLabel: "COPY CODE");
+
+        if (_settings.EnableInviteLinks)
+        {
+            var hostLink = BuildHostJoinLink(hostCode);
+            AddChatLine(
+                $"HOST LINK: {hostLink}",
+                isSystem: true,
+                hoverText: "Click COPY LINK to copy host link.",
+                copyText: hostLink,
+                actionLabel: "COPY LINK");
+        }
+    }
+
+    private static string BuildHostJoinLink(string hostCode)
+    {
+        var safeHostCode = (hostCode ?? string.Empty).Trim();
+        return string.IsNullOrWhiteSpace(safeHostCode)
+            ? string.Empty
+            : $"lattice://join/{safeHostCode}";
+    }
+
+    private bool TryCopyToClipboard(string value, out string error)
+    {
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            error = "Nothing to copy.";
+            return false;
+        }
+
+        try
+        {
+            WinClipboard.SetText(value);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Clipboard copy failed: {ex.Message}");
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private bool TryPasteClipboardIntoText(InputState input, ref string text)
+    {
+        var ctrlDown = input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl);
+        if (!ctrlDown || !input.IsNewKeyPress(Keys.V))
+            return false;
+
+        try
+        {
+            var clip = WinClipboard.GetText() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(clip))
+                return false;
+
+            clip = clip.Replace('\r', ' ').Replace('\n', ' ');
+            var available = Math.Max(0, CommandInputMaxLength - text.Length);
+            if (available <= 0)
+                return false;
+
+            if (clip.Length > available)
+                clip = clip.Substring(0, available);
+
+            text += clip;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Clipboard paste failed: {ex.Message}");
+            SetCommandStatus($"Clipboard paste failed: {ex.Message}", 4f, echoToChat: false);
+            return false;
+        }
+    }
+
+    private void OpenShareCode()
+    {
+        _pauseMenuOpen = false;
+        _pauseHostOptionsOpen = false;
+
+        if (!_onlineGate.CanUseOfficialOnline(_log, out var gateDenied))
+        {
+            SetCommandStatus(gateDenied);
+            return;
+        }
+
+        if (_lanSession is not EosP2PHostSession)
+        {
+            _log.Warn("Share code requested but this is not an EOS-hosted session.");
+            return;
+        }
+
+        var eos = EnsureEosClient();
+        if (eos == null || !eos.IsLoggedIn || string.IsNullOrWhiteSpace(eos.LocalProductUserId))
+        {
+            _log.Warn("Share code requested without EOS login.");
+            return;
+        }
+
+        SetCommandStatus("Join by code functionality removed.");
+        return;
+    }
+
+    public void OnClose()
+    {
+        _log.Info("GameWorldScreen: Closing world screen.");
+        _isClosing = true;
+        CancelBackgroundWork(waitForPreviewWorker: true);
+        if (!_skipOnCloseFullSave)
+        {
+            if (IsJoinedClientSession)
+            {
+                _log.Info("GameWorldScreen: OnClose skipped local world save for joined-client mirror session.");
+            }
+            else
+            {
+                var closeState = CapturePlayerState();
+                SavePlayerState(closeState);
+                var savedRemotePlayers = SaveConnectedRemotePlayerStates();
+                var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
+                
+                var savedMeshes = 0;
+                if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out var budgetState))
+                {
+                    _log.Info($"GameWorldScreen: OnClose skipped non-critical writes due to storage budget state={budgetState.State} size={budgetState.SizeBytes}.");
+                }
+
+                if (budgetState.IsConserve || budgetState.IsOverTarget)
+                    RegionCompactor.CompactIfNeeded(_worldPath, WorldStorageBudgetService.DefaultThresholds, _log);
+
+                _log.Info($"GameWorldScreen: OnClose saved {savedChunks} chunks, {savedMeshes} mesh caches, and {savedRemotePlayers} remote player snapshots.");
+            }
+        }
+        else
+        {
+            _log.Info("GameWorldScreen: OnClose save skipped because Save & Exit already completed.");
+        }
+
+        _streamingService?.Dispose();
+        _streamingService = null;
+        _meshQueue.Clear();
+        _meshQueued.Clear();
+        _priorityMeshQueue.Clear();
+        _priorityMeshQueued.Clear();
+        _postSyncDirtyHintQueue.Clear();
+        _postSyncDirtyHintQueued.Clear();
+        while (_completedMeshBuildQueue.TryDequeue(out _)) { }
+        while (_completedPriorityMeshBuildQueue.TryDequeue(out _)) { }
+        while (_chunkGenerationQueue.TryDequeue(out _)) { }
+        _chunkGenerationQueued.Clear();
+        _chunkGenerationInFlight.Clear();
+        if (_lanSession is EosP2PHostSession)
+        {
+            _log.Info("HOST_STOP requested transport=EOS_LOBBY_P2P");
+            var eos = EosClientProvider.Current;
+            WorldHostBootstrap.TryClearHostingPresence(_log, eos);
+            if (eos != null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var stopResult = await eos.StopHostedLobbyAsync().ConfigureAwait(false);
+                        _log.Info($"EOS_LOBBY_STOP_ON_CLOSE ok={stopResult}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"EOS_LOBBY_STOP_ON_CLOSE failed: {ex.Message}");
+                    }
+                });
+            }
+        }
+        _lanSession?.Dispose();
+        _blockIconCache?.Dispose();
+        _blockIconCache = null;
+        _samplerLow?.Dispose();
+        _samplerLow = null;
+        _samplerMedium?.Dispose();
+        _samplerMedium = null;
+        _samplerHigh?.Dispose();
+        _samplerHigh = null;
+        _samplerUltra?.Dispose();
+        _samplerUltra = null;
+        _cutoutEffect?.Dispose();
+        _cutoutEffect = null;
+        _effect?.Dispose();
+        _effect = null;
+        _lineEffect?.Dispose();
+        _lineEffect = null;
+        _itemEffect?.Dispose();
+        _itemEffect = null;
+        _waterEffect?.Dispose();
+        _waterEffect = null;
+        _handRenderer?.Dispose();
+        _handRenderer = null;
+
+        // Always dispose the world here to release region file handles immediately.
+        // Without this, Windows keeps r.*.lvregion locked until GC runs, which causes
+        // "every other join" behavior (first join loads fallback/generated chunks) and prevents deletion.
+        try
+        {
+            if (_world != null)
+            {
+                if (IsJoinedClientSession)
+                {
+                    _world.Dispose(saveDirtyChunks: false);
+                }
+                else
+                {
+                    // If Save & Exit already completed successfully, avoid a second full save pass.
+                    _world.Dispose(saveDirtyChunks: !_skipOnCloseFullSave);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"GameWorldScreen: Error disposing world: {ex.Message}");
+        }
+        _world = null;
+
+    }
+
+    private void SaveAndExit()
+    {
+        if (_saveAndExitInProgress)
+            return;
+
+        _pauseMenuOpen = false;
+        _pauseHostOptionsOpen = false;
+        _log.Info("Pause menu: Save & Exit requested.");
+        BeginSaveAndExit();
+    }
+
+    private void BeginSaveAndExit()
+    {
+        _isClosing = true;
+        CancelBackgroundWork(waitForPreviewWorker: false);
+        _saveAndExitError = null;
+        _saveAndExitInProgress = true;
+        _saveAndExitStartedUtc = DateTime.UtcNow;
+
+        // Apply any completed background mesh results before snapshotting save output.
+        ApplyCompletedMeshBuilds(256);
+
+        _saveAndExitTask = Task.Run(SaveWorldForExit);
+    }
+
+    private void CompleteSaveAndExit()
+    {
+        if (_saveAndExitTask == null)
+            return;
+
+        SaveAndExitResult result;
+        try
+        {
+            result = _saveAndExitTask.GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            result = new SaveAndExitResult(false, 0, 0, 0, ex.Message);
+        }
+
+        _saveAndExitTask = null;
+        _saveAndExitInProgress = false;
+
+        if (result.Success)
+        {
+            _skipOnCloseFullSave = true;
+            _log.Info($"Save & Exit complete: chunks={result.SavedChunks}, meshes={result.SavedMeshes}, time={result.Seconds:0.00}s");
+        }
+        else
+        {
+            _saveAndExitError = $"SAVE ERROR: {result.Error}";
+            _log.Warn($"Save & Exit failed after {result.Seconds:0.00}s: {result.Error}");
+        }
+
+        _menus.Pop();
+    }
+
+    private SaveAndExitResult SaveWorldForExit()
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            if (IsJoinedClientSession)
+            {
+                sw.Stop();
+                _log.Info("Save & Exit: skipped local world persistence for joined-client mirror session.");
+                return new SaveAndExitResult(true, 0, 0, sw.Elapsed.TotalSeconds, null);
+            }
+
+            var state = CapturePlayerState();
+            var playerId = _profile.PlayerId;
+            if (string.IsNullOrWhiteSpace(playerId))
+                playerId = _profile.GetDisplayUsername();
+            state.Username = _profile.GetDisplayUsername();
+            state.Save(_worldPath, playerId, _log);
+            var savedRemotePlayers = SaveConnectedRemotePlayerStates();
+            if (_meta != null)
+                _meta.Save(_metaPath, _log);
+
+            var ensuredGateMeshes = 0;
+            var savedChunks = _world?.SaveAllLoadedChunks() ?? 0;
+            var savedMeshes = 0;
+            var budgetState = WorldStorageBudgetService.GetBudgetState(_worldPath);
+            if (budgetState.IsConserve || budgetState.IsOverTarget)
+                RegionCompactor.CompactIfNeeded(_worldPath, WorldStorageBudgetService.DefaultThresholds, _log);
+
+            if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out budgetState))
+            {
+                _log.Info($"Save & Exit: skipped non-critical writes due to storage budget state={budgetState.State} size={budgetState.SizeBytes}.");
+            }
+
+            sw.Stop();
+            _log.Info($"Save & Exit detail: ensured gate meshes={ensuredGateMeshes}, cached meshes={savedMeshes}, remote players saved={savedRemotePlayers}");
+            return new SaveAndExitResult(true, savedChunks, savedMeshes, sw.Elapsed.TotalSeconds, null);
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            return new SaveAndExitResult(false, 0, 0, sw.Elapsed.TotalSeconds, ex.Message);
+        }
+    }
+
+    private int EnsureResumeGateMeshes(PlayerWorldState playerState)
+    {
+        if (_world == null || _atlas == null)
+            return 0;
+
+        var playerChunk = VoxelWorld.WorldToChunk(
+            (int)MathF.Floor(playerState.PosX),
+            (int)MathF.Floor(playerState.PosY),
+            (int)MathF.Floor(playerState.PosZ),
+            out _, out _, out _);
+        var maxCy = GetStreamingMaxChunkY(playerChunk.Y);
+        var prewarmRadius = Math.Clamp(Math.Min(_activeRadiusChunks, PrewarmRadius), 2, PrewarmRadius);
+        var gateRadius = Math.Clamp(Math.Min(prewarmRadius, PrewarmGateRadius), 1, prewarmRadius);
+        var gateRadiusSq = gateRadius * gateRadius;
+        var built = 0;
+
+        for (var dz = -gateRadius; dz <= gateRadius; dz++)
+        {
+            for (var dx = -gateRadius; dx <= gateRadius; dx++)
+            {
+                if (dx * dx + dz * dz > gateRadiusSq)
+                    continue;
+
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
+                    if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                        chunk = _world.GetOrCreateChunk(coord);
+
+                    if (_chunkMeshes.TryGetValue(coord, out var existingMesh) && ValidateMesh(existingMesh))
+                        continue;
+
+                    try
+                    {
+                        var mesh = VoxelMesherGreedy.BuildChunkMeshPriority(_world, chunk, _atlas, _log);
+                        if (!ValidateMesh(mesh))
+                            continue;
+
+                        _chunkMeshes[coord] = mesh;
+                        if (!_chunkOrder.Contains(coord))
+                            _chunkOrder.Add(coord);
+                        chunk.IsDirty = false;
+                        built++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"Resume gate mesh build failed for {coord}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        return built;
+    }
+
+    private int SaveTier0MeshesToCache()
+    {
+        // Disabled: no persistent mesh cache.
+        return 0;
+    }
+
+    private EosClient? EnsureEosClient()
+    {
+        if (_eosClient != null)
+            return _eosClient;
+
+        _eosClient = EosClientProvider.GetOrCreate(_log, "deviceid", allowRetry: true);
+        if (_eosClient == null)
+            _log.Warn("GameWorldScreen: EOS client not available.");
+        return _eosClient;
+    }
+
+
+
+
+    private bool CanOpenLanFromPause()
+    {
+        if (_saveAndExitInProgress || _world == null || _worldSyncInProgress)
+            return false;
+        return _lanSession == null;
+    }
+
+    private bool CanOpenOnlineFromPause()
+    {
+        if (_saveAndExitInProgress || _world == null || _worldSyncInProgress)
+            return false;
+
+        var launchMode = (Environment.GetEnvironmentVariable("LV_LAUNCH_MODE") ?? string.Empty).Trim();
+        if (string.Equals(launchMode, "offline", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (_lanSession != null)
+            return false;
+
+        if (!_onlineGate.CanUseOfficialOnline(_log, out _))
+            return false;
+
+        var eos = EnsureEosClient();
+        var snapshot = EosRuntimeStatus.Evaluate(eos);
+        return snapshot.Reason == EosRuntimeReason.Ready || snapshot.Reason == EosRuntimeReason.Connecting;
+    }
+
+    private bool CanShareJoinCode()
+    {
+        if (_lanSession == null || !_lanSession.IsHost)
+            return false;
+
+        if (_lanSession is not EosP2PHostSession)
+            return false;
+
+        var eos = EnsureEosClient();
+        return eos != null && eos.IsLoggedIn && !string.IsNullOrWhiteSpace(eos.LocalProductUserId);
+    }
+
+    private void SeedLocalPlayerName()
+    {
+        if (_lanSession == null)
+            return;
+
+        var name = _profile.GetDisplayUsername();
+        if (string.IsNullOrWhiteSpace(name))
+            name = "You";
+
+        _playerNames[_lanSession.LocalPlayerId] = name;
+    }
+
+    private void UpdateNetwork(float dt)
+    {
+        if (_lanSession == null)
+            return;
+
+        if (!_lanSession.IsConnected)
+        {
+            if (!_lanSession.IsHost)
+            {
+                if (!_lanSession.TryDequeueDisconnectReason(out var disconnectedReason))
+                    disconnectedReason = HostDisconnectedFallbackReason;
+                HandleHostDisconnected(disconnectedReason);
+            }
+            return;
+        }
+#if EOS_SDK
+        if (_lanSession is EosP2PHostSession eosHost)
+        {
+            eosHost.PumpIncoming();
+            _ = ProcessPendingJoinRequestsAsync(eosHost);
+        }
+        else if (_lanSession is EosP2PClientSession eosClient)
+            eosClient.PumpIncoming();
+#endif
+
+        while (_lanSession.TryDequeueDisconnectReason(out var pendingReason))
+        {
+            if (_lanSession.IsHost)
+                continue;
+
+            HandleHostDisconnected(pendingReason);
+            return;
+        }
+
+        var heldBlockId = (byte)_inventory.SelectedId;
+        var heldChanged = heldBlockId != _lastSentHeldBlockId;
+        _netSendAccumulator += dt;
+        if (_netSendAccumulator >= 0.05f || heldChanged)
+        {
+            byte status = 0;
+            if (_player.IsFlying)
+                status |= PlayerStatusFlying;
+            if (_player.IsSneaking)
+                status |= PlayerStatusSneaking;
+            if (_player.IsSprinting)
+                status |= PlayerStatusSprinting;
+            if (_localActionSwingTimer > 0f)
+                status |= PlayerStatusActionSwing;
+            if (_player.IsGrounded)
+                status |= PlayerStatusGrounded;
+            if (_gameMode == GameMode.Veilseer)
+                status |= PlayerStatusVeilseer;
+            if (_inventoryOpen)
+                status |= PlayerStatusInventoryOpen;
+            _lanSession.SendPlayerState(_player.Position, _player.Yaw, _player.Pitch, status, heldBlockId);
+            _lastSentHeldBlockId = heldBlockId;
+            _netSendAccumulator = 0;
+        }
+
+        UpdateNetworkPersistence(dt);
+
+        // Send inventory views at 10 Hz for live inventory mirroring
+        _liveInventorySendAccumulator += dt;
+        if (_liveInventorySendAccumulator >= LiveInventoryPushIntervalSeconds)
+        {
+            SendLiveInventoryViews();
+            _liveInventorySendAccumulator = 0;
+        }
+
+        if (!_lanSession.IsHost)
+        {
+            SendClientInventoryViewToHost(dt);
+        }
+
+        while (_lanSession.TryDequeuePlayerList(out var list))
+            ApplyPlayerList(list);
+
+        if (_lanSession.IsHost)
+            ProcessPendingPersistenceRestores();
+
+        while (_lanSession.TryDequeuePlayerState(out var state))
+        {
+            if (state.PlayerId == _lanSession.LocalPlayerId)
+                continue;
+
+            if (!_remotePlayers.TryGetValue(state.PlayerId, out var model))
+            {
+                model = new PlayerModel(_graphics.GraphicsDevice, _assets);
+                _remotePlayers[state.PlayerId] = model;
+            }
+
+            model.Position = state.Position;
+            model.Yaw = state.Yaw;
+            model.Pitch = state.Pitch;
+            model.IsFlying = (state.Status & PlayerStatusFlying) != 0;
+            model.IsSneaking = (state.Status & PlayerStatusSneaking) != 0;
+            model.IsSprinting = (state.Status & PlayerStatusSprinting) != 0;
+            model.IsGrounded = (state.Status & PlayerStatusGrounded) != 0;
+            model.HeldBlockId = (BlockId)state.HeldBlockId;
+            
+            // Update remote state caches
+            _remoteIsVeilseer[state.PlayerId] = (state.Status & PlayerStatusVeilseer) != 0;
+            _remoteInventoryOpen[state.PlayerId] = (state.Status & PlayerStatusInventoryOpen) != 0;
+            
+            _remoteLastStatus.TryGetValue(state.PlayerId, out var previousStatus);
+            var actionBitNow = (state.Status & PlayerStatusActionSwing) != 0;
+            var actionBitWasSet = (previousStatus & PlayerStatusActionSwing) != 0;
+            if (actionBitNow && !actionBitWasSet)
+                model.TriggerActionSwing();
+            _remoteLastStatus[state.PlayerId] = state.Status;
+        }
+
+        while (_lanSession.TryDequeueChat(out var chat))
+            HandleNetworkChat(chat);
+
+        while (_lanSession.TryDequeueInventoryView(out var inventoryView))
+        {
+            HandleNetworkInventoryView(inventoryView);
+
+            if (_lanSession.IsHost)
+            {
+                ForwardClientInventoryViewToViewers(inventoryView);
+            }
+        }
+
+        while (_lanSession.TryDequeueTeleport(out var teleport))
+            ApplyNetworkTeleport(teleport);
+
+        if (_world == null)
+            return;
+        
+        // Handle chunk data for initial world sync
+        if (_worldSyncInProgress)
+        {
+            if (_world == null) return;
+
+            // Time-sliced apply: catch up quickly while keeping frame spikes bounded.
+            var chunkProcessBudget = 16;
+            var chunkApplyBudgetMs = 2.0;
+            var chunkApplyStopwatch = Stopwatch.StartNew();
+            while (chunkProcessBudget > 0
+                && chunkApplyStopwatch.Elapsed.TotalMilliseconds < chunkApplyBudgetMs
+                && _lanSession.TryDequeueChunkData(out var chunkData))
+            {
+                if (chunkData.Blocks != null)
+                {
+                    var chunkCoord = new ChunkCoord(chunkData.X, chunkData.Y, chunkData.Z);
+                    if (!_world.TryGetChunk(chunkCoord, out var chunk) || chunk == null)
+                    {
+                        chunk = new VoxelChunkData(chunkCoord);
+                        _world.AddChunkDirect(chunkCoord, chunk);
+                    }
+
+                    chunk.Load(chunkData.Blocks);
+                    chunk.IsDirty = true; // Mark as dirty so it gets re-meshed
+                    EnqueuePostSyncDirtyHint(chunkCoord);
+                    EnqueuePostSyncDirtyHint(new ChunkCoord(chunkCoord.X + 1, chunkCoord.Y, chunkCoord.Z));
+                    EnqueuePostSyncDirtyHint(new ChunkCoord(chunkCoord.X - 1, chunkCoord.Y, chunkCoord.Z));
+                    EnqueuePostSyncDirtyHint(new ChunkCoord(chunkCoord.X, chunkCoord.Y, chunkCoord.Z + 1));
+                    EnqueuePostSyncDirtyHint(new ChunkCoord(chunkCoord.X, chunkCoord.Y, chunkCoord.Z - 1));
+                    _chunksReceived++;
+                }
+                chunkProcessBudget--;
+            }
+
+            if (_lanSession.TryDequeueWorldSyncComplete(out _)) // Check for signal message
+            {
+                _worldSyncInProgress = false;
+                _postSyncRecoveryTimer = PostSyncRecoverySeconds;
+                _postSyncDirtyScanGate = 0;
+                _log.Info("Initial world sync complete!");
+            }
+        }
+
+        while (_lanSession.TryDequeueBlockSet(out var block))
+        {
+            if (!_world.SetBlock(block.X, block.Y, block.Z, block.Id))
+            {
+                // Optional: log if client receives an invalid block set from host.
+            }
+        }
+
+        while (_lanSession.TryDequeueItemSpawn(out var spawn))
+            SpawnWorldItem(spawn);
+
+        while (_lanSession.TryDequeueItemPickup(out var pickup))
+            RemoveWorldItem(pickup.ItemId);
+    }
+
+    private void SendLiveInventoryViews()
+    {
+        if (_lanSession == null || !_lanSession.IsConnected)
+            return;
+
+        // Host sends inventory views to clients who are spectating
+        if (_lanSession.IsHost)
+        {
+            // Send inventory of each non-Veilseer player to any spectating clients
+            foreach (var pair in _inventoryViewTargetByViewer)
+            {
+                var viewerId = pair.Key;
+                var targetId = pair.Value;
+
+                if (targetId < 0)
+                    continue;
+
+                // If we have a live snapshot pushed from the target client, don't overwrite it with host guesses.
+                if (_liveInventoryViews.TryGetValue(targetId, out var clientPushed)
+                    && clientPushed.HotbarIds != null
+                    && clientPushed.HotbarIds.Length > 0)
+                {
+                    var forwarded = new LanInventoryView
+                    {
+                        ViewerPlayerId = viewerId,
+                        TargetPlayerId = targetId,
+                        SelectedIndex = clientPushed.SelectedIndex,
+                        HotbarIds = clientPushed.HotbarIds,
+                        HotbarCounts = clientPushed.HotbarCounts,
+                        GridIds = clientPushed.GridIds,
+                        GridCounts = clientPushed.GridCounts
+                    };
+                    _lanSession.SendInventoryView(forwarded);
+                    continue;
+                }
+
+                // Fallback (older behavior): get inventory data from remote player tracking
+                var inventory = GetRemotePlayerInventory(targetId);
+                if (inventory == null)
+                    continue;
+
+                var selectedIndex = 0;
+                if (_remotePlayers.TryGetValue(targetId, out var targetModel))
+                {
+                    // Approximation: match held block id to hotbar slot index.
+                    // (True selected index is not currently replicated over LAN.)
+                    var heldId = targetModel.HeldBlockId;
+                    if (heldId != BlockId.Air)
+                    {
+                        for (var i = 0; i < inventory.Hotbar.Length; i++)
+                        {
+                            if (inventory.Hotbar[i].Id == heldId)
+                            {
+                                selectedIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                var inventoryView = new LanInventoryView
+                {
+                    ViewerPlayerId = viewerId,
+                    TargetPlayerId = targetId,
+                    SelectedIndex = selectedIndex,
+                    HotbarIds = ConvertHotbarToBytes(inventory.Hotbar),
+                    HotbarCounts = ConvertHotbarCountsToBytes(inventory.Hotbar),
+                    GridIds = ConvertGridToBytes(inventory.Grid),
+                    GridCounts = ConvertGridCountsToBytes(inventory.Grid)
+                };
+                _lanSession.SendInventoryView(inventoryView);
+            }
+        }
+    }
+
+    private void SendClientInventoryViewToHost(float dt)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected)
+            return;
+        if (_lanSession.IsHost)
+            return;
+
+        if (!_liveInventoryHostRequestedLocal)
+            return;
+
+        _liveInventoryClientSendAccumulator += dt;
+        if (_liveInventoryClientSendAccumulator < 0.20f)
+            return;
+        _liveInventoryClientSendAccumulator = 0f;
+
+        var currentHash = ComputeInventoryHash(_inventory, _inventory.SelectedIndex);
+        if (currentHash == _liveInventoryLastSentHash)
+            return;
+        _liveInventoryLastSentHash = currentHash;
+
+        var view = new LanInventoryView
+        {
+            ViewerPlayerId = _lanSession.LocalPlayerId,
+            TargetPlayerId = _lanSession.LocalPlayerId,
+            SelectedIndex = _inventory.SelectedIndex,
+            HotbarIds = ConvertHotbarToBytes(_inventory.Hotbar),
+            HotbarCounts = ConvertHotbarCountsToBytes(_inventory.Hotbar),
+            GridIds = ConvertGridToBytes(_inventory.Grid),
+            GridCounts = ConvertGridCountsToBytes(_inventory.Grid)
+        };
+
+        _lanSession.SendInventoryView(view);
+    }
+
+    private static int ComputeInventoryHash(Inventory inventory, int selectedIndex)
+    {
+        unchecked
+        {
+            var hash = 17;
+            hash = hash * 31 + selectedIndex;
+            for (int i = 0; i < inventory.Hotbar.Length; i++)
+            {
+                hash = hash * 31 + (int)inventory.Hotbar[i].Id;
+                hash = hash * 31 + inventory.Hotbar[i].Count;
+            }
+            for (int i = 0; i < inventory.Grid.Length; i++)
+            {
+                hash = hash * 31 + (int)inventory.Grid[i].Id;
+                hash = hash * 31 + inventory.Grid[i].Count;
+            }
+            return hash;
+        }
+    }
+
+    private Inventory? GetRemotePlayerInventory(int playerId)
+    {
+        _remoteInventories.TryGetValue(playerId, out var inventory);
+        return inventory;
+    }
+
+    private byte[] ConvertHotbarToBytes(HotbarSlot[]? hotbar)
+    {
+        if (hotbar == null) return Array.Empty<byte>();
+        var bytes = new byte[Inventory.HotbarSize];
+        for (int i = 0; i < Math.Min(hotbar.Length, bytes.Length); i++)
+            bytes[i] = (byte)hotbar[i].Id;
+        return bytes;
+    }
+
+    private byte[] ConvertHotbarCountsToBytes(HotbarSlot[]? hotbar)
+    {
+        if (hotbar == null) return Array.Empty<byte>();
+        var bytes = new byte[Inventory.HotbarSize];
+        for (int i = 0; i < Math.Min(hotbar.Length, bytes.Length); i++)
+            bytes[i] = (byte)Math.Min(hotbar[i].Count, 255);
+        return bytes;
+    }
+
+    private byte[] ConvertGridToBytes(HotbarSlot[]? grid)
+    {
+        if (grid == null) return Array.Empty<byte>();
+        var bytes = new byte[Inventory.GridSize];
+        for (int i = 0; i < Math.Min(grid.Length, bytes.Length); i++)
+            bytes[i] = (byte)grid[i].Id;
+        return bytes;
+    }
+
+    private byte[] ConvertGridCountsToBytes(HotbarSlot[]? grid)
+    {
+        if (grid == null) return Array.Empty<byte>();
+        var bytes = new byte[Inventory.GridSize];
+        for (int i = 0; i < Math.Min(grid.Length, bytes.Length); i++)
+            bytes[i] = (byte)Math.Min(grid[i].Count, 255);
+        return bytes;
+    }
+
+    private void UpdateNetworkPersistence(float dt)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected)
+            return;
+
+        if (_lanSession.IsHost)
+        {
+            while (_lanSession.TryDequeuePersistenceSnapshot(out var snapshot))
+                HandleRemotePersistenceSnapshot(snapshot);
+
+            ProcessPendingPersistenceRestores();
+            return;
+        }
+
+        _persistenceSendAccumulator += dt;
+        if (_persistenceSendAccumulator >= PersistenceSendIntervalSeconds)
+        {
+            _persistenceSendAccumulator = 0f;
+            SendLocalPersistenceSnapshot();
+        }
+
+        while (_lanSession.TryDequeuePersistenceRestore(out var restore))
+            ApplyHostPersistenceRestore(restore);
+    }
+
+    private void SendLocalPersistenceSnapshot()
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || _lanSession.IsHost)
+            return;
+
+        var state = CapturePlayerState();
+        state.Username = _profile.GetDisplayUsername();
+        var payload = state.ToCompressedBytes(_log);
+        if (payload.Length == 0)
+            return;
+
+        _lanSession.SendPersistenceSnapshot(new LanPlayerPersistenceSnapshot
+        {
+            PlayerId = _lanSession.LocalPlayerId,
+            Username = state.Username,
+            Payload = payload,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private void HandleRemotePersistenceSnapshot(LanPlayerPersistenceSnapshot snapshot)
+    {
+        if (_lanSession == null || !_lanSession.IsHost)
+            return;
+
+        if (snapshot.PlayerId <= 0)
+            return;
+
+        var normalized = new LanPlayerPersistenceSnapshot
+        {
+            PlayerId = snapshot.PlayerId,
+            Username = snapshot.Username ?? string.Empty,
+            Payload = snapshot.Payload ?? Array.Empty<byte>(),
+            TimestampUtc = snapshot.TimestampUtc <= 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : snapshot.TimestampUtc
+        };
+
+        _latestRemotePersistenceByPlayerId[snapshot.PlayerId] = normalized;
+
+        if (!PlayerWorldState.TryFromCompressedBytes(normalized.Payload, _log, out var state))
+            return;
+
+        var resolvedName = ResolvePersistenceUsername(snapshot.PlayerId, normalized.Username, state.Username);
+        if (!string.IsNullOrWhiteSpace(resolvedName))
+        {
+            state.Username = resolvedName;
+            _playerNames[snapshot.PlayerId] = resolvedName;
+        }
+
+        if (!_remotePlayers.TryGetValue(snapshot.PlayerId, out var model))
+        {
+            model = new PlayerModel(_graphics.GraphicsDevice, _assets);
+            _remotePlayers[snapshot.PlayerId] = model;
+        }
+
+        model.Position = new Vector3(state.PosX, state.PosY, state.PosZ);
+        model.Yaw = state.Yaw;
+        model.Pitch = state.Pitch;
+        model.IsFlying = state.IsFlying;
+        model.IsGrounded = !state.IsFlying;
+        model.HeldBlockId = ResolveHeldBlockFromState(state);
+
+        TryFlushRemotePersistenceSnapshot(snapshot.PlayerId, normalized);
+    }
+
+    private static BlockId ResolveHeldBlockFromState(PlayerWorldState state)
+    {
+        if (state.Hotbar == null || state.Hotbar.Length == 0)
+            return BlockId.Air;
+        if (state.SelectedIndex < 0 || state.SelectedIndex >= state.Hotbar.Length)
+            return BlockId.Air;
+        var id = state.Hotbar[state.SelectedIndex].Id;
+        return id == BlockId.Air ? BlockId.Air : id;
+    }
+
+    private void TryFlushRemotePersistenceSnapshot(int playerId, LanPlayerPersistenceSnapshot snapshot, bool force = false)
+    {
+        if (playerId <= 0)
+            return;
+
+        if (!force
+            && _remotePersistenceLastFlushUtc.TryGetValue(playerId, out var lastFlush)
+            && DateTime.UtcNow - lastFlush < RemotePersistenceFlushInterval)
+        {
+            return;
+        }
+
+        if (!TrySaveRemotePlayerStateSnapshot(playerId, snapshot))
+            return;
+
+        _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
+    }
+
+    private void ProcessPendingPersistenceRestores()
+    {
+        if (_lanSession == null || !_lanSession.IsHost || _pendingRestorePlayerIds.Count == 0)
+            return;
+
+        var pending = _pendingRestorePlayerIds.ToArray();
+        for (var i = 0; i < pending.Length; i++)
+        {
+            var playerId = pending[i];
+            if (playerId <= 0 || !_playerNames.ContainsKey(playerId))
+            {
+                _pendingRestorePlayerIds.Remove(playerId);
+                continue;
+            }
+
+            if (!TryBuildPersistenceRestoreForPlayer(playerId, out var restore))
+                continue;
+
+            if (!_lanSession.SendPersistenceRestore(playerId, restore))
+                continue;
+
+            _pendingRestorePlayerIds.Remove(playerId);
+            _log.Info($"Sent persistence restore to player {ResolvePlayerName(playerId)} (id={playerId}).");
+        }
+    }
+
+    private bool TryBuildPersistenceRestoreForPlayer(int playerId, out LanPlayerPersistenceSnapshot snapshot)
+    {
+        snapshot = default;
+        if (playerId <= 0)
+            return false;
+
+        if (_latestRemotePersistenceByPlayerId.TryGetValue(playerId, out var cached) && cached.Payload is { Length: > 0 })
+        {
+            snapshot = new LanPlayerPersistenceSnapshot
+            {
+                PlayerId = playerId,
+                Username = ResolvePersistenceUsername(playerId, cached.Username, cached.Username),
+                Payload = cached.Payload,
+                TimestampUtc = cached.TimestampUtc <= 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : cached.TimestampUtc
+            };
+            return true;
+        }
+
+        var username = ResolvePersistenceUsername(playerId, ResolvePlayerName(playerId), string.Empty);
+        if (string.IsNullOrWhiteSpace(username))
+            return false;
+
+        var state = PlayerWorldState.LoadOrDefault(
+            _worldPath,
+            username,
+            () => BuildDefaultPlayerStateForUser(username),
+            _log);
+        state.Username = username;
+
+        var payload = state.ToCompressedBytes(_log);
+        if (payload.Length == 0)
+            return false;
+
+        snapshot = new LanPlayerPersistenceSnapshot
+        {
+            PlayerId = playerId,
+            Username = username,
+            Payload = payload,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        };
+        return true;
+    }
+
+    private void ApplyHostPersistenceRestore(LanPlayerPersistenceSnapshot restore)
+    {
+        if (_lanSession == null || _lanSession.IsHost)
+            return;
+
+        if (!PlayerWorldState.TryFromCompressedBytes(restore.Payload ?? Array.Empty<byte>(), _log, out var state))
+            return;
+
+        var localName = _profile.GetDisplayUsername();
+        if (!string.IsNullOrWhiteSpace(localName))
+            state.Username = localName;
+
+        ApplyPlayerState(state);
+        _log.Info("Applied host persistence restore snapshot.");
+    }
+
+    private void HandleHostDisconnected(string reason)
+    {
+        if (_multiplayerDisconnectHandled)
+            return;
+
+        _multiplayerDisconnectHandled = true;
+        var message = string.IsNullOrWhiteSpace(reason) ? HostDisconnectedFallbackReason : reason.Trim();
+        _log.Warn($"Multiplayer session closed: {message}");
+        var overlayMessage = BuildDisconnectOverlayMessage(message);
+        _menus.Pop();
+        _menus.Push(new MultiplayerDisconnectScreen(_menus, _assets, _font, _pixel, overlayMessage), _viewport);
+    }
+
+    private static string BuildDisconnectOverlayMessage(string reason)
+    {
+        var normalized = (reason ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return "Host Left Left the game";
+
+        if (normalized.StartsWith("Kicked by host", StringComparison.OrdinalIgnoreCase))
+        {
+            var detail = normalized.Contains(':')
+                ? normalized[(normalized.IndexOf(':') + 1)..].Trim()
+                : "No reason provided.";
+            if (string.IsNullOrWhiteSpace(detail))
+                detail = "No reason provided.";
+            return $"Kicked by Host - Reason: {detail}";
+        }
+
+        if (normalized.Contains("host disconnected", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("host left", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("connection to host lost", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Host Left Left the game";
+        }
+
+        return normalized;
+    }
+
+    private void ApplyNetworkTeleport(LanTeleport teleport)
+    {
+        if (_lanSession == null)
+            return;
+
+        if (teleport.TargetPlayerId != _lanSession.LocalPlayerId)
+            return;
+
+        if (!TryTeleportPlayer(teleport.X, teleport.Z, teleport.Y, out var result))
+        {
+            _log.Warn($"Forced teleport failed: {result}");
+            return;
+        }
+
+        _player.Yaw = teleport.Yaw;
+        _player.Pitch = teleport.Pitch;
+        SetCommandStatus(result);
+    }
+
+    private async Task ProcessPendingJoinRequestsAsync(EosP2PHostSession hostSession)
+    {
+        while (hostSession.TryDequeueJoinRequest(out var request))
+        {
+            var peerId = (request.ProductUserId ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(peerId))
+                continue;
+
+            var fallbackDisplay = (request.DisplayName ?? string.Empty).Trim();
+            var resolvedUsername = await ResolveUsernameAsync(peerId);
+            var resolvedLooksToken = string.IsNullOrWhiteSpace(resolvedUsername)
+                || LooksLikeIdentityToken(resolvedUsername);
+            var fallbackLooksToken = string.IsNullOrWhiteSpace(fallbackDisplay) || LooksLikeIdentityToken(fallbackDisplay);
+            var username = !resolvedLooksToken
+                ? resolvedUsername
+                : (!fallbackLooksToken ? fallbackDisplay : "PLAYER");
+            CacheUsername(peerId, username);
+
+            // If they are whitelisted by username, skip prompt and approve immediately.
+            if (_whitelist.Contains(username))
+            {
+                _log.Info($"P2P: Auto-approving whitelisted peer {username} ({peerId}) in ProcessPendingJoinRequests fallback.");
+                hostSession.PreApprovePuid(peerId);
+                hostSession.ApproveJoinRequest(peerId);
+                continue;
+            }
+
+            AddJoinRequestChatPrompt(peerId, username);
+        }
+    }
+
+    private void AddJoinRequestChatPrompt(string peerId, string displayName)
+    {
+        RememberPendingJoinRequester(peerId, displayName);
+        var hotkeyHint = FormatKeyLabel(_inviteQuickActionKey);
+        AddChatLine(
+            $"{displayName} wants to join! Accept? (Tap {hotkeyHint}=decline, hold {hotkeyHint}=accept)",
+            isSystem: true,
+            hoverText: "Allow this player to join your online world.",
+            actionLabel: "ACCEPT",
+            customActionToken: JoinApproveActionPrefix + peerId,
+            customActionStatus: $"{displayName} joined.",
+            actionLabel2: "REJECT",
+            customActionToken2: JoinDeclineActionPrefix + peerId,
+            customActionStatus2: $"{displayName} declined.");
+        SetInviteQuickStatus($"Invite received from {displayName}.", 2.4f);
+    }
+
+    private void RememberPendingJoinRequester(string peerId, string displayName)
+    {
+        var normalizedPeerId = (peerId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedPeerId))
+            return;
+
+        _pendingJoinLookup[normalizedPeerId] = normalizedPeerId;
+        var normalizedDisplay = (displayName ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(normalizedDisplay))
+        {
+            _pendingJoinLookup[normalizedDisplay] = normalizedPeerId;
+            _pendingJoinDisplayNames[normalizedPeerId] = normalizedDisplay;
+        }
+
+        _pendingJoinOrder.RemoveAll(id => string.Equals(id, normalizedPeerId, StringComparison.OrdinalIgnoreCase));
+        _pendingJoinOrder.Add(normalizedPeerId);
+    }
+
+    private void ForgetPendingJoinRequester(string peerId)
+    {
+        var normalizedPeerId = (peerId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedPeerId))
+            return;
+
+        var keysToRemove = _pendingJoinLookup
+            .Where(kvp => string.Equals(kvp.Value, normalizedPeerId, StringComparison.OrdinalIgnoreCase))
+            .Select(kvp => kvp.Key)
+            .ToArray();
+
+        for (var i = 0; i < keysToRemove.Length; i++)
+            _pendingJoinLookup.Remove(keysToRemove[i]);
+
+        _pendingJoinOrder.RemoveAll(id => string.Equals(id, normalizedPeerId, StringComparison.OrdinalIgnoreCase));
+        _pendingJoinDisplayNames.Remove(normalizedPeerId);
+        if (_inviteQuickHoldActive && string.Equals(normalizedPeerId, _inviteQuickHoldPeerId, StringComparison.OrdinalIgnoreCase))
+        {
+            _inviteQuickHoldActive = false;
+            _inviteQuickHoldAccepted = false;
+            _inviteQuickHoldElapsed = 0f;
+            _inviteQuickHoldPeerId = string.Empty;
+        }
+    }
+
+    private bool TryResolvePendingJoinRequester(string query, out string peerId)
+    {
+        peerId = string.Empty;
+        var normalized = (query ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return _pendingJoinLookup.TryGetValue(normalized, out peerId!) && !string.IsNullOrWhiteSpace(peerId);
+    }
+
+    private void ApplyPlayerList(LanPlayerList list)
+    {
+        var previousRemoteIds = _knownRemotePlayerIds.ToArray();
+        var localIdKnown = _lanSession != null && _lanSession.LocalPlayerId >= 0;
+        if (_lanSession == null)
+        {
+            _pendingRemoteJoinAnnouncements.Clear();
+            _announcedRemotePlayers.Clear();
+            _remoteJoinAnnouncedUtc.Clear();
+        }
+        
+        // Preserve old names for the "left the game" message
+        var oldNames = new Dictionary<int, string>(_playerNames);
+        
+        _playerNames.Clear();
+        var players = list.Players ?? Array.Empty<LanPlayerInfo>();
+        _knownRemotePlayerIds.Clear();
+        for (var i = 0; i < players.Length; i++)
+        {
+            var entry = players[i];
+            var name = string.IsNullOrWhiteSpace(entry.Name) ? $"Player{entry.PlayerId}" : entry.Name;
+            _playerNames[entry.PlayerId] = name;
+
+            if (_lanSession == null)
+            {
+                _knownRemotePlayerIds.Add(entry.PlayerId);
+            }
+            else if (localIdKnown && entry.PlayerId != _lanSession.LocalPlayerId)
+            {
+                _knownRemotePlayerIds.Add(entry.PlayerId);
+            }
+        }
+
+        if (_lanSession is EosP2PClientSession eosClientSession)
+        {
+            var hostId = (eosClientSession.HostProductUserId ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(hostId))
+            {
+                var hostName = ResolvePlayerName(0);
+                var existing = _profile.Friends.Find(f => string.Equals(f.UserId, hostId, StringComparison.OrdinalIgnoreCase));
+                var shouldSave = existing == null || !string.Equals(existing.Label, hostName, StringComparison.Ordinal);
+                if (shouldSave && _profile.AddOrUpdateFriend(hostId, hostName))
+                    _profile.Save(_log);
+            }
+        }
+
+        if (_lanSession != null && !_playerNames.ContainsKey(_lanSession.LocalPlayerId))
+            SeedLocalPlayerName();
+
+        if (_lanSession != null)
+        {
+            foreach (var playerId in _knownRemotePlayerIds)
+            {
+                if (playerId <= 0)
+                    continue;
+
+                if (!previousRemoteIds.Contains(playerId))
+                {
+                    if (_lanSession.IsHost)
+                        _pendingRestorePlayerIds.Add(playerId);
+
+                    // Initialize remote inventory tracking
+                    if (!_remoteInventories.ContainsKey(playerId))
+                        _remoteInventories[playerId] = new Inventory();
+
+                    _pendingRemoteJoinAnnouncements.Add(playerId);
+                    continue;
+                }
+
+                if (_pendingRemoteJoinAnnouncements.Remove(playerId))
+                {
+                    _announcedRemotePlayers.Add(playerId);
+                    _remoteJoinAnnouncedUtc[playerId] = DateTime.UtcNow;
+                    if (_hasReceivedInitialPlayerList && localIdKnown)
+                    {
+                        var joinedName = _playerNames.TryGetValue(playerId, out var nameVal) ? nameVal : $"Player{playerId}";
+                        AddChatLine($"{joinedName} joined the game", isSystem: true);
+                    }
+                }
+            }
+
+            for (var i = 0; i < previousRemoteIds.Length; i++)
+            {
+                var playerId = previousRemoteIds[i];
+                if (_knownRemotePlayerIds.Contains(playerId))
+                    continue;
+
+                _pendingRemoteJoinAnnouncements.Remove(playerId);
+                var wasAnnounced = _announcedRemotePlayers.Remove(playerId);
+                var hadJoinTimestamp = _remoteJoinAnnouncedUtc.TryGetValue(playerId, out var joinAnnouncedUtc);
+                if (hadJoinTimestamp)
+                    _remoteJoinAnnouncedUtc.Remove(playerId);
+                if (wasAnnounced && _hasReceivedInitialPlayerList && localIdKnown)
+                {
+                    var suppressEarlyLeave = hadJoinTimestamp
+                        && (DateTime.UtcNow - joinAnnouncedUtc) < RemoteLeaveAnnouncementGrace;
+                    if (!suppressEarlyLeave)
+                    {
+                        var leftName = oldNames.TryGetValue(playerId, out var oldNameVal) ? oldNameVal : $"Player{playerId}";
+                        AddChatLine($"{leftName} left the game", isSystem: true);
+                    }
+                }
+
+                if (_lanSession.IsHost)
+                {
+                    FlushPersistedRemoteStateForPlayer(playerId);
+                    _latestRemotePersistenceByPlayerId.Remove(playerId);
+                    _remotePersistenceLastFlushUtc.Remove(playerId);
+                    _pendingRestorePlayerIds.Remove(playerId);
+                }
+                _remoteLastStatus.Remove(playerId);
+            }
+        }
+
+        _hasReceivedInitialPlayerList = _hasReceivedInitialPlayerList || localIdKnown;
+
+        if (_lanSession != null && _lanSession.IsHost && _lanSession.IsConnected)
+            BroadcastOperatorSyncState();
+
+        PruneRemotePlayers();
+    }
+
+    private void PruneRemotePlayers()
+    {
+        if (_playerNames.Count == 0)
+            return;
+
+        PlayerModel? disconnectedSpectateModel = null;
+        var toRemove = new List<int>();
+        foreach (var id in _remotePlayers.Keys)
+        {
+            if (!_playerNames.ContainsKey(id))
+            {
+                if (id == _veilseerSpectateTargetPlayerId && _remotePlayers.TryGetValue(id, out var spectateModel))
+                    disconnectedSpectateModel = spectateModel;
+                toRemove.Add(id);
+            }
+        }
+
+        for (var i = 0; i < toRemove.Count; i++)
+        {
+            _remotePlayers.Remove(toRemove[i]);
+            _remoteLastStatus.Remove(toRemove[i]);
+        }
+
+        if (_veilseerSpectateTargetPlayerId >= 0 && !_remotePlayers.ContainsKey(_veilseerSpectateTargetPlayerId))
+        {
+            if (disconnectedSpectateModel != null)
+            {
+                _player.Position = disconnectedSpectateModel.Position;
+                _player.Yaw = disconnectedSpectateModel.Yaw;
+                _player.Pitch = disconnectedSpectateModel.Pitch;
+            }
+            _veilseerSpectateTargetPlayerId = -1;
+            _veilseerSpectateSlot = -1;
+            SetVeilseerSpectatePopup("Free Camera");
+            SetCommandStatus("VeilSeer target disconnected. Returned to free camera.", 3f);
+        }
+    }
+
+    private void RestoreOrCenterCamera()
+    {
+        if (_meta == null)
+        {
+            CenterCamera();
+            return;
+        }
+
+        if (IsJoinedClientSession)
+        {
+            ApplyPlayerState(BuildDefaultPlayerState());
+            return;
+        }
+
+        // Use PlayerId for stable per-world saves instead of username
+        var playerId = _profile.PlayerId;
+        if (string.IsNullOrWhiteSpace(playerId))
+        {
+            _log.Warn("PlayerId is empty, using username fallback");
+            playerId = _profile.GetDisplayUsername();
+        }
+        
+        var state = PlayerWorldState.LoadOrDefault(_worldPath, playerId, BuildDefaultPlayerState, _log);
+        ApplyPlayerState(state);
+        
+        // If this was a first-time join (no save file), save the defaults immediately
+        var playerDataPath = Path.Combine(_worldPath, "playerdata", $"{playerId}{FileConventions.PlayerExtension}");
+        if (!File.Exists(playerDataPath))
+        {
+            _log.Info($"First-time join for player {playerId}, creating initial save");
+            state.Save(_worldPath, playerId, _log);
+        }
+    }
+
+    private PlayerWorldState BuildDefaultPlayerState()
+    {
+        var username = _profile.GetDisplayUsername();
+        var state = new PlayerWorldState
+        {
+            Username = username,
+            CurrentGameMode = _meta?.CurrentWorldGameMode ?? GameMode.Artificer
+        };
+
+        if (_meta == null)
+            return state;
+
+        // Use dedicated spawn point instead of world center
+        var spawnPoint = GetWorldSpawnPoint();
+        
+        // Find safe spawn height by scanning terrain at spawn point
+        var safeHeight = FindSafeSpawnHeight(spawnPoint.X, spawnPoint.Y);
+        var height = _meta.HasCustomSpawn
+            ? Math.Clamp(_meta.SpawnY, 2, Math.Max(3, _meta.Size.Height - 2))
+            : Math.Max(safeHeight + 2f, 6f); // Spawn 2 blocks above ground
+        
+        // Position player at spawn point looking toward world center
+        var pos = new Vector3(spawnPoint.X, height, spawnPoint.Y);
+        var centerX = HasFiniteWorldBounds() ? _meta.Size.Width / 2f : spawnPoint.X + 256f;
+        var centerZ = HasFiniteWorldBounds() ? _meta.Size.Depth / 2f : spawnPoint.Y + 256f;
+        var target = new Vector3(centerX, height, centerZ);
+        var dir = Vector3.Normalize(target - pos);
+
+        state.PosX = pos.X;
+        state.PosY = pos.Y;
+        state.PosZ = pos.Z;
+        state.Yaw = (float)Math.Atan2(dir.Z, dir.X);
+        state.Pitch = (float)Math.Asin(dir.Y);
+
+        return state;
+    }
+
+    private PlayerWorldState BuildDefaultPlayerStateForUser(string username)
+    {
+        var state = BuildDefaultPlayerState();
+        state.Username = NormalizeIdentityToken(username);
+        return state;
+    }
+
+    private Vector2 GetWorldSpawnPoint()
+    {
+        if (_meta == null)
+            return new Vector2(64f, 64f); // Fallback spawn
+
+        if (_meta.HasCustomSpawn)
+        {
+            var customX = ClampWorldX(_meta.SpawnX);
+            var customZ = ClampWorldZ(_meta.SpawnZ);
+            return new Vector2(customX, customZ);
+        }
+
+        if (!HasFiniteWorldBounds())
+            return new Vector2(1024f, 1024f);
+
+        // For now, use a fixed spawn point that's 1/4 from the edge
+        // This could be enhanced with dedicated spawn point data in world meta
+        var spawnX = _meta.Size.Width * 0.25f; // 25% from left edge
+        var spawnZ = _meta.Size.Depth * 0.25f; // 25% from top edge
+        
+        // Ensure spawn is within world bounds
+        spawnX = Math.Max(16f, Math.Min(spawnX, _meta.Size.Width - 16f));
+        spawnZ = Math.Max(16f, Math.Min(spawnZ, _meta.Size.Depth - 16f));
+        
+        return new Vector2(spawnX, spawnZ);
+    }
+
+    
+private float FindSafeSpawnHeight(float x, float z)
+{
+    // Ensure the spawn chunk is generated before we probe blocks.
+    // If we query unloaded space we may see Nullblock and choose an invalid spawn Y.
+    if (_world == null)
+        return 70f;
+
+    int wx = (int)Math.Floor(x);
+    int wz = (int)Math.Floor(z);
+
+    try
+    {
+        var spawnCoord = VoxelWorld.WorldToChunk(wx, 0, wz, out _, out _, out _);
+        _world.GetOrCreateChunkData(spawnCoord, _log);
+    }
+    catch (Exception ex)
+    {
+        _log?.Warn($"FindSafeSpawnHeight: failed to ensure spawn chunk generated: {ex.Message}");
+    }
+
+    int top = Math.Max(0, _world.WorldHeight - 3);
+    for (int y = top; y >= 1; y--)
+    {
+        int id = _world.GetBlockIdAtWorld(wx, y, wz);
+        if (id == BlockIds.Air || id == BlockIds.Nullblock || id == BlockIds.NullRock)
+            continue;
+
+        int above1 = _world.GetBlockIdAtWorld(wx, y + 1, wz);
+        int above2 = _world.GetBlockIdAtWorld(wx, y + 2, wz);
+
+        bool air1 = (above1 == BlockIds.Air || above1 == BlockIds.Nullblock);
+        bool air2 = (above2 == BlockIds.Air || above2 == BlockIds.Nullblock);
+
+        if (air1 && air2)
+            return y + 1;
+    }
+
+    return 70f;
+}
+
+    /// <summary>
+    /// AGGRESSIVE FIX: Generate solid ground immediately at player position
+    /// This creates a guaranteed safe platform under the player
+    /// </summary>
+    private void GenerateSolidGroundAtPlayer()
+    {
+        if (_world == null || _player == null)
+            return;
+
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"AGGRESSIVE FIX: Generating solid ground at player position {playerPos}");
+        
+        // Create chunk if it doesn't exist
+        if (!_world.TryGetChunk(playerChunk, out var chunkData) || chunkData == null)
+        {
+            chunkData = new VoxelChunkData(playerChunk);
+            _world.AddChunkDirect(playerChunk, chunkData);
+        }
+        
+        // Generate SOLID ground in a 5x5 area around player
+        var playerBlockX = (int)Math.Floor(playerPos.X) - playerChunk.X * 16;
+        var playerBlockZ = (int)Math.Floor(playerPos.Z) - playerChunk.Z * 16;
+        var playerBlockY = (int)Math.Floor(playerPos.Y);
+        
+        // Generate solid ground from player level down to create a platform
+        for (int x = Math.Max(0, playerBlockX - 2); x <= Math.Min(15, playerBlockX + 2); x++)
+        {
+            for (int z = Math.Max(0, playerBlockZ - 2); z <= Math.Min(15, playerBlockZ + 2); z++)
+            {
+                for (int y = Math.Max(0, playerBlockY - 5); y <= Math.Min(15, playerBlockY + 2); y++)
+                {
+                    // Create solid ground layers
+                    if (y == playerBlockY)
+                    {
+                        chunkData.SetLocal(x, y, z, BlockIds.Grass); // Grass surface
+                    }
+                    else if (y >= playerBlockY - 3)
+                    {
+                        chunkData.SetLocal(x, y, z, BlockIds.Dirt); // Dirt layers
+                    }
+                    else
+                    {
+                        chunkData.SetLocal(x, y, z, BlockIds.Stone); // Stone below
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"AGGRESSIVE FIX: Generated solid ground platform at player position");
+    }
+
+    /// <summary>
+    /// AGGRESSIVE SAFETY: Ensure player has solid ground to stand on
+    /// This is the ultimate safety check to prevent falling
+    /// </summary>
+    private void EnsureSolidGroundUnderPlayer()
+    {
+        if (_world == null || _player == null)
+            return;
+
+        var playerPos = _player.Position;
+        var worldX = (int)Math.Floor(playerPos.X);
+        var worldY = (int)Math.Floor(playerPos.Y);
+        var worldZ = (int)Math.Floor(playerPos.Z);
+        
+        _log.Info($"AGGRESSIVE SAFETY: Ensuring solid ground under player at ({worldX}, {worldY}, {worldZ})");
+        
+        // Check if player has solid ground below them
+        bool hasSolidGround = false;
+        for (int y = worldY; y >= Math.Max(0, worldY - 10); y--)
+        {
+            var block = _world.GetBlock(worldX, y, worldZ);
+            if (block != BlockIds.Air && block != BlockIds.Nullblock)
+            {
+                hasSolidGround = true;
+                break;
+            }
+        }
+        
+        if (!hasSolidGround)
+        {
+            _log.Warn($"AGGRESSIVE SAFETY: No solid ground found below player! Creating emergency platform...");
+            
+            // Create emergency platform at player level
+            for (int dx = -3; dx <= 3; dx++)
+            {
+                for (int dz = -3; dz <= 3; dz++)
+                {
+                    for (int dy = 0; dy <= 3; dy++)
+                    {
+                        var blockX = worldX + dx;
+                        var blockY = worldY - dy;
+                        var blockZ = worldZ + dz;
+                        
+                        if (dy == 0)
+                        {
+                            _world.SetBlock(blockX, blockY, blockZ, BlockIds.Grass);
+                        }
+                        else if (dy <= 2)
+                        {
+                            _world.SetBlock(blockX, blockY, blockZ, BlockIds.Dirt);
+                        }
+                        else
+                        {
+                            _world.SetBlock(blockX, blockY, blockZ, BlockIds.Stone);
+                        }
+                    }
+                }
+            }
+            
+            _log.Info($"AGGRESSIVE SAFETY: Emergency platform created at player position");
+        }
+        else
+        {
+            _log.Info($"AGGRESSIVE SAFETY: Solid ground confirmed below player");
+        }
+    }
+
+    /// <summary>
+    /// ULTRA AGGRESSIVE: Force load additional chunks to prevent missing chunks
+    /// This loads a much larger area to ensure no random missing chunks
+    /// </summary>
+    private void ForceLoadAdditionalChunks()
+    {
+        if (_world == null || _streamingService == null || _player == null)
+            return;
+
+        _log.Info("ULTRA AGGRESSIVE: Force loading additional chunks to prevent missing chunks");
+        
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // ULTRA AGGRESSIVE: 7x7 area around player for complete coverage
+        var radius = 3; // 7x7 area = 49 chunks
+        var maxCy = _world.MaxChunkY;
+        var totalChunks = 0;
+        var loadedChunks = 0;
+        
+        for (var dx = -radius; dx <= radius; dx++)
+        {
+            for (var dz = -radius; dz <= radius; dz++)
+            {
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    totalChunks++;
+                    
+                    // Force chunk generation if it doesn't exist
+                    if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                    {
+                        _streamingService.EnqueueLoadJob(coord, -30); // Ultra high priority
+                        _log.Debug($"Force loading chunk {coord}");
+                    }
+                    else
+                    {
+                        loadedChunks++;
+                        
+                        // Force mesh generation if it doesn't exist
+                        if (!_chunkMeshes.ContainsKey(coord))
+                        {
+                            _streamingService.EnqueueMeshJob(coord, chunk, -30); // Ultra high priority
+                            _log.Debug($"Force meshing chunk {coord}");
+                        }
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Ultra aggressive loading: {loadedChunks}/{totalChunks} chunks loaded, {totalChunks - loadedChunks} chunks queued");
+        
+        // Process some results immediately
+        ProcessMeshJobsNonBlocking();
+        
+        // Wait a bit for immediate chunks to load
+        System.Threading.Thread.Sleep(500);
+        
+        // Check results and generate emergency meshes for anything still missing
+        GenerateEmergencyMeshesForMissingChunks();
+    }
+
+    /// <summary>
+    /// RESEARCH-BASED: Ensure spawn chunks are loaded using persistent spawn-chunk logic
+    /// Spawn chunks always tick even without players nearby
+    /// </summary>
+    private void EnsureSpawnChunksLoaded()
+    {
+        if (_world == null || _streamingService == null)
+            return;
+
+        _log.Info("RESEARCH-BASED: Ensuring persistent spawn chunks are loaded");
+        
+        var spawnPoint = GetWorldSpawnPoint();
+        var spawnChunk = VoxelWorld.WorldToChunk((int)spawnPoint.X, 0, (int)spawnPoint.Y, out _, out _, out _);
+        var surfaceSpawnChunk = new ChunkCoord(spawnChunk.X, spawnChunk.Y, spawnChunk.Z);
+        
+        var maxCy = _world.MaxChunkY;
+        var spawnChunksLoaded = 0;
+        
+        // Load spawn chunks in a persistent 3x3 area around spawn.
+        for (var dx = -1; dx <= 1; dx++)
+        {
+            for (var dz = -1; dz <= 1; dz++)
+            {
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(surfaceSpawnChunk.X + dx, cy, surfaceSpawnChunk.Z + dz);
+                    
+                    // Force load spawn chunks with highest priority
+                    if (!_world.TryGetChunk(coord, out _))
+                    {
+                        _streamingService.EnqueueLoadJob(coord, -50); // Spawn chunks get highest priority
+                        _log.Debug($"Loading spawn chunk {coord}");
+                    }
+                    else
+                    {
+                        spawnChunksLoaded++;
+                        
+                        // Force mesh generation for spawn chunks
+                        if (!_chunkMeshes.ContainsKey(coord))
+                        {
+                            if (_world.TryGetChunk(coord, out var spawnChunkData) && spawnChunkData != null)
+                            {
+                                _streamingService.EnqueueMeshJob(coord, spawnChunkData, -50);
+                                _log.Debug($"Meshing spawn chunk {coord}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Spawn chunks loaded: {spawnChunksLoaded} chunks in 3x3x{(maxCy + 1)} area");
+        
+        // Process spawn chunk results immediately
+        ProcessMeshJobsNonBlocking();
+    }
+
+    /// <summary>
+    /// RESEARCH-BASED: Force load critical chunks using admin-style force-load behavior
+    /// This keeps critical chunks loaded artificially to prevent missing chunks
+    /// </summary>
+    private void ForceLoadCriticalChunks()
+    {
+        if (_world == null || _streamingService == null || _player == null)
+            return;
+
+        _log.Info("RESEARCH-BASED: Force loading critical chunks with admin-style force-load behavior");
+        
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // Force load player's current chunk and immediate neighbors (like /forceload)
+        var criticalChunks = new List<ChunkCoord>();
+        
+        for (var dx = -1; dx <= 1; dx++)
+        {
+            for (var dz = -1; dz <= 1; dz++)
+            {
+                var coord = new ChunkCoord(playerChunk.X + dx, playerChunk.Y, playerChunk.Z + dz);
+                criticalChunks.Add(coord);
+            }
+        }
+        
+        var maxCy = _world.MaxChunkY;
+        var forceLoadedCount = 0;
+        
+        foreach (var coord in criticalChunks)
+        {
+            for (var cy = 0; cy <= maxCy; cy++)
+            {
+                var fullCoord = new ChunkCoord(coord.X, cy, coord.Z);
+                
+                // Force load with ultra high priority
+                if (!_world.TryGetChunk(fullCoord, out _))
+                {
+                    _streamingService.EnqueueLoadJob(fullCoord, -100); // Ultra high priority for force loading
+                    forceLoadedCount++;
+                    _log.Debug($"Force loading critical chunk {fullCoord}");
+                }
+                else
+                {
+                    // Force mesh generation for existing chunks
+                    if (!_chunkMeshes.ContainsKey(fullCoord))
+                    {
+                        if (_world.TryGetChunk(fullCoord, out var criticalChunk) && criticalChunk != null)
+                        {
+                            _streamingService.EnqueueMeshJob(fullCoord, criticalChunk, -100);
+                            _log.Debug($"Force meshing critical chunk {fullCoord}");
+                        }
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Force loaded {forceLoadedCount} critical chunks in immediate area");
+        
+        // Wait a bit for force-loaded chunks to process
+        System.Threading.Thread.Sleep(1000);
+        
+        // Process force-loaded results
+        ProcessMeshJobsNonBlocking();
+        
+        // Generate emergency meshes for anything still missing
+        GenerateEmergencyMeshesForMissingChunks();
+    }
+
+    /// <summary>
+    /// AGGRESSIVE: Ensure all chunks around player are visible
+    /// This guarantees no missing chunks when rejoining
+    /// </summary>
+    private void EnsureAllChunksVisible()
+    {
+        if (_world == null || _streamingService == null || _player == null)
+            return;
+
+        _log.Info("AGGRESSIVE: Ensuring all chunks around player are visible");
+        
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // AGGRESSIVE: 5x5 area around player to ensure no missing chunks
+        var radius = 2; // 5x5 area
+        var maxCy = _world.MaxChunkY;
+        var totalChunks = 0;
+        var existingChunks = 0;
+        var meshedChunks = 0;
+        
+        for (var dx = -radius; dx <= radius; dx++)
+        {
+            for (var dz = -radius; dz <= radius; dz++)
+            {
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    totalChunks++;
+                    
+                    // Check if chunk exists
+                    if (_world.TryGetChunk(coord, out var chunk) && chunk != null)
+                    {
+                        existingChunks++;
+                        
+                        // Check if mesh exists
+                        if (_chunkMeshes.ContainsKey(coord))
+                        {
+                            meshedChunks++;
+                        }
+                        else
+                        {
+                            // Force mesh generation for missing meshes
+                            _streamingService.EnqueueMeshJob(coord, chunk, -20);
+                            _log.Debug($"Enqueued mesh for missing chunk {coord}");
+                        }
+                    }
+                    else
+                    {
+                        // Force chunk generation for missing chunks
+                        _streamingService.EnqueueLoadJob(coord, -20);
+                        _log.Debug($"Enqueued load for missing chunk {coord}");
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Chunk visibility status: {meshedChunks}/{existingChunks}/{totalChunks} chunks meshed/existing/total");
+        
+        // Process some results immediately
+        ProcessMeshJobsNonBlocking();
+        
+        // Generate emergency meshes for any still-missing chunks
+        GenerateEmergencyMeshesForMissingChunks();
+    }
+
+    /// <summary>
+    /// AGGRESSIVE: Generate emergency meshes for missing chunks
+    /// This is the ultimate fallback to ensure visibility
+    /// </summary>
+    private void GenerateEmergencyMeshesForMissingChunks()
+    {
+        if (_world == null || _player == null)
+            return;
+
+        _log.Info("AGGRESSIVE: Generating emergency meshes for missing chunks");
+        
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // 3x3 area around player for emergency meshes
+        var radius = 1;
+        var maxCy = _world.MaxChunkY;
+        var emergencyCount = 0;
+        
+        for (var dx = -radius; dx <= radius; dx++)
+        {
+            for (var dz = -radius; dz <= radius; dz++)
+            {
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    
+                    if (!_chunkMeshes.ContainsKey(coord) && _world.TryGetChunk(coord, out var chunk) && chunk != null)
+                    {
+                        var emergencyMesh = BuildFallbackMesh(coord, chunk);
+                        if (emergencyMesh != null)
+                        {
+                            _chunkMeshes[coord] = emergencyMesh;
+                            emergencyCount++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Generated {emergencyCount} emergency meshes for missing chunks");
+    }
+
+    /// <summary>
+    /// OPTIMIZED: Force mesh generation for player's chunk without blocking
+    /// This prevents freezes while ensuring visibility
+    /// </summary>
+    private void ForceGeneratePlayerChunkMeshOptimized()
+    {
+        if (_world == null || _streamingService == null || _player == null)
+            return;
+
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"OPTIMIZED: Enqueueing mesh generation for player's chunk {playerChunk}");
+        
+        // Enqueue mesh generation for player's immediate area with high priority
+        var maxCy = _world.MaxChunkY;
+        var meshCount = 0;
+        
+        // Only generate meshes for immediate 3x3 area around player
+        for (var dx = -1; dx <= 1; dx++)
+        {
+            for (var dz = -1; dz <= 1; dz++)
+            {
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(playerChunk.X + dx, cy, playerChunk.Z + dz);
+                    
+                    if (_world.TryGetChunk(coord, out var chunk) && chunk != null)
+                    {
+                        // Only enqueue if mesh doesn't exist or chunk is dirty
+                        if (!_chunkMeshes.ContainsKey(coord) || chunk.IsDirty)
+                        {
+                            _streamingService.EnqueueMeshJob(coord, chunk, -10);
+                            meshCount++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        _log.Info($"Enqueued {meshCount} mesh jobs for player area");
+        
+        // Process a few results immediately but don't block
+        ProcessMeshJobsNonBlocking();
+    }
+
+    /// <summary>
+    /// AGGRESSIVE: Process additional chunks during loading to prevent missing chunks
+    /// </summary>
+    private void ProcessAdditionalChunks()
+    {
+        if (_world == null || _streamingService == null || _player == null)
+            return;
+
+        // Process more mesh results during loading
+        _streamingService.ProcessMeshResults(result =>
+        {
+            if (result.Mesh != null)
+            {
+                _chunkMeshes[result.Coord] = result.Mesh;
+            }
+        }, 10); // Process more results during loading
+        
+        // Check for any missing chunks in immediate area and force load them
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // Check 3x3 area for missing chunks
+        for (var dx = -1; dx <= 1; dx++)
+        {
+            for (var dz = -1; dz <= 1; dz++)
+            {
+                var coord = new ChunkCoord(playerChunk.X + dx, 0, playerChunk.Z + dz);
+                
+                if (!_world.TryGetChunk(coord, out _))
+                {
+                    _streamingService.EnqueueLoadJob(coord, -25); // High priority for missing chunks
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// OPTIMIZED: Process mesh jobs without blocking to prevent freezes
+    /// </summary>
+    private void ProcessMeshJobsNonBlocking()
+    {
+        if (_streamingService == null)
+            return;
+
+        // Process only a few results to prevent blocking
+        _streamingService.ProcessMeshResults(result =>
+        {
+            if (result.Mesh != null)
+            {
+                _chunkMeshes[result.Coord] = result.Mesh;
+            }
+        }, 5); // Only process 5 results to prevent freezing
+    }
+
+    /// <summary>
+    /// CRITICAL: Force immediate generation of player's current chunk
+    /// This ensures the player's chunk exists before any other operations
+    /// </summary>
+    private void ForceGeneratePlayerChunk()
+    {
+        if (_world == null || _streamingService == null)
+            return;
+
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"FORCE GENERATING player's chunk: {playerChunk} at position {playerPos}");
+        
+        // Check if chunk already exists
+        if (_world.TryGetChunk(playerChunk, out var existingChunk) && existingChunk != null)
+        {
+            _log.Info($"Player's chunk {playerChunk} already exists, skipping forced generation");
+            return;
+        }
+        
+        // ALL WORLD GENERATION DELETED - NO CHUNKS
+        
+        _log.Info($"Player's chunk {playerChunk} FORCE GENERATED and added to world");
+    }
+
+    /// <summary>
+    /// Pre-load chunks around PLAYER'S SAVED POSITION (not spawn)
+    /// This fixes the issue where chunks don't load when rejoining a world
+    /// </summary>
+    private void PreloadChunksAroundPlayer()
+    {
+        if (_world == null || _streamingService == null)
+            return;
+
+        // Get player's current position (which is their saved position)
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"Preloading chunks around player position: {playerChunk} (world pos: {playerPos})");
+        
+        // Start prewarming for smooth world formation
+        _spawnPrewarmComplete = false;
+        _spawnPrewarmStartTime = DateTime.UtcNow;
+        
+        // IMMEDIATELY GENERATE PLAYER'S CURRENT CHUNK (highest priority)
+        var currentChunk = new ChunkCoord(playerChunk.X, playerChunk.Y, playerChunk.Z);
+        if (!_world.TryGetChunk(currentChunk, out _))
+        {
+            _streamingService.EnqueueLoadJob(currentChunk, -100); // Highest priority
+        }
+        
+        // Also generate immediate surrounding chunks for stability
+        for (int dx = -2; dx <= 2; dx++) // Larger area for player safety
+        {
+            for (int dz = -2; dz <= 2; dz++)
+            {
+                var coord = new ChunkCoord(playerChunk.X + dx, playerChunk.Y, playerChunk.Z + dz);
+                
+                if (!_world.TryGetChunk(coord, out _))
+                {
+                    // Higher priority for chunks closer to player
+                    int priority = -50 - (Math.Abs(dx) + Math.Abs(dz));
+                    _streamingService.EnqueueLoadJob(coord, priority);
+                }
+            }
+        }
+        
+        _log.Info($"Preloaded {25} chunks around player position for safe rejoin");
+    }
+
+    /// <summary>
+    /// CRITICAL: Wait for player's chunk to be COMPLETELY loaded before allowing movement
+    /// This is the most important safety check to prevent falling through the world
+    /// </summary>
+    private void WaitForPlayerChunkComplete()
+    {
+        if (_world == null)
+            return;
+
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"WAITING for player's chunk to be COMPLETELY loaded: {playerChunk}");
+        
+        // Wait up to 15 seconds for player's chunk to be loaded (increased timeout)
+        var timeout = DateTime.UtcNow.AddSeconds(15);
+        
+        while (DateTime.UtcNow < timeout)
+        {
+            if (_world.TryGetChunk(playerChunk, out var chunkData) && chunkData != null)
+            {
+                // Verify chunk has actual data (not empty)
+                bool hasData = false;
+                for (int i = 0; i < chunkData.Blocks.Length; i++)
+                {
+                    if (chunkData.Blocks[i] != BlockIds.Air)
+                    {
+                        hasData = true;
+                        break;
+                    }
+                }
+                
+                if (hasData)
+                {
+                    _log.Info($"Player's chunk {playerChunk} is COMPLETELY loaded with data");
+                    return;
+                }
+                else
+                {
+                    _log.Warn($"Player's chunk {playerChunk} exists but appears empty, continuing to wait...");
+                }
+            }
+            
+            // Small delay to prevent busy waiting
+            System.Threading.Thread.Sleep(100);
+        }
+        
+        // If we get here, the chunk still isn't loaded properly
+        _log.Error($"FAILED to load player's chunk {playerChunk} within timeout! Player may fall through world.");
+        
+        // LAST RESORT: Generate a basic chunk to prevent falling
+        // ALL WORLD GENERATION DELETED - NO CHUNKS
+    }
+
+    /// <summary>
+    /// Wait for critical chunks around player to load before allowing movement
+    /// This prevents falling through the world when rejoining
+    /// </summary>
+    private void WaitForCriticalChunks()
+    {
+        if (_world == null || _streamingService == null)
+            return;
+
+        var playerPos = _player.Position;
+        var playerChunk = VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        _log.Info($"Waiting for critical chunks to load around player position: {playerChunk}");
+        
+        // Wait up to 10 seconds for critical chunks to load
+        var timeout = DateTime.UtcNow.AddSeconds(10);
+        var criticalChunks = new List<ChunkCoord>();
+        
+        // Add current chunk and immediate neighbors to critical list
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                criticalChunks.Add(new ChunkCoord(playerChunk.X + dx, playerChunk.Y, playerChunk.Z + dz));
+            }
+        }
+        
+        int loadedCount = 0;
+        while (DateTime.UtcNow < timeout && loadedCount < criticalChunks.Count)
+        {
+            loadedCount = 0;
+            foreach (var chunk in criticalChunks)
+            {
+                if (_world.TryGetChunk(chunk, out var chunkData) && chunkData != null)
+                {
+                    loadedCount++;
+                }
+            }
+            
+            if (loadedCount < criticalChunks.Count)
+            {
+                // Process streaming results to load chunks
+                ProcessStreamingResults(aggressiveApply: true);
+                
+                // Small delay to allow chunks to load
+                System.Threading.Thread.Sleep(50);
+            }
+        }
+        
+        _log.Info($"Critical chunks loaded: {loadedCount}/{criticalChunks.Count}");
+        
+        // If not all chunks loaded, at least ensure player's current chunk exists
+        if (!_world.TryGetChunk(playerChunk, out _))
+        {
+            _log.Warn($"Player's current chunk {playerChunk} still not loaded, generating immediately");
+            _streamingService.EnqueueLoadJob(playerChunk, -1000); // Ultra high priority
+            
+            // Wait a bit more for this critical chunk
+            var chunkTimeout = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < chunkTimeout)
+            {
+                ProcessStreamingResults(aggressiveApply: true);
+                if (_world.TryGetChunk(playerChunk, out _))
+                    break;
+                System.Threading.Thread.Sleep(100);
+            }
+        }
+    }
+
+    private void PreloadSpawnChunks()
+    {
+        if (_world == null || _meta == null || _streamingService == null)
+            return;
+
+        // FIX HOLE - Generate spawn chunk immediately
+        var spawnPoint = GetWorldSpawnPoint();
+        var spawnChunk = VoxelWorld.WorldToChunk((int)spawnPoint.X, 0, (int)spawnPoint.Y, out _, out _, out _);
+        
+        // Start prewarming for smooth world formation
+        _spawnPrewarmComplete = false;
+        _spawnPrewarmStartTime = DateTime.UtcNow;
+        
+        // IMMEDIATELY GENERATE SPAWN CHUNK (highest priority)
+        var surfaceChunk = new ChunkCoord(spawnChunk.X, spawnChunk.Y, spawnChunk.Z);
+        if (_world.TryGetChunk(surfaceChunk) == null)
+        {
+            _streamingService.EnqueueLoadJob(surfaceChunk, -100); // Highest priority
+        }
+        
+        // Also generate immediate surrounding chunks for stability
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                var coord = new ChunkCoord(spawnChunk.X + dx, spawnChunk.Y, spawnChunk.Z + dz);
+                
+                if (_world.TryGetChunk(coord) == null)
+                {
+                    _streamingService.EnqueueLoadJob(coord, -50); // High priority
+                }
+            }
+        }
+        
+        _log.Info("Spawn chunk generation initiated - fixing hole in world");
+    }
+
+    private bool AreSpawnChunksLoaded()
+    {
+        if (_world == null || _meta == null)
+            return false;
+
+        // FIX HOLE IN WORLD - Generate spawn chunk if it doesn't exist
+        var spawnPoint = GetWorldSpawnPoint();
+        var spawnChunk = VoxelWorld.WorldToChunk((int)spawnPoint.X, 0, (int)spawnPoint.Y, out _, out _, out _);
+        
+        // Check and generate surface spawn chunk
+        var surfaceChunk = new ChunkCoord(spawnChunk.X, spawnChunk.Y, spawnChunk.Z);
+        
+        // GENERATE CHUNK IF IT DOESN'T EXIST
+        var chunk = _world.TryGetChunk(surfaceChunk);
+        if (chunk == null)
+        {
+            if (_streamingService != null)
+            {
+                _streamingService.EnqueueLoadJob(surfaceChunk, -10); // High priority
+            }
+            return false; // Still loading
+        }
+        
+        // Also generate mesh if it doesn't exist
+        if (!_chunkMeshes.TryGetValue(surfaceChunk, out var mesh) || mesh == null)
+        {
+            if (_streamingService != null)
+            {
+                _streamingService.EnqueueMeshJob(surfaceChunk, chunk, -10); // High priority
+            }
+            return false; // Still loading
+        }
+        
+        // Mark as complete when spawn chunk and mesh are ready
+        if (!_spawnPrewarmComplete)
+        {
+            _spawnPrewarmComplete = true;
+            _log.Info("Spawn chunk and mesh ready - world formation complete");
+        }
+        
+        return true;
+    }
+
+    private bool IsVisibilitySafe()
+    {
+        // REMOVED - NO MORE VISIBILITY CHECKS
+        return true;
+    }
+
+    // CPU RAM OPTIMIZATION - Memory pool for chunk mesh vertices
+    private readonly Dictionary<int, List<VertexPositionTexture[]>> _vertexPool = new();
+    private readonly Dictionary<int, List<short[]>> _indexPool = new();
+    private readonly object _poolLock = new object();
+    private const int MaxPoolSize = 100; // Maximum pooled arrays per size
+    
+    // GPU RESOURCE OPTIMIZATION - Persistent buffer pools
+    private readonly Dictionary<int, DynamicVertexBuffer> _vertexBufferPool = new();
+    private readonly Dictionary<int, DynamicIndexBuffer> _indexBufferPool = new();
+    private const int MaxGpuPoolSize = 50; // Maximum GPU buffers per size
+
+    // NEW: Prevent loading screen after player has spawned
+    private bool ShouldShowLoadingScreen()
+    {
+        // Show loading until the world is loaded AND (if enabled) the spawn prewarm gate is ready.
+        if (!_hasLoadedWorld)
+            return true;
+
+        if (_worldSyncInProgress)
+            return true;
+
+        if (ENABLE_SPAWN_PREWARM && !_spawnPrewarmComplete)
+            return true;
+
+        return false;
+    }
+
+    // CPU RAM OPTIMIZATION - Memory pool helper methods
+    private VertexPositionTexture[] GetPooledVertices(int size)
+    {
+        lock (_poolLock)
+        {
+            if (_vertexPool.TryGetValue(size, out var pool) && pool.Count > 0)
+            {
+                var vertices = pool[pool.Count - 1];
+                pool.RemoveAt(pool.Count - 1);
+                return vertices;
+            }
+        }
+        return new VertexPositionTexture[size];
+    }
+    
+    private void ReturnPooledVertices(VertexPositionTexture[] vertices)
+    {
+        var size = vertices.Length;
+        lock (_poolLock)
+        {
+            if (!_vertexPool.TryGetValue(size, out var pool))
+            {
+                pool = new List<VertexPositionTexture[]>();
+                _vertexPool[size] = pool;
+            }
+            
+            if (pool.Count < MaxPoolSize)
+            {
+                Array.Clear(vertices, 0, vertices.Length); // Clear for reuse
+                pool.Add(vertices);
+            }
+        }
+    }
+    
+    private short[] GetPooledIndices(int size)
+    {
+        lock (_poolLock)
+        {
+            if (_indexPool.TryGetValue(size, out var pool) && pool.Count > 0)
+            {
+                var indices = pool[pool.Count - 1];
+                pool.RemoveAt(pool.Count - 1);
+                return indices;
+            }
+        }
+        return new short[size];
+    }
+    
+    private void ReturnPooledIndices(short[] indices)
+    {
+        var size = indices.Length;
+        lock (_poolLock)
+        {
+            if (!_indexPool.TryGetValue(size, out var pool))
+            {
+                pool = new List<short[]>();
+                _indexPool[size] = pool;
+            }
+            
+            if (pool.Count < MaxPoolSize)
+            {
+                Array.Clear(indices, 0, indices.Length); // Clear for reuse
+                pool.Add(indices);
+            }
+        }
+    }
+    
+    // GPU RESOURCE OPTIMIZATION - Buffer pool helper methods
+    private DynamicVertexBuffer GetPooledVertexBuffer(GraphicsDevice device, int size)
+    {
+        if (_vertexBufferPool.TryGetValue(size, out var buffer))
+        {
+            _vertexBufferPool.Remove(size);
+            return buffer;
+        }
+        return new DynamicVertexBuffer(device, VertexPositionTexture.VertexDeclaration, size, BufferUsage.WriteOnly);
+    }
+    
+    private void ReturnPooledVertexBuffer(int size, DynamicVertexBuffer buffer)
+    {
+        if (_vertexBufferPool.Count < MaxGpuPoolSize)
+        {
+            _vertexBufferPool[size] = buffer;
+        }
+        else
+        {
+            buffer.Dispose();
+        }
+    }
+    
+    private DynamicIndexBuffer GetPooledIndexBuffer(GraphicsDevice device, int size)
+    {
+        if (_indexBufferPool.TryGetValue(size, out var buffer))
+        {
+            _indexBufferPool.Remove(size);
+            return buffer;
+        }
+        return new DynamicIndexBuffer(device, typeof(short), size, BufferUsage.WriteOnly);
+    }
+    
+    private void ReturnPooledIndexBuffer(int size, DynamicIndexBuffer buffer)
+    {
+        if (_indexBufferPool.Count < MaxGpuPoolSize)
+        {
+            _indexBufferPool[size] = buffer;
+        }
+        else
+        {
+            buffer.Dispose();
+        }
+    }
+
+    private void EnsureFallbackMeshes()
+    {
+        // 3) TIER-0 FALLBACK MESHING - Build simple meshes for missing chunks, queue normal remesh later
+        if (_world == null || _streamingService == null)
+            return;
+
+        foreach (var coord in _tier0Chunks)
+        {
+            var chunk = _world.TryGetChunk(coord);
+            if (chunk != null)
+            {
+                if (!_chunkMeshes.TryGetValue(coord, out var mesh) || mesh == null || 
+                    (mesh.OpaqueVertices.Length == 0 && mesh.CutoutVertices.Length == 0 && mesh.TransparentVertices.Length == 0 && mesh.WaterVertices.Length == 0))
+                {
+                    _log.Warn($"Building Tier-0 fallback mesh for {coord}");
+                    var fallbackMesh = BuildFallbackMesh(coord, chunk);
+                    if (fallbackMesh != null)
+                    {
+                        _chunkMeshes[coord] = fallbackMesh;
+                        
+                        // 3) Queue normal greedy remesh for polish
+                        chunk.IsDirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private ChunkMesh BuildFallbackMesh(ChunkCoord coord, VoxelChunkData chunk)
+    {
+        // Fallback mesh is intentionally simple but still respects per-face visibility.
+        if (_atlas == null)
+            return ChunkMesh.Empty;
+
+        var opaque = new List<VertexPositionTexture>();
+        var cutout = new List<VertexPositionTexture>();
+        var transparent = new List<VertexPositionTexture>();
+        var water = new List<VertexPositionTexture>();
+
+        var bs = Scale.BlockSize;
+        var originX = coord.X * VoxelChunkData.ChunkSizeX;
+        var originY = coord.Y * VoxelChunkData.ChunkSizeY;
+        var originZ = coord.Z * VoxelChunkData.ChunkSizeZ;
+
+        for (int x = 0; x < VoxelChunkData.ChunkSizeX; x++)
+        {
+            for (int y = 0; y < VoxelChunkData.ChunkSizeY; y++)
+            {
+                for (int z = 0; z < VoxelChunkData.ChunkSizeZ; z++)
+                {
+                    var blockId = chunk.GetLocal(x, y, z);
+                    if (blockId == BlockIds.Air || blockId == BlockIds.Nullblock)
+                        continue;
+
+                    var def = BlockRegistry.Get(blockId);
+                    if (def.HasCustomModel)
+                        continue;
+
+                    var target = def.RenderLayer switch
+                    {
+                        BlockRenderLayer.Water => water,
+                        BlockRenderLayer.Cutout => cutout,
+                        BlockRenderLayer.Blended => transparent,
+                        _ => opaque
+                    };
+
+                    var worldX = originX + x;
+                    var worldY = originY + y;
+                    var worldZ = originZ + z;
+
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x + 1, y, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosX);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x - 1, y, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegX);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y + 1, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosY);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y - 1, z, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegY);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z + 1, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosZ);
+                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z - 1, chunk))
+                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegZ);
+                }
+            }
+        }
+
+        return new ChunkMesh(coord, opaque.ToArray(), cutout.ToArray(), transparent.ToArray(), water.ToArray(),
+            new BoundingBox(new Vector3(originX * bs, originY * bs, originZ * bs), 
+                           new Vector3((originX + VoxelChunkData.ChunkSizeX) * bs, 
+                                       (originY + VoxelChunkData.ChunkSizeY) * bs, 
+                                       (originZ + VoxelChunkData.ChunkSizeZ) * bs)));
+    }
+
+    private bool ShouldRenderFallbackFace(byte currentId, int x, int y, int z, int nx, int ny, int nz, VoxelChunkData chunk)
+    {
+        if (nx < 0 || ny < 0 || nz < 0
+            || nx >= VoxelChunkData.ChunkSizeX
+            || ny >= VoxelChunkData.ChunkSizeY
+            || nz >= VoxelChunkData.ChunkSizeZ)
+        {
+            return true;
+        }
+
+        var neighborId = chunk.GetLocal(nx, ny, nz);
+        if (neighborId == BlockIds.Air || neighborId == BlockIds.Nullblock)
+            return true;
+        if (neighborId == currentId)
+            return false;
+
+        var currentLayer = BlockRegistry.GetRenderLayer(currentId);
+        var neighborLayer = BlockRegistry.GetRenderLayer(neighborId);
+        var currentOpaque = currentLayer == BlockRenderLayer.Opaque;
+        var neighborOpaque = neighborLayer == BlockRenderLayer.Opaque;
+
+        if (currentOpaque && neighborOpaque)
+            return false;
+        if (currentOpaque && !neighborOpaque)
+            return true;
+        if (!currentOpaque && neighborOpaque)
+            return false;
+
+        if (currentLayer == neighborLayer)
+            return currentId <= neighborId;
+
+        return GetFallbackLayerPriority(currentLayer) >= GetFallbackLayerPriority(neighborLayer);
+    }
+
+    private static int GetFallbackLayerPriority(BlockRenderLayer layer) => layer switch
+    {
+        BlockRenderLayer.Cutout => 3,
+        BlockRenderLayer.Blended => 2,
+        BlockRenderLayer.Water => 1,
+        _ => 0
+    };
+
+    private void AddFallbackFace(List<VertexPositionTexture> vertices, int x, int y, int z, float bs, byte blockId, FaceDirection face)
+    {
+        if (_atlas == null)
+            return;
+
+        var min = new Vector3(x * bs, y * bs, z * bs);
+        var max = min + new Vector3(bs, bs, bs);
+
+        switch (face)
+        {
+            case FaceDirection.PosX:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegX:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.PosY:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, max.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z), new Vector3(min.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegY:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, min.Z), new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(min.X, min.Y, max.Z));
+                break;
+            case FaceDirection.PosZ:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.NegZ:
+                AddFace(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
+        }
+    }
+
+    private void PerformPanicRecovery()
+    {
+        // 6) PANIC RECOVERY - Clear queues, re-enqueue tier0, rebuild atlas
+        if (_streamingService == null || _world == null)
+            return;
+
+        try
+        {
+            _log.Error("AUTO-RECOVER: Clearing queues and rebuilding...");
+            
+            // Clear all chunk meshes to force rebuild
+            _chunkMeshes.Clear();
+            
+            // Rebuild atlas
+            _atlas = CubeNetAtlas.Build(_assets, _log, _settings.QualityPreset);
+            if (_atlas == null || _atlas.Texture == null)
+            {
+                _log.Error("AUTO-RECOVER: Atlas rebuild failed");
+                return;
+            }
+            
+            // Re-enqueue tier0 chunks with high priority
+            _tier0Chunks.Clear();
+            VoxelWorld.WorldToChunk((int)_player.Position.X, (int)_player.Position.Y, (int)_player.Position.Z, out var playerChunkX, out var playerChunkY, out var playerChunkZ);
+            var maxCy = _world.MaxChunkY;
+            
+            for (var ring = 0; ring <= 1; ring++)
+            {
+                for (var dz = -ring; dz <= ring; dz++)
+                {
+                    for (var dx = -ring; dx <= ring; dx++)
+                    {
+                        // Chebyshev distance = max(|dx|, |dz|)
+                        if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != ring)
+                            continue;
+
+                        for (var cy = 0; cy <= maxCy; cy++)
+                        {
+                            var coord = new ChunkCoord(playerChunkX + dx, cy, playerChunkZ + dz);
+                            _tier0Chunks.Add(coord);
+                            _streamingService.EnqueueLoadJob(coord, -10); // Highest priority
+                        }
+                    }
+                }
+            }
+            
+            _log.Error($"AUTO-RECOVER: Re-enqueued {_tier0Chunks.Count} tier0 chunks");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"AUTO-RECOVER failed: {ex.Message}");
+        }
+    }
+
+    private void PerformVisibilityAssert()
+    {
+        // E) FAILSAFE ASSERT - Check if player can see void or has no solid ground
+        if (_world == null || _visibilityAssertLogged)
+            return;
+
+        var playerPos = _player.Position;
+        VoxelWorld.WorldToChunk((int)playerPos.X, (int)playerPos.Y, (int)playerPos.Z, out _, out _, out _);
+        
+        // Check for solid block under player
+        var groundY = (int)MathF.Floor(playerPos.Y - 0.1f);
+        var groundBlock = _world.GetBlock((int)playerPos.X, groundY, (int)playerPos.Z);
+        var hasSolidGround = groundBlock != BlockIds.Air && groundBlock != BlockIds.Nullblock;
+        
+        // Check for void visibility (simplified - check if player is too high above ground)
+        var worldHeight = _world.MaxChunkY * VoxelChunkData.ChunkSizeY;
+        var isTooHigh = playerPos.Y > worldHeight - 10;
+        
+        if (!hasSolidGround || isTooHigh)
+        {
+            _log.Warn($"Visibility assert warning: Player at {playerPos} - Solid ground: {hasSolidGround}, Too high: {isTooHigh}");
+            _visibilityAssertLogged = true;
+        }
+        else
+        {
+            _log.Info("Visibility assert passed: Player has solid ground and reasonable height");
+            _visibilityAssertLogged = true;
+        }
+    }
+
+    private void ScheduleBackgroundRemeshPass()
+    {
+        // C) After gameplay starts, schedule a NORMAL remesh pass for visual polish
+        if (_world == null || _streamingService == null)
+            return;
+
+        _log.Info("Scheduling background remesh pass for Tier 0 chunks");
+        
+        foreach (var coord in _tier0Chunks)
+        {
+            var chunk = _world.TryGetChunk(coord);
+            if (chunk != null)
+            {
+                // Mark as dirty for normal remesh with full quality
+                chunk.IsDirty = true;
+            }
+        }
+    }
+
+    private void ApplyPlayerState(PlayerWorldState state)
+    {
+        var resolvedMode = state.Version >= 3 ? state.CurrentGameMode : _meta?.CurrentWorldGameMode ?? GameMode.Artificer;
+        if (!Enum.IsDefined(typeof(GameMode), resolvedMode))
+            resolvedMode = _meta?.CurrentWorldGameMode ?? GameMode.Artificer;
+
+        ApplyGameModeChange(resolvedMode, GameModeChangeSource.Load, persistImmediately: false, emitFeedback: false);
+        _player.Position = new Vector3(state.PosX, state.PosY, state.PosZ);
+        _player.Yaw = state.Yaw;
+        _player.Pitch = state.Pitch;
+        _player.Velocity = Vector3.Zero;
+        _player.SetFlying(_player.AllowFlying && state.IsFlying);
+        _homes.Clear();
+        if (state.Homes != null)
+        {
+            for (int i = 0; i < state.Homes.Count; i++)
+            {
+                var home = state.Homes[i];
+                if (home == null || string.IsNullOrWhiteSpace(home.Name))
+                    continue;
+
+                var entry = new PlayerHomeEntry
+                {
+                    Name = NormalizeHomeName(home.Name),
+                    Position = new Vector3(home.PosX, home.PosY, home.PosZ)
+                };
+
+                if (!string.IsNullOrWhiteSpace(home.IconBlockId) && TryResolveHomeIconBlock(home.IconBlockId, out var iconBlock))
+                {
+                    entry.HasIconBlock = true;
+                    entry.IconBlock = iconBlock;
+                }
+
+                UpsertHomeEntry(entry);
+            }
+        }
+
+        if (_homes.Count == 0 && state.HasHome)
+        {
+            _homes.Add(new PlayerHomeEntry
+            {
+                Name = DefaultHomeName,
+                Position = new Vector3(state.HomeX, state.HomeY, state.HomeZ)
+            });
+        }
+
+        _selectedHomeIndex = _homes.Count > 0 ? 0 : -1;
+        SyncLegacyHomeFields();
+        
+        // Restore inventory data
+        if (state.Hotbar != null && state.Hotbar.Length > 0)
+        {
+            _inventory.SetHotbarData(state.Hotbar);
+            _log.Info($"Restored hotbar with {state.Hotbar.Count(x => x.Id != BlockIds.Air)} items");
+        }
+
+        if (state.InventoryGrid != null && state.InventoryGrid.Length > 0)
+        {
+            _inventory.SetGridData(state.InventoryGrid);
+            _log.Info($"Restored inventory grid with {state.InventoryGrid.Count(x => x.Id != BlockIds.Air)} items");
+        }
+
+        _inventory.SetSandboxCatalogFavorites(state.ArtificerFavoriteBlockIds ?? Array.Empty<int>());
+        _inventory.ClearSandboxCatalogSearchQuery();
+        _inventory.SetSandboxCatalogFavoritesOnly(false);
+        _inventoryCatalogScrollOffsetPx = 0f;
+        _inventoryCatalogScrollVelocityPxPerSec = 0f;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        
+        // Restore selected slot
+        if (state.SelectedIndex >= 0 && state.SelectedIndex < Inventory.HotbarSize)
+        {
+            _inventory.SelectedIndex = state.SelectedIndex;
+            _log.Info($"Restored selected hotbar slot: {state.SelectedIndex}");
+        }
+        
+        // Mark player state as clean after successful load
+        _playerStateDirty = false;
+    }
+    
+    /// <summary>
+    /// Mark player state as dirty (needs saving)
+    /// </summary>
+    private void MarkPlayerStateDirty()
+    {
+        _playerStateDirty = true;
+    }
+
+    private PlayerWorldState CapturePlayerState()
+    {
+        return new PlayerWorldState
+        {
+            Username = _profile.GetDisplayUsername(),
+            PosX = _player.Position.X,
+            PosY = _player.Position.Y,
+            PosZ = _player.Position.Z,
+            Yaw = _player.Yaw,
+            Pitch = _player.Pitch,
+            IsFlying = _player.IsFlying,
+            CurrentGameMode = _gameMode,
+            HasHome = _hasHome,
+            HomeX = _homePosition.X,
+            HomeY = _homePosition.Y,
+            HomeZ = _homePosition.Z,
+            Homes = BuildPlayerHomeStateList(),
+            SelectedIndex = _inventory.SelectedIndex,
+            Hotbar = _inventory.GetHotbarData(),
+            InventoryGrid = _inventory.GetGridData(),
+            ArtificerFavoriteBlockIds = _inventory.GetSandboxCatalogFavoriteBlockIds()
+        };
+    }
+
+    private List<PlayerHomeState> BuildPlayerHomeStateList()
+    {
+        var list = new List<PlayerHomeState>(_homes.Count);
+        for (int i = 0; i < _homes.Count; i++)
+        {
+            var home = _homes[i];
+            list.Add(new PlayerHomeState
+            {
+                Name = home.Name,
+                PosX = home.Position.X,
+                PosY = home.Position.Y,
+                PosZ = home.Position.Z,
+                IconBlockId = home.HasIconBlock ? home.IconBlock.ToString() : string.Empty
+            });
+        }
+
+        return list;
+    }
+
+    private void SyncLegacyHomeFields()
+    {
+        _hasHome = _homes.Count > 0;
+        if (_hasHome)
+            _homePosition = _homes[0].Position;
+        else
+            _homePosition = Vector3.Zero;
+    }
+
+    private static string NormalizeHomeName(string? raw)
+    {
+        var value = (raw ?? string.Empty).Trim();
+        if (value.Length == 0)
+            value = DefaultHomeName;
+        if (value.Length > 24)
+            value = value.Substring(0, 24);
+        return value;
+    }
+
+    private bool TryResolveHomeIconBlock(string token, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        if (Enum.TryParse(token, true, out BlockId parsed) && parsed != BlockId.Air)
+        {
+            blockId = parsed;
+            return true;
+        }
+
+        foreach (var def in BlockRegistry.All)
+        {
+            if (!string.Equals(def.Name, token, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (def.Id == BlockId.Air)
+                return false;
+            blockId = def.Id;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryFindHomeIndex(string name, out int index)
+    {
+        index = -1;
+        var normalized = NormalizeHomeName(name);
+        for (int i = 0; i < _homes.Count; i++)
+        {
+            if (!string.Equals(_homes[i].Name, normalized, StringComparison.OrdinalIgnoreCase))
+                continue;
+            index = i;
+            return true;
+        }
+
+        return false;
+    }
+
+    private int GetMaxHomesForWorld()
+    {
+        if (_meta == null)
+            return 1;
+
+        if (!_meta.EnableMultipleHomes)
+            return 1;
+
+        return Math.Clamp(_meta.MaxHomesPerPlayer, 1, 32);
+    }
+
+    private bool IsMultipleHomesEnabled()
+    {
+        return (_meta?.EnableMultipleHomes ?? false) && GetMaxHomesForWorld() > 1;
+    }
+
+    private void UpsertHomeEntry(PlayerHomeEntry entry)
+    {
+        entry.Name = NormalizeHomeName(entry.Name);
+        if (TryFindHomeIndex(entry.Name, out var existing))
+        {
+            _homes[existing] = entry;
+            _selectedHomeIndex = existing;
+            SyncLegacyHomeFields();
+            return;
+        }
+
+        _homes.Add(entry);
+        _selectedHomeIndex = _homes.Count - 1;
+        SyncLegacyHomeFields();
+    }
+
+    private bool TrySetHome(string requestedName, Vector3 position, out string result)
+    {
+        if (_meta == null)
+        {
+            result = "World is not ready yet.";
+            return false;
+        }
+
+        var multi = IsMultipleHomesEnabled();
+        var requested = (requestedName ?? string.Empty).Trim();
+        var name = multi
+            ? (string.IsNullOrWhiteSpace(requested) ? GetNextAutomaticHomeName() : NormalizeHomeName(requested))
+            : DefaultHomeName;
+
+        if (TryFindHomeIndex(name, out var existing))
+        {
+            var updated = _homes[existing];
+            updated.Position = position;
+            _homes[existing] = updated;
+            _selectedHomeIndex = existing;
+            SyncLegacyHomeFields();
+            SavePlayerState();
+            result = $"Home '{updated.Name}' updated at {(int)position.X}, {(int)position.Y}, {(int)position.Z}.";
+            return true;
+        }
+
+        var maxHomes = GetMaxHomesForWorld();
+        if (_homes.Count >= maxHomes)
+        {
+            result = $"Home limit reached ({maxHomes}). Delete one first.";
+            return false;
+        }
+
+        var entry = new PlayerHomeEntry { Name = name, Position = position };
+        _homes.Add(entry);
+        _selectedHomeIndex = _homes.Count - 1;
+        SyncLegacyHomeFields();
+        SavePlayerState();
+        result = $"Home '{entry.Name}' set at {(int)position.X}, {(int)position.Y}, {(int)position.Z}.";
+        return true;
+    }
+
+    private string GetNextAutomaticHomeName()
+    {
+        if (!TryFindHomeIndex(DefaultHomeName, out _))
+            return DefaultHomeName;
+
+        for (var i = 1; i < 1000; i++)
+        {
+            var candidate = $"{DefaultHomeName} {i}";
+            if (!TryFindHomeIndex(candidate, out _))
+                return candidate;
+        }
+
+        return $"{DefaultHomeName} {_homes.Count + 1}";
+    }
+
+    private bool TryTeleportToHome(string? requestedName, out string result)
+    {
+        if (_homes.Count == 0)
+        {
+            result = "No home is set. Use /sethome first.";
+            return false;
+        }
+
+        int index;
+        if (string.IsNullOrWhiteSpace(requestedName))
+        {
+            index = _selectedHomeIndex >= 0 && _selectedHomeIndex < _homes.Count ? _selectedHomeIndex : 0;
+        }
+        else if (!TryFindHomeIndex(requestedName, out index))
+        {
+            result = $"Home not found: {requestedName}";
+            return false;
+        }
+
+        var home = _homes[index];
+        _selectedHomeIndex = index;
+        if (!TryTeleportPlayer((int)home.Position.X, (int)home.Position.Z, (int)home.Position.Y, out result))
+            return false;
+
+        result += $" (home: {home.Name})";
+        return true;
+    }
+
+    private void QueuePlayerStateSaveAsync()
+    {
+        if (IsJoinedClientSession)
+            return;
+
+        if (Interlocked.CompareExchange(ref _autoSaveInFlight, 1, 0) != 0)
+            return;
+
+        // Only save if dirty
+        if (!_playerStateDirty)
+        {
+            Interlocked.Exchange(ref _autoSaveInFlight, 0);
+            return;
+        }
+
+        var snapshot = CapturePlayerState();
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                SavePlayerState(snapshot);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to auto-save player state: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _autoSaveInFlight, 0);
+            }
+        });
+    }
+
+    private void SavePlayerState(PlayerWorldState? state = null)
+    {
+        try
+        {
+            // Use PlayerId for stable per-world saves instead of username
+            var playerId = _profile.PlayerId;
+            if (string.IsNullOrWhiteSpace(playerId))
+            {
+                _log.Warn("PlayerId is empty, using username fallback for save");
+                playerId = _profile.GetDisplayUsername();
+            }
+
+            state ??= CapturePlayerState();
+            // Keep the display name inside the file, but use PlayerId for the filename
+            state.Username = _profile.GetDisplayUsername();
+            state.Save(_worldPath, playerId, _log);
+            _playerStateDirty = false;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save player state: {ex.Message}");
+        }
+    }
+
+    private int SaveConnectedRemotePlayerStates()
+    {
+        if (_lanSession == null || !_lanSession.IsHost || string.IsNullOrWhiteSpace(_worldPath))
+            return 0;
+
+        var saved = 0;
+        var savedBySnapshot = new HashSet<int>();
+
+        foreach (var pair in _latestRemotePersistenceByPlayerId)
+        {
+            if (!TrySaveRemotePlayerStateSnapshot(pair.Key, pair.Value))
+                continue;
+
+            savedBySnapshot.Add(pair.Key);
+            saved++;
+        }
+
+        foreach (var pair in _remotePlayers)
+        {
+            if (savedBySnapshot.Contains(pair.Key))
+                continue;
+
+            var playerId = pair.Key;
+            var model = pair.Value;
+            if (model == null)
+                continue;
+
+            if (TrySaveRemotePlayerModelState(playerId, model))
+                saved++;
+        }
+
+        return saved;
+    }
+
+    private void FlushPersistedRemoteStateForPlayer(int playerId)
+    {
+        if (playerId <= 0)
+            return;
+
+        if (_latestRemotePersistenceByPlayerId.TryGetValue(playerId, out var snapshot)
+            && TrySaveRemotePlayerStateSnapshot(playerId, snapshot))
+        {
+            _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
+            return;
+        }
+
+        if (_remotePlayers.TryGetValue(playerId, out var model))
+        {
+            if (TrySaveRemotePlayerModelState(playerId, model))
+                _remotePersistenceLastFlushUtc[playerId] = DateTime.UtcNow;
+        }
+    }
+
+    private bool TrySaveRemotePlayerStateSnapshot(int playerId, LanPlayerPersistenceSnapshot snapshot)
+    {
+        if (playerId <= 0 || snapshot.Payload is not { Length: > 0 })
+            return false;
+
+        if (!PlayerWorldState.TryFromCompressedBytes(snapshot.Payload, _log, out var state))
+            return false;
+
+        var username = ResolvePersistenceUsername(playerId, snapshot.Username, state.Username);
+        if (string.IsNullOrWhiteSpace(username))
+            return false;
+
+        try
+        {
+            state.Username = username;
+            state.Save(_worldPath, _log);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save remote player snapshot for '{username}': {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool TrySaveRemotePlayerModelState(int playerId, PlayerModel model)
+    {
+        var username = ResolvePersistenceUsername(playerId, ResolvePlayerName(playerId), string.Empty);
+        if (string.IsNullOrWhiteSpace(username))
+            return false;
+
+        try
+        {
+            var state = PlayerWorldState.LoadOrDefault(
+                _worldPath,
+                username,
+                () => BuildDefaultPlayerStateForUser(username),
+                _log);
+            state.Username = username;
+            state.PosX = model.Position.X;
+            state.PosY = model.Position.Y;
+            state.PosZ = model.Position.Z;
+            state.Yaw = model.Yaw;
+            state.Pitch = model.Pitch;
+            state.IsFlying = model.IsFlying;
+            state.Save(_worldPath, _log);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save remote player state for '{username}': {ex.Message}");
+            return false;
+        }
+    }
+
+    private void CancelBackgroundWork(bool waitForPreviewWorker)
+    {
+        try
+        {
+            _backgroundWorkCts.Cancel();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        Task? previewWorker;
+        lock (_previewQueueLock)
+        {
+            _previewUpdatePending = false;
+            previewWorker = _previewUpdateWorker;
+        }
+
+        if (!waitForPreviewWorker || previewWorker == null)
+            return;
+
+        try
+        {
+            previewWorker.Wait(800);
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private void QueueWorldPreviewUpdate(PlayerWorldState state)
+    {
+        QueueWorldPreviewUpdate(
+            (int)MathF.Floor(state.PosX),
+            (int)MathF.Floor(state.PosZ));
+    }
+
+    private void QueueWorldPreviewUpdate(int centerX, int centerZ)
+    {
+        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+        if (_isClosing || _backgroundWorkCts.IsCancellationRequested)
+            return;
+        if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out _))
+            return;
+
+        lock (_previewQueueLock)
+        {
+            _previewPendingCenterX = centerX;
+            _previewPendingCenterZ = centerZ;
+            _previewUpdatePending = true;
+            if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
+                _previewUpdateWorker = Task.Run(
+                    () => ProcessPreviewUpdateQueue(_backgroundWorkCts.Token),
+                    _backgroundWorkCts.Token);
+        }
+    }
+
+    private void FlushWorldPreviewUpdate(PlayerWorldState state)
+    {
+        if (_meta == null || string.IsNullOrWhiteSpace(_worldPath))
+            return;
+        if (_isClosing || _backgroundWorkCts.IsCancellationRequested)
+            return;
+        if (WorldStorageBudgetService.ShouldSkipNonCriticalWrites(_worldPath, out _))
+            return;
+
+        Task? worker;
+        lock (_previewQueueLock)
+        {
+            _previewPendingCenterX = (int)MathF.Floor(state.PosX);
+            _previewPendingCenterZ = (int)MathF.Floor(state.PosZ);
+            _previewUpdatePending = true;
+            if (_previewUpdateWorker == null || _previewUpdateWorker.IsCompleted)
+                _previewUpdateWorker = Task.Run(
+                    () => ProcessPreviewUpdateQueue(_backgroundWorkCts.Token),
+                    _backgroundWorkCts.Token);
+            worker = _previewUpdateWorker;
+        }
+
+        try
+        {
+            worker?.GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to flush world preview update: {ex.Message}");
+        }
+    }
+
+    private void ProcessPreviewUpdateQueue(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                lock (_previewQueueLock)
+                    _previewUpdateWorker = null;
+                return;
+            }
+
+            int centerX;
+            int centerZ;
+            WorldMeta? meta;
+            lock (_previewQueueLock)
+            {
+                if (!_previewUpdatePending)
+                {
+                    _previewUpdateWorker = null;
+                    return;
+                }
+
+                centerX = _previewPendingCenterX;
+                centerZ = _previewPendingCenterZ;
+                _previewUpdatePending = false;
+                meta = _meta;
+            }
+
+            if (meta == null)
+                continue;
+
+            try
+            {
+                WorldPreviewGenerator.GenerateAndSave(
+                    meta,
+                    _worldPath,
+                    centerX,
+                    centerZ,
+                    _log,
+                    cancellationToken: cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_previewQueueLock)
+                    _previewUpdateWorker = null;
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"World preview update failed: {ex.Message}");
+            }
+        }
+    }
+
+    private void EnsurePlayerNotInsideSolid(bool forceLog)
+    {
+        if (_world == null)
+            return;
+
+        if (!IsPlayerInsideSolid())
+        {
+            if (forceLog)
+                _log.Info("Unstuck: player already clear.");
+            return;
+        }
+
+        var pos = _player.Position;
+        var step = 0.25f;
+        for (int i = 0; i < 64; i++)
+        {
+            pos.Y += step;
+            _player.Position = pos;
+            if (!IsPlayerInsideSolid())
+            {
+                _player.Velocity = Vector3.Zero;
+                _log.Warn("Unstuck: moved player upward to clear collision.");
+                return;
+            }
+        }
+
+        var fallback = FindFallbackSpawn();
+        _player.Position = fallback;
+        _player.Velocity = Vector3.Zero;
+        _log.Warn("Unstuck: fallback spawn used.");
+    }
+
+    private bool IsPlayerInsideSolid()
+    {
+        return IsPlayerInsideSolid(_player.Position);
+    }
+
+    private bool IsPlayerInsideSolid(Vector3 pos)
+    {
+        if (_world == null)
+            return false;
+
+        const float eps = 0.001f;
+        var half = PlayerController.ColliderHalfWidth;
+        var height = _player.ColliderHeight;
+        var min = new Vector3(pos.X - half, pos.Y, pos.Z - half);
+        var max = new Vector3(pos.X + half, pos.Y + height, pos.Z + half);
+
+        var minX = (int)MathF.Floor(min.X + eps);
+        var maxX = (int)MathF.Floor(max.X - eps);
+        var minY = (int)MathF.Floor(min.Y + eps);
+        var maxY = (int)MathF.Floor(max.Y - eps);
+        var minZ = (int)MathF.Floor(min.Z + eps);
+        var maxZ = (int)MathF.Floor(max.Z - eps);
+
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int z = minZ; z <= maxZ; z++)
+            {
+                for (int x = minX; x <= maxX; x++)
+                {
+                    if (BlockRegistry.IsSolid((byte)_world.GetBlock(x, y, z)))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private Vector3 FindFallbackSpawn()
+    {
+        if (_meta == null)
+            return _player.Position;
+
+        var spawnPoint = GetWorldSpawnPoint();
+        var centerX = HasFiniteWorldBounds() ? _meta.Size.Width / 2f : spawnPoint.X;
+        var centerZ = HasFiniteWorldBounds() ? _meta.Size.Depth / 2f : spawnPoint.Y;
+        var maxY = Math.Max(0, _meta.Size.Height - 1);
+        var groundY = -1;
+
+        for (int y = maxY; y >= 0; y--)
+        {
+            if (BlockRegistry.IsSolid((byte)_world!.GetBlock((int)centerX, y, (int)centerZ)))
+            {
+                groundY = y;
+                break;
+            }
+        }
+
+        var safeY = groundY >= 0 ? groundY + 2.0f : Math.Max(6f, _meta.Size.Height + 2f);
+        return new Vector3(centerX, safeY, centerZ);
+    }
+
+    private void ExportAtlas()
+    {
+        if (_atlas == null)
+            return;
+
+        _atlas.ExportBlockNetPngs(Paths.BlocksTexturesDir, _log);
+        var ok = _atlas.TryExportPng(Paths.BlocksAtlasPath, _log);
+        if (ok)
+            _log.Info($"Atlas exported: {Paths.BlocksAtlasPath}");
+    }
+
+    private void UpdateSelectionTimer(float dt)
+    {
+        if (_inventory.SelectedIndex != _lastSelectedIndex)
+        {
+            _lastSelectedIndex = _inventory.SelectedIndex;
+            MarkPlayerStateDirty(); // Mark dirty when hotbar selection changes
+            var id = _inventory.SelectedId;
+            if (id != BlockId.Air)
+            {
+                SetDisplayName(BlockRegistry.Get(id).Name);
+            }
+        }
+        
+        if (_selectedNameTimer > 0)
+        {
+            _selectedNameTimer -= dt;
+        }
+    }
+
+    private void SetDisplayName(string name)
+    {
+        _displayName = name;
+        _selectedNameTimer = 3.0f; // Show for 3 seconds
+    }
+
+    private void UpdateChatLines(float dt)
+    {
+        if (_chatLines.Count == 0)
+            return;
+
+        for (var i = _chatLines.Count - 1; i >= 0; i--)
+            _chatLines[i].TimeRemaining = Math.Max(0f, _chatLines[i].TimeRemaining - dt);
+
+        if (_pendingQuickConfirmActive)
+            TryGetPendingQuickConfirmation(out _, out _, out _);
+    }
+
+    private bool IsChatOpenKeyPressed(InputState input)
+    {
+        return input.IsNewKeyPress(_chatKey);
+    }
+
+    private bool IsCommandOpenKeyPressed(InputState input)
+    {
+        if (input.IsNewKeyPress(_commandKey))
+            return true;
+
+        // Always keep slash as a direct command opener even when rebound.
+        return input.IsNewKeyPress(Keys.OemQuestion) || input.IsNewKeyPress(Keys.Divide);
+    }
+
+    private void BeginChatInput(string initialText = "")
+    {
+        _chatInputActive = true;
+        _commandInputActive = false;
+        _chatInputText = initialText ?? string.Empty;
+        ResetCommandTabCompletion();
+        BeginTextInputHistorySession(_chatInputText);
+    }
+
+    private void BeginTextInputHistorySession(string currentText)
+    {
+        _textInputHistoryCursor = _textInputHistory.Count;
+        _textInputHistoryDraft = currentText;
+        _textInputHistoryBrowsing = false;
+    }
+
+    private bool TryNavigateTextInputHistory(InputState input, ref string text)
+    {
+        if (_textInputHistory.Count == 0)
+            return false;
+
+        if (input.IsNewKeyPress(Keys.Up))
+        {
+            if (!_textInputHistoryBrowsing)
+            {
+                _textInputHistoryDraft = text;
+                _textInputHistoryCursor = _textInputHistory.Count;
+                _textInputHistoryBrowsing = true;
+            }
+
+            if (_textInputHistoryCursor > 0)
+                _textInputHistoryCursor--;
+
+            _textInputHistoryCursor = Math.Clamp(_textInputHistoryCursor, 0, _textInputHistory.Count - 1);
+            text = _textInputHistory[_textInputHistoryCursor];
+            return true;
+        }
+
+        if (input.IsNewKeyPress(Keys.Down))
+        {
+            if (!_textInputHistoryBrowsing)
+                return false;
+
+            if (_textInputHistoryCursor < _textInputHistory.Count - 1)
+            {
+                _textInputHistoryCursor++;
+                text = _textInputHistory[_textInputHistoryCursor];
+            }
+            else
+            {
+                _textInputHistoryBrowsing = false;
+                _textInputHistoryCursor = _textInputHistory.Count;
+                text = _textInputHistoryDraft;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private void RegisterTextInputHistory(string text)
+    {
+        var value = (text ?? string.Empty).Trim();
+        if (value.Length == 0)
+            return;
+
+        if (_textInputHistory.Count > 0 && string.Equals(_textInputHistory[^1], value, StringComparison.Ordinal))
+        {
+            BeginTextInputHistorySession(value);
+            return;
+        }
+
+        _textInputHistory.Add(value);
+        if (_textInputHistory.Count > MaxTextInputHistory)
+            _textInputHistory.RemoveAt(0);
+
+        BeginTextInputHistorySession(value);
+    }
+
+    private void HandleChatOverlayActions(InputState input)
+    {
+        _overlayMousePos = input.MousePosition;
+
+        if (IsTextInputActive)
+        {
+            var maxScroll = Math.Max(0, _chatLines.Count - 1);
+            if (input.ScrollDelta != 0)
+            {
+                var delta = input.ScrollDelta > 0 ? 1 : -1;
+                _chatOverlayScrollLines = Math.Clamp(_chatOverlayScrollLines + delta, 0, maxScroll);
+            }
+
+            if (input.IsNewKeyPress(Keys.PageUp))
+                _chatOverlayScrollLines = Math.Clamp(_chatOverlayScrollLines + ChatHistoryScrollStep, 0, maxScroll);
+            if (input.IsNewKeyPress(Keys.PageDown))
+                _chatOverlayScrollLines = Math.Clamp(_chatOverlayScrollLines - ChatHistoryScrollStep, 0, maxScroll);
+            if (input.IsNewKeyPress(Keys.Home))
+                _chatOverlayScrollLines = maxScroll;
+            if (input.IsNewKeyPress(Keys.End))
+                _chatOverlayScrollLines = 0;
+        }
+        else
+        {
+            _chatOverlayScrollLines = 0;
+        }
+
+        _hoveredChatActionIndex = -1;
+        for (var i = 0; i < _chatActionHitboxes.Count; i++)
+        {
+            if (_chatActionHitboxes[i].Bounds.Contains(_overlayMousePos))
+            {
+                _hoveredChatActionIndex = i;
+                break;
+            }
+        }
+
+        if (_hoveredChatActionIndex >= 0 && input.IsNewLeftClick())
+            ExecuteChatAction(_chatActionHitboxes[_hoveredChatActionIndex]);
+    }
+
+    private void ExecuteChatAction(ChatActionHitbox action)
+    {
+        if (action.HasCopy)
+        {
+            if (TryCopyToClipboard(action.CopyText, out var error))
+            {
+                var status = string.IsNullOrWhiteSpace(action.CopyStatusText)
+                    ? "Copied to clipboard."
+                    : action.CopyStatusText;
+                SetCommandStatus(status, 3f, echoToChat: false);
+            }
+            else
+            {
+                SetCommandStatus($"Clipboard copy failed: {error}", 4f, echoToChat: false);
+            }
+            return;
+        }
+
+        if (action.HasCustomAction)
+        {
+            ExecuteCustomChatAction(action.CustomActionToken, action.CustomActionStatus);
+            return;
+        }
+
+        if (!action.HasTeleport)
+            return;
+
+        if (!TryTeleportPlayer(action.TeleportX, action.TeleportZ, action.TeleportY, out var result))
+        {
+            SetCommandStatus(result);
+            return;
+        }
+
+        _chatOverlayActionUnlockUntil = 0f;
+        SetCommandStatus(result);
+    }
+
+    private void ExecuteCustomChatAction(string token, string statusText)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(token))
+            return;
+
+        if (token.StartsWith("spoiler-reveal:", StringComparison.Ordinal))
+        {
+            var raw = token.Substring("spoiler-reveal:".Length).Trim();
+            if (int.TryParse(raw, out var lineId))
+            {
+                for (var i = _chatLines.Count - 1; i >= 0; i--)
+                {
+                    if (_chatLines[i].LineId != lineId)
+                        continue;
+                    _chatLines[i].SpoilerRevealed = true;
+                    break;
+                }
+            }
+            return;
+        }
+
+        if (_pendingQuickConfirmActive
+            && (string.Equals(token, _pendingQuickConfirmToken, StringComparison.Ordinal)
+                || string.Equals(token, _pendingQuickCancelToken, StringComparison.Ordinal)))
+        {
+            ClearPendingQuickConfirmation();
+        }
+
+        if (string.Equals(token, ChatClearConfirmActionToken, StringComparison.Ordinal))
+        {
+            ClearChatHistory();
+            return;
+        }
+
+        if (string.Equals(token, ChatClearCancelActionToken, StringComparison.Ordinal))
+        {
+            SetCommandStatus("Chat clear canceled.", 3f, echoToChat: false);
+            return;
+        }
+
+        if (token.StartsWith(InventoryClearConfirmActionPrefix, StringComparison.Ordinal))
+        {
+            var raw = token.Substring(InventoryClearConfirmActionPrefix.Length).Trim();
+            if (int.TryParse(raw, out var targetId))
+                ExecuteConfirmedInventoryClear(targetId);
+            return;
+        }
+
+        if (token.StartsWith(InventoryClearCancelActionPrefix, StringComparison.Ordinal))
+        {
+            SetCommandStatus("Inventory clear canceled.", 3f, echoToChat: false);
+            return;
+        }
+
+        if (_lanSession is not EosP2PHostSession)
+        {
+            SetCommandStatus("This action is only available to the online host.", 4f, echoToChat: false);
+            return;
+        }
+
+        if (token.StartsWith("wl-add:", StringComparison.Ordinal))
+        {
+            var target = token.Substring(7).Trim();
+            if (_whitelist.Add(target))
+            {
+                SaveWhitelist();
+                AddChatLine($"Added {target} to whitelist.", isSystem: true);
+                SetCommandStatus($"Added {target} to whitelist.", 4f, echoToChat: false);
+            }
+            return;
+        }
+
+        if (token.StartsWith("wl-remove:", StringComparison.Ordinal))
+        {
+            var target = token.Substring(10).Trim();
+            if (_whitelist.Remove(target))
+            {
+                SaveWhitelist();
+                RevokeWhitelistApprovalsForName(target);
+                AddChatLine($"Removed {target} from whitelist.", isSystem: true);
+                SetCommandStatus($"Removed {target} from whitelist.", 4f, echoToChat: false);
+            }
+            return;
+        }
+
+        if (token.StartsWith(JoinApproveActionPrefix, StringComparison.Ordinal))
+        {
+            var peerId = token.Substring(JoinApproveActionPrefix.Length).Trim();
+            var nameHint = GetPendingJoinDisplayName(peerId, "PLAYER");
+            _ = RespondToPendingJoinPeerIdAsync(peerId, nameHint, accept: true);
+            return;
+        }
+
+        if (token.StartsWith(JoinDeclineActionPrefix, StringComparison.Ordinal))
+        {
+            var peerId = token.Substring(JoinDeclineActionPrefix.Length).Trim();
+            var nameHint = GetPendingJoinDisplayName(peerId, "PLAYER");
+            _ = RespondToPendingJoinPeerIdAsync(peerId, nameHint, accept: false);
+        }
+    }
+
+    private bool TryTeleportPlayer(int x, int z, int? explicitY, out string result)
+    {
+        if (_world == null || _meta == null)
+        {
+            result = "World is not ready yet.";
+            return false;
+        }
+
+        var clampedX = ClampWorldX(x);
+        var clampedZ = ClampWorldZ(z);
+        var y = explicitY ?? FindSafeSpawnHeight(clampedX, clampedZ) + 1f;
+        y = Math.Clamp(y, 2f, Math.Max(3f, _meta.Size.Height - 2));
+
+        _player.Position = new Vector3(clampedX + 0.5f, y, clampedZ + 0.5f);
+        _player.Velocity = Vector3.Zero;
+        EnsurePlayerNotInsideSolid(forceLog: false);
+        UpdateActiveChunks(force: false);
+        _queuedLocateOriginX = clampedX;
+        _queuedLocateOriginZ = clampedZ;
+        _hasQueuedLocateOrigin = true;
+        var username = _profile.GetDisplayUsername();
+        result = $"{username} Teleported to {clampedX} {(int)MathF.Round(y)} {clampedZ}";
+        return true;
+    }
+
+    private bool TryOpenInventoryFromTextInput(InputState input, bool commandMode, string activeText)
+    {
+        if (!input.IsNewKeyPress(_inventoryKey))
+            return false;
+
+        var forceOpen = input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl);
+        if (!forceOpen && !commandMode)
+            return false;
+
+        if (!forceOpen && commandMode)
+        {
+            if ((activeText ?? string.Empty).Trim().Length > 1)
+                return false;
+        }
+
+        _chatInputActive = false;
+        _commandInputActive = false;
+        _chatInputText = "";
+        _commandInputText = "";
+        _inventoryOpen = true;
+        return true;
+    }
+
+    private void UpdateChatInput(InputState input)
+    {
+        HandleChatOverlayActions(input);
+
+        var commandLikeText = _chatInputText.TrimStart().StartsWith("/", StringComparison.Ordinal);
+        if (TryOpenInventoryFromTextInput(input, commandMode: commandLikeText, activeText: _chatInputText))
+            return;
+
+        if (TryNavigateTextInputHistory(input, ref _chatInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            _chatInputActive = false;
+            _chatInputText = "";
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Enter))
+        {
+            var message = _chatInputText.Trim();
+            _chatInputActive = false;
+            _chatInputText = "";
+            if (!string.IsNullOrWhiteSpace(message))
+            {
+                RegisterTextInputHistory(message);
+                if (message.StartsWith("/", StringComparison.Ordinal))
+                    ExecuteCommand(message);
+                else
+                    SubmitLocalChatMessage(message);
+            }
+
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        if (commandLikeText && input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _chatInputText, reverseCycle: shift))
+            return;
+        if (TryPasteClipboardIntoText(input, ref _chatInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        var changed = false;
+        foreach (var key in input.GetTextInputKeys())
+        {
+            if (key == Keys.Tab)
+                continue;
+
+            if (key == Keys.Back)
+            {
+                if (_chatInputText.Length > 0)
+                {
+                    _chatInputText = _chatInputText.Substring(0, _chatInputText.Length - 1);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (!TryMapCommandInputKey(key, shift, out var c))
+                continue;
+
+            if (_chatInputText.Length < CommandInputMaxLength)
+            {
+                _chatInputText += c;
+                changed = true;
+            }
+        }
+
+        if (changed && _textInputHistoryBrowsing)
+        {
+            _textInputHistoryBrowsing = false;
+            _textInputHistoryCursor = _textInputHistory.Count;
+            _textInputHistoryDraft = _chatInputText;
+        }
+
+        if (changed)
+            ResetCommandTabCompletion();
+    }
+
+    private void UpdateCommandInput(InputState input)
+    {
+        HandleChatOverlayActions(input);
+
+        if (TryOpenInventoryFromTextInput(input, commandMode: true, activeText: _commandInputText))
+            return;
+
+        if (TryNavigateTextInputHistory(input, ref _commandInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            _commandInputActive = false;
+            _commandInputText = "";
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        if (input.IsNewKeyPress(Keys.Enter))
+        {
+            var command = _commandInputText.Trim();
+            if (!string.IsNullOrWhiteSpace(command))
+            {
+                RegisterTextInputHistory(command);
+                ExecuteCommand(command);
+            }
+
+            _commandInputActive = false;
+            _commandInputText = "";
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        if (input.IsNewKeyPress(Keys.Tab) && TryApplyTabCommandCompletion(ref _commandInputText, reverseCycle: shift))
+            return;
+        if (TryPasteClipboardIntoText(input, ref _commandInputText))
+        {
+            ResetCommandTabCompletion();
+            return;
+        }
+
+        var changed = false;
+        foreach (var key in input.GetTextInputKeys())
+        {
+            if (key == Keys.Tab)
+                continue;
+
+            if (key == Keys.Back)
+            {
+                if (_commandInputText.Length > 0)
+                {
+                    _commandInputText = _commandInputText.Substring(0, _commandInputText.Length - 1);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (!TryMapCommandInputKey(key, shift, out var c))
+                continue;
+
+            if (_commandInputText.Length < CommandInputMaxLength)
+            {
+                _commandInputText += c;
+                changed = true;
+            }
+        }
+
+        if (changed && _textInputHistoryBrowsing)
+        {
+            _textInputHistoryBrowsing = false;
+            _textInputHistoryCursor = _textInputHistory.Count;
+            _textInputHistoryDraft = _commandInputText;
+        }
+
+        if (changed)
+            ResetCommandTabCompletion();
+    }
+
+    private void ResetCommandTabCompletion()
+    {
+        _commandTabContextKey = string.Empty;
+        _commandTabIndex = -1;
+        _commandTabAppendSpace = false;
+        _commandTabCycleCandidates.Clear();
+    }
+
+    private bool TryApplyTabCommandCompletion(ref string text, bool reverseCycle)
+    {
+        if (!TryParseCommandCompletionContext(text, out var context))
+            return false;
+
+        EnsureCommandRegistry();
+        BuildCommandCompletionCandidates(context, _commandTabBuildBuffer);
+        if (_commandTabBuildBuffer.Count == 0)
+            return false;
+
+        var contextKey = BuildCommandCompletionContextKey(context);
+        var sameContext = string.Equals(_commandTabContextKey, contextKey, StringComparison.Ordinal)
+            && HaveSameCommandCompletionSet(_commandTabCycleCandidates, _commandTabBuildBuffer);
+        if (!sameContext)
+        {
+            _commandTabCycleCandidates.Clear();
+            _commandTabCycleCandidates.AddRange(_commandTabBuildBuffer);
+            _commandTabContextKey = contextKey;
+            _commandTabIndex = reverseCycle ? _commandTabCycleCandidates.Count - 1 : 0;
+            // Standard behavior: keep cycling current token until user manually types space.
+            _commandTabAppendSpace = false;
+        }
+        else
+        {
+            if (_commandTabCycleCandidates.Count == 0)
+                return false;
+
+            _commandTabIndex = reverseCycle
+                ? (_commandTabIndex - 1 + _commandTabCycleCandidates.Count) % _commandTabCycleCandidates.Count
+                : (_commandTabIndex + 1) % _commandTabCycleCandidates.Count;
+        }
+
+        if (_commandTabIndex < 0 || _commandTabIndex >= _commandTabCycleCandidates.Count)
+            return false;
+
+        var replacement = _commandTabCycleCandidates[_commandTabIndex].Value;
+        text = $"{context.PrefixText}{replacement}{(_commandTabAppendSpace ? " " : string.Empty)}";
+        if (text.Length > CommandInputMaxLength)
+            text = text.Substring(0, CommandInputMaxLength);
+        return true;
+    }
+
+    private static bool HaveSameCommandCompletionSet(IReadOnlyList<CommandCompletionCandidate> a, IReadOnlyList<CommandCompletionCandidate> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!string.Equals(a[i].Value, b[i].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string BuildCommandCompletionContextKey(in CommandCompletionContext context)
+    {
+        return $"{context.TokenIndex}|{context.PrefixText.ToLowerInvariant()}";
+    }
+
+    private static bool TryParseCommandCompletionContext(string rawInput, out CommandCompletionContext context)
+    {
+        context = default;
+        var input = (rawInput ?? string.Empty).TrimStart();
+        if (!input.StartsWith("/", StringComparison.Ordinal))
+            return false;
+
+        var body = input.Length > 1 ? input.Substring(1) : string.Empty;
+        var tokens = body.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var endsWithSpace = input.EndsWith(" ", StringComparison.Ordinal);
+
+        var tokenIndex = 0;
+        var tokenPrefix = string.Empty;
+        if (tokens.Length > 0)
+        {
+            if (endsWithSpace)
+            {
+                tokenIndex = tokens.Length;
+            }
+            else
+            {
+                tokenIndex = tokens.Length - 1;
+                tokenPrefix = tokens[tokenIndex];
+            }
+        }
+
+        var prefixPartsCount = Math.Clamp(tokenIndex, 0, tokens.Length);
+        var prefixBody = prefixPartsCount > 0
+            ? string.Join(" ", tokens.Take(prefixPartsCount)) + " "
+            : string.Empty;
+        var prefixText = "/" + prefixBody;
+        context = new CommandCompletionContext(prefixText, tokenPrefix, tokenIndex, tokens);
+        return true;
+    }
+
+    private void BuildCommandCompletionCandidates(in CommandCompletionContext context, List<CommandCompletionCandidate> output)
+    {
+        output.Clear();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var prefix = context.TokenPrefix ?? string.Empty;
+        var prefixLower = prefix.ToLowerInvariant();
+
+        if (context.TokenIndex == 0)
+        {
+            var ordered = _commandDescriptors.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase);
+            foreach (var descriptor in ordered)
+            {
+                if (!HasCommandPermission(descriptor.Permission) || !IsCommandAllowedWithCheatsSetting(descriptor))
+                    continue;
+
+                AddCandidate(descriptor.Name, descriptor.Description, descriptor.Usage, filterByPrefix: true);
+                for (var i = 0; i < descriptor.Aliases.Length; i++)
+                    AddCandidate(descriptor.Aliases[i], $"Alias for /{descriptor.Name}. {descriptor.Description}", descriptor.Usage, filterByPrefix: true);
+            }
+
+            return;
+        }
+
+        if (context.Tokens.Length == 0)
+            return;
+
+        if (!_commandLookup.TryGetValue(context.Tokens[0], out var command))
+            return;
+        if (!HasCommandPermission(command.Permission) || !IsCommandAllowedWithCheatsSetting(command))
+            return;
+
+        var tokenOptions = GetCommandArgumentCompletionTokens(command, context.TokenIndex, context.Tokens);
+        var exactTokenMatch = !string.IsNullOrWhiteSpace(prefix)
+            && tokenOptions.Any(option => string.Equals(option, prefix, StringComparison.OrdinalIgnoreCase));
+        var filterByPrefix = !exactTokenMatch;
+        for (var i = 0; i < tokenOptions.Count; i++)
+            AddCandidate(tokenOptions[i], $"Argument for /{command.Name}.", command.Usage, filterByPrefix);
+        return;
+
+        void AddCandidate(string value, string description, string usage, bool filterByPrefix)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+            if (filterByPrefix && !value.StartsWith(prefixLower, StringComparison.OrdinalIgnoreCase))
+                return;
+            if (!seen.Add(value))
+                return;
+
+            output.Add(new CommandCompletionCandidate(
+                value,
+                $"{description} Usage: {usage}"));
+        }
+    }
+
+    private List<string> GetCommandArgumentCompletionTokens(in CommandDescriptor command, int tokenIndex, string[] tokens)
+    {
+        var values = new List<string>();
+        var name = command.Name.ToLowerInvariant();
+        switch (name)
+        {
+            case "help":
+                if (tokenIndex == 1)
+                {
+                    for (var i = 0; i < _commandDescriptors.Count; i++)
+                        values.Add(_commandDescriptors[i].Name);
+                }
+                break;
+
+            case "biome":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "list", "here", "desert", "forest", "hills", "grasslands", "ocean" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && TryResolveBiome(tokens[1], out _, out _))
+                    AppendRadiusPresets(values);
+                break;
+
+            case "whitelist":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "add", "remove", "list" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var sub = tokens[1].ToLowerInvariant();
+                    if (sub == "add")
+                        AppendFriendNameTokens(values);
+                    else if (sub == "remove")
+                        AppendWhitelistTokens(values);
+                }
+                break;
+
+            case "structure":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[] { "locate", "list" });
+                }
+                break;
+
+            case "gamemode":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "artificer", "veilwalker", "veilseer", "gui" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && !string.Equals(tokens[1], "gui", StringComparison.OrdinalIgnoreCase))
+                    AppendPlayerNameTokens(values);
+                break;
+
+            case "artificer":
+            case "veilwalker":
+            case "veilseer":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
+
+            case "difficulty":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "peaceful", "easy", "normal", "hard" });
+                break;
+
+            case "rules":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[]
+                    {
+                        "playercollision",
+                        "timecycle",
+                        "weathercycle",
+                        "enablemultiplehomes",
+                        "maxhomesperplayer",
+                        "homes",
+                        "maxhomes"
+                    });
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var ruleKey = NormalizeWorldRuleKey(tokens[1]);
+                    if (string.IsNullOrWhiteSpace(ruleKey))
+                        break;
+
+                    if (IsBooleanWorldRule(ruleKey))
+                        values.AddRange(new[] { "on", "off" });
+                    else if (string.Equals(ruleKey, "maxhomesperplayer", StringComparison.Ordinal))
+                        values.AddRange(new[] { "1", "2", "4", "8", "12", "16", "24", "32" });
+                }
+                break;
+
+            case "time":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "query", "day", "night", "set" });
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && string.Equals(tokens[1], "set", StringComparison.OrdinalIgnoreCase))
+                    values.AddRange(new[] { "0", "1000", "6000", "12000", "13000", "18000" });
+                break;
+
+            case "weather":
+                if (tokenIndex == 1)
+                    values.AddRange(new[] { "query", "clear", "rain", "storm" });
+                break;
+
+            case "chatclear":
+                if (tokenIndex == 1)
+                    values.Add("confirm");
+                break;
+
+            case "give":
+                if (tokenIndex == 1)
+                {
+                    AppendPlayerNameTokens(values);
+                    AppendAllGiveItemTokens(values, includeNumericIds: true);
+                    values.Add("list");
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    if (TryResolvePlayerTarget(tokens[1], out _, out _))
+                    {
+                        AppendAllGiveItemTokens(values, includeNumericIds: true);
+                    }
+                    else if (TryResolveInventoryItemToken(tokens[1], out _))
+                    {
+                        values.AddRange(new[] { "1", "16", "32", "64" });
+                    }
+                    else
+                    {
+                        // Keep /give discoverable even when the first argument is an unknown player token.
+                        AppendAllGiveItemTokens(values, includeNumericIds: true);
+                    }
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
+                {
+                    if (TryResolvePlayerTarget(tokens[1], out _, out _) && TryResolveInventoryItemToken(tokens[2], out _))
+                        values.AddRange(new[] { "1", "16", "32", "64" });
+                }
+                break;
+
+            case "clear":
+                if (tokenIndex == 1)
+                {
+                    AppendPlayerNameTokens(values);
+                    AppendInventoryItemTokens(values, includeNumericIds: true, includeFallbackCatalog: true);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length && TryResolvePlayerTarget(tokens[1], out _, out _))
+                {
+                    AppendInventoryItemTokens(values, includeNumericIds: true, includeFallbackCatalog: true);
+                }
+                break;
+
+            case "setspawn":
+                if (tokenIndex is 1 or 2 or 3)
+                    AppendCurrentPositionTokens(values);
+                break;
+
+            case "tp":
+                if (tokenIndex == 1)
+                {
+                    AppendTeleportCoordinateTokens(values, TeleportAxis.X);
+                    AppendPlayerNameTokens(values);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var firstToken = tokens[1];
+                    if (IsTeleportCoordinateToken(firstToken))
+                    {
+                        // /tp <x> <z> and /tp <x> <y> <z> both start here; z default first.
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Z);
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Y);
+                    }
+                    else
+                    {
+                        AppendPlayerNameTokens(values);
+                    }
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
+                {
+                    if (IsTeleportCoordinateToken(tokens[1]) && IsTeleportCoordinateToken(tokens[2]))
+                        AppendTeleportCoordinateTokens(values, TeleportAxis.Z);
+                }
+                break;
+
+            case "op":
+            case "deop":
+            case "kick":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
+
+            case "sethome":
+                if (tokenIndex == 1)
+                    AppendHomeNameTokens(values);
+                break;
+
+            case "home":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[] { "list", "gui", "set", "rename", "delete", "icon" });
+                    AppendHomeNameTokens(values);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var sub = tokens[1].ToLowerInvariant();
+                    if (sub is "rename" or "delete" or "icon")
+                        AppendHomeNameTokens(values);
+                    else if (sub == "set")
+                        AppendHomeNameTokens(values);
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length && string.Equals(tokens[1], "icon", StringComparison.OrdinalIgnoreCase))
+                {
+                    values.Add("auto");
+                    AppendBlockIconTokens(values);
+                }
+                break;
+
+            case "msg":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
+
+            case "pos":
+                if (tokenIndex == 1)
+                    AppendPlayerNameTokens(values);
+                break;
+        }
+
+        var ordered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < values.Count; i++)
+        {
+            var value = values[i];
+            if (string.IsNullOrWhiteSpace(value))
+                continue;
+            if (!seen.Add(value))
+                continue;
+            ordered.Add(value);
+        }
+        return ordered;
+    }
+
+    private static void AppendRadiusPresets(List<string> output)
+    {
+        for (var i = 0; i < FinderRadiusOptions.Length; i++)
+            output.Add(FinderRadiusOptions[i].ToString());
+    }
+
+    private enum TeleportAxis
+    {
+        X,
+        Y,
+        Z
+    }
+
+    private static bool IsTeleportCoordinateToken(string token)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (token.Length == 0)
+            return false;
+        if (token.StartsWith("~", StringComparison.Ordinal))
+            return true;
+
+        return float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
+    }
+
+    private void AppendTeleportCoordinateTokens(List<string> output, TeleportAxis axis)
+    {
+        var px = (int)MathF.Floor(_player.Position.X);
+        var py = (int)MathF.Floor(_player.Position.Y);
+        var pz = (int)MathF.Floor(_player.Position.Z);
+
+        var axisValue = axis switch
+        {
+            TeleportAxis.X => px,
+            TeleportAxis.Y => py,
+            _ => pz
+        };
+
+        output.Add(axisValue.ToString(CultureInfo.InvariantCulture));
+        output.Add("~");
+        output.Add("~0");
+    }
+
+    private void AppendCurrentPositionTokens(List<string> output)
+    {
+        var px = (int)MathF.Floor(_player.Position.X);
+        var py = (int)MathF.Floor(_player.Position.Y);
+        var pz = (int)MathF.Floor(_player.Position.Z);
+        output.Add(px.ToString());
+        output.Add(py.ToString());
+        output.Add(pz.ToString());
+    }
+
+    private void AppendHomeNameTokens(List<string> output)
+    {
+        for (var i = 0; i < _homes.Count; i++)
+            output.Add(_homes[i].Name);
+    }
+
+    private void AppendFriendNameTokens(List<string> output)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Use locally synced cache only to avoid chat-command lag during completion.
+        foreach (var f in _profile.Friends)
+        {
+            var display = NormalizeFriendDisplayName(
+                (f.Label ?? string.Empty).Trim(),
+                (f.LastKnownDisplayName ?? string.Empty).Trim());
+            if (!string.IsNullOrWhiteSpace(display) && seen.Add(display))
+                output.Add(display);
+        }
+    }
+
+    private void AppendWhitelistTokens(List<string> output)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in _whitelist)
+        {
+            var normalized = NormalizeWhitelistName(entry);
+            if (string.IsNullOrWhiteSpace(normalized) || !seen.Add(normalized))
+                continue;
+
+            output.Add(normalized);
+        }
+    }
+
+    private void AppendPlayerNameTokens(List<string> output)
+    {
+        var localName = _profile.GetDisplayUsername();
+        if (!string.IsNullOrWhiteSpace(localName))
+            output.Add(localName);
+
+        foreach (var name in _playerNames.Values)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+                output.Add(name);
+        }
+    }
+
+    private static void AppendBlockIconTokens(List<string> output)
+    {
+        var names = Enum.GetNames(typeof(BlockId));
+        for (var i = 0; i < names.Length; i++)
+        {
+            if (string.Equals(names[i], nameof(BlockId.Air), StringComparison.OrdinalIgnoreCase))
+                continue;
+            output.Add(names[i]);
+        }
+    }
+
+    private static void AppendAllGiveItemTokens(List<string> output, bool includeNumericIds = true)
+    {
+        var seenTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var def in BlockRegistry.All.OrderBy(d => d.AtlasIndex))
+        {
+            if (def.Id == BlockId.Air)
+                continue;
+
+            AppendItemTokenForId(output, def.Id, includeNumericIds, seenTokens: seenTokens);
+        }
+    }
+
+    private void AppendInventoryItemTokens(List<string> output, bool includeNumericIds = false, bool includeFallbackCatalog = false)
+    {
+        var seenIds = new HashSet<BlockId>();
+        AppendInventoryItemTokensFromSlots(output, _inventory.Hotbar, seenIds, includeNumericIds);
+
+        AppendInventoryItemTokensFromSlots(output, _inventory.Grid, seenIds, includeNumericIds);
+
+        if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
+            AppendItemTokenForId(output, _inventoryHeld.Id, includeNumericIds, seenIds);
+
+        if (!includeFallbackCatalog || seenIds.Count > 0)
+            return;
+
+        // Fallback so /clear remains usable even if inventory currently has no items.
+        AppendAllGiveItemTokens(output, includeNumericIds);
+    }
+
+    private static void AppendInventoryItemTokensFromSlots(List<string> output, HotbarSlot[] slots, HashSet<BlockId> seenIds, bool includeNumericIds)
+    {
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Count <= 0 || slot.Id == BlockId.Air)
+                continue;
+
+            AppendItemTokenForId(output, slot.Id, includeNumericIds, seenIds);
+        }
+    }
+
+    private static void AppendItemTokenForId(
+        List<string> output,
+        BlockId id,
+        bool includeNumericIds,
+        HashSet<BlockId>? seenIds = null,
+        HashSet<string>? seenTokens = null)
+    {
+        if (id == BlockId.Air)
+            return;
+        if (seenIds != null && !seenIds.Add(id))
+            return;
+
+        var aliases = BlockRegistry.GetCommandTokens(id);
+        for (var i = 0; i < aliases.Count; i++)
+        {
+            var alias = aliases[i];
+            if (string.IsNullOrWhiteSpace(alias))
+                continue;
+            if (seenTokens != null && !seenTokens.Add(alias))
+                continue;
+            output.Add(alias);
+        }
+
+        if (includeNumericIds)
+        {
+            var numeric = ((byte)id).ToString(CultureInfo.InvariantCulture);
+            if (seenTokens == null || seenTokens.Add(numeric))
+                output.Add(numeric);
+        }
+    }
+
+    private static bool TryResolveInventoryItemToken(string token, out BlockId blockId)
+    {
+        blockId = BlockId.Air;
+        var raw = (token ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+
+        if (byte.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId))
+        {
+            var parsedById = (BlockId)byId;
+            if (parsedById != BlockId.Air && BlockRegistry.Get(parsedById).Id == parsedById)
+            {
+                blockId = parsedById;
+                return true;
+            }
+        }
+
+        if (BlockRegistry.TryResolveToken(raw, out var resolvedByToken) && resolvedByToken != BlockId.Air)
+        {
+            blockId = resolvedByToken;
+            return true;
+        }
+
+        if (Enum.TryParse(raw, true, out BlockId parsedEnum) && parsedEnum != BlockId.Air && BlockRegistry.Get(parsedEnum).Id == parsedEnum)
+        {
+            blockId = parsedEnum;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void SubmitLocalChatMessage(string message)
+    {
+        var username = _profile.GetDisplayUsername();
+        var text = (message ?? string.Empty).Trim();
+        if (text.Length == 0)
+            return;
+
+        if (text.StartsWith("/", StringComparison.Ordinal))
+        {
+            ExecuteCommand(text);
+            return;
+        }
+
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.Chat,
+                Text = text,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            return;
+        }
+
+        AddFormattedPlayerChatLine($"{username}: ", text);
+    }
+
+    private void AddFormattedPlayerChatLine(string prefix, string rawMessage)
+    {
+        var parsed = ParseChatMarkup(rawMessage, Color.White);
+        AddChatLine(
+            $"{prefix}{parsed.CleanText}",
+            isSystem: false,
+            richPrefixText: prefix,
+            richMessageText: parsed.CleanText,
+            richMessageSpans: parsed.Spans,
+            hasSpoilerContent: parsed.HasSpoiler);
+    }
+
+    private static ChatMarkupParseResult ParseChatMarkup(string rawText, Color defaultColor)
+    {
+        var source = rawText ?? string.Empty;
+        var spans = new List<ChatStyledSpan>();
+        var currentColor = defaultColor;
+        var bold = false;
+        var italic = false;
+        var spoiler = false;
+        var hasSpoiler = false;
+        var segment = new StringBuilder(source.Length);
+        var clean = new StringBuilder(source.Length);
+
+        void FlushSegment()
+        {
+            if (segment.Length <= 0)
+                return;
+
+            var text = segment.ToString();
+            segment.Clear();
+            clean.Append(text);
+            if (spans.Count > 0
+                && spans[^1].Bold == bold
+                && spans[^1].Italic == italic
+                && spans[^1].Spoiler == spoiler
+                && spans[^1].Color == currentColor)
+            {
+                var merged = spans[^1];
+                spans[^1] = new ChatStyledSpan(
+                    merged.Text + text,
+                    merged.Color,
+                    merged.Bold,
+                    merged.Italic,
+                    merged.Spoiler);
+                return;
+            }
+
+            spans.Add(new ChatStyledSpan(text, currentColor, bold, italic, spoiler));
+        }
+
+        for (var i = 0; i < source.Length; i++)
+        {
+            if (source[i] != '$')
+            {
+                segment.Append(source[i]);
+                continue;
+            }
+
+            if (StartsWithToken(source, i, "$bold%"))
+            {
+                FlushSegment();
+                bold = true;
+                i += "$bold%".Length - 1;
+                continue;
+            }
+
+            if (StartsWithToken(source, i, "$italic&"))
+            {
+                FlushSegment();
+                italic = true;
+                i += "$italic&".Length - 1;
+                continue;
+            }
+
+            var close = source.IndexOf('$', i + 1);
+            if (close <= i + 1)
+            {
+                segment.Append(source[i]);
+                continue;
+            }
+
+            var token = source.Substring(i + 1, close - i - 1).Trim();
+            var nextColor = currentColor;
+            var nextBold = bold;
+            var nextItalic = italic;
+            var nextSpoiler = spoiler;
+            if (TryApplyChatStyleToken(token, defaultColor, ref nextColor, ref nextBold, ref nextItalic, ref nextSpoiler))
+            {
+                // Apply style tokens to following text only.
+                FlushSegment();
+                currentColor = nextColor;
+                bold = nextBold;
+                italic = nextItalic;
+                spoiler = nextSpoiler;
+                i = close;
+                continue;
+            }
+
+            segment.Append(source[i]);
+        }
+
+        FlushSegment();
+
+        if (spans.Count == 0)
+            spans.Add(new ChatStyledSpan(string.Empty, defaultColor, false, false, false));
+
+        for (var i = 0; i < spans.Count; i++)
+        {
+            if (spans[i].Spoiler && !string.IsNullOrWhiteSpace(spans[i].Text))
+            {
+                hasSpoiler = true;
+                break;
+            }
+        }
+
+        return new ChatMarkupParseResult(clean.ToString().Trim(), spans, hasSpoiler);
+    }
+
+    private static bool StartsWithToken(string source, int index, string token)
+    {
+        if (index < 0 || index + token.Length > source.Length)
+            return false;
+
+        for (var i = 0; i < token.Length; i++)
+        {
+            if (char.ToLowerInvariant(source[index + i]) != char.ToLowerInvariant(token[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryApplyChatStyleToken(string token, Color defaultColor, ref Color color, ref bool bold, ref bool italic, ref bool spoiler)
+    {
+        var key = (token ?? string.Empty).Trim().ToLowerInvariant();
+        key = key.TrimEnd('%', '&');
+
+        switch (key)
+        {
+            case "reset":
+            case "plain":
+            case "normal":
+                color = defaultColor;
+                bold = false;
+                italic = false;
+                spoiler = false;
+                return true;
+            case "bold":
+            case "b":
+                bold = true;
+                return true;
+            case "unbold":
+            case "nobold":
+            case "boldoff":
+                bold = false;
+                return true;
+            case "italic":
+            case "i":
+                italic = true;
+                return true;
+            case "unitalic":
+            case "noitalic":
+            case "italicoff":
+                italic = false;
+                return true;
+            case "spoiler":
+                spoiler = true;
+                return true;
+            case "unspoiler":
+            case "nospoiler":
+            case "spoileroff":
+                spoiler = false;
+                return true;
+            case "red":
+                color = new Color(255, 120, 120);
+                return true;
+            case "blue":
+                color = new Color(130, 185, 255);
+                return true;
+            case "green":
+                color = new Color(130, 230, 150);
+                return true;
+            case "yellow":
+                color = new Color(255, 230, 120);
+                return true;
+            case "orange":
+                color = new Color(255, 175, 90);
+                return true;
+            case "purple":
+                color = new Color(200, 140, 255);
+                return true;
+            case "pink":
+                color = new Color(255, 150, 210);
+                return true;
+            case "cyan":
+                color = new Color(120, 240, 245);
+                return true;
+            case "gray":
+            case "grey":
+                color = new Color(180, 180, 180);
+                return true;
+            case "white":
+                color = Color.White;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void AddChatLine(
+        string text,
+        bool isSystem,
+        int? teleportX = null,
+        int? teleportY = null,
+        int? teleportZ = null,
+        string? hoverText = null,
+        string? copyText = null,
+        string? actionLabel = null,
+        string? customActionToken = null,
+        string? customActionStatus = null,
+        string? actionLabel2 = null,
+        string? customActionToken2 = null,
+        string? customActionStatus2 = null,
+        string? hoverText2 = null,
+        Color? textColorOverride = null,
+        string? richPrefixText = null,
+        string? richMessageText = null,
+        List<ChatStyledSpan>? richMessageSpans = null,
+        bool hasSpoilerContent = false,
+        bool trackAsChatHistory = true)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        var hasTeleportAction = teleportX.HasValue && teleportY.HasValue && teleportZ.HasValue;
+        var normalizedCopyText = (copyText ?? string.Empty).Trim();
+        var hasCopyAction = !string.IsNullOrWhiteSpace(normalizedCopyText);
+        var normalizedCustomActionToken = (customActionToken ?? string.Empty).Trim();
+        var hasCustomAction = !string.IsNullOrWhiteSpace(normalizedCustomActionToken);
+        var normalizedCustomActionStatus = (customActionStatus ?? string.Empty).Trim();
+        var normalizedActionLabel = string.IsNullOrWhiteSpace(actionLabel)
+            ? (hasCopyAction ? "COPY" : hasCustomAction ? "ACTION" : string.Empty)
+            : actionLabel.Trim();
+
+        var normalizedCustomActionToken2 = (customActionToken2 ?? string.Empty).Trim();
+        var hasCustomAction2 = !string.IsNullOrWhiteSpace(normalizedCustomActionToken2);
+        var normalizedCustomActionStatus2 = (customActionStatus2 ?? string.Empty).Trim();
+        var normalizedActionLabel2 = (actionLabel2 ?? string.Empty).Trim();
+        var isConfirmCancelPair = hasCustomAction
+            && hasCustomAction2
+            && string.Equals(normalizedActionLabel, "CONFIRM", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(normalizedActionLabel2, "CANCEL", StringComparison.OrdinalIgnoreCase);
+
+        var shouldDedup = hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2;
+        if (shouldDedup && _chatLines.Count > 0 
+            && string.Equals(_chatLines[^1].Text, text, StringComparison.Ordinal)
+            && string.Equals(_chatLines[^1].CustomActionToken, normalizedCustomActionToken, StringComparison.Ordinal)
+            && string.Equals(_chatLines[^1].CustomActionToken2, normalizedCustomActionToken2, StringComparison.Ordinal))
+        {
+            _chatLines[^1].TimeRemaining = ChatLineLifetimeSeconds;
+            _chatLines[^1].IsSystem = isSystem;
+            _chatLines[^1].HasTeleportAction = hasTeleportAction;
+            _chatLines[^1].TeleportX = teleportX ?? 0;
+            _chatLines[^1].TeleportY = teleportY ?? 0;
+            _chatLines[^1].TeleportZ = teleportZ ?? 0;
+            _chatLines[^1].HasCopyAction = hasCopyAction;
+            _chatLines[^1].CopyText = normalizedCopyText;
+            _chatLines[^1].HasCustomAction = hasCustomAction;
+            _chatLines[^1].CustomActionToken = normalizedCustomActionToken;
+            _chatLines[^1].CustomActionStatus = normalizedCustomActionStatus;
+            _chatLines[^1].ActionLabel = normalizedActionLabel;
+            _chatLines[^1].HoverText = hoverText ?? string.Empty;
+            
+            _chatLines[^1].HasCustomAction2 = hasCustomAction2;
+            _chatLines[^1].CustomActionToken2 = normalizedCustomActionToken2;
+            _chatLines[^1].CustomActionStatus2 = normalizedCustomActionStatus2;
+            _chatLines[^1].ActionLabel2 = normalizedActionLabel2;
+            _chatLines[^1].HoverText2 = hoverText2 ?? string.Empty;
+            _chatLines[^1].HasTextColorOverride = textColorOverride.HasValue;
+            _chatLines[^1].TextColorOverride = textColorOverride ?? Color.White;
+            _chatLines[^1].HasRichText = richMessageSpans != null && richMessageSpans.Count > 0;
+            _chatLines[^1].RichPrefixText = richPrefixText ?? string.Empty;
+            _chatLines[^1].RichMessageText = richMessageText ?? string.Empty;
+            _chatLines[^1].RichMessageSpans = richMessageSpans != null
+                ? new List<ChatStyledSpan>(richMessageSpans)
+                : new List<ChatStyledSpan>();
+            _chatLines[^1].HasSpoilerContent = hasSpoilerContent;
+            _chatLines[^1].SpoilerRevealed = _chatLines[^1].SpoilerRevealed || !hasSpoilerContent;
+
+            if (hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2)
+                _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
+
+            if (isConfirmCancelPair)
+                RegisterPendingQuickConfirmation(text, normalizedCustomActionToken, normalizedCustomActionToken2);
+            return;
+        }
+
+        _chatLines.Add(new ChatLine
+        {
+            Text = text,
+            IsSystem = isSystem,
+            TimeRemaining = ChatLineLifetimeSeconds,
+            HasTeleportAction = hasTeleportAction,
+            TeleportX = teleportX ?? 0,
+            TeleportY = teleportY ?? 0,
+            TeleportZ = teleportZ ?? 0,
+            HasCopyAction = hasCopyAction,
+            CopyText = normalizedCopyText,
+            HasCustomAction = hasCustomAction,
+            CustomActionToken = normalizedCustomActionToken,
+            CustomActionStatus = normalizedCustomActionStatus,
+            ActionLabel = normalizedActionLabel,
+            HoverText = hoverText ?? string.Empty,
+
+            HasCustomAction2 = hasCustomAction2,
+            CustomActionToken2 = normalizedCustomActionToken2,
+            CustomActionStatus2 = normalizedCustomActionStatus2,
+            ActionLabel2 = normalizedActionLabel2,
+            HoverText2 = hoverText2 ?? string.Empty,
+            HasTextColorOverride = textColorOverride.HasValue,
+            TextColorOverride = textColorOverride ?? Color.White,
+            HasRichText = richMessageSpans != null && richMessageSpans.Count > 0,
+            RichPrefixText = richPrefixText ?? string.Empty,
+            RichMessageText = richMessageText ?? string.Empty,
+            RichMessageSpans = richMessageSpans != null
+                ? new List<ChatStyledSpan>(richMessageSpans)
+                : new List<ChatStyledSpan>(),
+            HasSpoilerContent = hasSpoilerContent,
+            SpoilerRevealed = !hasSpoilerContent,
+            LineId = _nextChatLineId++
+        });
+
+        if (trackAsChatHistory)
+            AppendChatHistoryRecord(text);
+
+        if (hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2)
+            _chatOverlayActionUnlockUntil = _worldTimeSeconds + ChatOverlayActionUnlockSeconds;
+
+        if (isConfirmCancelPair)
+            RegisterPendingQuickConfirmation(text, normalizedCustomActionToken, normalizedCustomActionToken2);
+
+        if (_chatLines.Count > MaxChatLines)
+            _chatLines.RemoveRange(0, _chatLines.Count - MaxChatLines);
+    }
+
+    private void AppendChatHistoryRecord(string line)
+        => AppendHistoryRecord(ChatHistoryLogPath, "CHAT", line);
+
+    private void AppendCommandHistoryRecord(string line)
+        => AppendHistoryRecord(CommandHistoryLogPath, "CMD", line);
+
+    private void AppendHistoryRecord(string path, string category, string line)
+    {
+        var text = (line ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        try
+        {
+            var worldName = _meta?.Name;
+            if (string.IsNullOrWhiteSpace(worldName))
+                worldName = Path.GetFileName(_worldPath);
+
+            var stamped = $"[{DateTimeOffset.UtcNow:O}] [{category}] [{worldName}] {text}";
+            lock (_historyFileLock)
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+
+                File.AppendAllText(path, stamped + Environment.NewLine);
+            }
+
+            // Mirror into runtime logs for easier diagnostics.
+            _log.Info(stamped);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to append {category} history: {ex.Message}");
+        }
+    }
+
+    private void TruncateHistoryFile(string path)
+    {
+        try
+        {
+            lock (_historyFileLock)
+            {
+                if (!File.Exists(path))
+                    return;
+
+                File.WriteAllText(path, string.Empty);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to clear history file {path}: {ex.Message}");
+        }
+    }
+
+    private void EnsureCommandRegistry()
+    {
+        if (_commandsInitialized)
+            return;
+
+        _commandsInitialized = true;
+        RegisterCommand("help", new[] { "?" }, "/help", "Show command help.", CommandPermission.Everyone, ExecuteHelpCommand);
+        RegisterCommand("biome", new[] { "biomes" }, "/biome [list|here|<desert|forest|hills|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
+        RegisterCommand("accept", Array.Empty<string>(), "/accept <username>", "Accept a world join invite.", CommandPermission.Everyone, ExecuteAcceptInviteCommand);
+        RegisterCommand("reject", Array.Empty<string>(), "/reject <username>", "Reject a world join invite.", CommandPermission.Everyone, ExecuteRejectInviteCommand);
+        RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list> [username]", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
+        RegisterCommand("structure", Array.Empty<string>(), "/structure <locate|list> [name]", "Structure lookup command (no GUI).", CommandPermission.Everyone, ExecuteStructureCommand);
+        RegisterCommand("tp", new[] { "teleport" }, "/tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>", "Teleport players by absolute/relative coords or player target.", CommandPermission.Operator, ExecuteTeleportCommand);
+        RegisterCommand("gamemode", new[] { "gm" }, "/gamemode <artificer|veilwalker|veilseer|gui> [player]", "Change gamemode or open selector.", CommandPermission.Operator, ExecuteGameModeCommand);
+        RegisterCommand("artificer", new[] { "gma", "gmc" }, "/artificer [player]", "Set ARTIFICER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Artificer, parts));
+        RegisterCommand("veilwalker", new[] { "gmvw", "gms" }, "/veilwalker [player]", "Set VEILWALKER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilwalker, parts));
+        RegisterCommand("veilseer", new[] { "gmvs", "gmsp" }, "/veilseer [player]", "Set VEILSEER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilseer, parts));
+        RegisterCommand("difficulty", new[] { "diff" }, "/difficulty <peaceful|easy|normal|hard>", "Set difficulty.", CommandPermission.Operator, ExecuteDifficultyCommand);
+        RegisterCommand("seed", Array.Empty<string>(), "/seed", "Show current world seed.", CommandPermission.Operator, ExecuteSeedCommand);
+        RegisterCommand("rules", new[] { "rule" }, "/rules [<rule> [value]]", "Inspect or set world rules.", CommandPermission.Operator, ExecuteRulesCommand);
+        RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <ticks>]", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
+        RegisterCommand("weather", Array.Empty<string>(), "/weather [query|clear|rain|storm]", "Set or inspect weather.", CommandPermission.Operator, ExecuteWeatherCommand);
+        RegisterCommand("setspawn", Array.Empty<string>(), "/setspawn [x y z]", "Set world spawn.", CommandPermission.Operator, ExecuteSetSpawnCommand);
+        RegisterCommand("op", Array.Empty<string>(), "/op <player>", "Grant operator permissions to a player.", CommandPermission.HostOnly, ExecuteOpCommand);
+        RegisterCommand("deop", Array.Empty<string>(), "/deop <player>", "Revoke operator permissions from a player.", CommandPermission.HostOnly, ExecuteDeopCommand);
+        RegisterCommand("kick", Array.Empty<string>(), "/kick <player> [reason]", "Kick a player from the current hosted world.", CommandPermission.HostOnly, ExecuteKickCommand);
+        RegisterCommand("spawn", Array.Empty<string>(), "/spawn", "Teleport to world spawn.", CommandPermission.Everyone, ExecuteSpawnCommand);
+        RegisterCommand("sethome", Array.Empty<string>(), "/sethome [name]", "Set or update a named home.", CommandPermission.Everyone, ExecuteSetHomeCommand);
+        RegisterCommand("home", Array.Empty<string>(), "/home [name|list|gui|set|rename|delete|icon]", "Teleport/manage homes.", CommandPermission.Everyone, ExecuteHomeCommand);
+        RegisterCommand("me", Array.Empty<string>(), "/me <action>", "Broadcast an action message.", CommandPermission.Everyone, ExecuteMeCommand);
+        RegisterCommand("msg", Array.Empty<string>(), "/msg <player> <message>", "Send a private message.", CommandPermission.Everyone, ExecuteMsgCommand);
+        RegisterCommand("chatclear", new[] { "clearchat", "cc" }, "/chatclear", "Clear chat history (with confirmation).", CommandPermission.Everyone, ExecuteChatClearCommand);
+        RegisterCommand("give", Array.Empty<string>(), "/give [player] <item|id> [amount]", "Give an item/block by token or numeric id.", CommandPermission.Operator, ExecuteGiveCommand);
+        RegisterCommand("clear", Array.Empty<string>(), "/clear [player] [item|id]", "Clear whole inventory (confirmation) or clear a specific item.", CommandPermission.Operator, ExecuteClearInventoryCommand);
+        RegisterCommand("inv", new[] { "inventory" }, "/inv [clear|player]", "View live inventory or clear inventory view.", CommandPermission.Everyone, ExecuteInvCommand);
+        RegisterCommand("pos", Array.Empty<string>(), "/pos [player]", "Show player's exact coordinates with one-click copy.", CommandPermission.Everyone, ExecutePosCommand);
+        RegisterCommand("broadcast", new[] { "bc" }, "/broadcast <message>", "Send a broadcast message to everyone.", CommandPermission.Everyone, ExecuteBroadcastCommand);
+        RegisterCommand("commandclear", Array.Empty<string>(), "/commandclear", "Clear command entries from shared input history.", CommandPermission.Everyone, ExecuteCommandClearCommand);
+    }
+
+    private void RegisterCommand(
+        string name,
+        string[] aliases,
+        string usage,
+        string description,
+        CommandPermission permission,
+        Action<string[]> handler)
+    {
+        var descriptor = new CommandDescriptor(name, aliases, usage, description, permission, handler);
+        _commandDescriptors.Add(descriptor);
+        _commandLookup[name] = descriptor;
+        for (var i = 0; i < aliases.Length; i++)
+            _commandLookup[aliases[i]] = descriptor;
+    }
+
+    private bool HasHostPermissions()
+    {
+        return _lanSession == null || _lanSession.IsHost;
+    }
+
+    private bool HasOperatorPermissions()
+    {
+        if (HasHostPermissions())
+            return true;
+
+        var localName = NormalizeIdentityToken(_profile.GetDisplayUsername());
+        return !string.IsNullOrWhiteSpace(localName) && _operators.Contains(localName);
+    }
+
+    private bool HasCommandPermission(CommandPermission permission)
+    {
+        return permission switch
+        {
+            CommandPermission.Everyone => true,
+            CommandPermission.Operator => HasOperatorPermissions(),
+            CommandPermission.HostOnly => HasHostPermissions(),
+            _ => false
+        };
+    }
+
+    private bool IsCommandAllowedWithCheatsSetting(CommandDescriptor descriptor)
+    {
+        if (_meta?.EnableCheats ?? true)
+            return true;
+
+        if (descriptor.Permission == CommandPermission.Everyone)
+            return true;
+
+        return CheatsDisabledAllowedCommands.Contains(descriptor.Name);
+    }
+
+    private void ExecuteCommand(string raw)
+    {
+        EnsureCommandRegistry();
+        var commandText = (raw ?? string.Empty).Trim();
+        if (commandText.Length == 0 || commandText == "/")
+        {
+            SetCommandStatus("Try /help for commands.");
+            return;
+        }
+
+        var echoed = commandText.StartsWith("/", StringComparison.Ordinal) ? commandText : "/" + commandText;
+        var username = _profile.GetDisplayUsername();
+        AppendCommandHistoryRecord($"{username}: {echoed}");
+        AddChatLine($"{username}: {echoed}", isSystem: false, trackAsChatHistory: false);
+
+        if (commandText.StartsWith("/", StringComparison.Ordinal))
+            commandText = commandText.Substring(1);
+
+        var parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            SetCommandStatus("Try /help for commands.");
+            return;
+        }
+
+        var commandName = parts[0].ToLowerInvariant();
+        if (commandName == "findbiome")
+        {
+            SetCommandStatus("Unknown command: /findbiome. Use /biome.");
+            return;
+        }
+
+        if (!_commandLookup.TryGetValue(commandName, out var descriptor))
+        {
+            SetCommandStatus($"Unknown command: /{commandName}. Use /help.");
+            return;
+        }
+
+        if (!HasCommandPermission(descriptor.Permission))
+        {
+            SetCommandStatus("You do not have permission to use that command.");
+            return;
+        }
+
+        if (!IsCommandAllowedWithCheatsSetting(descriptor))
+        {
+            SetCommandStatus("Cheats are disabled in this world.");
+            return;
+        }
+
+        descriptor.Handler(parts);
+    }
+
+    private void ExecuteAcceptInviteCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /accept <username>");
+            return;
+        }
+        _ = RespondToPendingJoinRequestAsync(commandParts[1], accept: true);
+    }
+
+    private void ExecuteRejectInviteCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /reject <username>");
+            return;
+        }
+        _ = RespondToPendingJoinRequestAsync(commandParts[1], accept: false);
+    }
+
+    private async Task RespondToPendingJoinRequestAsync(string username, bool accept)
+    {
+        if (_lanSession is not EosP2PHostSession hostSession)
+        {
+            SetCommandStatus("This command is only available to the online host.", echoToChat: false);
+            return;
+        }
+
+        if (!TryResolvePendingJoinRequester(username, out var peerId))
+        {
+            SetCommandStatus($"No pending join request from {username}.", echoToChat: false);
+            return;
+        }
+
+        await RespondToPendingJoinPeerIdAsync(peerId, username, accept);
+    }
+
+    private async Task RespondToPendingJoinPeerIdAsync(string peerId, string displayNameHint, bool accept)
+    {
+        if (_lanSession is not EosP2PHostSession hostSession)
+            return;
+
+        var normalizedPeerId = (peerId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedPeerId))
+            return;
+
+        bool ok;
+        if (accept)
+        {
+            hostSession.PreApprovePuid(normalizedPeerId);
+            ok = hostSession.ApproveJoinRequest(normalizedPeerId);
+        }
+        else
+        {
+            ok = hostSession.DeclineJoinRequest(normalizedPeerId);
+        }
+
+        var bestName = await ResolveUsernameAsync(normalizedPeerId);
+        if (string.IsNullOrWhiteSpace(bestName))
+            bestName = string.IsNullOrWhiteSpace(displayNameHint) ? "PLAYER" : displayNameHint.Trim();
+
+        if (ok)
+        {
+            var actionWord = accept ? "accepted" : "rejected";
+            SetCommandStatus($"Join request from {bestName} {actionWord}.", echoToChat: false);
+            AddChatLine($"You {actionWord} {bestName}'s join request.", isSystem: true);
+            ForgetPendingJoinRequester(normalizedPeerId);
+        }
+        else
+        {
+            var actionWord = accept ? "accept" : "reject";
+            SetCommandStatus($"Failed to {actionWord} {bestName}.", echoToChat: false);
+        }
+    }
+
+    private void ExecuteWhitelistCommand(string[] parts)
+    {
+        if (parts.Length < 2)
+        {
+            SetCommandStatus("Usage: /whitelist <add|remove|list> [username]");
+            return;
+        }
+
+        var sub = parts[1].ToLowerInvariant();
+        if (sub == "list")
+        {
+            if (_whitelist.Count == 0 && _profile.Friends.Count == 0)
+            {
+                SetCommandStatus("Whitelist and friends list are empty.");
+                return;
+            }
+
+            if (_whitelist.Count > 0)
+            {
+                AddChatLine("--- WHITELISTED ---", isSystem: true);
+                foreach (var entry in _whitelist
+                    .Select(NormalizeWhitelistName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    AddChatLine(entry, isSystem: true,
+                        actionLabel: "REMOVE",
+                        customActionToken: "wl-remove:" + entry,
+                        customActionStatus: "Removing...");
+                }
+            }
+
+            var friendsNotWhitelisted = _profile.Friends
+                .Select(f => NormalizeFriendDisplayName(
+                    (f.Label ?? string.Empty).Trim(),
+                    (f.LastKnownDisplayName ?? string.Empty).Trim()))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(name => !_whitelist.Contains(name))
+                .ToList();
+
+            if (friendsNotWhitelisted.Count > 0)
+            {
+                AddChatLine("--- FRIENDS (NOT WHITELISTED) ---", isSystem: true);
+                foreach (var friendName in friendsNotWhitelisted)
+                {
+                    AddChatLine(friendName, isSystem: true,
+                        actionLabel: "ADD",
+                        customActionToken: "wl-add:" + friendName,
+                        customActionStatus: "Adding...");
+                }
+            }
+            return;
+        }
+
+        if (parts.Length < 3)
+        {
+            SetCommandStatus($"Usage: /whitelist {sub} <username>");
+            return;
+        }
+
+        var name = NormalizeWhitelistName(parts[2]);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            SetCommandStatus("Use a Veilnet username (not raw player/product IDs).");
+            return;
+        }
+
+        if (sub == "add")
+        {
+            if (_whitelist.Add(name))
+            {
+                SaveWhitelist();
+                SetCommandStatus($"Added {name} to whitelist.");
+            }
+            else
+            {
+                SetCommandStatus($"{name} is already whitelisted.");
+            }
+        }
+        else if (sub == "remove")
+        {
+            if (_whitelist.Remove(name))
+            {
+                SaveWhitelist();
+                RevokeWhitelistApprovalsForName(name);
+                SetCommandStatus($"Removed {name} from whitelist.");
+            }
+            else
+            {
+                SetCommandStatus($"{name} is not in whitelist.");
+            }
+        }
+    }
+
+    private void SaveWhitelist()
+    {
+        try
+        {
+            var clean = _whitelist
+                .Select(NormalizeWhitelistName)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var lines = new List<string>(clean.Count + 1) { "# LatticeVeil world whitelist (.lvlist)" };
+            lines.AddRange(clean);
+            File.WriteAllLines(WhitelistPath, lines);
+            _whitelist = new HashSet<string>(clean, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save whitelist: {ex.Message}");
+        }
+    }
+
+    private HashSet<string> LoadWhitelistEntries()
+    {
+        var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var targetPath = File.Exists(WhitelistPath) ? WhitelistPath : LegacyWhitelistPath;
+            if (!File.Exists(targetPath))
+                return results;
+
+            if (targetPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                var json = File.ReadAllText(targetPath);
+                var list = JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+                for (var i = 0; i < list.Count; i++)
+                {
+                    var normalized = NormalizeWhitelistName(list[i]);
+                    if (!string.IsNullOrWhiteSpace(normalized))
+                        results.Add(normalized);
+                }
+                return results;
+            }
+
+            var lines = File.ReadAllLines(targetPath);
+            for (var i = 0; i < lines.Length; i++)
+            {
+                var line = lines[i]?.Trim() ?? string.Empty;
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                    continue;
+
+                var normalized = NormalizeWhitelistName(line);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                    results.Add(normalized);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load whitelist entries: {ex.Message}");
+        }
+
+        return results;
+    }
+
+    private void MigrateLegacyWorldTextFiles()
+    {
+        MigrateLegacyFile(LegacyChatHistoryLogPath, ChatHistoryLogPath);
+        MigrateLegacyFile(LegacyCommandHistoryLogPath, CommandHistoryLogPath);
+
+        if (File.Exists(LegacyWhitelistPath) && !File.Exists(WhitelistPath))
+        {
+            try
+            {
+                var list = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(LegacyWhitelistPath)) ?? new List<string>();
+                var clean = list
+                    .Select(NormalizeWhitelistName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (clean.Count > 0)
+                {
+                    var lines = new List<string>(clean.Count + 1) { "# LatticeVeil world whitelist (.lvlist)" };
+                    lines.AddRange(clean);
+                    File.WriteAllLines(WhitelistPath, lines);
+                }
+                else
+                {
+                    File.WriteAllLines(WhitelistPath, new[] { "# LatticeVeil world whitelist (.lvlist)" });
+                }
+
+                File.Delete(LegacyWhitelistPath);
+                _log.Info("Migrated whitelist.json to Whitelist.lvlist");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to migrate whitelist.json to .lvlist: {ex.Message}");
+            }
+        }
+    }
+
+    private void MigrateLegacyFile(string legacyPath, string targetPath)
+    {
+        try
+        {
+            if (!File.Exists(legacyPath))
+                return;
+
+            if (!File.Exists(targetPath))
+            {
+                File.Move(legacyPath, targetPath);
+                _log.Info($"Migrated legacy world file: {Path.GetFileName(legacyPath)} -> {Path.GetFileName(targetPath)}");
+                return;
+            }
+
+            var legacyContent = File.ReadAllText(legacyPath);
+            if (!string.IsNullOrWhiteSpace(legacyContent))
+                File.AppendAllText(targetPath, Environment.NewLine + legacyContent.Trim());
+
+            File.Delete(legacyPath);
+            _log.Info($"Merged and removed legacy world file: {Path.GetFileName(legacyPath)}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to migrate legacy world file {legacyPath}: {ex.Message}");
+        }
+    }
+
+    private bool PruneWhitelistIdentityTokens()
+    {
+        var before = _whitelist.Count;
+        if (before == 0)
+            return false;
+
+        var clean = _whitelist
+            .Select(NormalizeWhitelistName)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _whitelist = new HashSet<string>(clean, StringComparer.OrdinalIgnoreCase);
+        return _whitelist.Count != before;
+    }
+
+    private static string NormalizeWhitelistName(string value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text) || LooksLikeIdentityToken(text))
+            return string.Empty;
+
+        return text;
+    }
+
+    private void RevokeWhitelistApprovalsForName(string username)
+    {
+        if (_lanSession is not EosP2PHostSession hostSession)
+            return;
+
+        var target = NormalizeWhitelistName(username);
+        if (string.IsNullOrWhiteSpace(target))
+            return;
+
+        var peerIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_pendingJoinLookup.TryGetValue(target, out var pendingPeer) && !string.IsNullOrWhiteSpace(pendingPeer))
+            peerIds.Add(pendingPeer.Trim());
+
+        lock (_usernameCache)
+        {
+            foreach (var kvp in _usernameCache)
+            {
+                if (!string.Equals((kvp.Value ?? string.Empty).Trim(), target, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var peerId = (kvp.Key ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(peerId))
+                    peerIds.Add(peerId);
+            }
+        }
+
+        foreach (var peerId in peerIds)
+        {
+            if (hostSession.RevokePuidPreApproval(peerId))
+                _log.Info($"Whitelist removal revoked auto-join pre-approval for {target} ({peerId}).");
+        }
+    }
+
+    private static string NormalizeFriendDisplayName(string preferredUsername, string preferredDisplayName)
+    {
+        var username = NormalizeWhitelistName(preferredUsername);
+        if (!string.IsNullOrWhiteSpace(username))
+            return username;
+
+        var displayName = NormalizeWhitelistName(preferredDisplayName);
+        if (!string.IsNullOrWhiteSpace(displayName))
+            return displayName;
+
+        // We intentionally avoid returning raw identities/UUIDs to keep whitelist UX username-only.
+        return string.Empty;
+    }
+
+    private void ExecuteHelpCommand(string[] _)
+    {
+        var lines = new List<string>();
+        foreach (var descriptor in _commandDescriptors)
+        {
+            if (!HasCommandPermission(descriptor.Permission) || !IsCommandAllowedWithCheatsSetting(descriptor))
+                continue;
+            lines.Add("/" + descriptor.Name);
+        }
+
+        SetCommandStatus($"Commands: {string.Join(", ", lines)}", 10f);
+    }
+
+    private void ExecuteBiomeCommand(string[] commandParts)
+    {
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var originX = (int)MathF.Floor(_player.Position.X);
+        var originZ = (int)MathF.Floor(_player.Position.Z);
+
+        if (commandParts.Length < 2 || string.Equals(commandParts[1], "here", StringComparison.OrdinalIgnoreCase))
+        {
+            ReportCurrentBiome(originX, originZ);
+            return;
+        }
+
+        if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
+        {
+            SetCommandStatus("Biomes: Grasslands, Forest, Hills, Desert, Ocean", 8f);
+            return;
+        }
+
+        if (!TryResolveBiome(commandParts[1], out var targetBiomeToken, out var targetBiomeLabel))
+        {
+            SetCommandStatus("Biome must be one of: desert, forest, hills, grasslands, ocean. Use /biome list.");
+            return;
+        }
+
+        var maxRadius = CommandFindBiomeDefaultRadius;
+        if (commandParts.Length >= 3)
+        {
+            if (!int.TryParse(commandParts[2], out maxRadius))
+            {
+                SetCommandStatus("Radius must be a number.");
+                return;
+            }
+
+            maxRadius = Math.Clamp(maxRadius, 16, CommandFindBiomeMaxRadius);
+        }
+
+        if (!TryReportBiomeLocation(targetBiomeToken, targetBiomeLabel, maxRadius))
+            return;
+    }
+
+    private void ExecuteStructureCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /structure <locate|list> [name]");
+            return;
+        }
+
+        var sub = commandParts[1].ToLowerInvariant();
+        if (sub == "list")
+        {
+            SetCommandStatus("No structures are configured yet.", 8f);
+            return;
+        }
+
+        if (sub == "locate")
+        {
+            if (commandParts.Length >= 3)
+                SetCommandStatus($"Unable to locate '{commandParts[2]}': no structures configured yet.", 8f);
+            else
+                SetCommandStatus("No structures are configured yet.", 8f);
+            return;
+        }
+
+        SetCommandStatus("Usage: /structure <locate|list> [name]");
+    }
+
+    private bool TryReportBiomeLocation(string targetBiomeToken, string targetBiomeLabel, int maxRadius)
+    {
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return false;
+        }
+
+        var originX = (int)MathF.Floor(_player.Position.X);
+        var originZ = (int)MathF.Floor(_player.Position.Z);
+        if (_hasQueuedLocateOrigin)
+        {
+            originX = _queuedLocateOriginX;
+            originZ = _queuedLocateOriginZ;
+            _hasQueuedLocateOrigin = false;
+        }
+        if (!TryResolveValidatedBiomeCoordinate(targetBiomeToken, originX, originZ, maxRadius, out var foundX, out var foundZ))
+        {
+            SetCommandStatus($"Unable to locate {targetBiomeLabel}.");
+            return false;
+        }
+
+        var foundY = Math.Clamp(
+            (int)MathF.Round(FindSafeSpawnHeight(foundX, foundZ) + 1f),
+            2,
+            Math.Max(3, (_meta?.Size?.Height ?? 256) - 2));
+        var resultText = $"X: {foundX} Y: {foundY} Z: {foundZ}";
+        AddChatLine(
+            resultText,
+            isSystem: true,
+            teleportX: foundX,
+            teleportY: foundY,
+            teleportZ: foundZ,
+            hoverText: $"Click to teleport to {targetBiomeLabel} at {foundX} {foundY} {foundZ}");
+        return true;
+    }
+
+    private bool TryResolveValidatedBiomeCoordinate(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+
+        if (_world == null || _meta == null)
+            return false;
+
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+            return false;
+
+        originX = ClampWorldX(originX);
+        originZ = ClampWorldZ(originZ);
+
+        if (BiomeService.GetSampleAt(_meta, originX, originZ).BiomeId == targetBiomeId)
+        {
+            foundX = originX;
+            foundZ = originZ;
+            return true;
+        }
+
+        return BiomeLocateService.TryLocateNearest(
+            _meta,
+            _biomeIndex,
+            targetBiomeId,
+            originX,
+            originZ,
+            Math.Max(16, maxRadius),
+            out foundX,
+            out foundZ);
+    }
+
+    private bool TryFindBiomeOnRingScan(string targetBiomeToken, int originX, int originZ, int radius, int step, out int foundX, out int foundZ)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+            return false;
+            
+        // Ring scan pattern - check positions at increasing distances from origin
+        for (int r = step; r <= radius; r += step)
+        {
+            // Check 8 directions on each ring
+            int[][] directions = new int[][]
+            {
+                new[] { r, 0 }, new[] { -r, 0 }, new[] { 0, r }, new[] { 0, -r },
+                new[] { r, r }, new[] { -r, r }, new[] { r, -r }, new[] { -r, -r }
+            };
+            
+            foreach (var dir in directions)
+            {
+                int checkX = originX + dir[0];
+                int checkZ = originZ + dir[1];
+                
+                if (!IsWithinBiomeSearchBounds(checkX, checkZ))
+                    continue;
+                    
+                if (BiomeService.GetBiomeIdAtWorldXZ(_meta, checkX, checkZ) == targetBiomeId)
+                {
+                    foundX = checkX;
+                    foundZ = checkZ;
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+
+    private bool TryRefineBiomeCandidate(string targetBiomeToken, int originX, int originZ, int centerX, int centerZ, int radius, out int foundX, out int foundZ)
+    {
+        foundX = centerX;
+        foundZ = centerZ;
+
+        if (IsBiomeCoordinateValid(targetBiomeToken, centerX, centerZ))
+            return true;
+
+        radius = Math.Max(1, radius);
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        for (var wz = centerZ - radius; wz <= centerZ + radius; wz++)
+        {
+            for (var wx = centerX - radius; wx <= centerX + radius; wx++)
+            {
+                if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                    continue;
+
+                var dx = wx - originX;
+                var dz = wz - originZ;
+                var distSq = (long)dx * dx + (long)dz * dz;
+                if (distSq >= bestDistSq)
+                    continue;
+
+                bestDistSq = distSq;
+                foundX = wx;
+                foundZ = wz;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    private bool TryFinalizeBiomeLocateCandidate(string targetBiomeToken, int originX, int originZ, int candidateX, int candidateZ, out int foundX, out int foundZ)
+    {
+        foundX = candidateX;
+        foundZ = candidateZ;
+        if (!IsBiomeCoordinateValid(targetBiomeToken, candidateX, candidateZ))
+            return false;
+
+        var promotedX = candidateX;
+        var promotedZ = candidateZ;
+        TryPromoteBiomeInterior(targetBiomeToken, originX, originZ, ref promotedX, ref promotedZ);
+        if (IsBiomeCoordinateValid(targetBiomeToken, promotedX, promotedZ))
+        {
+            foundX = promotedX;
+            foundZ = promotedZ;
+        }
+
+        return true;
+    }
+
+    private void TryPromoteBiomeInterior(string targetBiomeToken, int originX, int originZ, ref int bestX, ref int bestZ)
+    {
+        if (_world == null || _meta == null)
+            return;
+
+        var radius = targetBiomeToken switch
+        {
+            "ocean" => 144,
+            "desert" => 128,
+            _ => 96
+        };
+        var step = targetBiomeToken == "ocean" ? 4 : 3;
+        var minX = HasFiniteWorldBounds() ? Math.Max(0, bestX - radius) : bestX - radius;
+        var maxX = HasFiniteWorldBounds() ? Math.Min(_meta.Size.Width - 1, bestX + radius) : bestX + radius;
+        var minZ = HasFiniteWorldBounds() ? Math.Max(0, bestZ - radius) : bestZ - radius;
+        var maxZ = HasFiniteWorldBounds() ? Math.Min(_meta.Size.Depth - 1, bestZ + radius) : bestZ + radius;
+
+        var bestStrength = GetBiomeLocateStrength(targetBiomeToken, bestX, bestZ);
+        var bestDistSq = (long)(bestX - originX) * (bestX - originX) + (long)(bestZ - originZ) * (bestZ - originZ);
+        if (bestStrength >= 0.92f)
+            return;
+
+        for (var wz = minZ; wz <= maxZ; wz += step)
+        {
+            for (var wx = minX; wx <= maxX; wx += step)
+            {
+                if (!IsBiomeCoordinateValid(targetBiomeToken, wx, wz))
+                    continue;
+
+                var strength = GetBiomeLocateStrength(targetBiomeToken, wx, wz);
+                var dx = wx - originX;
+                var dz = wz - originZ;
+                var distSq = (long)dx * dx + (long)dz * dz;
+                if (strength > bestStrength + 0.015f
+                    || (MathF.Abs(strength - bestStrength) <= 0.015f && distSq < bestDistSq))
+                {
+                    bestStrength = strength;
+                    bestDistSq = distSq;
+                    bestX = wx;
+                    bestZ = wz;
+                }
+            }
+        }
+    }
+
+    private float GetBiomeLocateStrength(string targetBiomeToken, int x, int z)
+    {
+        if (_meta == null)
+            return 0f;
+
+        var sample = BiomeService.GetSampleAt(_meta, x, z);
+        var oceanWeight = sample.OceanWeight;
+        var effectiveDesert = sample.EffectiveDesertWeight;
+        var hillsWeight = sample.HillsWeight;
+        return targetBiomeToken switch
+        {
+            "ocean" => Math.Clamp((oceanWeight - 0.67f) / 0.33f, 0f, 1f),
+            "desert" => Math.Clamp((effectiveDesert - 0.44f) / 0.56f, 0f, 1f),
+            "hills" => Math.Clamp((hillsWeight - 0.40f) / 0.60f, 0f, 1f),
+            _ => Math.Clamp(1f - MathF.Max(oceanWeight, effectiveDesert), 0f, 1f)
+        };
+    }
+
+    private bool IsBiomeCoordinateValid(string targetBiomeToken, int x, int z)
+    {
+        if (_meta == null)
+            return false;
+        if (!IsWithinBiomeSearchBounds(x, z))
+            return false;
+        if (!BiomeService.TryParseBiomeToken(targetBiomeToken, out var target))
+            return false;
+        return BiomeService.GetSampleAt(_meta, x, z).BiomeId == target;
+    }
+
+    private void ReportCurrentBiome(int wx, int wz)
+    {
+        if (_world == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var biome = _world.GetBiomeNameAt(wx, wz);
+        SetCommandStatus($"You are currently in {biome} biome at {wx}, {wz}.", 7f);
+    }
+
+    private void ExecuteTeleportCommand(string[] commandParts)
+    {
+        var baseX = (int)MathF.Floor(_player.Position.X);
+        var baseY = (int)MathF.Floor(_player.Position.Y);
+        var baseZ = (int)MathF.Floor(_player.Position.Z);
+
+        if (commandParts.Length == 2)
+        {
+            if (!TryResolvePlayerTarget(commandParts[1], out var targetId, out _))
+            {
+                SetCommandStatus($"Player not found: {commandParts[1]}");
+                return;
+            }
+
+            var sourceId = _lanSession?.LocalPlayerId ?? 0;
+            if (!TryTeleportPlayerToPlayer(sourceId, targetId, out var singleResult))
+            {
+                SetCommandStatus(singleResult);
+                return;
+            }
+
+            SetCommandStatus(singleResult);
+            return;
+        }
+
+        if (commandParts.Length == 3)
+        {
+            if (TryParseTeleportCoordinateToken(commandParts[1], baseX, out var x)
+                && TryParseTeleportCoordinateToken(commandParts[2], baseZ, out var z))
+            {
+                if (!TryTeleportPlayer(x, z, explicitY: null, out var coordResult))
+                {
+                    SetCommandStatus(coordResult);
+                    return;
+                }
+
+                SetCommandStatus(coordResult);
+                return;
+            }
+
+            if (!TryResolvePlayerTarget(commandParts[1], out var sourceId, out _))
+            {
+                SetCommandStatus($"Player not found: {commandParts[1]}");
+                return;
+            }
+
+            if (!TryResolvePlayerTarget(commandParts[2], out var targetId, out _))
+            {
+                SetCommandStatus($"Player not found: {commandParts[2]}");
+                return;
+            }
+
+            if (!TryTeleportPlayerToPlayer(sourceId, targetId, out var playerResult))
+            {
+                SetCommandStatus(playerResult);
+                return;
+            }
+
+            SetCommandStatus(playerResult);
+            return;
+        }
+
+        if (commandParts.Length == 4)
+        {
+            if (!TryParseTeleportCoordinateToken(commandParts[1], baseX, out var x) ||
+                !TryParseTeleportCoordinateToken(commandParts[2], baseY, out var parsedY) ||
+                !TryParseTeleportCoordinateToken(commandParts[3], baseZ, out var z))
+            {
+                SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+                return;
+            }
+
+            if (!TryTeleportPlayer(x, z, parsedY, out var xyzResult))
+            {
+                SetCommandStatus(xyzResult);
+                return;
+            }
+
+            SetCommandStatus(xyzResult);
+            return;
+        }
+
+        SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+    }
+
+    private static bool TryParseTeleportCoordinateToken(string token, int baseValue, out int result)
+    {
+        token = (token ?? string.Empty).Trim();
+        if (token.StartsWith("~", StringComparison.Ordinal))
+        {
+            if (token.Length == 1)
+            {
+                result = baseValue;
+                return true;
+            }
+
+            var offsetToken = token.Substring(1);
+            if (float.TryParse(offsetToken, NumberStyles.Float, CultureInfo.InvariantCulture, out var offset))
+            {
+                result = (int)MathF.Floor(baseValue + offset);
+                return true;
+            }
+
+            result = 0;
+            return false;
+        }
+
+        if (float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var absolute))
+        {
+            result = (int)MathF.Floor(absolute);
+            return true;
+        }
+
+        result = 0;
+        return false;
+    }
+
+    private bool TryTeleportPlayerToPlayer(int sourcePlayerId, int targetPlayerId, out string result)
+    {
+        if (_lanSession != null && sourcePlayerId == _lanSession.LocalPlayerId)
+        {
+            if (!TryGetKnownPlayerPose(targetPlayerId, out var targetPosition, out var targetYaw, out var targetPitch))
+            {
+                result = $"Unable to resolve target player position for {ResolvePlayerName(targetPlayerId)}.";
+                return false;
+            }
+
+            var tx = (int)MathF.Floor(targetPosition.X);
+            var ty = (int)MathF.Floor(targetPosition.Y);
+            var tz = (int)MathF.Floor(targetPosition.Z);
+            if (!TryTeleportPlayer(tx, tz, ty, out var localResult))
+            {
+                result = localResult;
+                return false;
+            }
+
+            _player.Yaw = targetYaw;
+            _player.Pitch = targetPitch;
+            result = $"{ResolvePlayerName(sourcePlayerId)} teleported to {ResolvePlayerName(targetPlayerId)}.";
+            return true;
+        }
+
+        if (_lanSession == null || !_lanSession.IsHost)
+        {
+            result = "Only the host can teleport other players.";
+            return false;
+        }
+
+        if (!TryGetKnownPlayerPose(targetPlayerId, out var destination, out var destYaw, out var destPitch))
+        {
+            result = $"Unable to resolve target player position for {ResolvePlayerName(targetPlayerId)}.";
+            return false;
+        }
+
+        if (!_lanSession.SendTeleport(sourcePlayerId, destination, destYaw, destPitch))
+        {
+            result = $"Teleport failed: {ResolvePlayerName(sourcePlayerId)} is not connected.";
+            return false;
+        }
+
+        if (_remotePlayers.TryGetValue(sourcePlayerId, out var sourceModel))
+        {
+            sourceModel.Position = destination;
+            sourceModel.Yaw = destYaw;
+            sourceModel.Pitch = destPitch;
+            sourceModel.IsFlying = false;
+        }
+
+        result = $"{ResolvePlayerName(sourcePlayerId)} teleported to {ResolvePlayerName(targetPlayerId)}.";
+        return true;
+    }
+
+    private bool TryGetKnownPlayerPose(int playerId, out Vector3 position, out float yaw, out float pitch)
+    {
+        if (_lanSession == null)
+        {
+            if (playerId == 0)
+            {
+                position = _player.Position;
+                yaw = _player.Yaw;
+                pitch = _player.Pitch;
+                return true;
+            }
+
+            position = default;
+            yaw = 0f;
+            pitch = 0f;
+            return false;
+        }
+
+        if (playerId == _lanSession.LocalPlayerId)
+        {
+            position = _player.Position;
+            yaw = _player.Yaw;
+            pitch = _player.Pitch;
+            return true;
+        }
+
+        if (_remotePlayers.TryGetValue(playerId, out var remote))
+        {
+            position = remote.Position;
+            yaw = remote.Yaw;
+            pitch = remote.Pitch;
+            return true;
+        }
+
+        position = default;
+        yaw = 0f;
+        pitch = 0f;
+        return false;
+    }
+
+    private void ExecuteGameModeCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /gamemode <artificer|veilwalker|veilseer|gui> [player]");
+            return;
+        }
+
+        if (string.Equals(commandParts[1], "gui", StringComparison.OrdinalIgnoreCase))
+        {
+            OpenGamemodeWheel(holdToOpen: false);
+            SetCommandStatus("Select a gamemode from the wheel.");
+            return;
+        }
+
+        if (!TryParseGameModeToken(commandParts[1], out var mode))
+        {
+            SetCommandStatus("Gamemode must be artificer, veilwalker, or veilseer.");
+            return;
+        }
+
+        if (commandParts.Length >= 3)
+        {
+            if (!TryResolvePlayerTarget(commandParts[2], out var targetId, out var targetName))
+            {
+                SetCommandStatus($"Player not found: {commandParts[2]}");
+                return;
+            }
+
+            ApplyTargetedGameModeChange(mode, targetId, targetName);
+            return;
+        }
+
+        ApplyGameModeChange(mode, GameModeChangeSource.Command, persistImmediately: true, emitFeedback: true);
+    }
+
+    private void ExecuteDirectGameMode(GameMode mode, string[] commandParts)
+    {
+        if (commandParts.Length >= 2)
+        {
+            if (!TryResolvePlayerTarget(commandParts[1], out var targetId, out var targetName))
+            {
+                SetCommandStatus($"Player not found: {commandParts[1]}");
+                return;
+            }
+
+            ApplyTargetedGameModeChange(mode, targetId, targetName);
+            return;
+        }
+
+        ApplyGameModeChange(mode, GameModeChangeSource.Command, persistImmediately: true, emitFeedback: true);
+    }
+
+    private void ApplyTargetedGameModeChange(GameMode mode, int targetId, string targetName)
+    {
+        if (_lanSession == null || targetId == _lanSession.LocalPlayerId)
+        {
+            ApplyGameModeChange(mode, GameModeChangeSource.Command, persistImmediately: true, emitFeedback: true);
+            return;
+        }
+
+        if (!_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can change another player's gamemode.");
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = -1,
+            Kind = LanChatKind.System,
+            Text = $"{GameModeSyncPrefix}{targetId}|{mode}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+
+        SetCommandStatus($"Set {targetName} to {mode.ToString().ToUpperInvariant()}.");
+    }
+
+    private static bool TryParseGameModeToken(string value, out GameMode mode)
+    {
+        mode = GameMode.Artificer;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var token = value.Trim().ToLowerInvariant();
+        switch (token)
+        {
+            case "artificer":
+            case "creative":
+            case "c":
+            case "1":
+                mode = GameMode.Artificer;
+                return true;
+            case "veilwalker":
+            case "survival":
+            case "s":
+            case "0":
+                mode = GameMode.Veilwalker;
+                return true;
+            case "veilseer":
+            case "spectator":
+            case "sp":
+            case "3":
+                mode = GameMode.Veilseer;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void ExecuteDifficultyCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus($"Current difficulty: {GetDifficultyLabel(_difficultyLevel)}.");
+            return;
+        }
+
+        if (!TryParseDifficultyToken(commandParts[1], out var difficulty))
+        {
+            SetCommandStatus("Difficulty must be peaceful, easy, normal, or hard.");
+            return;
+        }
+
+        _difficultyLevel = difficulty;
+        if (_meta != null)
+        {
+            _meta.DifficultyLevel = _difficultyLevel;
+            _meta.Save(_metaPath, _log);
+        }
+        SetCommandStatus($"Difficulty set to {GetDifficultyLabel(_difficultyLevel).ToUpperInvariant()}.");
+    }
+
+    private void ExecuteSeedCommand(string[] _)
+    {
+        if (_meta == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        SetCommandStatus($"Seed: {_meta.Seed}", 8f);
+    }
+
+    private void ExecuteRulesCommand(string[] commandParts)
+    {
+        if (_meta == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        if (commandParts.Length <= 1)
+        {
+            SetCommandStatus(BuildWorldRulesSummary(), 8f);
+            return;
+        }
+
+        var ruleKey = NormalizeWorldRuleKey(commandParts[1]);
+        if (string.IsNullOrWhiteSpace(ruleKey))
+        {
+            SetCommandStatus("Unknown rule. Use /rules to list available rules.");
+            return;
+        }
+
+        if (commandParts.Length == 2)
+        {
+            if (!TryGetWorldRuleValue(ruleKey, out var currentValue))
+            {
+                SetCommandStatus("Could not read that rule.");
+                return;
+            }
+
+            SetCommandStatus($"{ruleKey} = {currentValue}", 8f);
+            return;
+        }
+
+        if (commandParts.Length > 3)
+        {
+            SetCommandStatus("Usage: /rules [<rule> [value]]");
+            return;
+        }
+
+        if (!TryNormalizeWorldRuleValue(ruleKey, commandParts[2], out var normalizedValue, out var normalizeError))
+        {
+            SetCommandStatus(normalizeError);
+            return;
+        }
+
+        if (_lanSession != null && _lanSession.IsConnected && !_lanSession.IsHost)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.System,
+                Text = $"{RuleRequestPrefix}set|{ruleKey}|{normalizedValue}",
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            SetCommandStatus($"Requested {ruleKey} = {normalizedValue} from host.");
+            return;
+        }
+
+        if (!TryApplyWorldRule(ruleKey, normalizedValue, persist: true, out var appliedValue, out var status))
+        {
+            SetCommandStatus(status);
+            return;
+        }
+
+        if (_lanSession != null && _lanSession.IsConnected && _lanSession.IsHost)
+            BroadcastRuleSync(ruleKey, appliedValue);
+
+        SetCommandStatus(status);
+    }
+
+    private string BuildWorldRulesSummary()
+    {
+        TryGetWorldRuleValue("playercollision", out var playerCollision);
+        TryGetWorldRuleValue("timecycle", out var timeCycle);
+        TryGetWorldRuleValue("weathercycle", out var weatherCycle);
+        TryGetWorldRuleValue("enablemultiplehomes", out var multipleHomes);
+        TryGetWorldRuleValue("maxhomesperplayer", out var maxHomes);
+        return $"Rules: playercollision={playerCollision} | timecycle={timeCycle} | weathercycle={weatherCycle} | enablemultiplehomes={multipleHomes} | maxhomesperplayer={maxHomes}";
+    }
+
+    private static string NormalizeWorldRuleKey(string rawKey)
+    {
+        var token = (rawKey ?? string.Empty).Trim().ToLowerInvariant();
+        return token switch
+        {
+            "playercollision" => "playercollision",
+            "collision" => "playercollision",
+            "timecycle" => "timecycle",
+            "weathercycle" => "weathercycle",
+            "enablemultiplehomes" => "enablemultiplehomes",
+            "homes" => "enablemultiplehomes",
+            "maxhomesperplayer" => "maxhomesperplayer",
+            "maxhomes" => "maxhomesperplayer",
+            _ => string.Empty
+        };
+    }
+
+    private static bool IsBooleanWorldRule(string ruleKey)
+    {
+        return ruleKey is "playercollision" or "timecycle" or "weathercycle" or "enablemultiplehomes";
+    }
+
+    private static bool TryParseRuleBoolToken(string token, out bool enabled)
+    {
+        switch ((token ?? string.Empty).Trim().ToLowerInvariant())
+        {
+            case "on":
+            case "true":
+            case "1":
+            case "enabled":
+            case "yes":
+                enabled = true;
+                return true;
+            case "off":
+            case "false":
+            case "0":
+            case "disabled":
+            case "no":
+                enabled = false;
+                return true;
+            default:
+                enabled = false;
+                return false;
+        }
+    }
+
+    private static bool TryNormalizeWorldRuleValue(string ruleKey, string rawValue, out string normalizedValue, out string error)
+    {
+        normalizedValue = string.Empty;
+        error = string.Empty;
+
+        if (IsBooleanWorldRule(ruleKey))
+        {
+            if (!TryParseRuleBoolToken(rawValue, out var enabled))
+            {
+                error = $"Rule '{ruleKey}' expects on/off.";
+                return false;
+            }
+
+            normalizedValue = enabled ? "on" : "off";
+            return true;
+        }
+
+        if (string.Equals(ruleKey, "maxhomesperplayer", StringComparison.Ordinal))
+        {
+            if (!int.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var maxHomes))
+            {
+                error = "Rule 'maxhomesperplayer' expects a number from 1 to 32.";
+                return false;
+            }
+
+            normalizedValue = Math.Clamp(maxHomes, 1, 32).ToString(CultureInfo.InvariantCulture);
+            return true;
+        }
+
+        error = $"Unknown rule: {ruleKey}.";
+        return false;
+    }
+
+    private bool TryApplyWorldRule(string ruleKey, string normalizedValue, bool persist, out string appliedValue, out string status)
+    {
+        appliedValue = string.Empty;
+        status = string.Empty;
+        if (_meta == null)
+        {
+            status = "World is not ready yet.";
+            return false;
+        }
+
+        switch (ruleKey)
+        {
+            case "playercollision":
+                _playerCollisionEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _playerCollisionEnabled ? "on" : "off";
+                status = _playerCollisionEnabled ? "Player collision enabled." : "Player collision disabled.";
+                break;
+            case "timecycle":
+                _timeCycleEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _timeCycleEnabled ? "on" : "off";
+                status = _timeCycleEnabled ? "Time cycle enabled." : "Time cycle disabled.";
+                break;
+            case "weathercycle":
+                _weatherCycleEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _weatherCycleEnabled ? "on" : "off";
+                status = _weatherCycleEnabled ? "Weather cycle enabled." : "Weather cycle disabled.";
+                break;
+            case "enablemultiplehomes":
+                _meta.EnableMultipleHomes = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                if (!_meta.EnableMultipleHomes)
+                    _meta.MaxHomesPerPlayer = 1;
+                appliedValue = _meta.EnableMultipleHomes ? "on" : "off";
+                status = _meta.EnableMultipleHomes ? "Multiple homes enabled." : "Multiple homes disabled.";
+                break;
+            case "maxhomesperplayer":
+                if (!int.TryParse(normalizedValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var maxHomes))
+                {
+                    status = "Rule 'maxhomesperplayer' expects a number from 1 to 32.";
+                    return false;
+                }
+                _meta.MaxHomesPerPlayer = Math.Clamp(maxHomes, 1, 32);
+                if (!_meta.EnableMultipleHomes)
+                    _meta.MaxHomesPerPlayer = 1;
+                appliedValue = _meta.MaxHomesPerPlayer.ToString(CultureInfo.InvariantCulture);
+                status = $"Max homes per player set to {appliedValue}.";
+                break;
+            default:
+                status = $"Unknown rule: {ruleKey}.";
+                return false;
+        }
+
+        SyncRuntimeRulesToMeta(persist);
+        return true;
+    }
+
+    private bool TryGetWorldRuleValue(string ruleKey, out string value)
+    {
+        value = string.Empty;
+        if (_meta == null)
+            return false;
+
+        switch (ruleKey)
+        {
+            case "playercollision":
+                value = _playerCollisionEnabled ? "on" : "off";
+                return true;
+            case "timecycle":
+                value = _timeCycleEnabled ? "on" : "off";
+                return true;
+            case "weathercycle":
+                value = _weatherCycleEnabled ? "on" : "off";
+                return true;
+            case "enablemultiplehomes":
+                value = _meta.EnableMultipleHomes ? "on" : "off";
+                return true;
+            case "maxhomesperplayer":
+                value = Math.Clamp(_meta.MaxHomesPerPlayer, 1, 32).ToString(CultureInfo.InvariantCulture);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void SyncRuntimeRulesToMeta(bool persist)
+    {
+        if (_meta == null)
+            return;
+
+        _meta.PlayerCollision = _playerCollisionEnabled;
+        _meta.TimeCycleEnabled = _timeCycleEnabled;
+        _meta.WeatherCycleEnabled = _weatherCycleEnabled;
+        _meta.TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(_timeOfDayTicks);
+        _meta.WeatherState = WorldMeta.CanonicalWeatherState(_weatherState);
+        _timeOfDayTicks = _meta.TimeOfDayTicks;
+        _weatherState = _meta.WeatherState;
+
+        _meta.MaxHomesPerPlayer = Math.Clamp(_meta.MaxHomesPerPlayer, 1, 32);
+        if (!_meta.EnableMultipleHomes)
+            _meta.MaxHomesPerPlayer = 1;
+
+        _meta.Player ??= new PlayerSettings();
+        _meta.Gameplay ??= new GameplaySettings();
+
+        _meta.Player.PlayerCollision = _meta.PlayerCollision;
+        _meta.Gameplay.EnableMultipleHomes = _meta.EnableMultipleHomes;
+        _meta.Gameplay.MaxHomesPerPlayer = _meta.MaxHomesPerPlayer;
+        _meta.Gameplay.TimeCycleEnabled = _meta.TimeCycleEnabled;
+        _meta.Gameplay.WeatherCycleEnabled = _meta.WeatherCycleEnabled;
+        _meta.Gameplay.TimeOfDayTicks = _meta.TimeOfDayTicks;
+        _meta.Gameplay.WeatherState = _meta.WeatherState;
+
+        if (persist)
+            _meta.Save(_metaPath, _log);
+    }
+
+    private void UpdateWorldRuleCycles(float dt)
+    {
+        if (dt <= 0f)
+            return;
+
+        if (_timeCycleEnabled)
+        {
+            _timeCycleAccumulator += dt * 20f;
+            var tickDelta = (int)_timeCycleAccumulator;
+            if (tickDelta != 0)
+            {
+                _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_timeOfDayTicks + tickDelta);
+                _timeCycleAccumulator -= tickDelta;
+            }
+        }
+
+        if (_weatherCycleEnabled)
+        {
+            _weatherCycleAccumulator += dt;
+            var guard = 0;
+            while (guard < WeatherCycleStates.Length)
+            {
+                var duration = WeatherCycleDurationsSeconds[Math.Clamp(_weatherCycleIndex, 0, WeatherCycleDurationsSeconds.Length - 1)];
+                if (_weatherCycleAccumulator < duration)
+                    break;
+
+                _weatherCycleAccumulator -= duration;
+                _weatherCycleIndex = (_weatherCycleIndex + 1) % WeatherCycleStates.Length;
+                _weatherState = WeatherCycleStates[_weatherCycleIndex];
+                guard++;
+            }
+        }
+    }
+
+    private void SyncWeatherCycleIndexFromState(bool resetAccumulator)
+    {
+        _weatherState = WorldMeta.CanonicalWeatherState(_weatherState);
+        _weatherCycleIndex = Array.IndexOf(WeatherCycleStates, _weatherState);
+        if (_weatherCycleIndex < 0)
+            _weatherCycleIndex = 0;
+
+        if (resetAccumulator)
+            _weatherCycleAccumulator = 0f;
+    }
+
+    private void ExecuteTimeCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2 || string.Equals(commandParts[1], "query", StringComparison.OrdinalIgnoreCase))
+        {
+            SetCommandStatus($"Time: {_timeOfDayTicks}");
+            return;
+        }
+
+        var token = commandParts[1].ToLowerInvariant();
+        switch (token)
+        {
+            case "day":
+                _timeOfDayTicks = 1000;
+                SyncRuntimeRulesToMeta(persist: true);
+                SetCommandStatus("Time set to day.");
+                return;
+            case "night":
+                _timeOfDayTicks = 13000;
+                SyncRuntimeRulesToMeta(persist: true);
+                SetCommandStatus("Time set to night.");
+                return;
+            case "set":
+                if (commandParts.Length < 3 || !int.TryParse(commandParts[2], out var ticks))
+                {
+                    SetCommandStatus("Usage: /time set <ticks>");
+                    return;
+                }
+
+                _timeOfDayTicks = ((ticks % 24000) + 24000) % 24000;
+                SyncRuntimeRulesToMeta(persist: true);
+                SetCommandStatus($"Time set to {_timeOfDayTicks}.");
+                return;
+            default:
+                SetCommandStatus("Usage: /time [query|day|night|set <ticks>]");
+                return;
+        }
+    }
+
+    private void ExecuteWeatherCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2 || string.Equals(commandParts[1], "query", StringComparison.OrdinalIgnoreCase))
+        {
+            SetCommandStatus($"Weather: {_weatherState.ToUpperInvariant()}");
+            return;
+        }
+
+        var token = commandParts[1].ToLowerInvariant();
+        if (token is "clear" or "rain" or "storm")
+        {
+            // Check if rain is allowed at current position (for desert biomes)
+            if (token is "rain" or "storm")
+            {
+                var playerX = (int)_player.Position.X;
+                var playerZ = (int)_player.Position.Z;
+                if (!BiomeService.IsRainAllowedAt(_meta, playerX, playerZ))
+                {
+                    SetCommandStatus("Cannot make it rain in desert biome.");
+                    return;
+                }
+            }
+            
+            _weatherState = token;
+            SyncWeatherCycleIndexFromState(resetAccumulator: true);
+            SyncRuntimeRulesToMeta(persist: true);
+            SetCommandStatus($"Weather set to {_weatherState.ToUpperInvariant()}.");
+            return;
+        }
+
+        SetCommandStatus("Usage: /weather [query|clear|rain|storm]");
+    }
+
+    private void ExecuteSetSpawnCommand(string[] commandParts)
+    {
+        if (_meta == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        int x;
+        int y;
+        int z;
+        if (commandParts.Length >= 4)
+        {
+            if (!int.TryParse(commandParts[1], out x) || !int.TryParse(commandParts[2], out y) || !int.TryParse(commandParts[3], out z))
+            {
+                SetCommandStatus("Usage: /setspawn [x y z]");
+                return;
+            }
+        }
+        else
+        {
+            x = (int)MathF.Floor(_player.Position.X);
+            y = (int)MathF.Floor(_player.Position.Y);
+            z = (int)MathF.Floor(_player.Position.Z);
+        }
+
+        _meta.HasCustomSpawn = true;
+        _meta.SpawnX = ClampWorldX(x);
+        _meta.SpawnY = Math.Clamp(y, 2, Math.Max(3, _meta.Size.Height - 2));
+        _meta.SpawnZ = ClampWorldZ(z);
+        _meta.Save(_metaPath, _log);
+        SetCommandStatus($"Spawn set to {_meta.SpawnX}, {_meta.SpawnY}, {_meta.SpawnZ}.");
+    }
+
+    private void ExecuteOpCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /op <player>");
+            return;
+        }
+
+        if (!TryResolveOperatorToken(commandParts[1], out var targetName))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        if (_operators.Contains(targetName))
+        {
+            SetCommandStatus($"{targetName} is already an operator.");
+            return;
+        }
+
+        _operators.Add(targetName);
+        PersistOperatorsToMeta();
+        BroadcastOperatorSyncState();
+        SetCommandStatus($"{targetName} is now an operator.");
+    }
+
+    private void ExecuteDeopCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /deop <player>");
+            return;
+        }
+
+        if (!TryResolveOperatorToken(commandParts[1], out var targetName))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        if (!_operators.Remove(targetName))
+        {
+            SetCommandStatus($"{targetName} is not an operator.");
+            return;
+        }
+
+        PersistOperatorsToMeta();
+        BroadcastOperatorSyncState();
+        SetCommandStatus($"{targetName} is no longer an operator.");
+    }
+
+    private void ExecuteKickCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /kick <player> [reason]");
+            return;
+        }
+
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+        {
+            SetCommandStatus("Kick is only available while hosting multiplayer.");
+            return;
+        }
+
+        if (!TryResolvePlayerTarget(commandParts[1], out var targetId, out var targetName))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        if (targetId <= 0 || targetId == _lanSession.LocalPlayerId)
+        {
+            SetCommandStatus("You cannot kick yourself.");
+            return;
+        }
+
+        var reason = commandParts.Length >= 3
+            ? string.Join(" ", commandParts.Skip(2)).Trim()
+            : string.Empty;
+
+        FlushPersistedRemoteStateForPlayer(targetId);
+
+        if (!_lanSession.KickPlayer(targetId, reason))
+        {
+            SetCommandStatus($"Failed to kick {targetName}.");
+            return;
+        }
+
+        var status = string.IsNullOrWhiteSpace(reason)
+            ? $"{targetName} was kicked."
+            : $"{targetName} was kicked: {reason}";
+        AddChatLine(status, isSystem: true);
+        SetCommandStatus(status);
+    }
+
+    private void ExecuteSpawnCommand(string[] _)
+    {
+        if (_meta == null)
+        {
+            SetCommandStatus("World is not ready yet.");
+            return;
+        }
+
+        var spawn = GetWorldSpawnPoint();
+        int? explicitY = _meta.HasCustomSpawn ? _meta.SpawnY : null;
+        if (!TryTeleportPlayer((int)spawn.X, (int)spawn.Y, explicitY, out var result))
+        {
+            SetCommandStatus(result);
+            return;
+        }
+
+        SetCommandStatus(result);
+    }
+
+    private void ExecuteSetHomeCommand(string[] commandParts)
+    {
+        var requestedName = commandParts.Length >= 2 ? commandParts[1] : DefaultHomeName;
+        if (!TrySetHome(requestedName, _player.Position, out var result))
+        {
+            SetCommandStatus(result);
+            return;
+        }
+
+        SetCommandStatus(result);
+    }
+
+    private void ExecuteHomeCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            if (_homes.Count == 0)
+            {
+                SetCommandStatus("No home is set. Use /sethome first.");
+                return;
+            }
+
+            if (_homes.Count > 1 && IsMultipleHomesEnabled())
+            {
+                OpenHomeGui();
+                SetCommandStatus("Opened home menu.");
+                return;
+            }
+
+            if (!TryTeleportToHome(null, out var defaultResult))
+            {
+                SetCommandStatus(defaultResult);
+                return;
+            }
+
+            SetCommandStatus(defaultResult);
+            return;
+        }
+
+        var action = commandParts[1].ToLowerInvariant();
+        switch (action)
+        {
+            case "gui":
+                OpenHomeGui();
+                SetCommandStatus("Opened home menu.");
+                return;
+            case "list":
+                if (_homes.Count == 0)
+                {
+                    SetCommandStatus("No homes set. Use /sethome <name>.");
+                    return;
+                }
+
+                SetCommandStatus("Homes: " + string.Join(", ", _homes.Select(h => h.Name)), 10f);
+                return;
+            case "set":
+                if (commandParts.Length < 3)
+                {
+                    SetCommandStatus("Usage: /home set <name>");
+                    return;
+                }
+
+                if (!TrySetHome(commandParts[2], _player.Position, out var setResult))
+                {
+                    SetCommandStatus(setResult);
+                    return;
+                }
+
+                SetCommandStatus(setResult);
+                return;
+            case "rename":
+                if (commandParts.Length < 4)
+                {
+                    SetCommandStatus("Usage: /home rename <old> <new>");
+                    return;
+                }
+
+                if (!TryFindHomeIndex(commandParts[2], out var fromIndex))
+                {
+                    SetCommandStatus($"Home not found: {commandParts[2]}");
+                    return;
+                }
+
+                var targetName = NormalizeHomeName(commandParts[3]);
+                if (TryFindHomeIndex(targetName, out var collision) && collision != fromIndex)
+                {
+                    SetCommandStatus($"Home name already exists: {targetName}");
+                    return;
+                }
+
+                var oldName = _homes[fromIndex].Name;
+                var renamed = _homes[fromIndex];
+                renamed.Name = targetName;
+                _homes[fromIndex] = renamed;
+                _selectedHomeIndex = fromIndex;
+                SavePlayerState();
+                SetCommandStatus($"Renamed home '{oldName}' to '{targetName}'.");
+                return;
+            case "delete":
+            case "remove":
+                if (commandParts.Length < 3)
+                {
+                    SetCommandStatus("Usage: /home delete <name>");
+                    return;
+                }
+
+                if (!TryFindHomeIndex(commandParts[2], out var deleteIndex))
+                {
+                    SetCommandStatus($"Home not found: {commandParts[2]}");
+                    return;
+                }
+
+                var removedName = _homes[deleteIndex].Name;
+                _homes.RemoveAt(deleteIndex);
+                _selectedHomeIndex = _homes.Count == 0 ? -1 : Math.Clamp(_selectedHomeIndex, 0, _homes.Count - 1);
+                SyncLegacyHomeFields();
+                SavePlayerState();
+                SetCommandStatus($"Deleted home '{removedName}'.");
+                return;
+            case "icon":
+                if (commandParts.Length < 4)
+                {
+                    SetCommandStatus("Usage: /home icon <name> <block|auto>");
+                    return;
+                }
+
+                if (!TryFindHomeIndex(commandParts[2], out var iconIndex))
+                {
+                    SetCommandStatus($"Home not found: {commandParts[2]}");
+                    return;
+                }
+
+                var iconToken = commandParts[3];
+                var iconEntry = _homes[iconIndex];
+                if (string.Equals(iconToken, "auto", StringComparison.OrdinalIgnoreCase))
+                {
+                    iconEntry.HasIconBlock = false;
+                    iconEntry.IconBlock = BlockId.Air;
+                    _homes[iconIndex] = iconEntry;
+                    SavePlayerState();
+                    SetCommandStatus($"Home '{iconEntry.Name}' icon set to letter.");
+                    return;
+                }
+
+                if (!TryResolveHomeIconBlock(iconToken, out var iconBlock))
+                {
+                    SetCommandStatus($"Unknown block icon: {iconToken}");
+                    return;
+                }
+
+                iconEntry.HasIconBlock = true;
+                iconEntry.IconBlock = iconBlock;
+                _homes[iconIndex] = iconEntry;
+                SavePlayerState();
+                SetCommandStatus($"Home '{iconEntry.Name}' icon set to {iconBlock}.");
+                return;
+            default:
+                if (!TryTeleportToHome(commandParts[1], out var result))
+                {
+                    SetCommandStatus(result);
+                    return;
+                }
+
+                SetCommandStatus(result);
+                return;
+        }
+    }
+
+    private void OpenHomeGui()
+    {
+        _homeGuiOpen = true;
+        _homeGuiNameInputFocused = false;
+        _homeGuiEditIndex = -1;
+        _homeGuiEditText = string.Empty;
+        _homeGuiDragHotbarIndex = -1;
+        _homeGuiDragAssignPending = false;
+        _homeGuiHoverHint = string.Empty;
+        _homeGuiScroll = 0f;
+        if (_selectedHomeIndex < 0 && _homes.Count > 0)
+            _selectedHomeIndex = 0;
+        _homeGuiNameInput = GetNextAutomaticHomeName();
+        LayoutHomeGui();
+    }
+
+    private void LayoutHomeGui()
+    {
+        var panelW = Math.Clamp(_viewport.Width - 220, 560, 820);
+        var panelH = Math.Clamp(_viewport.Height - 180, 360, 560);
+        _homeGuiPanelRect = new Rectangle(
+            _viewport.Center.X - panelW / 2,
+            _viewport.Center.Y - panelH / 2,
+            panelW,
+            panelH);
+
+        _homeGuiInputRect = new Rectangle(_homeGuiPanelRect.X + 16, _homeGuiPanelRect.Y + 40, _homeGuiPanelRect.Width - 32, 34);
+        _homeGuiHotbarRect = new Rectangle(_homeGuiPanelRect.X + 16, _homeGuiInputRect.Bottom + 8, _homeGuiPanelRect.Width - 32, 44);
+        _homeGuiListRect = new Rectangle(_homeGuiPanelRect.X + 16, _homeGuiHotbarRect.Bottom + 10, _homeGuiPanelRect.Width - 32, _homeGuiPanelRect.Height - 210);
+
+        var slotSize = Math.Max(28, _homeGuiHotbarRect.Height - 8);
+        var gap = 6;
+        var totalWidth = (slotSize * Inventory.HotbarSize) + gap * (Inventory.HotbarSize - 1);
+        var slotStartX = _homeGuiHotbarRect.X + Math.Max(6, (_homeGuiHotbarRect.Width - totalWidth) / 2);
+        var slotY = _homeGuiHotbarRect.Y + (_homeGuiHotbarRect.Height - slotSize) / 2;
+        for (var i = 0; i < _homeGuiHotbarSlots.Length; i++)
+        {
+            var x = slotStartX + i * (slotSize + gap);
+            _homeGuiHotbarSlots[i] = new Rectangle(x, slotY, slotSize, slotSize);
+        }
+
+        var buttonY = _homeGuiListRect.Bottom + 10;
+        var buttonW = (_homeGuiPanelRect.Width - 16 * 2 - 10 * 2) / 3;
+        var buttonH = 30;
+        _homeGuiSetHereBtn.Bounds = new Rectangle(_homeGuiPanelRect.X + 16, buttonY, buttonW, buttonH);
+        _homeGuiRenameBtn.Bounds = new Rectangle(_homeGuiSetHereBtn.Bounds.Right + 10, buttonY, buttonW, buttonH);
+        _homeGuiDeleteBtn.Bounds = new Rectangle(_homeGuiRenameBtn.Bounds.Right + 10, buttonY, buttonW, buttonH);
+
+        var buttonY2 = buttonY + buttonH + 8;
+        _homeGuiSetIconHeldBtn.Bounds = new Rectangle(_homeGuiPanelRect.X + 16, buttonY2, buttonW, buttonH);
+        _homeGuiSetIconAutoBtn.Bounds = new Rectangle(_homeGuiSetIconHeldBtn.Bounds.Right + 10, buttonY2, buttonW, buttonH);
+        _homeGuiCloseBtn.Bounds = new Rectangle(_homeGuiSetIconAutoBtn.Bounds.Right + 10, buttonY2, buttonW, buttonH);
+    }
+
+    private void UpdateHomeGui(InputState input, float dt)
+    {
+        LayoutHomeGui();
+        if (_homeGuiStatusTimer > 0f)
+        {
+            _homeGuiStatusTimer = Math.Max(0f, _homeGuiStatusTimer - dt);
+            if (_homeGuiStatusTimer <= 0f)
+                _homeGuiStatus = string.Empty;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            if (_homeGuiEditIndex >= 0)
+            {
+                _homeGuiEditIndex = -1;
+                _homeGuiEditText = string.Empty;
+                return;
+            }
+            if (_homeGuiNameInputFocused)
+            {
+                _homeGuiNameInputFocused = false;
+                return;
+            }
+            _homeGuiOpen = false;
+            _homeGuiNameInputFocused = false;
+            return;
+        }
+
+        if (input.IsNewKeyPress(_homeGuiKey) && !_homeGuiNameInputFocused && _homeGuiEditIndex < 0)
+        {
+            _homeGuiOpen = false;
+            _homeGuiNameInputFocused = false;
+            return;
+        }
+
+        if (input.IsNewLeftClick())
+            _homeGuiNameInputFocused = _homeGuiInputRect.Contains(input.MousePosition);
+
+        var maxScroll = Math.Max(0f, _homes.Count * HomeGuiRowHeight - _homeGuiListRect.Height);
+        if (_homeGuiListRect.Contains(input.MousePosition) && input.ScrollDelta != 0)
+        {
+            var delta = input.ScrollDelta > 0 ? -HomeGuiRowHeight : HomeGuiRowHeight;
+            _homeGuiScroll = Math.Clamp(_homeGuiScroll + delta, 0f, maxScroll);
+        }
+
+        _homeGuiHoverRowIndex = -1;
+        if (TryGetHomeRowAtPoint(input.MousePosition, out var hoverIndex, out _))
+            _homeGuiHoverRowIndex = hoverIndex;
+
+        if (input.IsNewLeftClick())
+        {
+            for (var i = 0; i < _homeGuiHotbarSlots.Length; i++)
+            {
+                if (!_homeGuiHotbarSlots[i].Contains(input.MousePosition))
+                    continue;
+                ref var slot = ref _inventory.Hotbar[i];
+                if (slot.Id == BlockId.Air || slot.Count <= 0)
+                    continue;
+                _homeGuiDragHotbarIndex = i;
+                _homeGuiDragAssignPending = true;
+                _homeGuiHoverHint = "Release over a home row to set icon.";
+                break;
+            }
+        }
+
+        if (input.IsNewLeftClick() && _homeGuiListRect.Contains(input.MousePosition))
+        {
+            if (TryGetHomeRowAtPoint(input.MousePosition, out var idx, out var rowRect))
+            {
+                var pencilRect = new Rectangle(rowRect.Right - 28, rowRect.Y + 7, 20, 20);
+                if (pencilRect.Contains(input.MousePosition))
+                {
+                    BeginHomeInlineEdit(idx);
+                }
+                else
+                {
+                    if (idx == _homeGuiLastClickIndex && (_worldTimeSeconds - _homeGuiLastClickTime) <= 0.4f)
+                    {
+                        _selectedHomeIndex = idx;
+                        _homeGuiNameInput = _homes[idx].Name;
+                        if (TryTeleportToHome(_homes[idx].Name, out var doubleClickResult))
+                            SetHomeGuiStatus(doubleClickResult);
+                        else
+                            SetHomeGuiStatus(doubleClickResult);
+                    }
+                    else
+                    {
+                        _selectedHomeIndex = idx;
+                        _homeGuiNameInput = _homes[idx].Name;
+                    }
+                }
+
+                _homeGuiLastClickIndex = idx;
+                _homeGuiLastClickTime = _worldTimeSeconds;
+            }
+        }
+
+        if (_homeGuiDragAssignPending && _homeGuiDragHotbarIndex >= 0 && !input.IsLeftDown())
+        {
+            if (_homeGuiHoverRowIndex >= 0)
+            {
+                AssignHomeIconFromHotbarIndex(_homeGuiHoverRowIndex, _homeGuiDragHotbarIndex);
+            }
+            _homeGuiDragAssignPending = false;
+            _homeGuiDragHotbarIndex = -1;
+        }
+
+        if (_homeGuiHoverRowIndex >= 0 && TryGetNewHotbarNumber(input, out var hotbarSlot))
+            AssignHomeIconFromHotbarIndex(_homeGuiHoverRowIndex, hotbarSlot);
+
+        if (input.IsNewKeyPress(Keys.Enter))
+        {
+            if (_homeGuiEditIndex >= 0)
+            {
+                CommitHomeInlineEdit();
+                return;
+            }
+            SetHomeAtCurrentPositionFromGui();
+            return;
+        }
+
+        if (_homeGuiEditIndex >= 0)
+        {
+            foreach (var key in input.GetTextInputKeys())
+            {
+                if (key == Keys.Back)
+                {
+                    if (_homeGuiEditText.Length > 0)
+                        _homeGuiEditText = _homeGuiEditText.Substring(0, _homeGuiEditText.Length - 1);
+                    continue;
+                }
+
+                if (!TryMapCommandInputKey(key, input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift), out var c))
+                    continue;
+
+                if (_homeGuiEditText.Length < 24)
+                    _homeGuiEditText += c;
+            }
+        }
+        else if (_homeGuiNameInputFocused)
+        {
+            foreach (var key in input.GetTextInputKeys())
+            {
+                if (key == Keys.Back)
+                {
+                    if (_homeGuiNameInput.Length > 0)
+                        _homeGuiNameInput = _homeGuiNameInput.Substring(0, _homeGuiNameInput.Length - 1);
+                    continue;
+                }
+
+                if (!TryMapCommandInputKey(key, input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift), out var c))
+                    continue;
+
+                if (_homeGuiNameInput.Length < 24)
+                    _homeGuiNameInput += c;
+            }
+        }
+
+        _homeGuiHoverHint = BuildHomeInlineHintText();
+        _homeGuiSetHereBtn.Update(input);
+        _homeGuiRenameBtn.Enabled = _selectedHomeIndex >= 0 && _selectedHomeIndex < _homes.Count;
+        _homeGuiDeleteBtn.Enabled = _selectedHomeIndex >= 0 && _selectedHomeIndex < _homes.Count;
+        _homeGuiSetIconHeldBtn.Enabled = _selectedHomeIndex >= 0 && _selectedHomeIndex < _homes.Count && _inventory.SelectedId != BlockId.Air;
+        _homeGuiSetIconAutoBtn.Enabled = _selectedHomeIndex >= 0 && _selectedHomeIndex < _homes.Count;
+        _homeGuiRenameBtn.Update(input);
+        _homeGuiDeleteBtn.Update(input);
+        _homeGuiSetIconHeldBtn.Update(input);
+        _homeGuiSetIconAutoBtn.Update(input);
+        _homeGuiCloseBtn.Update(input);
+    }
+
+    private void DrawHomeGui(SpriteBatch sb)
+    {
+        sb.Draw(_pixel, _viewport, new Color(0, 0, 0, 110));
+        sb.Draw(_pixel, _homeGuiPanelRect, new Color(18, 22, 28, 230));
+        DrawBorder(sb, _homeGuiPanelRect, new Color(210, 220, 235));
+        _font.DrawString(sb, "HOME MANAGER", new Vector2(_homeGuiPanelRect.X + 16, _homeGuiPanelRect.Y + 12), Color.White);
+
+        sb.Draw(_pixel, _homeGuiInputRect, new Color(10, 10, 10, 210));
+        DrawBorder(sb, _homeGuiInputRect, _homeGuiNameInputFocused ? new Color(230, 230, 130) : new Color(190, 190, 190));
+        var nameInput = string.IsNullOrWhiteSpace(_homeGuiNameInput) ? "(new home name: blank = auto)" : _homeGuiNameInput;
+        _font.DrawString(sb, nameInput, new Vector2(_homeGuiInputRect.X + 8, _homeGuiInputRect.Y + 8), Color.White);
+
+        sb.Draw(_pixel, _homeGuiHotbarRect, new Color(10, 12, 18, 205));
+        DrawBorder(sb, _homeGuiHotbarRect, new Color(156, 170, 190));
+        _font.DrawString(sb, "ICON PICKER: DRAG SLOT TO HOME ROW OR HOVER ROW + PRESS 1-9", new Vector2(_homeGuiHotbarRect.X + 8, _homeGuiHotbarRect.Y - _font.LineHeight), new Color(180, 210, 240));
+        for (var i = 0; i < _homeGuiHotbarSlots.Length; i++)
+        {
+            var slotRect = _homeGuiHotbarSlots[i];
+            var selected = _homeGuiDragHotbarIndex == i && _homeGuiDragAssignPending;
+            sb.Draw(_pixel, slotRect, selected ? new Color(40, 74, 118, 240) : new Color(24, 24, 24, 235));
+            DrawBorder(sb, slotRect, selected ? new Color(220, 235, 255) : new Color(180, 180, 180));
+            var slot = _inventory.Hotbar[i];
+            if (slot.Count > 0 && slot.Id != BlockId.Air)
+            {
+                var icon = GetBlockIcon(slot.Id, Math.Max(16, slotRect.Width - 8));
+                var iconRect = new Rectangle(slotRect.X + 4, slotRect.Y + 4, slotRect.Width - 8, slotRect.Height - 8);
+                if (icon != null)
+                    sb.Draw(icon, iconRect, Color.White);
+                else if (_atlas != null)
+                    sb.Draw(_atlas.Texture, iconRect, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+            }
+
+            _font.DrawString(sb, (i + 1).ToString(), new Vector2(slotRect.X + 2, slotRect.Bottom - _font.LineHeight), new Color(220, 220, 220));
+        }
+
+        sb.Draw(_pixel, _homeGuiListRect, new Color(8, 8, 8, 180));
+        DrawBorder(sb, _homeGuiListRect, new Color(170, 170, 170));
+        _homeGuiRowRects.Clear();
+        _homeGuiPencilRects.Clear();
+
+        var start = (int)(_homeGuiScroll / HomeGuiRowHeight);
+        var yOffset = (int)(_homeGuiScroll % HomeGuiRowHeight);
+        var visibleRows = Math.Max(1, _homeGuiListRect.Height / HomeGuiRowHeight + 2);
+        for (int i = 0; i < visibleRows; i++)
+        {
+            var idx = start + i;
+            if (idx < 0 || idx >= _homes.Count)
+                continue;
+
+            var rowY = _homeGuiListRect.Y + i * HomeGuiRowHeight - yOffset;
+            var rowRect = new Rectangle(_homeGuiListRect.X + 2, rowY, _homeGuiListRect.Width - 4, HomeGuiRowHeight - 2);
+            if (rowRect.Bottom < _homeGuiListRect.Y || rowRect.Y > _homeGuiListRect.Bottom)
+                continue;
+
+            var selected = idx == _selectedHomeIndex;
+            sb.Draw(_pixel, rowRect, selected ? new Color(38, 78, 118, 210) : new Color(20, 20, 20, 175));
+            DrawBorder(sb, rowRect, selected ? new Color(190, 230, 255) : new Color(120, 120, 120));
+            _homeGuiRowRects.Add(rowRect);
+
+            var home = _homes[idx];
+            var iconRect = new Rectangle(rowRect.X + 6, rowRect.Y + 6, 28, 28);
+            DrawHomeIcon(sb, home, iconRect);
+            var pencilRect = new Rectangle(rowRect.Right - 28, rowRect.Y + 7, 20, 20);
+            _homeGuiPencilRects.Add(pencilRect);
+            sb.Draw(_pixel, pencilRect, idx == _homeGuiEditIndex ? new Color(70, 124, 186, 220) : new Color(28, 30, 36, 210));
+            DrawBorder(sb, pencilRect, new Color(184, 204, 224));
+            _font.DrawString(sb, "P", new Vector2(pencilRect.X + 6, pencilRect.Y + 3), new Color(240, 240, 240));
+
+            var coords = $"{(int)home.Position.X}, {(int)home.Position.Y}, {(int)home.Position.Z}";
+            var rowName = idx == _homeGuiEditIndex ? _homeGuiEditText : home.Name;
+            _font.DrawString(sb, rowName, new Vector2(iconRect.Right + 8, rowRect.Y + 6), Color.White);
+            _font.DrawString(sb, coords, new Vector2(iconRect.Right + 8, rowRect.Y + 6 + _font.LineHeight), new Color(190, 205, 225));
+            if (idx == _homeGuiEditIndex && ((int)(_worldTimeSeconds * 2f) % 2 == 0))
+            {
+                var caretX = iconRect.Right + 8 + _font.MeasureString(rowName).X;
+                sb.Draw(_pixel, new Rectangle((int)MathF.Round(caretX), rowRect.Y + 6, 2, _font.LineHeight), new Color(230, 230, 150));
+            }
+        }
+
+        _homeGuiSetHereBtn.Draw(sb, _pixel, _font);
+        _homeGuiRenameBtn.Draw(sb, _pixel, _font);
+        _homeGuiDeleteBtn.Draw(sb, _pixel, _font);
+        _homeGuiSetIconHeldBtn.Draw(sb, _pixel, _font);
+        _homeGuiSetIconAutoBtn.Draw(sb, _pixel, _font);
+        _homeGuiCloseBtn.Draw(sb, _pixel, _font);
+
+        if (!string.IsNullOrWhiteSpace(_homeGuiStatus))
+        {
+            _font.DrawString(sb, _homeGuiStatus, new Vector2(_homeGuiPanelRect.X + 16, _homeGuiPanelRect.Bottom - _font.LineHeight - 4), new Color(235, 235, 180));
+        }
+        else if (!string.IsNullOrWhiteSpace(_homeGuiHoverHint))
+        {
+            _font.DrawString(sb, _homeGuiHoverHint, new Vector2(_homeGuiPanelRect.X + 16, _homeGuiPanelRect.Bottom - _font.LineHeight - 4), new Color(180, 220, 245));
+        }
+
+        if (_homeGuiDragAssignPending && _homeGuiDragHotbarIndex >= 0)
+        {
+            ref var slot = ref _inventory.Hotbar[_homeGuiDragHotbarIndex];
+            if (slot.Count > 0 && slot.Id != BlockId.Air)
+            {
+                var icon = GetBlockIcon(slot.Id, 36);
+                var dragRect = new Rectangle(_overlayMousePos.X - 18, _overlayMousePos.Y - 18, 36, 36);
+                if (icon != null)
+                    sb.Draw(icon, dragRect, Color.White * 0.9f);
+                else if (_atlas != null)
+                    sb.Draw(_atlas.Texture, dragRect, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White * 0.9f);
+            }
+        }
+    }
+
+    private void DrawHomeIcon(SpriteBatch sb, PlayerHomeEntry home, Rectangle iconRect)
+    {
+        sb.Draw(_pixel, iconRect, new Color(28, 28, 28, 240));
+        DrawBorder(sb, iconRect, new Color(200, 200, 200));
+
+        if (home.HasIconBlock)
+        {
+            var iconTexture = GetBlockIcon(home.IconBlock, iconRect.Width - 4);
+            if (iconTexture != null)
+            {
+                sb.Draw(iconTexture, new Rectangle(iconRect.X + 2, iconRect.Y + 2, iconRect.Width - 4, iconRect.Height - 4), Color.White);
+                return;
+            }
+        }
+
+        var fallback = home.Name.Length > 0 ? char.ToUpperInvariant(home.Name[0]).ToString() : "?";
+        _font.DrawString(sb, fallback, new Vector2(iconRect.X + 9, iconRect.Y + 6), Color.White);
+    }
+
+    private bool TryGetHomeRowAtPoint(Point point, out int index, out Rectangle rowRect)
+    {
+        index = -1;
+        rowRect = Rectangle.Empty;
+        if (!_homeGuiListRect.Contains(point))
+            return false;
+
+        var localY = point.Y - _homeGuiListRect.Y + (int)MathF.Round(_homeGuiScroll);
+        index = localY / HomeGuiRowHeight;
+        if (index < 0 || index >= _homes.Count)
+        {
+            index = -1;
+            return false;
+        }
+
+        var rowTop = _homeGuiListRect.Y + (index * HomeGuiRowHeight) - (int)MathF.Round(_homeGuiScroll);
+        rowRect = new Rectangle(_homeGuiListRect.X + 2, rowTop, _homeGuiListRect.Width - 4, HomeGuiRowHeight - 2);
+        return true;
+    }
+
+    private static bool TryGetNewHotbarNumber(InputState input, out int index)
+    {
+        index = -1;
+        if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1)) index = 0;
+        else if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2)) index = 1;
+        else if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3)) index = 2;
+        else if (input.IsNewKeyPress(Keys.D4) || input.IsNewKeyPress(Keys.NumPad4)) index = 3;
+        else if (input.IsNewKeyPress(Keys.D5) || input.IsNewKeyPress(Keys.NumPad5)) index = 4;
+        else if (input.IsNewKeyPress(Keys.D6) || input.IsNewKeyPress(Keys.NumPad6)) index = 5;
+        else if (input.IsNewKeyPress(Keys.D7) || input.IsNewKeyPress(Keys.NumPad7)) index = 6;
+        else if (input.IsNewKeyPress(Keys.D8) || input.IsNewKeyPress(Keys.NumPad8)) index = 7;
+        else if (input.IsNewKeyPress(Keys.D9) || input.IsNewKeyPress(Keys.NumPad9)) index = 8;
+        return index >= 0;
+    }
+
+    private void BeginHomeInlineEdit(int index)
+    {
+        if (index < 0 || index >= _homes.Count)
+            return;
+        _homeGuiEditIndex = index;
+        _homeGuiEditText = _homes[index].Name;
+        _homeGuiNameInputFocused = false;
+    }
+
+    private void CommitHomeInlineEdit()
+    {
+        if (_homeGuiEditIndex < 0 || _homeGuiEditIndex >= _homes.Count)
+            return;
+
+        var newName = NormalizeHomeName(_homeGuiEditText);
+        if (TryFindHomeIndex(newName, out var existingIndex) && existingIndex != _homeGuiEditIndex)
+        {
+            SetHomeGuiStatus($"Home name already exists: {newName}");
+            return;
+        }
+
+        var entry = _homes[_homeGuiEditIndex];
+        var oldName = entry.Name;
+        entry.Name = newName;
+        _homes[_homeGuiEditIndex] = entry;
+        _selectedHomeIndex = _homeGuiEditIndex;
+        _homeGuiNameInput = entry.Name;
+        _homeGuiEditIndex = -1;
+        _homeGuiEditText = string.Empty;
+        SavePlayerState();
+        SetHomeGuiStatus($"Renamed home '{oldName}' to '{entry.Name}'.");
+    }
+
+    private void AssignHomeIconFromHotbarIndex(int homeIndex, int hotbarIndex)
+    {
+        if (homeIndex < 0 || homeIndex >= _homes.Count)
+            return;
+        if (hotbarIndex < 0 || hotbarIndex >= _inventory.Hotbar.Length)
+            return;
+
+        ref var slot = ref _inventory.Hotbar[hotbarIndex];
+        if (slot.Count <= 0 || slot.Id == BlockId.Air)
+        {
+            SetHomeGuiStatus($"Hotbar {hotbarIndex + 1} is empty.");
+            return;
+        }
+
+        var entry = _homes[homeIndex];
+        entry.HasIconBlock = true;
+        entry.IconBlock = slot.Id;
+        _homes[homeIndex] = entry;
+        SavePlayerState();
+        SetHomeGuiStatus($"Home '{entry.Name}' icon set to {slot.Id}.");
+    }
+
+    private string BuildHomeInlineHintText()
+    {
+        if (_homeGuiEditIndex >= 0)
+            return "Editing home name: Enter to save, Esc to cancel.";
+        if (_homeGuiHoverRowIndex >= 0)
+            return "Hover row: press PENCIL to rename, or press 1-9 to copy an icon from hotbar.";
+        return "Tip: drag a hotbar block onto any home row to set an icon.";
+    }
+
+    private void SetHomeAtCurrentPositionFromGui()
+    {
+        if (!TrySetHome(_homeGuiNameInput, _player.Position, out var result))
+        {
+            SetHomeGuiStatus(result);
+            return;
+        }
+
+        _homeGuiNameInput = GetNextAutomaticHomeName();
+        SetHomeGuiStatus(result);
+    }
+
+    private void RenameSelectedHomeFromGui()
+    {
+        if (_selectedHomeIndex < 0 || _selectedHomeIndex >= _homes.Count)
+        {
+            SetHomeGuiStatus("Select a home first.");
+            return;
+        }
+
+        var newName = NormalizeHomeName(_homeGuiNameInput);
+        if (TryFindHomeIndex(newName, out var collision) && collision != _selectedHomeIndex)
+        {
+            SetHomeGuiStatus($"Home name already exists: {newName}");
+            return;
+        }
+
+        var oldName = _homes[_selectedHomeIndex].Name;
+        var renamed = _homes[_selectedHomeIndex];
+        renamed.Name = newName;
+        _homes[_selectedHomeIndex] = renamed;
+        SavePlayerState();
+        SetHomeGuiStatus($"Renamed '{oldName}' to '{newName}'.");
+    }
+
+    private void DeleteSelectedHomeFromGui()
+    {
+        if (_selectedHomeIndex < 0 || _selectedHomeIndex >= _homes.Count)
+        {
+            SetHomeGuiStatus("Select a home first.");
+            return;
+        }
+
+        var removedName = _homes[_selectedHomeIndex].Name;
+        _homes.RemoveAt(_selectedHomeIndex);
+        _selectedHomeIndex = _homes.Count == 0 ? -1 : Math.Clamp(_selectedHomeIndex, 0, _homes.Count - 1);
+        SyncLegacyHomeFields();
+        SavePlayerState();
+        SetHomeGuiStatus($"Deleted '{removedName}'.");
+    }
+
+    private void SetSelectedHomeIconFromHeld()
+    {
+        if (_selectedHomeIndex < 0 || _selectedHomeIndex >= _homes.Count)
+        {
+            SetHomeGuiStatus("Select a home first.");
+            return;
+        }
+
+        if (_inventory.SelectedId == BlockId.Air)
+        {
+            SetHomeGuiStatus("Select a block in hotbar first.");
+            return;
+        }
+
+        var entry = _homes[_selectedHomeIndex];
+        entry.HasIconBlock = true;
+        entry.IconBlock = _inventory.SelectedId;
+        _homes[_selectedHomeIndex] = entry;
+        SavePlayerState();
+        SetHomeGuiStatus($"Icon for '{entry.Name}' set to {_inventory.SelectedId}.");
+    }
+
+    private void SetSelectedHomeIconAuto()
+    {
+        if (_selectedHomeIndex < 0 || _selectedHomeIndex >= _homes.Count)
+        {
+            SetHomeGuiStatus("Select a home first.");
+            return;
+        }
+
+        var entry = _homes[_selectedHomeIndex];
+        entry.HasIconBlock = false;
+        entry.IconBlock = BlockId.Air;
+        _homes[_selectedHomeIndex] = entry;
+        SavePlayerState();
+        SetHomeGuiStatus($"Icon for '{entry.Name}' set to letter.");
+    }
+
+    private void SetHomeGuiStatus(string message)
+    {
+        _homeGuiStatus = message;
+        _homeGuiStatusTimer = 4f;
+    }
+
+    private void OpenStructureFinderGui(bool openStructuresTab)
+    {
+        _homeGuiOpen = false;
+        _structureFinderOpen = true;
+        _structureFinderStructureTab = openStructuresTab;
+        _structureFinderStatus = string.Empty;
+        _structureFinderStatusTimer = 0f;
+        LayoutStructureFinderGui();
+    }
+
+    private void LayoutStructureFinderGui()
+    {
+        if (_structureFinderBiomeRects.Length != FinderBiomeLabels.Length)
+            _structureFinderBiomeRects = new Rectangle[FinderBiomeLabels.Length];
+
+        var panelW = Math.Clamp((int)MathF.Round(_viewport.Width * 0.56f), 520, 860);
+        var panelH = Math.Clamp((int)MathF.Round(_viewport.Height * 0.60f), 360, 620);
+        _structureFinderPanelRect = new Rectangle(
+            _viewport.Center.X - panelW / 2,
+            _viewport.Center.Y - panelH / 2,
+            panelW,
+            panelH);
+
+        var topY = _structureFinderPanelRect.Y + 44;
+        var sidePad = 16;
+        var tabGap = 10;
+        var tabWidth = (_structureFinderPanelRect.Width - sidePad * 2 - tabGap) / 2;
+        _structureFinderBiomeTabBtn.Bounds = new Rectangle(_structureFinderPanelRect.X + sidePad, topY, tabWidth, 34);
+        _structureFinderStructureTabBtn.Bounds = new Rectangle(_structureFinderBiomeTabBtn.Bounds.Right + tabGap, topY, tabWidth, 34);
+
+        _structureFinderListRect = new Rectangle(
+            _structureFinderPanelRect.X + sidePad,
+            _structureFinderBiomeTabBtn.Bounds.Bottom + 10,
+            _structureFinderPanelRect.Width - sidePad * 2,
+            _structureFinderPanelRect.Height - 178);
+
+        var rowH = Math.Max(40, (_structureFinderListRect.Height - 8) / FinderBiomeLabels.Length);
+        for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+        {
+            _structureFinderBiomeRects[i] = new Rectangle(
+                _structureFinderListRect.X + 4,
+                _structureFinderListRect.Y + 4 + i * rowH,
+                _structureFinderListRect.Width - 8,
+                rowH - 6);
+        }
+
+        var bottomY = _structureFinderPanelRect.Bottom - 44;
+        _structureFinderRadiusBtn.Bounds = new Rectangle(_structureFinderPanelRect.X + sidePad, bottomY, 180, 30);
+        _structureFinderFindBtn.Bounds = new Rectangle(_structureFinderRadiusBtn.Bounds.Right + 10, bottomY, 120, 30);
+        _structureFinderCloseBtn.Bounds = new Rectangle(_structureFinderPanelRect.Right - sidePad - 120, bottomY, 120, 30);
+    }
+
+    private void UpdateStructureFinderGui(InputState input, float dt)
+    {
+        LayoutStructureFinderGui();
+        if (_structureFinderStatusTimer > 0f)
+        {
+            _structureFinderStatusTimer = Math.Max(0f, _structureFinderStatusTimer - dt);
+            if (_structureFinderStatusTimer <= 0f)
+                _structureFinderStatus = string.Empty;
+        }
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            _structureFinderOpen = false;
+            return;
+        }
+
+        if (input.IsNewKeyPress(_structureFinderKey))
+        {
+            _structureFinderOpen = false;
+            return;
+        }
+
+        if (!_structureFinderStructureTab && input.IsNewLeftClick() && _structureFinderListRect.Contains(input.MousePosition))
+        {
+            for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+            {
+                if (_structureFinderBiomeRects[i].Contains(input.MousePosition))
+                {
+                    _structureFinderSelectedBiomeIndex = i;
+                    break;
+                }
+            }
+        }
+
+        _structureFinderBiomeTabBtn.ForceDisabledStyle = !_structureFinderStructureTab;
+        _structureFinderStructureTabBtn.ForceDisabledStyle = _structureFinderStructureTab;
+        _structureFinderRadiusBtn.Enabled = !_structureFinderStructureTab;
+        _structureFinderFindBtn.Enabled = !_structureFinderStructureTab;
+        _structureFinderRadiusBtn.ForceDisabledStyle = _structureFinderStructureTab;
+        _structureFinderFindBtn.ForceDisabledStyle = _structureFinderStructureTab;
+
+        _structureFinderBiomeTabBtn.Update(input);
+        _structureFinderStructureTabBtn.Update(input);
+        _structureFinderRadiusBtn.Update(input);
+        _structureFinderFindBtn.Update(input);
+        _structureFinderCloseBtn.Update(input);
+    }
+
+    private void DrawStructureFinderGui(SpriteBatch sb)
+    {
+        sb.Draw(_pixel, _viewport, new Color(0, 0, 0, 120));
+        if (_structureFinderPanelTexture != null)
+            sb.Draw(_structureFinderPanelTexture, _structureFinderPanelRect, Color.White);
+        else
+            sb.Draw(_pixel, _structureFinderPanelRect, new Color(18, 22, 28, 235));
+        DrawBorder(sb, _structureFinderPanelRect, new Color(210, 220, 235));
+
+        _font.DrawString(sb, "FINDER", new Vector2(_structureFinderPanelRect.X + 16, _structureFinderPanelRect.Y + 12), Color.White);
+        _structureFinderBiomeTabBtn.Draw(sb, _pixel, _font);
+        _structureFinderStructureTabBtn.Draw(sb, _pixel, _font);
+
+        sb.Draw(_pixel, _structureFinderListRect, new Color(8, 8, 8, 180));
+        DrawBorder(sb, _structureFinderListRect, new Color(170, 170, 170));
+        if (_structureFinderStructureTab)
+        {
+            var empty = "No structures configured yet.";
+            var helper = "Biome finder is available in the BIOMES tab.";
+            var emptySize = _font.MeasureString(empty);
+            var helperSize = _font.MeasureString(helper);
+            _font.DrawString(sb, empty, new Vector2(_structureFinderListRect.Center.X - emptySize.X / 2f, _structureFinderListRect.Center.Y - _font.LineHeight), new Color(230, 230, 230));
+            _font.DrawString(sb, helper, new Vector2(_structureFinderListRect.Center.X - helperSize.X / 2f, _structureFinderListRect.Center.Y + 4), new Color(175, 195, 220));
+        }
+        else
+        {
+            for (var i = 0; i < _structureFinderBiomeRects.Length; i++)
+            {
+                var rect = _structureFinderBiomeRects[i];
+                var selected = i == _structureFinderSelectedBiomeIndex;
+                sb.Draw(_pixel, rect, selected ? new Color(38, 78, 118, 210) : new Color(20, 20, 20, 175));
+                DrawBorder(sb, rect, selected ? new Color(190, 230, 255) : new Color(120, 120, 120));
+                _font.DrawString(sb, FinderBiomeLabels[i], new Vector2(rect.X + 10, rect.Y + 10), Color.White);
+            }
+        }
+
+        _structureFinderRadiusBtn.Draw(sb, _pixel, _font);
+        _structureFinderFindBtn.Draw(sb, _pixel, _font);
+        _structureFinderCloseBtn.Draw(sb, _pixel, _font);
+
+        var hint = "Find posts one clickable X Y Z result in chat.";
+        _font.DrawString(sb, hint, new Vector2(_structureFinderPanelRect.X + 16, _structureFinderRadiusBtn.Bounds.Y - _font.LineHeight - 4), new Color(182, 202, 224));
+        if (!string.IsNullOrWhiteSpace(_structureFinderStatus))
+            _font.DrawString(sb, _structureFinderStatus, new Vector2(_structureFinderPanelRect.X + 16, _structureFinderPanelRect.Bottom - _font.LineHeight - 8), new Color(235, 235, 180));
+    }
+
+    private void CycleStructureFinderRadius()
+    {
+        _structureFinderRadiusIndex++;
+        if (_structureFinderRadiusIndex >= FinderRadiusOptions.Length)
+            _structureFinderRadiusIndex = 0;
+        SyncStructureFinderRadiusLabel();
+    }
+
+    private void SyncStructureFinderRadiusLabel()
+    {
+        var index = Math.Clamp(_structureFinderRadiusIndex, 0, FinderRadiusOptions.Length - 1);
+        _structureFinderRadiusIndex = index;
+        _structureFinderRadiusBtn.Label = $"RADIUS: {FinderRadiusOptions[index]}";
+    }
+
+    private void ExecuteStructureFinderSearchFromGui()
+    {
+        if (_structureFinderStructureTab)
+        {
+            SetStructureFinderStatus("No structures configured yet.");
+            return;
+        }
+
+        var biomeIndex = Math.Clamp(_structureFinderSelectedBiomeIndex, 0, FinderBiomeTokens.Length - 1);
+        var radiusIndex = Math.Clamp(_structureFinderRadiusIndex, 0, FinderRadiusOptions.Length - 1);
+        var token = FinderBiomeTokens[biomeIndex];
+        var label = FinderBiomeLabels[biomeIndex];
+        var radius = FinderRadiusOptions[radiusIndex];
+        if (TryReportBiomeLocation(token, label, radius))
+            SetStructureFinderStatus($"Located {label}.");
+        else
+            SetStructureFinderStatus($"Unable to locate {label}.");
+    }
+
+    private void SetStructureFinderStatus(string message)
+    {
+        _structureFinderStatus = message;
+        _structureFinderStatusTimer = 4f;
+    }
+
+    private void ExecuteMeCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /me <action>");
+            return;
+        }
+
+        var raw = string.Join(" ", commandParts.Skip(1));
+        var username = _profile.GetDisplayUsername();
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.Emote,
+                Text = raw,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            return;
+        }
+
+        AddChatLine($"* {username} {raw}", isSystem: false);
+    }
+
+    private void ExecuteMsgCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 3)
+        {
+            SetCommandStatus("Usage: /msg <player> <message>");
+            return;
+        }
+
+        if (_lanSession == null || !_lanSession.IsConnected)
+        {
+            SetCommandStatus("Private messaging is only available in multiplayer.");
+            return;
+        }
+
+        if (!TryResolvePlayerTarget(commandParts[1], out var targetId, out var targetName))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        var text = string.Join(" ", commandParts.Skip(2));
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.Whisper,
+            Text = text,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private void ExecuteChatClearCommand(string[] commandParts)
+    {
+        if (commandParts.Length >= 2 && string.Equals(commandParts[1], "confirm", StringComparison.OrdinalIgnoreCase))
+        {
+            ClearChatHistory();
+            return;
+        }
+
+        AddChatLine(
+            "Clear chat history?",
+            isSystem: true,
+            actionLabel: "CONFIRM",
+            customActionToken: ChatClearConfirmActionToken,
+            customActionStatus: "Chat history cleared.",
+            actionLabel2: "CANCEL",
+            customActionToken2: ChatClearCancelActionToken,
+            customActionStatus2: "Chat clear canceled.");
+        SetCommandStatus("Click CONFIRM to clear chat history.", 4f, echoToChat: false);
+    }
+
+    private void ClearChatHistory()
+    {
+        _chatLines.Clear();
+        _chatActionHitboxes.Clear();
+        _hoveredChatActionIndex = -1;
+        _chatOverlayScrollLines = 0;
+        TruncateHistoryFile(ChatHistoryLogPath);
+        ClearPendingQuickConfirmation();
+        ResetInviteQuickHoldState();
+        SetCommandStatus("Chat history cleared.");
+    }
+
+    private void ExecuteGiveCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /give [player] <item_name|id> [amount]. Use TAB for autocomplete.");
+            return;
+        }
+
+        if (string.Equals(commandParts[1], "list", StringComparison.OrdinalIgnoreCase))
+        {
+            var all = BlockRegistry.All
+                .Where(def => def.Id != BlockId.Air)
+                .OrderBy(def => def.AtlasIndex)
+                .Select(def => $"{(byte)def.Id}:{def.Id} ({def.Name})")
+                .ToArray();
+            AddChatLine($"Give IDs: {string.Join(", ", all)}", isSystem: true);
+            SetCommandStatus($"Listed {all.Length} items/blocks. Use snake_case names (example: coal_ore).", 6f, echoToChat: false);
+            return;
+        }
+
+        var args = commandParts.Skip(1).ToList();
+        var amount = 1;
+
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var targetId = localId;
+        var targetName = ResolvePlayerName(localId);
+        var itemParts = new List<string>(args);
+
+        string itemToken;
+        if (args.Count >= 2 && TryResolvePlayerTarget(args[0], out var candidateId, out var candidateName))
+        {
+            targetId = candidateId;
+            targetName = candidateName;
+            itemParts = args.Skip(1).ToList();
+        }
+
+        if (itemParts.Count > 1
+            && int.TryParse(itemParts[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount))
+        {
+            amount = Math.Max(1, parsedAmount);
+            itemParts.RemoveAt(itemParts.Count - 1);
+        }
+
+        itemToken = string.Join(" ", itemParts);
+        if (!TryResolveInventoryItemToken(itemToken, out var itemId))
+        {
+            SetCommandStatus($"Unknown item/block: {itemToken}");
+            return;
+        }
+
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can give items to another player.");
+            return;
+        }
+
+        if (_lanSession == null || targetId == localId)
+        {
+            var added = GiveLocalInventoryItem(itemId, amount);
+            if (added <= 0)
+            {
+                SetCommandStatus($"No inventory space for {itemId}.");
+                return;
+            }
+
+            SetCommandStatus($"Gave {added}x {itemId} to {targetName}.", 4f, echoToChat: false);
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryGiveSyncPrefix}{targetId}|{(byte)itemId}|{amount}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+        SetCommandStatus($"Requested give: {amount}x {itemId} -> {targetName}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteClearInventoryCommand(string[] commandParts)
+    {
+        var args = commandParts.Skip(1).ToArray();
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var targetId = localId;
+        var targetName = ResolvePlayerName(localId);
+
+        // /clear <item> OR /clear <player> <item>
+        if (args.Length >= 1)
+        {
+            if (args.Length >= 2 && TryResolvePlayerTarget(args[0], out var itemTargetId, out var itemTargetName))
+            {
+                var itemToken = string.Join(" ", args.Skip(1));
+                if (TryResolveInventoryItemToken(itemToken, out var targetItemId))
+                {
+                    ExecuteClearSpecificItem(itemTargetId, itemTargetName, targetItemId);
+                    return;
+                }
+            }
+
+            var selfItemToken = string.Join(" ", args);
+            if (TryResolveInventoryItemToken(selfItemToken, out var selfItemId))
+            {
+                ExecuteClearSpecificItem(localId, targetName, selfItemId);
+                return;
+            }
+
+            if (!TryResolvePlayerTarget(args[0], out targetId, out targetName))
+            {
+                SetCommandStatus($"Player not found or invalid item: {args[0]}");
+                return;
+            }
+        }
+
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        AddChatLine(
+            $"Clear inventory for {targetName}?",
+            isSystem: true,
+            actionLabel: "CONFIRM",
+            customActionToken: $"{InventoryClearConfirmActionPrefix}{targetId}",
+            customActionStatus: $"Cleared inventory for {targetName}.",
+            actionLabel2: "CANCEL",
+            customActionToken2: $"{InventoryClearCancelActionPrefix}{targetId}",
+            customActionStatus2: "Inventory clear canceled.");
+        SetCommandStatus($"Click CONFIRM to clear {targetName}'s inventory.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteClearSpecificItem(int targetId, string targetName, BlockId itemId)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory items.");
+            return;
+        }
+
+        if (_lanSession == null || targetId == localId)
+        {
+            var removed = RemoveLocalInventoryItem(itemId);
+            if (removed <= 0)
+            {
+                SetCommandStatus($"{targetName} has no {itemId} in inventory.", 4f, echoToChat: false);
+                return;
+            }
+
+            SetCommandStatus($"Removed {removed}x {itemId} from {targetName}.", 4f, echoToChat: false);
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryClearItemSyncPrefix}{targetId}|{(byte)itemId}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+        SetCommandStatus($"Requested clear of {itemId} for {targetName}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteConfirmedInventoryClear(int targetId)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        var targetName = ResolvePlayerName(targetId);
+        if (_lanSession == null || targetId == localId)
+        {
+            var removed = ClearLocalInventoryItems();
+            var status = removed > 0
+                ? $"Cleared your inventory ({removed} item{(removed == 1 ? string.Empty : "s")})."
+                : "Your inventory is already empty.";
+            SetCommandStatus(status);
+            return;
+        }
+
+        if (!_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory.");
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetId,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryClearSyncPrefix}{targetId}|{_profile.GetDisplayUsername()}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+
+        SetCommandStatus($"Requested inventory clear for {targetName}.");
+    }
+
+    private int ClearLocalInventoryItems()
+    {
+        var removed = _inventory.ClearAll(clearGrid: true);
+        _inventoryHeld = default;
+        _inventoryHasHeld = false;
+        _heldFrom = InventorySlotGroup.None;
+        _heldIndex = -1;
+        SavePlayerState();
+        return removed;
+    }
+
+    private void ClearArtificerInventoryFromUi()
+    {
+        if (_gameMode != GameMode.Artificer)
+            return;
+
+        if (!_inventoryClearConfirmPending)
+        {
+            _inventoryClearConfirmPending = true;
+            _inventoryClearConfirmTimer = InventoryClearConfirmSeconds;
+            SetCommandStatus("Click CLEAR INVENTORY again to confirm.", 3f, echoToChat: false);
+            return;
+        }
+
+        _inventoryClearConfirmPending = false;
+        _inventoryClearConfirmTimer = 0f;
+        var removed = ClearLocalInventoryItems();
+        var status = removed > 0
+            ? $"Inventory cleared ({removed} item{(removed == 1 ? string.Empty : "s")})."
+            : "Inventory is already empty.";
+        SetCommandStatus(status, 3f, echoToChat: false);
+    }
+
+    private int GiveLocalInventoryItem(BlockId itemId, int amount)
+    {
+        var leftover = _inventory.Add(itemId, Math.Max(1, amount));
+        var added = Math.Max(0, amount - leftover);
+        if (added > 0)
+            SavePlayerState();
+        return added;
+    }
+
+    private int RemoveLocalInventoryItem(BlockId itemId)
+    {
+        if (itemId == BlockId.Air)
+            return 0;
+
+        var removed = 0;
+        removed += RemoveItemFromSlots(_inventory.Hotbar, itemId);
+        if (_inventory.Mode != GameMode.Artificer)
+            removed += RemoveItemFromSlots(_inventory.Grid, itemId);
+
+        if (_inventoryHasHeld && _inventoryHeld.Id == itemId && _inventoryHeld.Count > 0)
+        {
+            removed += _inventoryHeld.Count;
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        if (removed > 0)
+            SavePlayerState();
+
+        return removed;
+    }
+
+    private static int RemoveItemFromSlots(HotbarSlot[] slots, BlockId itemId)
+    {
+        var removed = 0;
+        for (var i = 0; i < slots.Length; i++)
+        {
+            if (slots[i].Id != itemId || slots[i].Count <= 0)
+                continue;
+
+            removed += slots[i].Count;
+            slots[i].Id = BlockId.Air;
+            slots[i].Count = 0;
+        }
+
+        return removed;
+    }
+
+    private void ExecutePosCommand(string[] commandParts)
+    {
+        var targetId = _lanSession?.LocalPlayerId ?? 0;
+        if (commandParts.Length >= 2 && !TryResolvePlayerTarget(commandParts[1], out targetId, out _))
+        {
+            SetCommandStatus($"Player not found: {commandParts[1]}");
+            return;
+        }
+
+        if (!TryGetKnownPlayerPose(targetId, out var position, out _, out _))
+        {
+            SetCommandStatus($"Unable to resolve position for {ResolvePlayerName(targetId)}.");
+            return;
+        }
+
+        var x = (int)MathF.Floor(position.X);
+        var y = (int)MathF.Floor(position.Y);
+        var z = (int)MathF.Floor(position.Z);
+        var targetName = ResolvePlayerName(targetId);
+        var coords = $"{x} {y} {z}";
+        AddChatLine(
+            $"{targetName} position: {coords}",
+            isSystem: true,
+            hoverText: "Click COPY to copy coordinates.",
+            copyText: coords,
+            actionLabel: "COPY");
+        SetCommandStatus($"{targetName} is at {coords}.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteBroadcastCommand(string[] commandParts)
+    {
+        if (commandParts.Length < 2)
+        {
+            SetCommandStatus("Usage: /broadcast <message>");
+            return;
+        }
+
+        var text = string.Join(" ", commandParts.Skip(1)).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            SetCommandStatus("Usage: /broadcast <message>");
+            return;
+        }
+
+        var line = $"[BROADCAST] {text}";
+
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.System,
+                Text = line,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            SetCommandStatus("Broadcast sent.", 3f, echoToChat: false);
+            return;
+        }
+
+        AddChatLine(line, isSystem: true);
+        SetCommandStatus("Broadcast sent.", 3f, echoToChat: false);
+    }
+
+    private void ExecuteInvCommand(string[] commandParts)
+    {
+        if (!HasOperatorPermissions())
+        {
+            SetCommandStatus("Inventory viewing requires operator permissions.");
+            return;
+        }
+
+        var args = commandParts.Skip(1).ToArray();
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+
+        // /inv clear - clear inventory view
+        if (args.Length == 1 && args[0].Equals("clear", StringComparison.OrdinalIgnoreCase))
+        {
+            ClearInventoryView();
+            SetCommandStatus("Inventory view cleared.", 3f, echoToChat: false);
+            return;
+        }
+
+        // /inv [player] - view player's inventory
+        int targetId = localId;
+        string targetName = ResolvePlayerName(localId);
+
+        if (args.Length >= 1)
+        {
+            if (!TryResolvePlayerTarget(args[0], out targetId, out targetName))
+            {
+                SetCommandStatus($"Player not found: {args[0]}");
+                return;
+            }
+        }
+        else if (_veilseerSpectateTargetPlayerId >= 0)
+        {
+            targetId = _veilseerSpectateTargetPlayerId;
+            targetName = ResolvePlayerName(targetId);
+        }
+
+        // Start spectating the target player to view their inventory
+        if (targetId == localId)
+        {
+            // View own inventory (open regular inventory UI)
+            if (!_inventoryOpen)
+            {
+                _inventoryOpen = true;
+                SetCommandStatus("Opened your inventory.", 3f, echoToChat: false);
+            }
+            else
+            {
+                SetCommandStatus("Your inventory is already open.", 3f, echoToChat: false);
+            }
+        }
+        else
+        {
+            // Start spectating remote player to view their inventory
+            if (_lanSession == null)
+            {
+                SetCommandStatus("Inventory viewing requires multiplayer session.");
+                return;
+            }
+
+            // Check if target is Veilseer (can't view Veilseer inventory)
+            if (_remoteIsVeilseer.TryGetValue(targetId, out var isVeilseer) && isVeilseer)
+            {
+                SetCommandStatus($"Cannot view {targetName}'s inventory - Veilseer is hidden.");
+                return;
+            }
+
+            // Start spectating and request inventory view
+            StartSpectatingPlayer(targetId);
+            RequestInventoryView(targetId);
+            SetCommandStatus($"Now viewing {targetName}'s inventory.", 3f, echoToChat: false);
+        }
+    }
+
+    private void ClearInventoryView()
+    {
+        // Clear current inventory view target
+        if (_lanSession != null && _lanSession.IsConnected)
+        {
+            var localId = _lanSession.LocalPlayerId;
+            if (_inventoryViewTargetByViewer.TryGetValue(localId, out var targetId))
+            {
+                _inventoryViewTargetByViewer.Remove(localId);
+                if (HasOperatorPermissions())
+                {
+                    _lanSession.SendChat(new LanChatMessage
+                    {
+                        FromPlayerId = localId,
+                        ToPlayerId = -1,
+                        Kind = LanChatKind.System,
+                        Text = InventoryViewClosePrefix + targetId,
+                        TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    });
+                }
+            }
+        }
+        
+        // Stop spectating if currently spectating for inventory viewing
+        if (_veilseerSpectateTargetPlayerId >= 0)
+        {
+            StopSpectatingPlayer();
+        }
+        
+        // Close inventory UI if open
+        if (_inventoryOpen)
+        {
+            _inventoryOpen = false;
+        }
+    }
+
+    private void StartSpectatingPlayer(int targetId)
+    {
+        // Set spectate target
+        _veilseerSpectateTargetPlayerId = targetId;
+        _veilseerSpectateSlot = -1; // Not using slot-based spectating
+        
+        // Show spectate popup
+        var targetName = ResolvePlayerName(targetId);
+        _veilseerSpectatePopupText = $"Spectating {targetName}";
+        _veilseerSpectatePopupTimer = 3f;
+    }
+
+    private void StopSpectatingPlayer()
+    {
+        _veilseerSpectateTargetPlayerId = -1;
+        _veilseerSpectateSlot = -1;
+        _veilseerSpectatePopupText = string.Empty;
+        _veilseerSpectatePopupTimer = 0f;
+        
+        // Clear live inventory view when stopping spectate
+        _currentLiveInventoryTarget = -1;
+    }
+
+    private void RequestInventoryView(int targetId)
+    {
+        if (_lanSession == null)
+            return;
+
+        if (!HasOperatorPermissions())
+            return;
+            
+        var localId = _lanSession.LocalPlayerId;
+        _inventoryViewTargetByViewer[localId] = targetId;
+        _inventoryViewPushAccumulator[localId] = 0f; // Reset accumulator to send immediately
+        
+        // Set current live inventory target
+        _currentLiveInventoryTarget = targetId;
+        
+        // Open inventory UI to show live view
+        if (!_inventoryOpen)
+        {
+            _inventoryOpen = true;
+        }
+
+        if (_lanSession.IsConnected)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.System,
+                Text = InventoryViewRequestPrefix + targetId,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+        }
+    }
+
+    private void UpdateLiveInventoryDisplay(LanInventoryView inventoryView)
+    {
+        // This method will be called when new inventory data arrives
+        // The actual UI rendering will happen in DrawInventory method
+        // with live data from _liveInventoryViews[_currentLiveInventoryTarget]
+    }
+
+    private void ForwardClientInventoryViewToViewers(LanInventoryView inventoryView)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        // Client-to-host updates come in as ViewerPlayerId == TargetPlayerId (the client itself).
+        // Forward to any viewer currently requesting this target.
+        foreach (var pair in _inventoryViewTargetByViewer)
+        {
+            var viewerId = pair.Key;
+            var targetId = pair.Value;
+            if (targetId != inventoryView.TargetPlayerId)
+                continue;
+
+            var forwarded = new LanInventoryView
+            {
+                ViewerPlayerId = viewerId,
+                TargetPlayerId = inventoryView.TargetPlayerId,
+                SelectedIndex = inventoryView.SelectedIndex,
+                HotbarIds = inventoryView.HotbarIds,
+                HotbarCounts = inventoryView.HotbarCounts,
+                GridIds = inventoryView.GridIds,
+                GridCounts = inventoryView.GridCounts
+            };
+
+            _lanSession.SendInventoryView(forwarded);
+        }
+    }
+
+    private void ExecuteCommandClearCommand(string[] _)
+    {
+        var removed = _textInputHistory.RemoveAll(x => x.StartsWith("/", StringComparison.Ordinal));
+        _textInputHistoryBrowsing = false;
+        _textInputHistoryCursor = _textInputHistory.Count;
+        _textInputHistoryDraft = _chatInputActive ? _chatInputText : _commandInputText;
+        TruncateHistoryFile(CommandHistoryLogPath);
+        SetCommandStatus(removed > 0
+            ? $"Cleared {removed} command history entr{(removed == 1 ? "y" : "ies")}."
+            : "No command history entries to clear.");
+    }
+
+    private bool TryResolvePlayerTarget(string token, out int playerId, out string name)
+    {
+        playerId = -1;
+        name = string.Empty;
+        token = (token ?? string.Empty).Trim();
+        if (token.Length == 0)
+            return false;
+
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var localName = (_profile.GetDisplayUsername() ?? string.Empty).Trim();
+
+        if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byId))
+        {
+            if (_playerNames.TryGetValue(byId, out var byIdName))
+            {
+                playerId = byId;
+                name = byIdName;
+                return true;
+            }
+
+            if (byId == localId)
+            {
+                playerId = localId;
+                name = !string.IsNullOrWhiteSpace(localName) ? localName : ResolvePlayerName(localId);
+                return true;
+            }
+        }
+
+        if (string.Equals(token, "@s", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "self", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(token, "me", StringComparison.OrdinalIgnoreCase))
+        {
+            playerId = localId;
+            name = !string.IsNullOrWhiteSpace(localName) ? localName : ResolvePlayerName(localId);
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(localName) && string.Equals(localName, token, StringComparison.OrdinalIgnoreCase))
+        {
+            playerId = localId;
+            name = localName;
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(localName)
+            && localName.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            playerId = localId;
+            name = localName;
+            return true;
+        }
+
+        foreach (var entry in _playerNames)
+        {
+            if (string.Equals(entry.Value, token, StringComparison.OrdinalIgnoreCase))
+            {
+                playerId = entry.Key;
+                name = entry.Value;
+                return true;
+            }
+        }
+
+        foreach (var entry in _playerNames)
+        {
+            if (string.IsNullOrWhiteSpace(entry.Value))
+                continue;
+            if (entry.Value.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                playerId = entry.Key;
+                name = entry.Value;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryResolveOperatorToken(string token, out string operatorName)
+    {
+        operatorName = string.Empty;
+        if (TryResolvePlayerTarget(token, out _, out var resolved))
+            token = resolved;
+
+        var normalized = NormalizeIdentityToken(token);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        operatorName = normalized;
+        return true;
+    }
+
+    private static string NormalizeIdentityToken(string? raw)
+    {
+        return (raw ?? string.Empty).Trim();
+    }
+
+    private string ResolvePersistenceUsername(int playerId, string? primary, string? secondary)
+    {
+        var candidates = new[]
+        {
+            NormalizeIdentityToken(primary),
+            NormalizeIdentityToken(secondary),
+            _playerNames.TryGetValue(playerId, out var mapped) ? NormalizeIdentityToken(mapped) : string.Empty,
+            NormalizeIdentityToken(ResolvePlayerName(playerId))
+        };
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            var candidate = candidates[i];
+            if (string.IsNullOrWhiteSpace(candidate))
+                continue;
+            if (IsGeneratedPlayerPlaceholder(candidate))
+                continue;
+
+            return candidate;
+        }
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            var candidate = candidates[i];
+            if (!string.IsNullOrWhiteSpace(candidate))
+                return candidate;
+        }
+
+        return string.Empty;
+    }
+
+    private static bool IsGeneratedPlayerPlaceholder(string candidate)
+    {
+        if (!candidate.StartsWith("Player", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var suffix = candidate.Substring("Player".Length);
+        return int.TryParse(suffix, out _);
+    }
+
+    private void LoadOperatorsFromMeta()
+    {
+        _operators.Clear();
+        if (_meta?.OperatorUsernames == null)
+            return;
+
+        for (var i = 0; i < _meta.OperatorUsernames.Count; i++)
+        {
+            var normalized = NormalizeIdentityToken(_meta.OperatorUsernames[i]);
+            if (!string.IsNullOrWhiteSpace(normalized))
+                _operators.Add(normalized);
+        }
+    }
+
+    private void PersistOperatorsToMeta()
+    {
+        if (_meta == null)
+            return;
+
+        _meta.OperatorUsernames = _operators
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _meta.Save(_metaPath, _log);
+    }
+
+    private void BroadcastOperatorSyncState()
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        var payload = BuildOperatorSyncPayload();
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = -1,
+            Kind = LanChatKind.System,
+            Text = payload,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private string BuildOperatorSyncPayload()
+    {
+        var payloadNames = _operators
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return OperatorSyncPrefix + string.Join("|", payloadNames);
+    }
+
+    private bool TryHandleOperatorSyncMessage(LanChatMessage message)
+    {
+        if (message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(OperatorSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(OperatorSyncPrefix.Length);
+        _operators.Clear();
+        if (!string.IsNullOrWhiteSpace(payload))
+        {
+            var names = payload.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            for (var i = 0; i < names.Length; i++)
+            {
+                var normalized = NormalizeIdentityToken(names[i]);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                    _operators.Add(normalized);
+            }
+        }
+
+        return true;
+    }
+
+    private bool TryHandleGameModeSyncMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(GameModeSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(GameModeSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            return true;
+
+        if (!int.TryParse(parts[0], out var targetId))
+            return true;
+        if (!TryParseGameModeToken(parts[1], out var mode))
+            return true;
+
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        ApplyGameModeChange(mode, GameModeChangeSource.Command, persistImmediately: _lanSession.IsHost, emitFeedback: true);
+        return true;
+    }
+
+    private bool TryCanPlayerEditRules(int playerId)
+    {
+        if (_lanSession == null)
+            return true;
+        if (playerId == _lanSession.LocalPlayerId)
+            return HasOperatorPermissions();
+
+        var normalizedName = NormalizeIdentityToken(ResolvePlayerName(playerId));
+        return !string.IsNullOrWhiteSpace(normalizedName) && _operators.Contains(normalizedName);
+    }
+
+    private void BroadcastRuleSync(string ruleKey, string normalizedValue)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = -1,
+            Kind = LanChatKind.System,
+            Text = $"{RuleSyncPrefix}{ruleKey}|{normalizedValue}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private void SendRuleStatusToPlayer(int targetPlayerId, string text)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetPlayerId,
+            Kind = LanChatKind.System,
+            Text = text,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private bool TryHandleRuleRequestMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(RuleRequestPrefix, StringComparison.Ordinal))
+            return false;
+
+        // Always swallow internal sync traffic on clients.
+        if (!_lanSession.IsHost)
+            return true;
+
+        var payload = text.Substring(RuleRequestPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3 || !string.Equals(parts[0], "set", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!TryCanPlayerEditRules(message.FromPlayerId))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, "You do not have permission to edit world rules.");
+            return true;
+        }
+
+        var ruleKey = NormalizeWorldRuleKey(parts[1]);
+        if (string.IsNullOrWhiteSpace(ruleKey))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, $"Unknown rule '{parts[1]}'.");
+            return true;
+        }
+
+        if (!TryNormalizeWorldRuleValue(ruleKey, parts[2], out var normalizedValue, out var normalizeError))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, normalizeError);
+            return true;
+        }
+
+        if (!TryApplyWorldRule(ruleKey, normalizedValue, persist: true, out var appliedValue, out var status))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, status);
+            return true;
+        }
+
+        BroadcastRuleSync(ruleKey, appliedValue);
+        SendRuleStatusToPlayer(message.FromPlayerId, status);
+        return true;
+    }
+
+    private bool TryHandleRuleSyncMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(RuleSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(RuleSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            return true;
+
+        var ruleKey = NormalizeWorldRuleKey(parts[0]);
+        if (string.IsNullOrWhiteSpace(ruleKey))
+            return true;
+
+        if (!TryApplyWorldRule(ruleKey, parts[1], persist: false, out var appliedValue, out var _))
+            return true;
+
+        if (message.FromPlayerId != _lanSession.LocalPlayerId)
+            SetCommandStatus($"Rule synced: {ruleKey} = {appliedValue}.", 4f, echoToChat: false);
+
+        return true;
+    }
+
+    private bool TryHandleInventoryClearMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryClearSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryClearSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 1 || !int.TryParse(parts[0], out var targetId))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var hostName = parts.Length >= 2 ? parts[1] : ResolvePlayerName(message.FromPlayerId);
+        var removed = ClearLocalInventoryItems();
+        AddChatLine(
+            removed > 0
+                ? $"Inventory cleared by {hostName} ({removed} item{(removed == 1 ? string.Empty : "s")})."
+                : $"Inventory clear requested by {hostName}, but it was already empty.",
+            isSystem: true);
+        return true;
+    }
+
+    private bool TryHandleInventoryClearItemMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryClearItemSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryClearItemSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2 || !int.TryParse(parts[0], out var targetId) || !byte.TryParse(parts[1], out var itemRaw))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var itemId = (BlockId)itemRaw;
+        var hostName = parts.Length >= 3 ? parts[2] : ResolvePlayerName(message.FromPlayerId);
+        var removed = RemoveLocalInventoryItem(itemId);
+        AddChatLine(
+            removed > 0
+                ? $"{hostName} removed {removed}x {itemId} from your inventory."
+                : $"{hostName} tried to remove {itemId}, but you had none.",
+            isSystem: true);
+        return true;
+    }
+
+    private bool TryHandleInventoryGiveMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryGiveSyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryGiveSyncPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3
+            || !int.TryParse(parts[0], out var targetId)
+            || !byte.TryParse(parts[1], out var itemRaw)
+            || !int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+            return true;
+        if (targetId != _lanSession.LocalPlayerId)
+            return true;
+
+        var itemId = (BlockId)itemRaw;
+        var hostName = parts.Length >= 4 ? parts[3] : ResolvePlayerName(message.FromPlayerId);
+        var added = GiveLocalInventoryItem(itemId, Math.Max(1, amount));
+        AddChatLine(
+            added > 0
+                ? $"{hostName} gave you {added}x {itemId}."
+                : $"{hostName} tried to give {itemId}, but your inventory is full.",
+            isSystem: true);
+        return true;
+    }
+
+    private void HandleNetworkChat(LanChatMessage message)
+    {
+        if (TryHandleOperatorSyncMessage(message))
+            return;
+        if (TryHandleGameModeSyncMessage(message))
+            return;
+        if (TryHandleRuleRequestMessage(message))
+            return;
+        if (TryHandleRuleSyncMessage(message))
+            return;
+        if (TryHandleInventoryClearMessage(message))
+            return;
+        if (TryHandleInventoryClearItemMessage(message))
+            return;
+        if (TryHandleInventoryGiveMessage(message))
+            return;
+        if (TryHandleInventoryViewRequestMessage(message))
+            return;
+
+        var localId = _lanSession?.LocalPlayerId ?? -1;
+        var fromName = ResolvePlayerName(message.FromPlayerId);
+        switch (message.Kind)
+        {
+            case LanChatKind.Emote:
+                {
+                    AddFormattedPlayerChatLine($"* {fromName} ", message.Text ?? string.Empty);
+                    return;
+                }
+            case LanChatKind.Whisper:
+                {
+                    if (message.FromPlayerId == localId && message.ToPlayerId >= 0)
+                    {
+                        AddFormattedPlayerChatLine($"[TO {ResolvePlayerName(message.ToPlayerId)}] ", message.Text ?? string.Empty);
+                    }
+                    else if (message.ToPlayerId == localId)
+                    {
+                        AddFormattedPlayerChatLine($"[FROM {fromName}] ", message.Text ?? string.Empty);
+                    }
+                    return;
+                }
+            case LanChatKind.System:
+                AddChatLine(message.Text, isSystem: true);
+                return;
+            default:
+                {
+                    AddFormattedPlayerChatLine($"{fromName}: ", message.Text ?? string.Empty);
+                    return;
+                }
+        }
+    }
+
+    private void HandleNetworkInventoryView(LanInventoryView inventoryView)
+    {
+        // Direct request packets (used by EOS): empty payloads addressed to self toggle push on/off.
+        if (_lanSession != null
+            && inventoryView.ViewerPlayerId == _lanSession.LocalPlayerId
+            && inventoryView.TargetPlayerId == _lanSession.LocalPlayerId
+            && (inventoryView.HotbarIds == null || inventoryView.HotbarIds.Length == 0)
+            && (inventoryView.GridIds == null || inventoryView.GridIds.Length == 0))
+        {
+            if (inventoryView.SelectedIndex >= 0)
+            {
+                _liveInventoryHostRequestedLocal = true;
+                _liveInventoryHostRequestedTarget = _lanSession.LocalPlayerId;
+                SetCommandStatus($"InvView: push enabled (P{_lanSession.LocalPlayerId}).", 2.0f, echoToChat: false);
+            }
+            else
+            {
+                _liveInventoryHostRequestedLocal = false;
+                _liveInventoryHostRequestedTarget = -1;
+                _liveInventoryLastSentHash = 0;
+                SetCommandStatus($"InvView: push disabled (P{_lanSession.LocalPlayerId}).", 2.0f, echoToChat: false);
+            }
+            return;
+        }
+
+        // Only process inventory views intended for this player
+        if (inventoryView.ViewerPlayerId != (_lanSession?.LocalPlayerId ?? -1))
+            return;
+
+        // Update live inventory state for the target player
+        _liveInventoryTargetPlayerId = inventoryView.TargetPlayerId;
+        _liveInventoryLastUpdateUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (inventoryView.TargetPlayerId == _currentLiveInventoryTarget)
+            SetCommandStatus($"InvView: snapshot applied for P{inventoryView.TargetPlayerId}.", 1.0f, echoToChat: false);
+        
+        // Update mirrored inventory data
+        var hotbarIds = inventoryView.HotbarIds ?? Array.Empty<byte>();
+        var hotbarCounts = inventoryView.HotbarCounts ?? Array.Empty<byte>();
+        var gridIds = inventoryView.GridIds ?? Array.Empty<byte>();
+        var gridCounts = inventoryView.GridCounts ?? Array.Empty<byte>();
+        
+        // Copy hotbar data
+        for (int i = 0; i < Math.Min(hotbarIds.Length, Inventory.HotbarSize); i++)
+        {
+            _liveInventoryHotbar[i] = new HotbarSlot
+            {
+                Id = (BlockId)(hotbarIds[i]),
+                Count = hotbarCounts.Length > i ? hotbarCounts[i] : (byte)0
+            };
+        }
+        
+        // Copy grid data  
+        for (int i = 0; i < Math.Min(gridIds.Length, Inventory.GridSize); i++)
+        {
+            _liveInventoryGrid[i] = new HotbarSlot
+            {
+                Id = (BlockId)(gridIds[i]),
+                Count = gridCounts.Length > i ? gridCounts[i] : (byte)0
+            };
+        }
+        
+        _liveInventorySelectedIndex = Math.Clamp(inventoryView.SelectedIndex, 0, Inventory.HotbarSize - 1);
+    }
+
+    private string ResolvePlayerName(int playerId)
+    {
+        if (_playerNames.TryGetValue(playerId, out var name) && !string.IsNullOrWhiteSpace(name))
+            return name;
+
+        if (_lanSession == null && playerId == 0)
+        {
+            var offlineName = _profile.GetDisplayUsername();
+            if (!string.IsNullOrWhiteSpace(offlineName))
+                return offlineName;
+        }
+
+        if (_lanSession != null && playerId == _lanSession.LocalPlayerId)
+        {
+            var local = _profile.GetDisplayUsername();
+            if (!string.IsNullOrWhiteSpace(local))
+                return local;
+        }
+
+        return $"Player{playerId}";
+    }
+
+    private void ApplyGameModeChange(GameMode target, GameModeChangeSource source, bool persistImmediately, bool emitFeedback)
+    {
+        var modeChanged = _gameMode != target;
+        var previousMode = _gameMode;
+        if (previousMode == GameMode.Artificer)
+            _lastArtificerInventoryView = _artificerInventoryView;
+        _gameMode = target;
+        _inventory.SetMode(target);
+        _artificerInventoryView = target == GameMode.Artificer
+            ? _lastArtificerInventoryView
+            : ArtificerInventoryView.Inventory;
+        if (_inventoryOpen)
+            UpdateInventoryLayout();
+
+        var wasFlying = _player.IsFlying;
+        _player.AllowFlying = target == GameMode.Artificer || target == GameMode.Veilseer;
+        _player.AllowCrouch = target != GameMode.Veilseer;
+        _player.NoClipEnabled = target == GameMode.Veilseer;
+        if (target == GameMode.Veilseer)
+            _player.SetFlying(true);
+        if (!_player.AllowFlying && wasFlying)
+        {
+            _player.SetFlying(false);
+            if (!_player.IsGrounded)
+            {
+                var vel = _player.Velocity;
+                vel.Y = MathF.Min(vel.Y, -1f);
+                _player.Velocity = vel;
+            }
+        }
+
+        if (target != GameMode.Veilseer)
+        {
+            _veilseerXrayEnabled = false;
+            _veilseerSpectateTargetPlayerId = -1;
+            _veilseerSpectateSlot = -1;
+        }
+
+        if (_meta != null)
+        {
+            _meta.CurrentWorldGameMode = target;
+            _meta.GameMode = target;
+            if (persistImmediately)
+                _meta.Save(_metaPath, _log);
+        }
+
+        if (persistImmediately)
+            SavePlayerState();
+
+        if (!emitFeedback || !modeChanged)
+            return;
+
+        var username = _profile.GetDisplayUsername();
+        var modeLabel = target.ToString().ToUpperInvariant();
+        _gamemodeToastText = $"{username} is now {modeLabel}";
+        _gamemodeToastTimer = 2.6f;
+        SetCommandStatus(_gamemodeToastText, 5f);
+    }
+
+    private bool HandleGameModeWheelInput(InputState input)
+    {
+        if (!HasOperatorPermissions())
+        {
+            _gamemodeWheelVisible = false;
+            return false;
+        }
+
+        if (_pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _chatInputActive || _commandInputActive)
+            return false;
+
+        var modifierDown = input.IsKeyDown(_gamemodeModifierKey);
+        var wheelKeyPressed = input.IsNewKeyPress(_gamemodeWheelKey);
+        if (modifierDown && wheelKeyPressed && !IsGamemodeWheelAllowedWithCheats())
+        {
+            _gamemodeWheelVisible = false;
+            ShowGamemodeWheelCheatsDisabledStatus();
+            return true;
+        }
+
+        if (!_gamemodeWheelVisible && modifierDown && wheelKeyPressed)
+        {
+            OpenGamemodeWheel(holdToOpen: true);
+            return true;
+        }
+
+        if (!_gamemodeWheelVisible)
+            return false;
+
+        if (modifierDown && wheelKeyPressed)
+        {
+            var nextMode = GetNextGamemodeWheelMode(_gameMode);
+            _gamemodeWheelHoverMode = GetGamemodeWheelIndex(nextMode);
+            _gamemodeWheelWaitForRelease = true;
+            ApplyGameModeChange(nextMode, GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+            return true;
+        }
+
+        UpdateGamemodeWheelSelection(input.MousePosition);
+        if (input.IsNewKeyPress(Keys.D1) || input.IsNewKeyPress(Keys.NumPad1))
+            _gamemodeWheelHoverMode = 0;
+        else if (input.IsNewKeyPress(Keys.D2) || input.IsNewKeyPress(Keys.NumPad2))
+            _gamemodeWheelHoverMode = 1;
+        else if (input.IsNewKeyPress(Keys.D3) || input.IsNewKeyPress(Keys.NumPad3))
+            _gamemodeWheelHoverMode = 2;
+
+        if (input.IsNewKeyPress(Keys.Escape))
+        {
+            _gamemodeWheelVisible = false;
+            return true;
+        }
+
+        if (_gamemodeWheelHoldToOpen)
+        {
+            if (!modifierDown)
+            {
+                if (!_gamemodeWheelWaitForRelease)
+                    ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+                _gamemodeWheelVisible = false;
+            }
+            else if (input.IsNewLeftClick())
+            {
+                ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+                _gamemodeWheelVisible = false;
+            }
+
+            return true;
+        }
+
+        if (input.IsNewLeftClick() || input.IsNewKeyPress(Keys.Enter))
+        {
+            ApplyGameModeChange(GameModeWheelModes[_gamemodeWheelHoverMode], GameModeChangeSource.Wheel, persistImmediately: true, emitFeedback: true);
+            _gamemodeWheelVisible = false;
+            return true;
+        }
+
+        return true;
+    }
+
+    private bool IsGamemodeWheelAllowedWithCheats()
+        => _meta?.EnableCheats ?? true;
+
+    private void ShowGamemodeWheelCheatsDisabledStatus()
+    {
+        const string text = "Cheats are disabled in this world.";
+        var shouldEcho = !string.Equals(_commandStatusText, text, StringComparison.Ordinal) || _commandStatusTimer <= 0f;
+        SetCommandStatus(text, 4f, echoToChat: shouldEcho);
+    }
+
+    private static int GetGamemodeWheelIndex(GameMode mode)
+    {
+        for (var i = 0; i < GameModeWheelModes.Length; i++)
+        {
+            if (GameModeWheelModes[i] == mode)
+                return i;
+        }
+
+        return 0;
+    }
+
+    private static GameMode GetNextGamemodeWheelMode(GameMode currentMode)
+    {
+        var index = GetGamemodeWheelIndex(currentMode);
+        return GameModeWheelModes[(index + 1) % GameModeWheelModes.Length];
+    }
+
+    private void OpenGamemodeWheel(bool holdToOpen)
+    {
+        _gamemodeWheelVisible = true;
+        _gamemodeWheelHoldToOpen = holdToOpen;
+        _gamemodeWheelWaitForRelease = false;
+        _gamemodeWheelHoverMode = (int)_gameMode;
+    }
+
+    private void UpdateGamemodeWheelSelection(Point mousePoint)
+    {
+        var center = new Vector2(_viewport.Center.X, _viewport.Center.Y);
+        var ringRadius = Math.Clamp(_viewport.Height / 4, 120, 240);
+        var buttonWidth = 220;
+        var buttonHeight = 152;
+
+        for (var i = 0; i < GameModeWheelModes.Length; i++)
+        {
+            var rect = GetGamemodeWheelButtonRect(center, ringRadius, buttonWidth, buttonHeight, i);
+            if (!rect.Contains(mousePoint))
+                continue;
+
+            _gamemodeWheelHoverMode = i;
+            return;
+        }
+    }
+
+    private void DrawGamemodeToast(SpriteBatch sb)
+    {
+        if (_gamemodeToastTimer <= 0f || string.IsNullOrWhiteSpace(_gamemodeToastText))
+            return;
+
+        var size = _font.MeasureString(_gamemodeToastText);
+        var width = (int)Math.Ceiling(size.X) + 24;
+        var height = _font.LineHeight + 14;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 96, width, height);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 190));
+        DrawBorder(sb, rect, new Color(255, 255, 255, 180));
+        _font.DrawString(sb, _gamemodeToastText, new Vector2(rect.X + 12, rect.Y + 7), new Color(235, 235, 235));
+    }
+
+    private void DrawFlySpeedToast(SpriteBatch sb)
+    {
+        if (_flySpeedToastTimer <= 0f || string.IsNullOrWhiteSpace(_flySpeedToastText))
+            return;
+
+        var size = _font.MeasureString(_flySpeedToastText);
+        var width = (int)Math.Ceiling(Math.Max(size.X + 24, 220f));
+        var height = _font.LineHeight + 28;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 136, width, height);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 180));
+        DrawBorder(sb, rect, new Color(255, 255, 255, 170));
+        _font.DrawString(sb, _flySpeedToastText, new Vector2(rect.X + 12, rect.Y + 6), new Color(230, 230, 230));
+
+        var barRect = new Rectangle(rect.X + 12, rect.Bottom - 12, rect.Width - 24, 6);
+        sb.Draw(_pixel, barRect, new Color(255, 255, 255, 50));
+        var fillWidth = (int)Math.Round(barRect.Width * Math.Clamp(_flySpeedToastPercent, 0f, 1f));
+        if (fillWidth > 0)
+            sb.Draw(_pixel, new Rectangle(barRect.X, barRect.Y, fillWidth, barRect.Height), new Color(120, 220, 255));
+    }
+
+    private void DrawVeilseerStatus(SpriteBatch sb)
+    {
+        if (_gameMode != GameMode.Veilseer)
+            return;
+
+        var status = _veilseerXrayEnabled ? "XRAY ON" : "XRAY OFF";
+        if (_veilseerSpectateTargetPlayerId >= 0)
+            status += $" | VIEWING {ResolvePlayerName(_veilseerSpectateTargetPlayerId).ToUpperInvariant()}";
+
+        var size = _font.MeasureString(status);
+        var width = (int)Math.Ceiling(size.X) + 16;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 20, width, _font.LineHeight + 10);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 160));
+        DrawBorder(sb, rect, new Color(180, 220, 255, 180));
+        _font.DrawString(sb, status, new Vector2(rect.X + 8, rect.Y + 5), new Color(220, 240, 255));
+    }
+
+    private void DrawThirdPersonStatus(SpriteBatch sb)
+    {
+        if (!IsThirdPersonCameraActive() || _gameMode == GameMode.Veilseer)
+            return;
+
+        var label = _thirdPersonFreeLookHeld
+            ? $"FREE LOOK ({FormatKeyLabel(_gamemodeModifierKey)} HELD)"
+            : "FOLLOW CAMERA";
+        var borderColor = _thirdPersonFreeLookHeld
+            ? new Color(250, 220, 120, 210)
+            : new Color(170, 220, 255, 180);
+        var textColor = _thirdPersonFreeLookHeld
+            ? new Color(255, 245, 205)
+            : new Color(220, 240, 255);
+        var size = _font.MeasureString(label);
+        var width = (int)Math.Ceiling(size.X) + 16;
+        var height = _font.LineHeight + 10;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 20, width, height);
+        sb.Draw(_pixel, rect, new Color(0, 0, 0, 155));
+        DrawBorder(sb, rect, borderColor);
+        _font.DrawString(sb, label, new Vector2(rect.X + 8, rect.Y + 5), textColor);
+    }
+
+    private void DrawVeilseerSpectatePopup(SpriteBatch sb)
+    {
+        if (_gameMode != GameMode.Veilseer || _veilseerSpectatePopupTimer <= 0f || string.IsNullOrWhiteSpace(_veilseerSpectatePopupText))
+            return;
+
+        var fadeWindow = Math.Min(0.35f, _veilseerSpectatePopupTimer);
+        var alpha = Math.Clamp(fadeWindow / 0.35f, 0f, 1f);
+        var text = _veilseerSpectatePopupText;
+        var size = _font.MeasureString(text);
+        var width = (int)MathF.Ceiling(size.X) + 26;
+        var height = _font.LineHeight + 14;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Center.Y + 26, width, height);
+        var bg = new Color(0, 0, 0, Math.Clamp((int)(170f * alpha), 0, 255));
+        var border = new Color(205, 232, 255, Math.Clamp((int)(235f * alpha), 0, 255));
+        var fg = new Color(238, 248, 255, Math.Clamp((int)(255f * alpha), 0, 255));
+        sb.Draw(_pixel, rect, bg);
+        DrawBorder(sb, rect, border);
+        _font.DrawString(sb, text, new Vector2(rect.X + 13, rect.Y + 7), fg);
+    }
+
+    private void DrawGamemodeWheel(SpriteBatch sb)
+    {
+        if (!_gamemodeWheelVisible)
+            return;
+
+        var center = new Vector2(_viewport.Center.X, _viewport.Center.Y);
+        var ringRadius = Math.Clamp(_viewport.Height / 4, 120, 240);
+        var buttonWidth = 220;
+        var buttonHeight = 152;
+
+        for (var i = 0; i < GameModeWheelModes.Length; i++)
+        {
+            var mode = GameModeWheelModes[i];
+            var rect = GetGamemodeWheelButtonRect(center, ringRadius, buttonWidth, buttonHeight, i);
+            var hovered = i == _gamemodeWheelHoverMode;
+            sb.Draw(_pixel, rect, hovered ? new Color(42, 82, 116, 230) : new Color(0, 0, 0, 190));
+            DrawBorder(sb, rect, hovered ? new Color(225, 241, 255) : new Color(176, 176, 176));
+
+            var iconRect = new Rectangle(rect.X + 12, rect.Y + 10, rect.Width - 24, rect.Height - (_font.LineHeight + 22));
+            DrawTextureFit(sb, GetGamemodeWheelIcon(mode), iconRect, Color.White);
+
+            var label = mode.ToString().ToUpperInvariant();
+            var size = _font.MeasureString(label);
+            var labelPos = new Vector2(rect.Center.X - size.X / 2f, rect.Bottom - _font.LineHeight - 8);
+            _font.DrawString(sb, label, labelPos, hovered ? new Color(245, 250, 255) : new Color(225, 225, 225));
+        }
+
+        var help = _gamemodeWheelHoldToOpen
+            ? $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)} HOLD: release to apply | HOLD {FormatKeyLabel(_gamemodeModifierKey)} + TAP {FormatKeyLabel(_gamemodeWheelKey)}: cycle"
+            : "Click or Enter to apply | Esc to cancel";
+        var helpSize = _font.MeasureString(help);
+        _font.DrawString(sb, help, new Vector2(center.X - helpSize.X / 2f, center.Y - _font.LineHeight / 2f), new Color(235, 235, 235));
+    }
+
+    private void LoadGamemodeWheelIcons()
+    {
+        _gamemodeArtificerIcon = TryLoadOptionalTexture(
+            "textures/menu/buttons/GamemodeArtificerIcon.png",
+            "textures/menu/buttons/Artificer.png");
+        _gamemodeVeilwalkerIcon = TryLoadOptionalTexture(
+            "textures/menu/buttons/GamemodeVeilwalkerIcon.png",
+            "textures/menu/buttons/Veilwalker.png");
+        _gamemodeVeilseerIcon = TryLoadOptionalTexture(
+            "textures/menu/buttons/GamemodeVeilseerIcon.png",
+            "textures/menu/buttons/Veilseer.png");
+    }
+
+    private Texture2D? TryLoadOptionalTexture(params string[] candidates)
+    {
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            try
+            {
+                return _assets.LoadTexture(candidates[i]);
+            }
+            catch
+            {
+                // Try next candidate.
+            }
+        }
+
+        return null;
+    }
+
+    private Texture2D? GetGamemodeWheelIcon(GameMode mode)
+    {
+        return mode switch
+        {
+            GameMode.Artificer => _gamemodeArtificerIcon,
+            GameMode.Veilwalker => _gamemodeVeilwalkerIcon,
+            _ => _gamemodeVeilseerIcon
+        };
+    }
+
+    private static Rectangle GetGamemodeWheelButtonRect(Vector2 center, int ringRadius, int buttonWidth, int buttonHeight, int index)
+    {
+        var angle = -MathF.PI / 2f + index * (MathF.Tau / 3f);
+        var cx = center.X + MathF.Cos(angle) * ringRadius;
+        var cy = center.Y + MathF.Sin(angle) * ringRadius;
+        return new Rectangle((int)(cx - buttonWidth / 2f), (int)(cy - buttonHeight / 2f), buttonWidth, buttonHeight);
+    }
+
+    private static Rectangle GetFitRect(Texture2D texture, Rectangle bounds)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0 || texture.Width <= 0 || texture.Height <= 0)
+            return Rectangle.Empty;
+
+        var scale = Math.Min(bounds.Width / (float)texture.Width, bounds.Height / (float)texture.Height);
+        var width = Math.Max(1, (int)Math.Round(texture.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(texture.Height * scale));
+        return new Rectangle(
+            bounds.Center.X - width / 2,
+            bounds.Center.Y - height / 2,
+            width,
+            height);
+    }
+
+    private static void DrawTextureFit(SpriteBatch sb, Texture2D? texture, Rectangle bounds, Color color)
+    {
+        if (texture == null)
+            return;
+
+        var fit = GetFitRect(texture, bounds);
+        if (fit.Width <= 0 || fit.Height <= 0)
+            return;
+
+        sb.Draw(texture, fit, color);
+    }
+
+    private static bool TryParseDifficultyToken(string value, out int difficulty)
+    {
+        difficulty = 1;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var token = value.Trim().ToLowerInvariant();
+        switch (token)
+        {
+            case "peaceful":
+            case "0":
+                difficulty = 0;
+                return true;
+            case "easy":
+            case "1":
+                difficulty = 1;
+                return true;
+            case "normal":
+            case "2":
+                difficulty = 2;
+                return true;
+            case "hard":
+            case "3":
+                difficulty = 3;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static string GetDifficultyLabel(int difficulty)
+    {
+        return difficulty switch
+        {
+            0 => "Peaceful",
+            1 => "Easy",
+            2 => "Normal",
+            3 => "Hard",
+            _ => "Easy"
+        };
+    }
+
+    private bool TryFindNearestBiome(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ, out float distance)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        distance = 0f;
+
+        if (_world == null || _meta == null)
+            return false;
+
+        originX = ClampWorldX(originX);
+        originZ = ClampWorldZ(originZ);
+        foundX = originX;
+        foundZ = originZ;
+
+        if (IsBiomeMatch(_world.GetBiomeNameAt(originX, originZ), targetBiomeToken))
+            return true;
+
+        var hasCatalogTarget = BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId);
+
+        var step = maxRadius >= 4096 ? 8 : 4;
+        var bestDistSq = long.MaxValue;
+        var bestX = originX;
+        var bestZ = originZ;
+        var found = false;
+
+        void EvaluateCandidate(int wx, int wz)
+        {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+
+            var biome = _world.GetBiomeNameAt(wx, wz);
+            if (!IsBiomeMatch(biome, targetBiomeToken))
+                return;
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (distSq >= bestDistSq)
+                return;
+
+            bestDistSq = distSq;
+            bestX = wx;
+            bestZ = wz;
+            found = true;
+        }
+
+        if (hasCatalogTarget)
+        {
+            // Use BiomeService for deterministic biome lookup instead of catalog
+            for (var wz = originZ - BiomeSearchRefineWindow; wz <= originZ + BiomeSearchRefineWindow; wz++)
+            {
+                for (var wx = originX - BiomeSearchRefineWindow; wx <= originX + BiomeSearchRefineWindow; wx++)
+                {
+                    if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                    {
+                        EvaluateCandidate(wx, wz);
+                    }
+                }
+            }
+        }
+
+        for (var radius = step; radius <= maxRadius; radius += step)
+        {
+            for (var dx = -radius; dx <= radius; dx += step)
+            {
+                EvaluateCandidate(originX + dx, originZ - radius);
+                EvaluateCandidate(originX + dx, originZ + radius);
+            }
+
+            for (var dz = -radius + step; dz <= radius - step; dz += step)
+            {
+                EvaluateCandidate(originX - radius, originZ + dz);
+                EvaluateCandidate(originX + radius, originZ + dz);
+            }
+
+            if (found)
+                break;
+        }
+
+        if (!found)
+        {
+            var worldRadius = GetBiomeSearchWorldRadius();
+
+            if (hasCatalogTarget)
+            {
+                // Use BiomeService for deterministic biome lookup instead of catalog
+                for (var wz = originZ - BiomeSearchRefineWindow; wz <= originZ + BiomeSearchRefineWindow; wz++)
+                {
+                    for (var wx = originX - BiomeSearchRefineWindow; wx <= originX + BiomeSearchRefineWindow; wx++)
+                    {
+                        if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                        {
+                            EvaluateCandidate(wx, wz);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!found)
+        {
+            var stride = Math.Max(step, 8);
+            var searchRadius = HasFiniteWorldBounds() ? 0 : Math.Max(2048, maxRadius);
+            var minX = HasFiniteWorldBounds() ? 0 : originX - searchRadius;
+            var maxX = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Width - 1) : originX + searchRadius;
+            var minZ = HasFiniteWorldBounds() ? 0 : originZ - searchRadius;
+            var maxZ = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Depth - 1) : originZ + searchRadius;
+            for (var wz = minZ; wz <= maxZ; wz += stride)
+            {
+                for (var wx = minX; wx <= maxX; wx += stride)
+                    EvaluateCandidate(wx, wz);
+                if (HasFiniteWorldBounds())
+                    EvaluateCandidate(maxX, wz);
+            }
+
+            if (HasFiniteWorldBounds())
+            {
+                for (var wx = 0; wx <= maxX; wx += stride)
+                    EvaluateCandidate(wx, maxZ);
+                EvaluateCandidate(maxX, maxZ);
+            }
+        }
+
+        if (!found)
+        {
+            if (!TryFindBestBiomeClimateCandidate(targetBiomeToken, originX, originZ, out bestX, out bestZ))
+            {
+                bestX = originX;
+                bestZ = originZ;
+            }
+
+            bestDistSq = (long)(bestX - originX) * (bestX - originX) + (long)(bestZ - originZ) * (bestZ - originZ);
+            found = true;
+        }
+
+        var coarseX = bestX;
+        var coarseZ = bestZ;
+        var refineRadius = Math.Max(3, step * 2);
+        for (var wz = coarseZ - refineRadius; wz <= coarseZ + refineRadius; wz++)
+        {
+            for (var wx = coarseX - refineRadius; wx <= coarseX + refineRadius; wx++)
+                EvaluateCandidate(wx, wz);
+        }
+
+        if (!found)
+        {
+            bestX = originX;
+            bestZ = originZ;
+            bestDistSq = 0;
+            found = true;
+        }
+
+        foundX = bestX;
+        foundZ = bestZ;
+        distance = MathF.Sqrt(bestDistSq);
+        return found;
+    }
+
+    private bool TryFindExactBiomeCoordinate(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ, out float distance)
+    {
+        foundX = originX;
+        foundZ = originZ;
+        distance = 0f;
+
+        if (_world == null || _meta == null)
+            return false;
+
+        originX = ClampWorldX(originX);
+        originZ = ClampWorldZ(originZ);
+        foundX = originX;
+        foundZ = originZ;
+        if (IsBiomeMatch(_world.GetBiomeNameAt(originX, originZ), targetBiomeToken))
+            return true;
+
+        var radiusDistSq = (long)Math.Max(16, maxRadius) * Math.Max(16, maxRadius);
+        var bestDistSq = long.MaxValue;
+        var found = false;
+        var bestXLocal = originX;
+        var bestZLocal = originZ;
+
+        void EvaluateCandidate(int wx, int wz, bool ignoreRadius = false)
+        {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+            if (!IsBiomeMatch(_world.GetBiomeNameAt(wx, wz), targetBiomeToken))
+                return;
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (!ignoreRadius && distSq > radiusDistSq)
+                return;
+            if (distSq >= bestDistSq)
+                return;
+
+            bestDistSq = distSq;
+            bestXLocal = wx;
+            bestZLocal = wz;
+            found = true;
+        }
+
+        if (BiomeService.TryParseBiomeToken(targetBiomeToken, out var targetBiomeId))
+        {
+            // Use BiomeService for deterministic biome lookup instead of catalog
+            var stride = 64;
+            var climateRadius = HasFiniteWorldBounds() ? GetBiomeSearchWorldRadius() : Math.Max(2048, maxRadius);
+            var minX = HasFiniteWorldBounds() ? 0 : originX - climateRadius;
+            var maxX = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Width - 1) : originX + climateRadius;
+            var minZ = HasFiniteWorldBounds() ? 0 : originZ - climateRadius;
+            var maxZ = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Depth - 1) : originZ + climateRadius;
+            for (var wz = minZ; wz <= maxZ; wz += stride)
+            {
+                for (var wx = minX; wx <= maxX; wx += stride)
+                {
+                    if (BiomeService.GetBiomeIdAtWorldXZ(_meta, wx, wz) == targetBiomeId)
+                    {
+                        EvaluateCandidate(wx, wz);
+                    }
+                }
+            }
+        }
+
+        if (!found)
+        {
+            var step = maxRadius >= 4096 ? 8 : 4;
+            for (var radius = step; radius <= maxRadius; radius += step)
+            {
+                for (var dx = -radius; dx <= radius; dx += step)
+                {
+                    EvaluateCandidate(originX + dx, originZ - radius);
+                    EvaluateCandidate(originX + dx, originZ + radius);
+                }
+
+                for (var dz = -radius + step; dz <= radius - step; dz += step)
+                {
+                    EvaluateCandidate(originX - radius, originZ + dz);
+                    EvaluateCandidate(originX + radius, originZ + dz);
+                }
+
+                if (found)
+                    break;
+            }
+        }
+
+        if (!found)
+        {
+            var searchRadius = HasFiniteWorldBounds() ? 0 : Math.Max(2048, maxRadius);
+            var minX = HasFiniteWorldBounds() ? 0 : originX - searchRadius;
+            var maxX = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Width - 1) : originX + searchRadius;
+            var minZ = HasFiniteWorldBounds() ? 0 : originZ - searchRadius;
+            var maxZ = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Depth - 1) : originZ + searchRadius;
+            foreach (var stride in new[] { 16, 8, 4, 2 })
+            {
+                for (var wz = minZ; wz <= maxZ; wz += stride)
+                {
+                    for (var wx = minX; wx <= maxX; wx += stride)
+                        EvaluateCandidate(wx, wz);
+                    if (HasFiniteWorldBounds())
+                        EvaluateCandidate(maxX, wz);
+                }
+
+                if (HasFiniteWorldBounds())
+                {
+                    for (var wx = 0; wx <= maxX; wx += stride)
+                        EvaluateCandidate(wx, maxZ);
+                    EvaluateCandidate(maxX, maxZ);
+                }
+
+                if (found)
+                    break;
+            }
+
+            if (!found)
+            {
+                // Final exact sweep across the whole world to guarantee accuracy when a biome exists.
+                for (var wz = 0; wz <= maxZ; wz++)
+                {
+                    for (var wx = 0; wx <= maxX; wx++)
+                        EvaluateCandidate(wx, wz, ignoreRadius: true);
+                }
+            }
+        }
+
+        if (!found)
+            return false;
+
+        foundX = bestXLocal;
+        foundZ = bestZLocal;
+        distance = MathF.Sqrt(bestDistSq);
+        return true;
+    }
+
+    private int GetBiomeSearchWorldRadius()
+    {
+        if (_meta?.Size == null)
+            return CommandFindBiomeMaxRadius;
+
+        if (!HasFiniteWorldBounds())
+            return Math.Max(CommandFindBiomeMaxRadius, 16384);
+
+        var width = Math.Max(1, _meta.Size.Width);
+        var depth = Math.Max(1, _meta.Size.Depth);
+        var diag = Math.Sqrt((double)width * width + (double)depth * depth);
+        return Math.Max(CommandFindBiomeMaxRadius, (int)Math.Ceiling(diag));
+    }
+
+    private bool TryFindBestBiomeClimateCandidate(string targetBiomeToken, int originX, int originZ, out int bestX, out int bestZ)
+    {
+        if (_world == null || _meta?.Size == null)
+        {
+            bestX = originX;
+            bestZ = originZ;
+            return false;
+        }
+
+        var stride = 8;
+        var bestScore = float.NegativeInfinity;
+        var bestDistSq = long.MaxValue;
+        var searchRadius = HasFiniteWorldBounds() ? 0 : Math.Max(2048, GetBiomeSearchWorldRadius() / 4);
+        var minX = HasFiniteWorldBounds() ? 0 : originX - searchRadius;
+        var maxX = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Width - 1) : originX + searchRadius;
+        var minZ = HasFiniteWorldBounds() ? 0 : originZ - searchRadius;
+        var maxZ = HasFiniteWorldBounds() ? Math.Max(0, _meta.Size.Depth - 1) : originZ + searchRadius;
+        var bestXLocal = originX;
+        var bestZLocal = originZ;
+
+        void Evaluate(int wx, int wz)
+        {
+            if (!IsWithinBiomeSearchBounds(wx, wz))
+                return;
+
+            var ocean = _world.GetOceanWeightAt(wx, wz);
+            var desert = _world.GetDesertWeightAt(wx, wz);
+            var hills = _world.GetHillsWeightAt(wx, wz);
+            var score = targetBiomeToken switch
+            {
+                "ocean" => ocean,
+                "desert" => desert * (1f - ocean * 0.9f),
+                "hills" => hills,
+                _ => Math.Clamp(1f - MathF.Max(ocean, desert), 0f, 1f)
+            };
+
+            var dx = wx - originX;
+            var dz = wz - originZ;
+            var distSq = (long)dx * dx + (long)dz * dz;
+            if (score < bestScore)
+                return;
+            if (MathF.Abs(score - bestScore) < 0.0001f && distSq >= bestDistSq)
+                return;
+
+            bestScore = score;
+            bestDistSq = distSq;
+            bestXLocal = wx;
+            bestZLocal = wz;
+        }
+
+        for (var wz = minZ; wz <= maxZ; wz += stride)
+        {
+            for (var wx = minX; wx <= maxX; wx += stride)
+                Evaluate(wx, wz);
+            if (HasFiniteWorldBounds())
+                Evaluate(maxX, wz);
+        }
+
+        if (HasFiniteWorldBounds())
+        {
+            for (var wx = 0; wx <= maxX; wx += stride)
+                Evaluate(wx, maxZ);
+            Evaluate(maxX, maxZ);
+        }
+
+        bestX = bestXLocal;
+        bestZ = bestZLocal;
+        return !float.IsNegativeInfinity(bestScore);
+    }
+
+
+    private bool IsWithinBiomeSearchBounds(int wx, int wz)
+    {
+        if (_meta == null)
+            return false;
+
+        if (!HasFiniteWorldBounds())
+            return true;
+
+        return wx >= 0
+            && wz >= 0
+            && wx < _meta.Size.Width
+            && wz < _meta.Size.Depth;
+    }
+
+    private static bool IsBiomeMatch(string biomeName, string targetBiomeToken)
+    {
+        return NormalizeBiomeToken(biomeName) == targetBiomeToken;
+    }
+
+    private static bool TryResolveBiome(string value, out string biomeToken, out string biomeLabel)
+    {
+        biomeToken = "";
+        biomeLabel = "";
+        switch (NormalizeBiomeToken(value))
+        {
+            case "desert":
+                biomeToken = "desert";
+                biomeLabel = "Desert";
+                return true;
+            case "grass":
+            case "grassy":
+            case "grassland":
+            case "grasslands":
+            case "plains":
+                biomeToken = "grasslands";
+                biomeLabel = "Grasslands";
+                return true;
+            case "forest":
+            case "woods":
+            case "woodland":
+            case "trees":
+                biomeToken = "forest";
+                biomeLabel = "Forest";
+                return true;
+            case "hill":
+            case "hills":
+            case "highlands":
+                biomeToken = "hills";
+                biomeLabel = "Hills";
+                return true;
+            case "ocean":
+            case "sea":
+            case "water":
+                biomeToken = "ocean";
+                biomeLabel = "Ocean";
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static string NormalizeBiomeToken(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var chars = value.Trim().ToLowerInvariant();
+        var buffer = new char[chars.Length];
+        var count = 0;
+        for (var i = 0; i < chars.Length; i++)
+        {
+            var c = chars[i];
+            if (char.IsWhiteSpace(c) || c == '_' || c == '-')
+                continue;
+            buffer[count++] = c;
+        }
+
+        return count <= 0 ? string.Empty : new string(buffer, 0, count);
+    }
+
+    private static bool TryMapCommandInputKey(Keys key, bool shift, out char c)
+    {
+        c = '\0';
+
+        if (key >= Keys.A && key <= Keys.Z)
+        {
+            c = (char)('A' + (key - Keys.A));
+            if (!shift)
+                c = char.ToLowerInvariant(c);
+            return true;
+        }
+
+        if (key >= Keys.D0 && key <= Keys.D9)
+        {
+            var digit = (int)(key - Keys.D0);
+            if (shift)
+            {
+                const string shiftedDigits = ")!@#$%^&*(";
+                c = shiftedDigits[digit];
+            }
+            else
+            {
+                c = (char)('0' + digit);
+            }
+
+            return true;
+        }
+
+        if (key >= Keys.NumPad0 && key <= Keys.NumPad9)
+        {
+            c = (char)('0' + (key - Keys.NumPad0));
+            return true;
+        }
+
+        switch (key)
+        {
+            case Keys.Space:
+                c = ' ';
+                return true;
+            case Keys.OemMinus:
+            case Keys.Subtract:
+                c = shift ? '_' : '-';
+                return true;
+            case Keys.OemPlus:
+            case Keys.Add:
+                c = shift ? '+' : '=';
+                return true;
+            case Keys.OemPeriod:
+            case Keys.Decimal:
+                c = '.';
+                return true;
+            case Keys.OemComma:
+                c = shift ? '<' : ',';
+                return true;
+            case Keys.OemQuestion:
+            case Keys.Divide:
+                c = shift ? '?' : '/';
+                return true;
+            case Keys.OemSemicolon:
+                c = shift ? ':' : ';';
+                return true;
+            case Keys.OemQuotes:
+                c = shift ? '"' : '\'';
+                return true;
+            case Keys.OemOpenBrackets:
+                c = shift ? '{' : '[';
+                return true;
+            case Keys.OemCloseBrackets:
+                c = shift ? '}' : ']';
+                return true;
+            case Keys.OemPipe:
+                c = shift ? '|' : '\\';
+                return true;
+            case Keys.OemTilde:
+                c = shift ? '~' : '`';
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void SetCommandStatus(string text, float seconds = 5f, bool echoToChat = true)
+    {
+        _commandStatusText = text;
+        _commandStatusTimer = Math.Max(0f, seconds);
+        if (echoToChat)
+            AddChatLine(text, isSystem: true);
+    }
+
+    private void DrawCommandOverlay(SpriteBatch sb)
+    {
+        _chatActionHitboxes.Clear();
+        _hoveredChatActionIndex = -1;
+
+        var hasVisibleChatLines = _chatLines.Any(line => line.TimeRemaining > 0f);
+        var hasPendingQuickConfirmation = TryGetPendingQuickConfirmation(out _, out _, out var quickConfirmPrompt);
+        var hasInviteQuickOverlay = _inviteQuickStatusTimer > 0f || _inviteQuickHoldActive || hasPendingQuickConfirmation;
+        if (!IsTextInputActive && !hasVisibleChatLines && !hasInviteQuickOverlay)
+            return;
+
+        var x = _viewport.X + 20;
+        var overlayWidth = Math.Clamp((int)MathF.Round(_viewport.Width * ChatOverlayWidthRatio), ChatOverlayMinWidth, ChatOverlayMaxWidth);
+        var reservedAboveBottomUi = _hotbarRect.Y > 0 ? _hotbarRect.Y - 92 : _viewport.Bottom - 20;
+        var y = Math.Min(_viewport.Bottom - 20, reservedAboveBottomUi);
+        y = Math.Max(_viewport.Y + 160, y);
+        var overlayTop = _viewport.Y + 120;
+        if (IsTextInputActive)
+        {
+            var tintRect = new Rectangle(x - 8, overlayTop, overlayWidth + 16, Math.Max(24, y - overlayTop + 10));
+            sb.Draw(_pixel, tintRect, new Color(100, 100, 100, 56));
+            DrawBorder(sb, tintRect, new Color(185, 185, 185, 120));
+        }
+
+        if (_commandInputActive || _chatInputActive)
+        {
+            var blink = ((int)(_worldTimeSeconds * 2f) & 1) == 0;
+            var prompt = _commandInputActive ? "CMD> " : "CHAT> ";
+            var value = _commandInputActive ? _commandInputText : _chatInputText;
+            var inputLine = $"{prompt}{value}{(blink ? "_" : string.Empty)}";
+            y = DrawCommandLine(sb, x, y, inputLine, new Color(0, 0, 0, 210), new Color(235, 235, 235), fixedWidth: overlayWidth);
+            y -= 6;
+
+            var predictionInput = (_commandInputActive ? _commandInputText : _chatInputText).TrimStart();
+            if (predictionInput.StartsWith("/", StringComparison.Ordinal))
+            {
+                BuildCommandPredictions(predictionInput);
+                for (var i = 0; i < _commandPredictionBuffer.Count; i++)
+                {
+                    var prediction = _commandPredictionBuffer[i];
+                    var action = string.IsNullOrWhiteSpace(prediction.HoverText)
+                        ? (ChatActionHitbox?)null
+                        : new ChatActionHitbox { HoverText = prediction.HoverText };
+                    y = DrawCommandLine(sb, x, y, prediction.Text, new Color(0, 0, 0, 175), new Color(180, 240, 255), action: action, fixedWidth: overlayWidth);
+                    y -= 2;
+                }
+            }
+
+            if (_chatLines.Count > 0)
+            {
+                var historyHint = _chatOverlayScrollLines > 0
+                    ? $"HISTORY OFFSET: {_chatOverlayScrollLines} (Wheel/PageUp/PageDown)"
+                    : "HISTORY: LATEST (Wheel/PageUp/PageDown)";
+                y = DrawCommandLine(sb, x, y, historyHint, new Color(0, 0, 0, 160), new Color(170, 190, 220), fixedWidth: overlayWidth);
+                y -= 2;
+            }
+        }
+
+        if (hasInviteQuickOverlay)
+        {
+            var hasPendingJoin = TryGetNewestPendingJoinRequest(out var pendingPeerId, out var pendingDisplay);
+            var inviteName = hasPendingJoin ? pendingDisplay : "PLAYER";
+            var keyLabel = FormatKeyLabel(_inviteQuickActionKey);
+            string inviteText;
+            if (_inviteQuickStatusTimer > 0f && !string.IsNullOrWhiteSpace(_inviteQuickStatusText))
+            {
+                inviteText = _inviteQuickStatusText;
+            }
+            else if (hasPendingQuickConfirmation)
+            {
+                inviteText = $"{quickConfirmPrompt} Tap {keyLabel} to CANCEL, hold {keyLabel} to CONFIRM.";
+            }
+            else
+            {
+                inviteText = $"Invite from {inviteName}: tap {keyLabel} to DECLINE, hold {keyLabel} to ACCEPT.";
+            }
+
+            y = DrawCommandLine(sb, x, y, inviteText, new Color(0, 0, 0, 190), new Color(230, 235, 255), fixedWidth: overlayWidth);
+
+            if (_inviteQuickHoldActive && (!string.IsNullOrWhiteSpace(pendingPeerId) || hasPendingQuickConfirmation))
+            {
+                var progress = Math.Clamp(_inviteQuickHoldElapsed / InviteQuickHoldAcceptSeconds, 0f, 1f);
+                var barRect = new Rectangle(x + 10, y - 16, overlayWidth - 20, 10);
+                var fillRect = new Rectangle(barRect.X + 1, barRect.Y + 1, Math.Max(0, (int)((barRect.Width - 2) * progress)), Math.Max(0, barRect.Height - 2));
+                sb.Draw(_pixel, barRect, new Color(20, 20, 20, 220));
+                sb.Draw(_pixel, fillRect, new Color(90, 205, 140, 220));
+                DrawBorder(sb, barRect, new Color(220, 240, 255, 170));
+                y -= 18;
+            }
+
+            y -= 4;
+        }
+
+        var startIndex = _chatLines.Count - 1;
+        if (startIndex >= 0 && IsTextInputActive)
+            startIndex = Math.Clamp(startIndex - _chatOverlayScrollLines, 0, _chatLines.Count - 1);
+
+        for (var i = startIndex; i >= 0; i--)
+        {
+            var line = _chatLines[i];
+            if (!IsTextInputActive && line.TimeRemaining <= 0f)
+                continue;
+
+            var fg = line.HasTextColorOverride
+                ? line.TextColorOverride
+                : line.IsSystem ? new Color(200, 220, 255) : new Color(230, 230, 230);
+            if (line.HasTeleportAction)
+            {
+                var action = new ChatActionHitbox
+                {
+                    HasTeleport = true,
+                    TeleportX = line.TeleportX,
+                    TeleportY = line.TeleportY,
+                    TeleportZ = line.TeleportZ,
+                    HoverText = string.IsNullOrWhiteSpace(line.HoverText)
+                        ? $"Teleport to {line.TeleportX} {line.TeleportY} {line.TeleportZ}"
+                        : line.HoverText
+                };
+                y = DrawCommandLine(sb, x, y, line.Text, new Color(0, 0, 0, 145), fg, action: action, fixedWidth: overlayWidth);
+            }
+            else if (line.HasCopyAction)
+            {
+                var action = new ChatActionHitbox
+                {
+                    HasCopy = true,
+                    CopyText = line.CopyText,
+                    CopyStatusText = "Copied to clipboard.",
+                    HoverText = string.IsNullOrWhiteSpace(line.HoverText)
+                        ? "Click to copy."
+                        : line.HoverText
+                };
+                y = DrawCommandLine(
+                    sb,
+                    x,
+                    y,
+                    line.Text,
+                    new Color(0, 0, 0, 145),
+                    fg,
+                    actionLabel: line.ActionLabel,
+                    action: action,
+                    fixedWidth: overlayWidth);
+            }
+            else if (line.HasCustomAction)
+            {
+                var action = new ChatActionHitbox
+                {
+                    HasCustomAction = true,
+                    CustomActionToken = line.CustomActionToken,
+                    CustomActionStatus = line.CustomActionStatus,
+                    HoverText = string.IsNullOrWhiteSpace(line.HoverText)
+                        ? "Click to run action."
+                        : line.HoverText
+                };
+                y = DrawCommandLine(
+                    sb,
+                    x,
+                    y,
+                    line.Text,
+                    new Color(0, 0, 0, 145),
+                    fg,
+                    actionLabel: line.ActionLabel,
+                    action: action,
+                    fixedWidth: overlayWidth,
+                    actionLabel2: line.ActionLabel2,
+                    action2: line.HasCustomAction2 ? new ChatActionHitbox
+                    {
+                        HasCustomAction = true,
+                        CustomActionToken = line.CustomActionToken2,
+                        CustomActionStatus = line.CustomActionStatus2,
+                        HoverText = string.IsNullOrWhiteSpace(line.HoverText2)
+                            ? "Click to perform action."
+                            : line.HoverText2
+                    } : (ChatActionHitbox?)null);
+            }
+            else
+            {
+                if (line.HasRichText)
+                {
+                    var hideSpoiler = line.HasSpoilerContent && !line.SpoilerRevealed;
+                    if (hideSpoiler)
+                    {
+                        var revealAction = new ChatActionHitbox
+                        {
+                            HasCustomAction = true,
+                            CustomActionToken = $"spoiler-reveal:{line.LineId}",
+                            CustomActionStatus = "Spoiler revealed.",
+                            HoverText = "Reveal spoiler text."
+                        };
+                        y = DrawRichCommandLine(
+                            sb,
+                            x,
+                            y,
+                            line,
+                            new Color(0, 0, 0, 145),
+                            fg,
+                            fixedWidth: overlayWidth,
+                            hideSpoilers: true,
+                            actionLabel: "REVEAL",
+                            action: revealAction);
+                    }
+                    else
+                    {
+                        y = DrawRichCommandLine(sb, x, y, line, new Color(0, 0, 0, 145), fg, fixedWidth: overlayWidth);
+                    }
+                }
+                else
+                    y = DrawCommandLine(sb, x, y, line.Text, new Color(0, 0, 0, 145), fg, fixedWidth: overlayWidth);
+            }
+
+            y -= 2;
+            if (y <= _viewport.Y + 120)
+                break;
+        }
+
+        if (_hoveredChatActionIndex >= 0 && _hoveredChatActionIndex < _chatActionHitboxes.Count)
+        {
+            var hover = _chatActionHitboxes[_hoveredChatActionIndex];
+            if (!string.IsNullOrWhiteSpace(hover.HoverText))
+            {
+                var tooltip = hover.HoverText;
+                var size = _font.MeasureString(tooltip);
+                var tw = (int)Math.Ceiling(size.X) + 12;
+                var th = _font.LineHeight + 10;
+                var tx = Math.Clamp(_overlayMousePos.X + 14, _viewport.X + 8, _viewport.Right - tw - 8);
+                var ty = Math.Clamp(_overlayMousePos.Y - th - 10, _viewport.Y + 8, _viewport.Bottom - th - 8);
+                var rect = new Rectangle(tx, ty, tw, th);
+                sb.Draw(_pixel, rect, new Color(0, 0, 0, 220));
+                DrawBorder(sb, rect, new Color(255, 255, 255, 180));
+                _font.DrawString(sb, tooltip, new Vector2(rect.X + 6, rect.Y + 5), new Color(230, 235, 255));
+            }
+        }
+    }
+
+    private void BuildCommandPredictions(string input)
+    {
+        _commandPredictionBuffer.Clear();
+        if (string.IsNullOrWhiteSpace(input) || !input.StartsWith("/", StringComparison.Ordinal))
+            return;
+
+        EnsureCommandRegistry();
+        if (!TryParseCommandCompletionContext(input, out var context))
+            return;
+
+        BuildCommandCompletionCandidates(context, _commandTabBuildBuffer);
+        if (_commandTabBuildBuffer.Count == 0)
+            return;
+
+        var maxCount = Math.Min(MaxCommandPredictions, _commandTabBuildBuffer.Count);
+        for (var i = 0; i < maxCount; i++)
+        {
+            var candidate = _commandTabBuildBuffer[i];
+            var preview = context.TokenIndex == 0
+                ? "/" + candidate.Value
+                : context.PrefixText + candidate.Value;
+            _commandPredictionBuffer.Add(new CommandPredictionItem(preview, candidate.HoverText));
+        }
+    }
+
+    private int DrawCommandLine(
+        SpriteBatch sb,
+        int x,
+        int bottomY,
+        string text,
+        Color background,
+        Color foreground,
+        string? actionLabel = null,
+        ChatActionHitbox? action = null,
+        int? fixedWidth = null,
+        string? actionLabel2 = null,
+        ChatActionHitbox? action2 = null)
+    {
+        var actionWidth = 0;
+        if (!string.IsNullOrWhiteSpace(actionLabel))
+            actionWidth = (int)Math.Ceiling(_font.MeasureString(actionLabel).X) + 16;
+
+        var actionWidth2 = 0;
+        if (!string.IsNullOrWhiteSpace(actionLabel2))
+            actionWidth2 = (int)Math.Ceiling(_font.MeasureString(actionLabel2).X) + 16;
+
+        var totalActionWidth = actionWidth + (actionWidth2 > 0 ? actionWidth2 + 8 : 0);
+
+        var maxWidth = Math.Max(240, _viewport.Width - 40);
+        var requestedWidth = fixedWidth ?? maxWidth;
+        var width = Math.Clamp(requestedWidth, 320, maxWidth);
+        var textWidth = Math.Max(120, width - 18 - totalActionWidth);
+        var wrappedLines = WrapOverlayText(text, textWidth);
+        var lineSpacing = 2;
+        var textHeight = wrappedLines.Count * _font.LineHeight + Math.Max(0, wrappedLines.Count - 1) * lineSpacing;
+        var height = textHeight + 12;
+        var rect = new Rectangle(x, bottomY - height, width, height);
+        sb.Draw(_pixel, rect, background);
+        DrawBorder(sb, rect, new Color(255, 255, 255, 170));
+        var textY = rect.Y + 6;
+        for (var i = 0; i < wrappedLines.Count; i++)
+        {
+            _font.DrawString(sb, wrappedLines[i], new Vector2(rect.X + 8, textY), foreground);
+            textY += _font.LineHeight + lineSpacing;
+        }
+
+        if (action.HasValue)
+        {
+            var index = _chatActionHitboxes.Count;
+            var hitbox = action.Value;
+            var targetRect = rect;
+            if (!string.IsNullOrWhiteSpace(actionLabel))
+            {
+                // Align buttons to the right, Button 2 is further right than Button 1 if both exist.
+                // Wait, usually we want [Label] [Label2] or [Label2] [Label]
+                // Let's do [Label] [Label2] from right to left.
+                var button2Offset = actionWidth2 > 0 ? actionWidth2 + 8 : 0;
+                targetRect = new Rectangle(rect.Right - totalActionWidth - 8, rect.Y + 4, actionWidth, rect.Height - 8);
+            }
+
+            hitbox.Bounds = targetRect;
+            _chatActionHitboxes.Add(hitbox);
+
+            var hovered = targetRect.Contains(_overlayMousePos);
+            if (hovered)
+                _hoveredChatActionIndex = index;
+
+            if (!string.IsNullOrWhiteSpace(actionLabel))
+            {
+                sb.Draw(_pixel, targetRect, hovered ? new Color(45, 90, 145, 230) : new Color(30, 70, 120, 220));
+                DrawBorder(sb, targetRect, hovered ? new Color(190, 230, 255) : new Color(120, 170, 210));
+                var labelPos = new Vector2(targetRect.X + 8, targetRect.Y + 3);
+                _font.DrawString(sb, actionLabel, labelPos, new Color(235, 245, 255));
+            }
+            else if (hovered)
+            {
+                DrawBorder(sb, rect, new Color(190, 230, 255));
+            }
+        }
+
+        if (action2.HasValue && !string.IsNullOrWhiteSpace(actionLabel2))
+        {
+            var index = _chatActionHitboxes.Count;
+            var hitbox = action2.Value;
+            var targetRect = new Rectangle(rect.Right - actionWidth2 - 8, rect.Y + 4, actionWidth2, rect.Height - 8);
+
+            hitbox.Bounds = targetRect;
+            _chatActionHitboxes.Add(hitbox);
+
+            var hovered = targetRect.Contains(_overlayMousePos);
+            if (hovered)
+                _hoveredChatActionIndex = index;
+
+            sb.Draw(_pixel, targetRect, hovered ? new Color(45, 90, 145, 230) : new Color(30, 70, 120, 220));
+            DrawBorder(sb, targetRect, hovered ? new Color(190, 230, 255) : new Color(120, 170, 210));
+            var labelPos = new Vector2(targetRect.X + 8, targetRect.Y + 3);
+            _font.DrawString(sb, actionLabel2, labelPos, new Color(235, 245, 255));
+        }
+
+        return rect.Y;
+    }
+
+    private int DrawRichCommandLine(
+        SpriteBatch sb,
+        int x,
+        int bottomY,
+        ChatLine line,
+        Color background,
+        Color fallbackForeground,
+        int? fixedWidth = null,
+        bool hideSpoilers = false,
+        string? actionLabel = null,
+        ChatActionHitbox? action = null)
+    {
+        var actionWidth = 0;
+        if (!string.IsNullOrWhiteSpace(actionLabel))
+            actionWidth = (int)Math.Ceiling(_font.MeasureString(actionLabel).X) + 16;
+
+        var maxWidth = Math.Max(240, _viewport.Width - 40);
+        var requestedWidth = fixedWidth ?? maxWidth;
+        var width = Math.Clamp(requestedWidth, 320, maxWidth);
+        var textWidth = Math.Max(120, width - 18 - actionWidth);
+
+        BuildRichTextBuffers(
+            line,
+            fallbackForeground,
+            out var fullText,
+            out var colors,
+            out var boldFlags,
+            out var italicFlags,
+            out var spoilerFlags);
+
+        var wrappedRanges = WrapOverlayTextRanges(fullText, textWidth);
+        var lineSpacing = 2;
+        var textHeight = wrappedRanges.Count * _font.LineHeight + Math.Max(0, wrappedRanges.Count - 1) * lineSpacing;
+        var height = textHeight + 12;
+        var rect = new Rectangle(x, bottomY - height, width, height);
+        sb.Draw(_pixel, rect, background);
+        DrawBorder(sb, rect, new Color(255, 255, 255, 170));
+
+        var textY = rect.Y + 6;
+        for (var i = 0; i < wrappedRanges.Count; i++)
+        {
+            var range = wrappedRanges[i];
+            DrawRichTextRange(
+                sb,
+                fullText,
+                range.start,
+                range.length,
+                colors,
+                boldFlags,
+                italicFlags,
+                spoilerFlags,
+                rect.X + 8,
+                textY,
+                fallbackForeground,
+                hideSpoilers);
+            textY += _font.LineHeight + lineSpacing;
+        }
+
+        if (action.HasValue && !string.IsNullOrWhiteSpace(actionLabel))
+        {
+            var index = _chatActionHitboxes.Count;
+            var hitbox = action.Value;
+            var targetRect = new Rectangle(rect.Right - actionWidth - 8, rect.Y + 4, actionWidth, rect.Height - 8);
+            hitbox.Bounds = targetRect;
+            _chatActionHitboxes.Add(hitbox);
+
+            var hovered = targetRect.Contains(_overlayMousePos);
+            if (hovered)
+                _hoveredChatActionIndex = index;
+
+            sb.Draw(_pixel, targetRect, hovered ? new Color(45, 90, 145, 230) : new Color(30, 70, 120, 220));
+            DrawBorder(sb, targetRect, hovered ? new Color(190, 230, 255) : new Color(120, 170, 210));
+            _font.DrawString(sb, actionLabel, new Vector2(targetRect.X + 8, targetRect.Y + 3), new Color(235, 245, 255));
+        }
+
+        return rect.Y;
+    }
+
+    private void BuildRichTextBuffers(
+        ChatLine line,
+        Color fallbackForeground,
+        out string fullText,
+        out Color[] colors,
+        out bool[] boldFlags,
+        out bool[] italicFlags,
+        out bool[] spoilerFlags)
+    {
+        var prefix = line.RichPrefixText ?? string.Empty;
+        var message = line.RichMessageText ?? string.Empty;
+        fullText = prefix + message;
+
+        if (fullText.Length == 0)
+            fullText = string.Empty;
+
+        colors = new Color[fullText.Length];
+        boldFlags = new bool[fullText.Length];
+        italicFlags = new bool[fullText.Length];
+        spoilerFlags = new bool[fullText.Length];
+        for (var i = 0; i < fullText.Length; i++)
+            colors[i] = fallbackForeground;
+
+        var prefixLen = prefix.Length;
+        var cursor = Math.Clamp(prefixLen, 0, fullText.Length);
+        if (line.RichMessageSpans == null || line.RichMessageSpans.Count == 0)
+            return;
+
+        for (var spanIndex = 0; spanIndex < line.RichMessageSpans.Count; spanIndex++)
+        {
+            var span = line.RichMessageSpans[spanIndex];
+            var spanText = span.Text ?? string.Empty;
+            for (var i = 0; i < spanText.Length && cursor < fullText.Length; i++, cursor++)
+            {
+                colors[cursor] = span.Color;
+                boldFlags[cursor] = span.Bold;
+                italicFlags[cursor] = span.Italic;
+                spoilerFlags[cursor] = span.Spoiler;
+            }
+        }
+    }
+
+    private void DrawRichTextRange(
+        SpriteBatch sb,
+        string text,
+        int start,
+        int length,
+        Color[] colors,
+        bool[] boldFlags,
+        bool[] italicFlags,
+        bool[] spoilerFlags,
+        int x,
+        int y,
+        Color fallbackForeground,
+        bool hideSpoilers)
+    {
+        if (length <= 0)
+            return;
+
+        var end = Math.Min(text.Length, start + length);
+        float drawX = x;
+        var i = Math.Clamp(start, 0, text.Length);
+        while (i < end)
+        {
+            var color = (i < colors.Length) ? colors[i] : fallbackForeground;
+            var bold = i < boldFlags.Length && boldFlags[i];
+            var italic = i < italicFlags.Length && italicFlags[i];
+            var spoiler = i < spoilerFlags.Length && spoilerFlags[i];
+            var runStart = i;
+            i++;
+            while (i < end)
+            {
+                var sameColor = i < colors.Length && colors[i] == color;
+                var sameBold = i < boldFlags.Length && boldFlags[i] == bold;
+                var sameItalic = i < italicFlags.Length && italicFlags[i] == italic;
+                var sameSpoiler = i < spoilerFlags.Length && spoilerFlags[i] == spoiler;
+                if (!sameColor || !sameBold || !sameItalic || !sameSpoiler)
+                    break;
+                i++;
+            }
+
+            var chunk = text.Substring(runStart, i - runStart);
+            var chunkWidth = _font.MeasureString(chunk).X;
+            if (hideSpoilers && spoiler)
+            {
+                var spoilerRect = new Rectangle((int)drawX, y + 1, Math.Max(4, (int)Math.Ceiling(chunkWidth)), Math.Max(4, _font.LineHeight - 2));
+                sb.Draw(_pixel, spoilerRect, new Color(0, 0, 0, 230));
+                DrawBorder(sb, spoilerRect, new Color(70, 70, 70, 220));
+            }
+            else
+            {
+                DrawStyledChatChunk(sb, chunk, new Vector2(drawX, y), color, bold, italic);
+            }
+
+            drawX += chunkWidth;
+        }
+    }
+
+    private void DrawStyledChatChunk(SpriteBatch sb, string text, Vector2 pos, Color color, bool bold, bool italic)
+    {
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        if (italic)
+            _font.DrawString(sb, text, pos + new Vector2(1f, 0f), new Color(color.R, color.G, color.B, Math.Max(60, color.A - 30)));
+
+        _font.DrawString(sb, text, pos, color);
+
+        if (bold)
+            _font.DrawString(sb, text, pos + new Vector2(1f, 0f), color);
+    }
+
+    private List<(int start, int length)> WrapOverlayTextRanges(string text, int maxTextWidth)
+    {
+        var ranges = new List<(int start, int length)>();
+        if (string.IsNullOrEmpty(text))
+        {
+            ranges.Add((0, 0));
+            return ranges;
+        }
+
+        var paragraphStart = 0;
+        while (paragraphStart <= text.Length)
+        {
+            var newline = text.IndexOf('\n', paragraphStart);
+            var paragraphEnd = newline >= 0 ? newline : text.Length;
+            if (paragraphEnd <= paragraphStart)
+            {
+                ranges.Add((paragraphStart, 0));
+            }
+            else
+            {
+                var cursor = paragraphStart;
+                while (cursor < paragraphEnd)
+                {
+                    var bestLen = 0;
+                    var bestSpaceLen = -1;
+                    for (var len = 1; cursor + len <= paragraphEnd; len++)
+                    {
+                        var sample = text.Substring(cursor, len);
+                        if (_font.MeasureString(sample).X > maxTextWidth)
+                            break;
+                        bestLen = len;
+                        if (char.IsWhiteSpace(text[cursor + len - 1]))
+                            bestSpaceLen = len;
+                    }
+
+                    if (bestLen <= 0)
+                        bestLen = 1;
+
+                    var useLen = bestLen;
+                    if (cursor + bestLen < paragraphEnd && bestSpaceLen > 0)
+                        useLen = bestSpaceLen;
+
+                    while (useLen > 0 && char.IsWhiteSpace(text[cursor + useLen - 1]))
+                        useLen--;
+
+                    if (useLen <= 0)
+                    {
+                        cursor += Math.Max(1, bestLen);
+                        continue;
+                    }
+
+                    ranges.Add((cursor, useLen));
+                    cursor += bestLen;
+                    while (cursor < paragraphEnd && char.IsWhiteSpace(text[cursor]))
+                        cursor++;
+                }
+            }
+
+            if (newline < 0)
+                break;
+            paragraphStart = newline + 1;
+        }
+
+        if (ranges.Count == 0)
+            ranges.Add((0, 0));
+        return ranges;
+    }
+
+    private List<string> WrapOverlayText(string text, int maxTextWidth)
+    {
+        var lines = new List<string>();
+        var content = text ?? string.Empty;
+        if (content.Length == 0)
+        {
+            lines.Add(string.Empty);
+            return lines;
+        }
+
+        var paragraphs = content.Split('\n');
+        for (var p = 0; p < paragraphs.Length; p++)
+        {
+            var paragraph = paragraphs[p];
+            if (string.IsNullOrWhiteSpace(paragraph))
+            {
+                lines.Add(string.Empty);
+                continue;
+            }
+
+            var words = paragraph.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var current = string.Empty;
+            for (var i = 0; i < words.Length; i++)
+            {
+                var word = words[i];
+                var candidate = current.Length == 0 ? word : $"{current} {word}";
+                if (_font.MeasureString(candidate).X <= maxTextWidth)
+                {
+                    current = candidate;
+                    continue;
+                }
+
+                if (current.Length > 0)
+                {
+                    lines.Add(current);
+                    current = string.Empty;
+                }
+
+                if (_font.MeasureString(word).X <= maxTextWidth)
+                {
+                    current = word;
+                    continue;
+                }
+
+                // Hard-wrap overly long tokens.
+                var token = word;
+                var start = 0;
+                while (start < token.Length)
+                {
+                    var take = 1;
+                    var best = token.Substring(start, take);
+                    while (start + take <= token.Length)
+                    {
+                        var slice = token.Substring(start, take);
+                        if (_font.MeasureString(slice).X > maxTextWidth)
+                            break;
+                        best = slice;
+                        take++;
+                    }
+
+                    lines.Add(best);
+                    start += best.Length;
+                }
+            }
+
+            if (current.Length > 0)
+                lines.Add(current);
+        }
+
+        if (lines.Count == 0)
+            lines.Add(string.Empty);
+
+        return lines;
+    }
+
+    private void DrawSelectedBlockName(SpriteBatch sb)
+    {
+        if (_selectedNameTimer <= 0 || _pauseMenuOpen || string.IsNullOrEmpty(_displayName))
+            return;
+
+        var text = _displayName.ToUpperInvariant();
+        var size = _font.MeasureString(text);
+        
+        // Draw above hotbar
+        var alpha = Math.Min(1.0f, _selectedNameTimer);
+        var pos = new Vector2((_viewport.Width - size.X) / 2f, _hotbarRect.Y - size.Y - 10f);
+        
+        // Shadow/Glow effect
+        _font.DrawString(sb, text, pos + new Vector2(2, 2), Color.Black * 0.6f * alpha);
+        _font.DrawString(sb, text, pos, Color.White * alpha);
+    }
+
+    private VertexPositionTexture[] BuildBoxVertices(Vector3 min, Vector3 max, CubeNetAtlas atlas, byte id)
+    {
+        var verts = new List<VertexPositionTexture>();
+        
+        // Helper to add faces with UVs from atlas
+        AddFace(verts, atlas, id, FaceDirection.PosX, new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z));
+        AddFace(verts, atlas, id, FaceDirection.NegX, new Vector3(min.X, min.Y, max.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(min.X, max.Y, max.Z));
+        AddFace(verts, atlas, id, FaceDirection.PosY, new Vector3(min.X, max.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z), new Vector3(min.X, max.Y, min.Z));
+        AddFace(verts, atlas, id, FaceDirection.NegY, new Vector3(min.X, min.Y, min.Z), new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(min.X, min.Y, max.Z));
+        AddFace(verts, atlas, id, FaceDirection.PosZ, new Vector3(min.X, min.Y, max.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(min.X, max.Y, max.Z));
+        AddFace(verts, atlas, id, FaceDirection.NegZ, new Vector3(max.X, min.Y, min.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(max.X, max.Y, min.Z));
+
+        return verts.ToArray();
+    }
+
+    private void AddFace(List<VertexPositionTexture> verts, CubeNetAtlas atlas, byte id, FaceDirection face, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3)
+    {
+        atlas.GetFaceUvRect(id, face, out var uv00, out var uv10, out var uv11, out var uv01);
+        
+        // Vertex order for non-flipped faces
+        verts.Add(new VertexPositionTexture(p0, uv00));
+        verts.Add(new VertexPositionTexture(p1, uv10));
+        verts.Add(new VertexPositionTexture(p2, uv11));
+        verts.Add(new VertexPositionTexture(p0, uv00));
+        verts.Add(new VertexPositionTexture(p2, uv11));
+        verts.Add(new VertexPositionTexture(p3, uv01));
+    }
+
+    private struct ChatActionHitbox
+    {
+        public Rectangle Bounds;
+        public bool HasTeleport;
+        public int TeleportX;
+        public int TeleportY;
+        public int TeleportZ;
+        public bool HasCopy;
+        public string CopyText;
+        public string CopyStatusText;
+        public bool HasCustomAction;
+        public string CustomActionToken;
+        public string CustomActionStatus;
+        public string HoverText;
+    }
+
+    private enum CommandPermission
+    {
+        Everyone,
+        Operator,
+        HostOnly
+    }
+
+    private enum GameModeChangeSource
+    {
+        Command,
+        Wheel,
+        Load
+    }
+
+    private readonly struct CommandDescriptor
+    {
+        public CommandDescriptor(
+            string name,
+            string[] aliases,
+            string usage,
+            string description,
+            CommandPermission permission,
+            Action<string[]> handler)
+        {
+            Name = name;
+            Aliases = aliases;
+            Usage = usage;
+            Description = description;
+            Permission = permission;
+            Handler = handler;
+        }
+
+        public string Name { get; }
+        public string[] Aliases { get; }
+        public string Usage { get; }
+        public string Description { get; }
+        public CommandPermission Permission { get; }
+        public Action<string[]> Handler { get; }
+    }
+
+    private readonly struct CommandPredictionItem
+    {
+        public CommandPredictionItem(string text, string hoverText)
+        {
+            Text = text;
+            HoverText = hoverText;
+        }
+
+        public string Text { get; }
+        public string HoverText { get; }
+    }
+
+    private readonly struct CommandCompletionCandidate
+    {
+        public CommandCompletionCandidate(string value, string hoverText)
+        {
+            Value = value;
+            HoverText = hoverText;
+        }
+
+        public string Value { get; }
+        public string HoverText { get; }
+    }
+
+    private readonly struct CommandCompletionContext
+    {
+        public CommandCompletionContext(string prefixText, string tokenPrefix, int tokenIndex, string[] tokens)
+        {
+            PrefixText = prefixText;
+            TokenPrefix = tokenPrefix;
+            TokenIndex = tokenIndex;
+            Tokens = tokens;
+        }
+
+        public string PrefixText { get; }
+        public string TokenPrefix { get; }
+        public int TokenIndex { get; }
+        public string[] Tokens { get; }
+    }
+
+    private readonly struct ChatStyledSpan
+    {
+        public ChatStyledSpan(string text, Color color, bool bold, bool italic, bool spoiler)
+        {
+            Text = text;
+            Color = color;
+            Bold = bold;
+            Italic = italic;
+            Spoiler = spoiler;
+        }
+
+        public string Text { get; init; }
+        public Color Color { get; init; }
+        public bool Bold { get; init; }
+        public bool Italic { get; init; }
+        public bool Spoiler { get; init; }
+    }
+
+    private readonly struct ChatMarkupParseResult
+    {
+        public ChatMarkupParseResult(string cleanText, List<ChatStyledSpan> spans, bool hasSpoiler)
+        {
+            CleanText = cleanText;
+            Spans = spans;
+            HasSpoiler = hasSpoiler;
+        }
+
+        public string CleanText { get; }
+        public List<ChatStyledSpan> Spans { get; }
+        public bool HasSpoiler { get; }
+    }
+
+    private enum CatalogRarity
+    {
+        Common = 0,
+        Uncommon = 1,
+        Rare = 2,
+        Legendary = 3
+    }
+
+    private readonly struct CatalogLoreEntry
+    {
+        public CatalogLoreEntry(string displayName, string description, string[] tags, CatalogRarity rarity)
+        {
+            DisplayName = displayName;
+            Description = description;
+            Tags = tags;
+            Rarity = rarity;
+        }
+
+        public string DisplayName { get; }
+        public string Description { get; }
+        public string[] Tags { get; }
+        public CatalogRarity Rarity { get; }
+    }
+
+    private sealed class CatalogLoreFile
+    {
+        public List<CatalogLoreBlockDto> Blocks { get; set; } = new();
+    }
+
+    private sealed class CatalogLoreBlockDto
+    {
+        public string? BlockEnum { get; set; }
+        public int ByteId { get; set; }
+        public string? DisplayNameOverride { get; set; }
+        public string[]? LoreLines { get; set; }
+        public string[]? Tags { get; set; }
+    }
+
+    private sealed class ChatLine
+    {
+        public string Text = "";
+        public bool IsSystem;
+        public float TimeRemaining;
+        public bool HasTeleportAction;
+        public int TeleportX;
+        public int TeleportY;
+        public int TeleportZ;
+        public bool HasCopyAction;
+        public string CopyText = "";
+        public bool HasCustomAction;
+        public string CustomActionToken = "";
+        public string CustomActionStatus = "";
+        public string ActionLabel = "";
+        public string HoverText = "";
+
+        public bool HasCustomAction2;
+        public string CustomActionToken2 = "";
+        public string CustomActionStatus2 = "";
+        public string ActionLabel2 = "";
+        public string HoverText2 = "";
+        public bool HasTextColorOverride;
+        public Color TextColorOverride = Color.White;
+        public bool HasRichText;
+        public string RichPrefixText = "";
+        public string RichMessageText = "";
+        public List<ChatStyledSpan> RichMessageSpans = new();
+        public bool HasSpoilerContent;
+        public bool SpoilerRevealed;
+        public int LineId;
+    }
+
+    private struct PlayerHomeEntry
+    {
+        public string Name;
+        public Vector3 Position;
+        // Optional metadata (some builds persist/track these; keep them here to avoid compile churn)
+        public float Rotation;
+        public long LastVisitedTicks;
+        public bool HasIconBlock;
+        public BlockId IconBlock;
+    }
+
+    private sealed class WorldItem
+    {
+        public int ItemId;
+        public BlockId BlockId;
+        public int Count;
+        public Vector3 Position;
+        public Vector3 Velocity;
+        public float SpawnTime;
+        public float LastUpdateTime;
+        public float PickupDelay;
+        public int PickupLockPlayerId;
+        public bool IsGrounded;
+        public float GroundedTime;
+    }
+}

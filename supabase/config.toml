@@ -1,0 +1,10 @@
+# Supabase Edge Functions config (LatticeVeil)
+# Launcher uses a custom Veilnet token (NOT Supabase Auth JWT), so disable gateway JWT verification.
+[functions.online-ticket]
+verify_jwt = false
+
+[functions.online-ticket-validate]
+verify_jwt = false
+
+[functions.eos-secret]
+verify_jwt = false

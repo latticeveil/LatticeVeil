@@ -1,0 +1,38 @@
+{
+  "format_version": "baked-1",
+  "texture_size": [16, 16],
+  "display": {
+    "gui": {
+      "rotation": [20, -35, 0],
+      "scale": [0.8, 0.8, 0.8]
+    },
+    "firstperson_righthand": {
+      "rotation": [-8, 10, 2],
+      "translation": [1, 2, -2],
+      "scale": [0.55, 0.55, 0.55]
+    },
+    "thirdperson_righthand": {
+      "rotation": [14, 0, 0],
+      "scale": [0.5, 0.5, 0.5]
+    },
+    "ground": {
+      "rotation": [0, 0, 0],
+      "scale": [0.5, 0.5, 0.5]
+    }
+  },
+  "elements": [
+    {
+      "name": "bucket_sprite_plane",
+      "from": [1, 1, 7.5],
+      "to": [15, 15, 8.5],
+      "faces": {
+        "north": { "uv": [0, 0, 16, 16] },
+        "south": { "uv": [0, 0, 16, 16] },
+        "east": { "uv": [0, 0, 16, 16] },
+        "west": { "uv": [0, 0, 16, 16] },
+        "up": { "uv": [0, 0, 16, 16] },
+        "down": { "uv": [0, 0, 16, 16] }
+      }
+    }
+  ]
+}
