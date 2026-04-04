@@ -131,6 +131,7 @@ public sealed class LauncherForm : Form
     private bool _gameUpdateBusy;
     private bool _gameUpdateCheckInProgress;
     private bool _gameUpdateReminderShown;
+    private bool _gameUpdateStartQueued;
     private string _gameUpdateStatusDetail = "Checking for updates...";
     private GameReleaseCheckResult? _gameUpdateCheck;
 
@@ -1758,7 +1759,7 @@ public sealed class LauncherForm : Form
                 var choice = ShowGameUpdateReminderDialog(_gameUpdateCheck.ReleaseTitle);
                 if (choice == UpdateReminderChoice.UpdateNow)
                 {
-                    StartGameUpdate();
+                    _gameUpdateStartQueued = true;
                     return;
                 }
 
@@ -1803,6 +1804,11 @@ public sealed class LauncherForm : Form
         {
             _gameUpdateCheckInProgress = false;
             UpdateGameReleaseVisuals();
+            if (_gameUpdateStartQueued)
+            {
+                _gameUpdateStartQueued = false;
+                BeginInvoke(new Action(StartGameUpdate));
+            }
         }
     }
 

@@ -209,9 +209,12 @@ public sealed class GameReleaseUpdater
 
         Process.Start(new ProcessStartInfo
         {
-            FileName = scriptPath,
+            FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+            Arguments = $"/c \"\"{scriptPath}\"\"",
             WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? AppContext.BaseDirectory,
-            UseShellExecute = true
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
         });
     }
 
@@ -346,10 +349,11 @@ public sealed class GameReleaseUpdater
         sb.AppendLine("  timeout /t 1 /nobreak >nul");
         sb.AppendLine("  goto wait_for_launcher");
         sb.AppendLine(")");
-        sb.AppendLine($"copy /Y {quotedSource} {quotedTarget} >nul");
+        sb.AppendLine($"if exist {quotedTarget} del /F /Q {quotedTarget} >nul 2>nul");
+        sb.AppendLine($"move /Y {quotedSource} {quotedTarget} >nul");
         sb.AppendLine("if errorlevel 1 exit /b 1");
-        sb.AppendLine($"del /F /Q {quotedSource} >nul 2>nul");
         sb.AppendLine($"start \"\" {quotedTarget}{quotedRestartArgs}");
+        sb.AppendLine("exit /b 0");
         return sb.ToString();
     }
 
