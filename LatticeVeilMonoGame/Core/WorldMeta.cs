@@ -93,6 +93,7 @@ public sealed class WorldMeta
             {
                 EnableCheats = false,
                 EnableMultipleHomes = true,
+                EnableSigilPower = true,
                 MaxHomesPerPlayer = 8,
                 TimeCycleEnabled = true,
                 WeatherCycleEnabled = true,
@@ -185,27 +186,13 @@ public sealed class WorldMeta
             FormatVersion = 2;
             WorldVersion = 2;
 
-            // Sync grouped settings -> legacy fields (so older code paths still work)
             Gameplay ??= new GameplaySettings();
             WorldGeneration ??= new WorldGenerationSettings();
             Player ??= new PlayerSettings();
             Performance ??= new PerformanceSettings();
 
             CanonicalizeWorldGenerationContract();
-
-            EnableCheats = Gameplay.EnableCheats;
-            EnableMultipleHomes = Gameplay.EnableMultipleHomes;
-            MaxHomesPerPlayer = Gameplay.MaxHomesPerPlayer;
-            TimeCycleEnabled = Gameplay.TimeCycleEnabled;
-            WeatherCycleEnabled = Gameplay.WeatherCycleEnabled;
-            TimeOfDayTicks = Gameplay.TimeOfDayTicks;
-            WeatherState = Gameplay.WeatherState;
-            OperatorUsernames = Gameplay.OperatorUsernames ?? OperatorUsernames;
-            PlayerCollision = Player.PlayerCollision;
-            HasCustomSpawn = Player.HasCustomSpawn;
-            SpawnX = Player.SpawnX;
-            SpawnY = Player.SpawnY;
-            SpawnZ = Player.SpawnZ;
+            ApplyGroupedSettingsToLegacyFields();
 
             GameMode = CurrentWorldGameMode;
             DifficultyLevel = Math.Clamp(DifficultyLevel, 0, 3);
@@ -222,21 +209,11 @@ public sealed class WorldMeta
             TimeOfDayTicks = CanonicalTimeTicks(TimeOfDayTicks);
             WeatherState = CanonicalWeatherState(WeatherState);
 
-            Gameplay.EnableCheats = EnableCheats;
-            Gameplay.EnableMultipleHomes = EnableMultipleHomes;
-            Gameplay.MaxHomesPerPlayer = MaxHomesPerPlayer;
-            Gameplay.TimeCycleEnabled = TimeCycleEnabled;
-            Gameplay.WeatherCycleEnabled = WeatherCycleEnabled;
-            Gameplay.TimeOfDayTicks = TimeOfDayTicks;
-            Gameplay.WeatherState = WeatherState;
-            Player.PlayerCollision = PlayerCollision;
-            Player.HasCustomSpawn = HasCustomSpawn;
-            Player.SpawnX = SpawnX;
-            Player.SpawnY = SpawnY;
-            Player.SpawnZ = SpawnZ;
+            ApplyLegacyFieldsToGroupedSettings();
 
             // LVC key=value only
             var dict = LvcSerializer.SerializeObject(this);
+            RemoveLegacyMirroredFieldsFromSave(dict);
             LvcSerializer.Write(path, dict);
         }
         catch (LvcSerializer.LegacyFormatException)
@@ -281,20 +258,7 @@ public sealed class WorldMeta
 
             meta.CanonicalizeWorldGenerationContract();
 
-            // Sync legacy fields -> grouped (preferred authoring)
-            meta.Gameplay.EnableCheats = meta.EnableCheats;
-            meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
-            meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
-            meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
-            meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
-            meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
-            meta.Gameplay.WeatherState = meta.WeatherState;
-            meta.Gameplay.OperatorUsernames = meta.OperatorUsernames ?? meta.Gameplay.OperatorUsernames;
-            meta.Player.PlayerCollision = meta.PlayerCollision;
-            meta.Player.HasCustomSpawn = meta.HasCustomSpawn;
-            meta.Player.SpawnX = meta.SpawnX;
-            meta.Player.SpawnY = meta.SpawnY;
-            meta.Player.SpawnZ = meta.SpawnZ;
+            meta.MergeGroupedAndLegacySettings(data);
 
             // Post-load canonicalization
             meta.MaxHomesPerPlayer = Math.Clamp(meta.MaxHomesPerPlayer, 1, 32);
@@ -304,18 +268,7 @@ public sealed class WorldMeta
             meta.WeatherState = CanonicalWeatherState(meta.WeatherState);
             meta.DifficultyLevel = Math.Clamp(meta.DifficultyLevel, 0, 3);
 
-            meta.Gameplay.EnableCheats = meta.EnableCheats;
-            meta.Gameplay.EnableMultipleHomes = meta.EnableMultipleHomes;
-            meta.Gameplay.MaxHomesPerPlayer = meta.MaxHomesPerPlayer;
-            meta.Gameplay.TimeCycleEnabled = meta.TimeCycleEnabled;
-            meta.Gameplay.WeatherCycleEnabled = meta.WeatherCycleEnabled;
-            meta.Gameplay.TimeOfDayTicks = meta.TimeOfDayTicks;
-            meta.Gameplay.WeatherState = meta.WeatherState;
-            meta.Player.PlayerCollision = meta.PlayerCollision;
-            meta.Player.HasCustomSpawn = meta.HasCustomSpawn;
-            meta.Player.SpawnX = meta.SpawnX;
-            meta.Player.SpawnY = meta.SpawnY;
-            meta.Player.SpawnZ = meta.SpawnZ;
+            meta.ApplyLegacyFieldsToGroupedSettings();
 
             // Keep the behavior from older code: GameMode mirrors current.
             if (meta.CurrentWorldGameMode == default)
@@ -347,6 +300,104 @@ public sealed class WorldMeta
     }
 
     private static string CreateWorldId() => Guid.NewGuid().ToString("N");
+
+    private void ApplyGroupedSettingsToLegacyFields()
+    {
+        EnableCheats = Gameplay.EnableCheats;
+        EnableMultipleHomes = Gameplay.EnableMultipleHomes;
+        // Sigil power is stored on Gameplay only; old worlds default to enabled.
+        MaxHomesPerPlayer = Gameplay.MaxHomesPerPlayer;
+        TimeCycleEnabled = Gameplay.TimeCycleEnabled;
+        WeatherCycleEnabled = Gameplay.WeatherCycleEnabled;
+        TimeOfDayTicks = Gameplay.TimeOfDayTicks;
+        WeatherState = Gameplay.WeatherState;
+        OperatorUsernames = Gameplay.OperatorUsernames ?? OperatorUsernames;
+        PlayerCollision = Player.PlayerCollision;
+        HasCustomSpawn = Player.HasCustomSpawn;
+        SpawnX = Player.SpawnX;
+        SpawnY = Player.SpawnY;
+        SpawnZ = Player.SpawnZ;
+    }
+
+    private void ApplyLegacyFieldsToGroupedSettings()
+    {
+        Gameplay.EnableCheats = EnableCheats;
+        Gameplay.EnableMultipleHomes = EnableMultipleHomes;
+        Gameplay.MaxHomesPerPlayer = MaxHomesPerPlayer;
+        Gameplay.TimeCycleEnabled = TimeCycleEnabled;
+        Gameplay.WeatherCycleEnabled = WeatherCycleEnabled;
+        Gameplay.TimeOfDayTicks = TimeOfDayTicks;
+        Gameplay.WeatherState = WeatherState;
+        Gameplay.OperatorUsernames = OperatorUsernames ?? Gameplay.OperatorUsernames;
+        Player.PlayerCollision = PlayerCollision;
+        Player.HasCustomSpawn = HasCustomSpawn;
+        Player.SpawnX = SpawnX;
+        Player.SpawnY = SpawnY;
+        Player.SpawnZ = SpawnZ;
+    }
+
+    private void MergeGroupedAndLegacySettings(Dictionary<string, string> data)
+    {
+        var hasGameplay = data.Keys.Any(k => k.StartsWith("Gameplay.", StringComparison.OrdinalIgnoreCase));
+        var hasPlayer = data.Keys.Any(k => k.StartsWith("Player.", StringComparison.OrdinalIgnoreCase));
+
+        if (hasGameplay)
+        {
+            EnableCheats = Gameplay.EnableCheats;
+            EnableMultipleHomes = Gameplay.EnableMultipleHomes;
+            MaxHomesPerPlayer = Gameplay.MaxHomesPerPlayer;
+            TimeCycleEnabled = Gameplay.TimeCycleEnabled;
+            WeatherCycleEnabled = Gameplay.WeatherCycleEnabled;
+            TimeOfDayTicks = Gameplay.TimeOfDayTicks;
+            WeatherState = Gameplay.WeatherState;
+            OperatorUsernames = Gameplay.OperatorUsernames ?? OperatorUsernames;
+        }
+        else
+        {
+            Gameplay.EnableCheats = EnableCheats;
+            Gameplay.EnableMultipleHomes = EnableMultipleHomes;
+            Gameplay.MaxHomesPerPlayer = MaxHomesPerPlayer;
+            Gameplay.TimeCycleEnabled = TimeCycleEnabled;
+            Gameplay.WeatherCycleEnabled = WeatherCycleEnabled;
+            Gameplay.TimeOfDayTicks = TimeOfDayTicks;
+            Gameplay.WeatherState = WeatherState;
+            Gameplay.OperatorUsernames = OperatorUsernames ?? Gameplay.OperatorUsernames;
+        }
+
+        if (hasPlayer)
+        {
+            PlayerCollision = Player.PlayerCollision;
+            HasCustomSpawn = Player.HasCustomSpawn;
+            SpawnX = Player.SpawnX;
+            SpawnY = Player.SpawnY;
+            SpawnZ = Player.SpawnZ;
+        }
+        else
+        {
+            Player.PlayerCollision = PlayerCollision;
+            Player.HasCustomSpawn = HasCustomSpawn;
+            Player.SpawnX = SpawnX;
+            Player.SpawnY = SpawnY;
+            Player.SpawnZ = SpawnZ;
+        }
+    }
+
+    private static void RemoveLegacyMirroredFieldsFromSave(Dictionary<string, string> dict)
+    {
+        dict.Remove(nameof(EnableCheats));
+        dict.Remove(nameof(EnableMultipleHomes));
+        dict.Remove(nameof(MaxHomesPerPlayer));
+        dict.Remove(nameof(TimeCycleEnabled));
+        dict.Remove(nameof(WeatherCycleEnabled));
+        dict.Remove(nameof(TimeOfDayTicks));
+        dict.Remove(nameof(WeatherState));
+        dict.Remove(nameof(OperatorUsernames));
+        dict.Remove(nameof(PlayerCollision));
+        dict.Remove(nameof(HasCustomSpawn));
+        dict.Remove(nameof(SpawnX));
+        dict.Remove(nameof(SpawnY));
+        dict.Remove(nameof(SpawnZ));
+    }
 
     // NOTE: This keeps compatibility with previous world-id scheme so existing worlds don't change IDs.
     private static string BuildLegacyWorldId(WorldMeta meta)

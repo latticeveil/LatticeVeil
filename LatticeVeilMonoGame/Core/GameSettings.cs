@@ -146,6 +146,7 @@ public sealed class GameSettings
         ["VeilseerXrayToggle"] = Keys.X,
         ["InviteQuickAction"] = Keys.Y
     };
+    public Dictionary<string, string> MouseBinds { get; set; } = new();
 
     // Packs
     public List<string> EnabledPacks { get; set; } = new();
@@ -216,6 +217,7 @@ public sealed class GameSettings
         s.FlyingOutlineColor = NormalizeHexColor(s.FlyingOutlineColor, DefaultFlyingOutlineColor);
 
         EnsureKeybinds(s);
+        s.MouseBinds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         s.EnabledPacks ??= new List<string>();
     }

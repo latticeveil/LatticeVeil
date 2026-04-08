@@ -1204,7 +1204,7 @@ public sealed class OptionsScreen : IScreen
     {
         var visibleActions = GetVisibleBindActions();
         var scroll = GetScrollOffset();
-        var listRect = GetCurrentBindListRect(scroll);
+        var listRect = ScrollRect(_controlsListRect, scroll);
         if (_bindingAction is null)
         {
             if (input.IsNewLeftClick())
@@ -1213,7 +1213,7 @@ public sealed class OptionsScreen : IScreen
                 if (listRect.Contains(p))
                 {
                     var rowH = 36;
-                    var idx = (p.Y - listRect.Y) / rowH;
+                    var idx = (p.Y - listRect.Y + scroll) / rowH;
                     if (idx >= 0 && idx < visibleActions.Count)
                         _bindingAction = visibleActions[idx];
                 }
@@ -1228,6 +1228,15 @@ public sealed class OptionsScreen : IScreen
                 return;
             }
 
+            var mouseBind = GetNewMouseBindToken(input);
+            if (!string.IsNullOrWhiteSpace(mouseBind))
+            {
+                _working.MouseBinds[_bindingAction] = mouseBind;
+                _log.Info($"Option changed: Mouse bind {_bindingAction} = {mouseBind}");
+                _bindingAction = null;
+                return;
+            }
+
             foreach (var k in input.GetNewKeys())
             {
                 if ((k == Keys.LeftShift || k == Keys.RightShift)
@@ -1237,6 +1246,7 @@ public sealed class OptionsScreen : IScreen
                     && !string.Equals(_bindingAction, "GamemodeModifier", StringComparison.Ordinal))
                     continue;
                 _working.Keybinds[_bindingAction] = k;
+                _working.MouseBinds.Remove(_bindingAction);
                 _log.Info($"Option changed: Keybind {_bindingAction} = {k}");
                 _bindingAction = null;
                 break;
@@ -1490,7 +1500,7 @@ public sealed class OptionsScreen : IScreen
 
             _font.DrawString(sb, GetBindActionLabel(action), new Vector2(row.X + 10, row.Y + 10), Color.White);
 
-            var key = _working.Keybinds.TryGetValue(action, out var k) ? k.ToString() : "UNBOUND";
+            var key = GetDisplayedBindingLabel(action);
             var keyText = _bindingAction == action ? "PRESS KEY..." : key.ToUpperInvariant();
             _font.DrawString(sb, keyText, new Vector2(row.Right - 220, row.Y + 10), Color.White);
         }
@@ -1552,9 +1562,8 @@ public sealed class OptionsScreen : IScreen
 
         try
         {
-            var packsDir = Path.Combine(Paths.AssetsDir, "packs");
-            if (!Directory.Exists(packsDir))
-                packsDir = Path.Combine(Paths.AssetsDir, "Assets", "packs");
+            var packsDir = Paths.PacksDir;
+            Directory.CreateDirectory(packsDir);
 
             if (Directory.Exists(packsDir))
             {
@@ -1598,7 +1607,7 @@ public sealed class OptionsScreen : IScreen
     {
         var scroll = GetScrollOffset();
         var listRect = ScrollRect(_packsListRect, scroll);
-        _font.DrawString(sb, "PACKS (Documents/LatticeVeil/Assets/packs)", new Vector2(listRect.X, listRect.Y - _font.LineHeight), Color.White);
+        _font.DrawString(sb, "PACKS (Documents/LatticeVeil/Packs)", new Vector2(listRect.X, listRect.Y - _font.LineHeight), Color.White);
 
         if (_availablePacks.Count == 0)
         {
@@ -1619,6 +1628,41 @@ public sealed class OptionsScreen : IScreen
             _font.DrawString(sb, enabled ? "[X]" : "[ ]", new Vector2(row.X + 10, row.Y + 10), Color.White);
             _font.DrawString(sb, pack.ToUpperInvariant(), new Vector2(row.X + 60, row.Y + 10), Color.White);
         }
+    }
+
+    private string GetDisplayedBindingLabel(string action)
+    {
+        if (_working.MouseBinds != null
+            && _working.MouseBinds.TryGetValue(action, out var mouseBind)
+            && !string.IsNullOrWhiteSpace(mouseBind))
+        {
+            return mouseBind switch
+            {
+                "mouseleft" => "Mouse1",
+                "mouseright" => "Mouse2",
+                "mousemiddle" => "Mouse3",
+                "mousex1" => "Mouse4",
+                "mousex2" => "Mouse5",
+                _ => mouseBind
+            };
+        }
+
+        return _working.Keybinds.TryGetValue(action, out var key) ? key.ToString() : "UNBOUND";
+    }
+
+    private static string? GetNewMouseBindToken(InputState input)
+    {
+        if (input.IsNewLeftClick())
+            return "mouseleft";
+        if (input.IsNewRightClick())
+            return "mouseright";
+        if (input.IsNewMiddleClick())
+            return "mousemiddle";
+        if (input.IsNewXButton1Click())
+            return "mousex1";
+        if (input.IsNewXButton2Click())
+            return "mousex2";
+        return null;
     }
 
     private int GetCurrentBindListTop()

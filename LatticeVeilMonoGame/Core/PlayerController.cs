@@ -55,6 +55,19 @@ public sealed class PlayerController
     public Keys CrouchKey { get; set; } = Keys.LeftShift;
     public Keys SprintKey { get; set; } = Keys.LeftControl;
     public Keys FlyDescendKey { get; set; } = Keys.LeftShift;
+    public Keys MoveUpKey { get; set; } = Keys.W;
+    public Keys MoveDownKey { get; set; } = Keys.S;
+    public Keys MoveLeftKey { get; set; } = Keys.A;
+    public Keys MoveRightKey { get; set; } = Keys.D;
+    public Keys JumpKey { get; set; } = Keys.Space;
+    public string? MoveUpMouseBind { get; set; }
+    public string? MoveDownMouseBind { get; set; }
+    public string? MoveLeftMouseBind { get; set; }
+    public string? MoveRightMouseBind { get; set; }
+    public string? JumpMouseBind { get; set; }
+    public string? CrouchMouseBind { get; set; }
+    public string? SprintMouseBind { get; set; }
+    public string? FlyDescendMouseBind { get; set; }
 
     public const float ColliderHalfWidth = HalfWidth;
     public const float ColliderStandingHeight = StandingHeight;
@@ -138,7 +151,7 @@ public sealed class PlayerController
 
     private void HandleFlyToggle(double nowSeconds, InputState input)
     {
-        if (!AllowFlying || !input.IsNewKeyPress(Keys.Space))
+        if (!AllowFlying || !IsBoundNewPress(input, JumpKey, JumpMouseBind))
             return;
 
         if (nowSeconds - _lastSpaceTapTime <= DoubleTapSeconds)
@@ -160,10 +173,10 @@ public sealed class PlayerController
         var right = new Vector3(-forward.Z, 0f, forward.X);
         var moveXZ = Vector3.Zero;
 
-        if (input.IsKeyDown(Keys.W)) moveXZ += forward;
-        if (input.IsKeyDown(Keys.S)) moveXZ -= forward;
-        if (input.IsKeyDown(Keys.A)) moveXZ -= right;
-        if (input.IsKeyDown(Keys.D)) moveXZ += right;
+        if (IsBoundDown(input, MoveUpKey, MoveUpMouseBind)) moveXZ += forward;
+        if (IsBoundDown(input, MoveDownKey, MoveDownMouseBind)) moveXZ -= forward;
+        if (IsBoundDown(input, MoveLeftKey, MoveLeftMouseBind)) moveXZ -= right;
+        if (IsBoundDown(input, MoveRightKey, MoveRightMouseBind)) moveXZ += right;
 
         if (moveXZ != Vector3.Zero)
             moveXZ.Normalize();
@@ -176,8 +189,8 @@ public sealed class PlayerController
             _sprintLatched = false;
 
             var vertical = 0f;
-            if (input.IsKeyDown(Keys.Space)) vertical += 1f;
-            if (IsControlDown(input, FlyDescendKey)) vertical -= 1f;
+            if (IsBoundDown(input, JumpKey, JumpMouseBind)) vertical += 1f;
+            if (IsControlDown(input, FlyDescendKey, FlyDescendMouseBind)) vertical -= 1f;
 
             var move = new Vector3(moveXZ.X, vertical, moveXZ.Z);
             if (move.LengthSquared() > 1f)
@@ -207,7 +220,7 @@ public sealed class PlayerController
         }
         else if (ToggleCrouchEnabled)
         {
-            if (IsControlNewPress(input, CrouchKey))
+            if (IsControlNewPress(input, CrouchKey, CrouchMouseBind))
             {
                 if (_toggleSneakLatched)
                 {
@@ -227,7 +240,7 @@ public sealed class PlayerController
         else
         {
             _toggleSneakLatched = false;
-            var crouchRequested = IsControlDown(input, CrouchKey);
+            var crouchRequested = IsControlDown(input, CrouchKey, CrouchMouseBind);
             if (crouchRequested)
             {
                 IsSneaking = true;
@@ -256,7 +269,7 @@ public sealed class PlayerController
         {
             _sprintLatched = false;
         }
-        else if (IsControlNewPress(input, SprintKey) && !IsSneaking && !IsFlying)
+        else if (IsControlNewPress(input, SprintKey, SprintMouseBind) && !IsSneaking && !IsFlying)
         {
             // Arm sprint even before movement begins so sprint starts as soon as motion resumes.
             _sprintLatched = true;
@@ -265,7 +278,7 @@ public sealed class PlayerController
         var canSprint = groundedNow
             && !IsSneaking
             && hasMoveInput
-            && (SprintLatchEnabled ? _sprintLatched : IsControlDown(input, SprintKey));
+            && (SprintLatchEnabled ? _sprintLatched : IsControlDown(input, SprintKey, SprintMouseBind));
         IsSprinting = canSprint;
         if (IsSprinting)
             speed *= SprintMoveMultiplier;
@@ -275,7 +288,7 @@ public sealed class PlayerController
         var wasGrounded = IsGrounded;
         IsGrounded = false;
 
-        if (input.IsNewKeyPress(Keys.Space) && groundedNow)
+        if (IsBoundNewPress(input, JumpKey, JumpMouseBind) && groundedNow)
         {
             vel.Y = JumpSpeed;
             wasGrounded = false;
@@ -524,8 +537,10 @@ public sealed class PlayerController
         max = new Vector3(pos.X + HalfWidth - Skin, pos.Y + colliderHeight - Skin, pos.Z + HalfWidth - Skin);
     }
 
-    private static bool IsControlDown(InputState input, Keys key)
+    private static bool IsControlDown(InputState input, Keys key, string? mouseBind = null)
     {
+        if (IsMouseBindDown(input, mouseBind))
+            return true;
         return key switch
         {
             Keys.LeftShift or Keys.RightShift => input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift),
@@ -535,8 +550,10 @@ public sealed class PlayerController
         };
     }
 
-    private static bool IsControlNewPress(InputState input, Keys key)
+    private static bool IsControlNewPress(InputState input, Keys key, string? mouseBind = null)
     {
+        if (IsMouseBindNewPress(input, mouseBind))
+            return true;
         return key switch
         {
             Keys.LeftShift or Keys.RightShift => input.IsNewKeyPress(Keys.LeftShift) || input.IsNewKeyPress(Keys.RightShift),
@@ -545,4 +562,39 @@ public sealed class PlayerController
             _ => input.IsNewKeyPress(key)
         };
     }
+
+    private static bool IsBoundDown(InputState input, Keys key, string? mouseBind)
+        => IsControlDown(input, key, mouseBind);
+
+    private static bool IsBoundNewPress(InputState input, Keys key, string? mouseBind)
+        => IsControlNewPress(input, key, mouseBind);
+
+    private static bool IsMouseBindDown(InputState input, string? mouseBind)
+    {
+        return NormalizeMouseBind(mouseBind) switch
+        {
+            "mouseleft" => input.IsLeftDown(),
+            "mouseright" => input.IsRightDown(),
+            "mousemiddle" => input.IsMiddleDown(),
+            "mousex1" => input.IsXButton1Down(),
+            "mousex2" => input.IsXButton2Down(),
+            _ => false
+        };
+    }
+
+    private static bool IsMouseBindNewPress(InputState input, string? mouseBind)
+    {
+        return NormalizeMouseBind(mouseBind) switch
+        {
+            "mouseleft" => input.IsNewLeftClick(),
+            "mouseright" => input.IsNewRightClick(),
+            "mousemiddle" => input.IsNewMiddleClick(),
+            "mousex1" => input.IsNewXButton1Click(),
+            "mousex2" => input.IsNewXButton2Click(),
+            _ => false
+        };
+    }
+
+    private static string NormalizeMouseBind(string? mouseBind)
+        => (mouseBind ?? string.Empty).Trim().ToLowerInvariant();
 }

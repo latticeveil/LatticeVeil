@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
-using WinClipboard = System.Windows.Forms.Clipboard;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -54,7 +54,7 @@ public enum ProfileScreenStartTab
     private readonly Button _denyRequestBtn;
     private readonly Button _blockUserBtn;
     private readonly Button _unblockUserBtn;
-    private readonly Button _copyIdBtn;
+    private readonly Button _viewFriendsBtn;
     private readonly Button _refreshProfileBtn;
     private readonly Button _backBtn;
 
@@ -119,6 +119,7 @@ public enum ProfileScreenStartTab
     private Task<VeilnetProfileRefreshPayload>? _veilnetProfileRefreshTask;
     private readonly TimeSpan _veilnetProfileRefreshInterval;
     private static readonly string LegacyVeilnetCacheDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "LatticeVeil", "VeilnetCache");
+    private VeilnetProfileCacheStore? _veilnetProfileCache;
 
     public ProfileScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile,
         global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, EosClient? eosClient,
@@ -153,7 +154,7 @@ public enum ProfileScreenStartTab
         _denyRequestBtn = new Button("DENY", () => _ = DenyRequestAsync()) { BoldText = true };
         _blockUserBtn = new Button("BLOCK", () => _ = BlockSelectedUserAsync()) { BoldText = true };
         _unblockUserBtn = new Button("UNBLOCK", () => _ = UnblockSelectedUserAsync()) { BoldText = true };
-        _copyIdBtn = new Button("COPY MY ID", CopyLocalId) { BoldText = true };
+        _viewFriendsBtn = new Button("VIEW FRIENDS", () => _activeTab = ProfileScreenStartTab.Friends) { BoldText = true };
         _refreshProfileBtn = new Button("REFRESH", () => QueueVeilnetProfileRefresh(force: true)) { BoldText = true };
         _backBtn = new Button("BACK", () => _menus.Pop()) { BoldText = true };
 
@@ -168,10 +169,12 @@ public enum ProfileScreenStartTab
             // optional
         }
 
+        LoadCachedVeilnetProfile();
+
         _lastVeilnetTokenSnapshot = ResolveVeilnetToken();
         if (IsUsableToken(_lastVeilnetTokenSnapshot))
             QueueVeilnetProfileRefresh(force: true);
-        else
+        else if (string.IsNullOrWhiteSpace(_veilnetUsername))
         {
             _veilnetProfileError = "Sign in via launcher to view your Veilnet profile.";
             _lastVeilnetSyncOk = false;
@@ -242,7 +245,7 @@ public enum ProfileScreenStartTab
         var buttonH = Math.Max(44, _font.LineHeight * 2);
         
         // Identity view actions
-        _copyIdBtn.Bounds = new Rectangle(contentRect.X, buttonY, contentRect.Width, buttonH);
+        _viewFriendsBtn.Bounds = new Rectangle(contentRect.X, buttonY, contentRect.Width, buttonH);
         
         // Friends view actions
         var friendsButtonW = (contentRect.Width - gap * 2) / 3;
@@ -287,7 +290,7 @@ public enum ProfileScreenStartTab
 
         if (_activeTab == ProfileScreenStartTab.Identity)
         {
-            _copyIdBtn.Update(input);
+            _viewFriendsBtn.Update(input);
             _refreshProfileBtn.Update(input);
             if (!_veilnetProfileRefreshInProgress && DateTime.UtcNow >= _nextVeilnetProfileRefreshUtc)
                 QueueVeilnetProfileRefresh(force: false);
@@ -363,7 +366,7 @@ public enum ProfileScreenStartTab
 
         if (_activeTab == ProfileScreenStartTab.Identity)
         {
-            _copyIdBtn.Draw(sb, _pixel, _font);
+            _viewFriendsBtn.Draw(sb, _pixel, _font);
             _refreshProfileBtn.Draw(sb, _pixel, _font);
         }
         else
@@ -450,9 +453,11 @@ public enum ProfileScreenStartTab
             if (_veilnetAvatarPlaceholderTexture is { IsDisposed: false })
                 sb.Draw(_veilnetAvatarPlaceholderTexture, _identityAvatarRect, Color.White);
 
-            var noPicX = _identityAvatarRect.X + (_identityAvatarRect.Width / 2f) - (_font.MeasureString("NO PIC").X / 2f);
-            var noPicY = _identityAvatarRect.Y + (_identityAvatarRect.Height - _font.LineHeight) / 2f;
-            _font.DrawString(sb, "NO PIC", new Vector2(noPicX, noPicY), new Color(232, 236, 248));
+            var placeholderGlyph = ResolveDisplayUsername();
+            placeholderGlyph = string.IsNullOrWhiteSpace(placeholderGlyph) ? "?" : placeholderGlyph[..1].ToUpperInvariant();
+            var glyphX = _identityAvatarRect.X + (_identityAvatarRect.Width / 2f) - (_font.MeasureString(placeholderGlyph).X / 2f);
+            var glyphY = _identityAvatarRect.Y + (_identityAvatarRect.Height - _font.LineHeight) / 2f;
+            _font.DrawString(sb, placeholderGlyph, new Vector2(glyphX, glyphY), new Color(232, 236, 248));
         }
 
         if (_veilnetAvatarRingTexture is { IsDisposed: false })
@@ -477,10 +482,117 @@ public enum ProfileScreenStartTab
             infoBorder,
             infoTitle);
 
-        var eosSnapshot = EosRuntimeStatus.Evaluate(_eos);
-        var id = (_eos?.LocalProductUserId ?? _identityStore.ProductUserId ?? string.Empty).Trim();
-        var statusLines = $"EOS: {eosSnapshot.StatusText}\nMY ID: {(string.IsNullOrWhiteSpace(id) ? "(waiting...)" : id)}\nCONFIG: {EosRuntimeStatus.DescribeConfigSource()}";
+        var statusLines = BuildIdentityStatusLines();
         DrawIdentityInfoPanel(sb, _identityStatusRect, "STATUS", statusLines, infoBorder, infoTitle);
+    }
+
+    private string BuildIdentityStatusLines()
+    {
+        var eosSnapshot = EosRuntimeStatus.Evaluate(_eos);
+        var profileState = _veilnetProfileRefreshInProgress
+            ? "Refreshing..."
+            : string.IsNullOrWhiteSpace(_veilnetUsername)
+                ? (string.IsNullOrWhiteSpace(_veilnetProfileError) ? "Waiting for launcher sign-in." : _veilnetProfileError)
+                : _lastVeilnetSyncOk
+                    ? "Synced"
+                    : string.IsNullOrWhiteSpace(_veilnetProfileError)
+                        ? "Using cached profile"
+                        : $"Using cached profile ({_veilnetProfileError})";
+
+        var friendsState = _friendsSyncInProgress
+            ? "Refreshing..."
+            : _friendsEndpointUnavailable
+                ? "Service unavailable"
+                : "Ready";
+
+        return $"EOS: {eosSnapshot.StatusText}\nPROFILE: {profileState}\nFRIENDS: {friendsState}";
+    }
+
+    private void LoadCachedVeilnetProfile()
+    {
+        _veilnetProfileCache = VeilnetProfileCacheStore.Load(_log);
+        if (_veilnetProfileCache == null)
+            return;
+
+        _veilnetUsername = (_veilnetProfileCache.Username ?? string.Empty).Trim();
+        _veilnetAboutMe = NormalizeMultiline(_veilnetProfileCache.AboutMe);
+        _veilnetPictureUrl = (_veilnetProfileCache.PictureUrl ?? string.Empty).Trim();
+        _veilnetBannerUrl = (_veilnetProfileCache.BannerUrl ?? string.Empty).Trim();
+        _veilnetThemeColorRaw = (_veilnetProfileCache.ThemeColor ?? string.Empty).Trim();
+        _veilnetTheme = (_veilnetProfileCache.Theme ?? string.Empty).Trim();
+        _veilnetUpdatedAt = (_veilnetProfileCache.UpdatedAt ?? string.Empty).Trim();
+        ApplyVeilnetTheme(_veilnetThemeColorRaw, _veilnetTheme);
+        TryLoadCachedProfileImages();
+        if (!string.IsNullOrWhiteSpace(_veilnetUsername))
+            _veilnetProfileError = "Using cached profile.";
+    }
+
+    private void SaveCachedVeilnetProfile()
+    {
+        _veilnetProfileCache ??= new VeilnetProfileCacheStore();
+        _veilnetProfileCache.Username = _veilnetUsername;
+        _veilnetProfileCache.AboutMe = _veilnetAboutMe;
+        _veilnetProfileCache.PictureUrl = _veilnetPictureUrl;
+        _veilnetProfileCache.BannerUrl = _veilnetBannerUrl;
+        _veilnetProfileCache.ThemeColor = _veilnetThemeColorRaw;
+        _veilnetProfileCache.Theme = _veilnetTheme;
+        _veilnetProfileCache.UpdatedAt = _veilnetUpdatedAt;
+        _veilnetProfileCache.Save(_log);
+    }
+
+    private void TryLoadCachedProfileImages()
+    {
+        if (_graphics?.GraphicsDevice == null)
+            return;
+
+        try
+        {
+            if (_veilnetAvatarTexture == null && File.Exists(Paths.VeilnetAvatarCachePath))
+            {
+                var avatarBytes = File.ReadAllBytes(Paths.VeilnetAvatarCachePath);
+                var avatar = CreateCircularAvatarTextureFromBytes(avatarBytes);
+                if (avatar != null)
+                    _veilnetAvatarTexture = avatar;
+            }
+
+            if (_veilnetBannerTexture == null && File.Exists(Paths.VeilnetBannerCachePath))
+            {
+                var bannerBytes = File.ReadAllBytes(Paths.VeilnetBannerCachePath);
+                var banner = _webTextureLoader.CreateTextureFromBytes(_graphics.GraphicsDevice, bannerBytes);
+                if (banner != null)
+                    _veilnetBannerTexture = banner;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load cached Veilnet profile images: {ex.Message}");
+        }
+    }
+
+    private void SaveCachedProfileImage(string path, byte[] bytes)
+    {
+        try
+        {
+            Directory.CreateDirectory(Paths.RootDir);
+            File.WriteAllBytes(path, bytes);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save cached profile image '{Path.GetFileName(path)}': {ex.Message}");
+        }
+    }
+
+    private void DeleteCachedProfileImage(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to clear cached profile image '{Path.GetFileName(path)}': {ex.Message}");
+        }
     }
 
     private void HandleVeilnetTokenChange()
@@ -493,20 +605,11 @@ public enum ProfileScreenStartTab
         if (!IsUsableToken(token))
         {
             CancelVeilnetRefreshTask();
-            DisposeVeilnetTextures();
-            DisposeAvatarDecorTextures();
-            _veilnetUsername = string.Empty;
-            _veilnetAboutMe = string.Empty;
-            _veilnetPictureUrl = string.Empty;
-            _veilnetBannerUrl = string.Empty;
-            _veilnetThemeColorRaw = string.Empty;
-            _veilnetTheme = string.Empty;
-            _veilnetUpdatedAt = string.Empty;
-            _veilnetProfileError = "You are not signed in. Open launcher online login.";
+            _veilnetProfileError = string.IsNullOrWhiteSpace(_veilnetUsername)
+                ? "Sign in via launcher to view your Veilnet profile."
+                : "Using cached profile. Sign in via launcher to refresh.";
             _lastVeilnetSyncOk = false;
             _lastVeilnetSyncError = "missing_access_token";
-            _lastVeilnetProfileUtc = DateTime.MinValue;
-            ApplyVeilnetTheme(string.Empty, string.Empty);
             _nextVeilnetProfileRefreshUtc = DateTime.UtcNow.AddSeconds(5);
             ClearLegacyVeilnetCacheDir();
             return;
@@ -529,7 +632,9 @@ public enum ProfileScreenStartTab
         var token = ResolveVeilnetToken();
         if (!IsUsableToken(token))
         {
-            _veilnetProfileError = "You are not signed in. Open launcher online login.";
+            _veilnetProfileError = string.IsNullOrWhiteSpace(_veilnetUsername)
+                ? "Sign in via launcher to view your Veilnet profile."
+                : "Using cached profile. Sign in via launcher to refresh.";
             _lastVeilnetSyncOk = false;
             _lastVeilnetSyncError = "missing_access_token";
             _nextVeilnetProfileRefreshUtc = DateTime.UtcNow.AddSeconds(5);
@@ -578,13 +683,15 @@ public enum ProfileScreenStartTab
         var previousBanner = _veilnetBannerUrl;
 
         if (!string.IsNullOrWhiteSpace(profile.PictureUrl)
-            && !string.Equals(profile.PictureUrl, previousPicture, StringComparison.OrdinalIgnoreCase))
+            && (!string.Equals(profile.PictureUrl, previousPicture, StringComparison.OrdinalIgnoreCase)
+                || _veilnetAvatarTexture == null))
         {
             payload.AvatarBytes = await _webTextureLoader.DownloadImageBytesAsync(profile.PictureUrl, ct).ConfigureAwait(false);
         }
 
         if (!string.IsNullOrWhiteSpace(profile.BannerUrl)
-            && !string.Equals(profile.BannerUrl, previousBanner, StringComparison.OrdinalIgnoreCase))
+            && (!string.Equals(profile.BannerUrl, previousBanner, StringComparison.OrdinalIgnoreCase)
+                || _veilnetBannerTexture == null))
         {
             payload.BannerBytes = await _webTextureLoader.DownloadImageBytesAsync(profile.BannerUrl, ct).ConfigureAwait(false);
         }
@@ -602,7 +709,7 @@ public enum ProfileScreenStartTab
             _veilnetProfileError = error;
             _lastVeilnetSyncOk = false;
             _lastVeilnetSyncError = error;
-            SetStatus("Profile refresh failed.", 1.8);
+            SetStatus(string.IsNullOrWhiteSpace(_veilnetUsername) ? "Profile refresh failed." : "Using cached profile.", 1.8);
             return;
         }
 
@@ -623,6 +730,7 @@ public enum ProfileScreenStartTab
             _veilnetPictureUrl = string.Empty;
             _veilnetAvatarTexture?.Dispose();
             _veilnetAvatarTexture = null;
+            DeleteCachedProfileImage(Paths.VeilnetAvatarCachePath);
         }
         else if (payload.AvatarBytes is { Length: > 0 })
         {
@@ -632,6 +740,7 @@ public enum ProfileScreenStartTab
                 _veilnetAvatarTexture?.Dispose();
                 _veilnetAvatarTexture = nextAvatar;
                 _veilnetPictureUrl = profile.PictureUrl.Trim();
+                SaveCachedProfileImage(Paths.VeilnetAvatarCachePath, payload.AvatarBytes);
             }
             else
             {
@@ -644,6 +753,7 @@ public enum ProfileScreenStartTab
             _veilnetBannerUrl = string.Empty;
             _veilnetBannerTexture?.Dispose();
             _veilnetBannerTexture = null;
+            DeleteCachedProfileImage(Paths.VeilnetBannerCachePath);
         }
         else if (payload.BannerBytes is { Length: > 0 })
         {
@@ -653,6 +763,7 @@ public enum ProfileScreenStartTab
                 _veilnetBannerTexture?.Dispose();
                 _veilnetBannerTexture = nextBanner;
                 _veilnetBannerUrl = profile.BannerUrl.Trim();
+                SaveCachedProfileImage(Paths.VeilnetBannerCachePath, payload.BannerBytes);
             }
             else
             {
@@ -660,7 +771,8 @@ public enum ProfileScreenStartTab
             }
         }
 
-        SetStatus("Refreshed.", 1.4);
+        SaveCachedVeilnetProfile();
+        SetStatus("Profile refreshed.", 1.4);
     }
 
     private Texture2D? CreateCircularAvatarTextureFromBytes(byte[] imageBytes)
@@ -1188,7 +1300,7 @@ public enum ProfileScreenStartTab
                 new Color(170, 170, 170));
         }
 
-        var rowH = _font.LineHeight + 8;
+        var rowHeight = Math.Max(54, (_font.LineHeight * 2) + 14);
         var y = _friendsRect.Y + _font.LineHeight + 12;
         if (_friendsListMode == ProfileScreenFriendsMode.Friends)
         {
@@ -1200,21 +1312,14 @@ public enum ProfileScreenStartTab
 
             for (var i = 0; i < _profile.Friends.Count; i++)
             {
-                var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowH);
-                var selected = i == _selectedFriend;
-                sb.Draw(_pixel, row, selected ? new Color(60, 90, 130, 220) : new Color(26, 26, 26, 200));
-                DrawBorder(sb, row, selected ? new Color(200, 230, 255) : new Color(110, 110, 110));
-
                 var f = _profile.Friends[i];
-                var friendCode = EosIdentityStore.GenerateFriendCode(f.UserId);
-                var displayName = !string.IsNullOrWhiteSpace(f.LastKnownDisplayName)
-                    ? f.LastKnownDisplayName
-                    : (!string.IsNullOrWhiteSpace(f.Label) ? f.Label : PlayerProfile.ShortId(f.UserId));
-                var line = $"{displayName} ({friendCode})";
-                _font.DrawString(sb, line, new Vector2(row.X + 8, row.Y + 3), Color.White);
+                var username = ResolveFriendUsername(f);
+                var secondary = BuildFriendPresenceText(f.LastKnownPresence);
+                var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowHeight);
+                DrawSocialRow(sb, row, username, secondary, i == _selectedFriend, new Color(60, 90, 130, 220), new Color(200, 230, 255));
 
-                y += rowH + 4;
-                if (y + rowH > _friendsRect.Bottom - 8)
+                y += rowHeight + 6;
+                if (y + rowHeight > _friendsRect.Bottom - 8)
                     break;
             }
 
@@ -1237,25 +1342,20 @@ public enum ProfileScreenStartTab
 
                 for (var i = 0; i < _incomingRequests.Count; i++)
                 {
-                    var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowH);
-                    var selected = i == _selectedRequest;
-                    sb.Draw(_pixel, row, selected ? new Color(90, 72, 40, 220) : new Color(26, 26, 26, 200));
-                    DrawBorder(sb, row, selected ? new Color(240, 220, 160) : new Color(110, 110, 110));
-
                     var req = _incomingRequests[i];
                     var user = req.User;
-                    var displayName = !string.IsNullOrWhiteSpace(user.DisplayName) ? user.DisplayName : PlayerProfile.ShortId(user.ProductUserId);
-                    var line = $"{displayName} ({user.FriendCode})";
-                    _font.DrawString(sb, line, new Vector2(row.X + 8, row.Y + 3), Color.White);
+                    var username = ResolveGateUsername(user);
+                    var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowHeight);
+                    DrawSocialRow(sb, row, username, "Incoming request", i == _selectedRequest, new Color(90, 72, 40, 220), new Color(240, 220, 160));
 
-                    y += rowH + 4;
-                    if (y + rowH > _friendsRect.Bottom - 8)
+                    y += rowHeight + 6;
+                    if (y + rowHeight > _friendsRect.Bottom - 8)
                         break;
                 }
             }
 
             // Outgoing
-            if (_outgoingRequests.Count > 0 && y + rowH + 20 < _friendsRect.Bottom)
+            if (_outgoingRequests.Count > 0 && y + rowHeight + 20 < _friendsRect.Bottom)
             {
                 y += 8;
                 _font.DrawString(sb, "OUTGOING:", new Vector2(_friendsRect.X + 8, y), new Color(200, 200, 200));
@@ -1263,18 +1363,14 @@ public enum ProfileScreenStartTab
 
                 for (var i = 0; i < _outgoingRequests.Count; i++)
                 {
-                    var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowH);
-                    sb.Draw(_pixel, row, new Color(20, 20, 20, 180));
-                    DrawBorder(sb, row, new Color(80, 80, 80));
-
                     var req = _outgoingRequests[i];
                     var user = req.User;
-                    var displayName = !string.IsNullOrWhiteSpace(user.DisplayName) ? user.DisplayName : PlayerProfile.ShortId(user.ProductUserId);
-                    var line = $"{displayName} ({user.FriendCode}) [PENDING]";
-                    _font.DrawString(sb, line, new Vector2(row.X + 8, row.Y + 3), new Color(180, 180, 180));
+                    var username = ResolveGateUsername(user);
+                    var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowHeight);
+                    DrawSocialRow(sb, row, username, "Outgoing request", false, new Color(20, 20, 20, 180), new Color(80, 80, 80));
 
-                    y += rowH + 4;
-                    if (y + rowH > _friendsRect.Bottom - 8)
+                    y += rowHeight + 6;
+                    if (y + rowHeight > _friendsRect.Bottom - 8)
                         break;
                 }
             }
@@ -1290,22 +1386,100 @@ public enum ProfileScreenStartTab
 
         for (var i = 0; i < _blockedUsers.Count; i++)
         {
-            var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowH);
-            var selected = i == _selectedBlocked;
-            sb.Draw(_pixel, row, selected ? new Color(110, 52, 52, 220) : new Color(26, 26, 26, 200));
-            DrawBorder(sb, row, selected ? new Color(245, 170, 170) : new Color(110, 110, 110));
-
             var blockedUser = _blockedUsers[i];
-            var displayName = !string.IsNullOrWhiteSpace(blockedUser.DisplayName)
-                ? blockedUser.DisplayName
-                : PlayerProfile.ShortId(blockedUser.ProductUserId);
-            var line = $"{displayName} ({blockedUser.FriendCode})";
-            _font.DrawString(sb, line, new Vector2(row.X + 8, row.Y + 3), Color.White);
+            var username = ResolveGateUsername(blockedUser);
+            var row = new Rectangle(_friendsRect.X + 6, y, _friendsRect.Width - 12, rowHeight);
+            DrawSocialRow(sb, row, username, "Blocked", i == _selectedBlocked, new Color(110, 52, 52, 220), new Color(245, 170, 170));
 
-            y += rowH + 4;
-            if (y + rowH > _friendsRect.Bottom - 8)
+            y += rowHeight + 6;
+            if (y + rowHeight > _friendsRect.Bottom - 8)
                 break;
         }
+    }
+
+    private void DrawSocialRow(SpriteBatch sb, Rectangle row, string title, string subtitle, bool selected, Color selectedFill, Color selectedBorder)
+    {
+        sb.Draw(_pixel, row, selected ? selectedFill : new Color(26, 26, 26, 200));
+        DrawBorder(sb, row, selected ? selectedBorder : new Color(110, 110, 110));
+
+        var iconSize = Math.Max(28, row.Height - 14);
+        var iconRect = new Rectangle(row.X + 8, row.Y + (row.Height - iconSize) / 2, iconSize, iconSize);
+        DrawCircularBadge(sb, iconRect, title);
+        var glyph = string.IsNullOrWhiteSpace(title) ? "?" : title[..1].ToUpperInvariant();
+        var glyphPos = new Vector2(iconRect.Center.X - (_font.MeasureString(glyph).X / 2f), iconRect.Center.Y - (_font.LineHeight / 2f));
+        _font.DrawString(sb, glyph, glyphPos, Color.White);
+
+        var textX = iconRect.Right + 10;
+        _font.DrawString(sb, title, new Vector2(textX, row.Y + 7), Color.White);
+        _font.DrawString(sb, subtitle, new Vector2(textX, row.Y + 7 + _font.LineHeight), new Color(180, 188, 205));
+    }
+
+    private void DrawCircularBadge(SpriteBatch sb, Rectangle rect, string seed)
+    {
+        var baseColor = ResolveBadgeColor(seed);
+        var center = new Vector2(rect.Center.X, rect.Center.Y);
+        var radius = rect.Width / 2f;
+        for (var y = rect.Top; y < rect.Bottom; y++)
+        {
+            for (var x = rect.Left; x < rect.Right; x++)
+            {
+                var dx = x + 0.5f - center.X;
+                var dy = y + 0.5f - center.Y;
+                if ((dx * dx) + (dy * dy) > radius * radius)
+                    continue;
+
+                sb.Draw(_pixel, new Rectangle(x, y, 1, 1), baseColor);
+            }
+        }
+
+        DrawBorder(sb, rect, WithAlpha(BlendColors(baseColor, Color.White, 0.25f), 220));
+    }
+
+    private Color ResolveBadgeColor(string seed)
+    {
+        var text = string.IsNullOrWhiteSpace(seed) ? "friend" : seed.Trim().ToLowerInvariant();
+        var hash = 17;
+        for (var i = 0; i < text.Length; i++)
+            hash = (hash * 31) + text[i];
+
+        var palette = new[]
+        {
+            new Color(88, 114, 214),
+            new Color(98, 168, 122),
+            new Color(184, 123, 82),
+            new Color(147, 102, 196),
+            new Color(74, 150, 170)
+        };
+
+        return palette[Math.Abs(hash) % palette.Length];
+    }
+
+    private string ResolveFriendUsername(PlayerProfile.FriendEntry friend)
+    {
+        var username = (friend.Label ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(username))
+            username = (friend.LastKnownDisplayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(username))
+            username = PlayerProfile.ShortId(friend.UserId);
+        return username;
+    }
+
+    private static string ResolveGateUsername(GateIdentityUser user)
+    {
+        var username = (user.Username ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(username))
+            username = (user.DisplayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(username))
+            username = PlayerProfile.ShortId(user.ProductUserId);
+        return username;
+    }
+
+    private static string BuildFriendPresenceText(string? presence)
+    {
+        var value = (presence ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return "Offline";
+        return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(value.Replace('_', ' ').ToLowerInvariant());
     }
 
     private void DrawFriendsModeTabs(SpriteBatch sb)
@@ -1329,32 +1503,56 @@ public enum ProfileScreenStartTab
         if (!_friendsRect.Contains(input.MousePosition))
             return;
 
-        var rowH = _font.LineHeight + 8;
-        var startY = _friendsRect.Y + _font.LineHeight + 12;
-        var relY = input.MousePosition.Y - startY;
-        if (relY < 0)
-            return;
-
-        var index = relY / (rowH + 4);
         if (_friendsListMode == ProfileScreenFriendsMode.Friends)
         {
-            if (index < 0 || index >= _profile.Friends.Count)
+            var selectedIndex = ResolveFriendsRowIndex(input.MousePosition.Y, _profile.Friends.Count);
+            if (selectedIndex < 0 || selectedIndex >= _profile.Friends.Count)
                 return;
-            _selectedFriend = index;
+            _selectedFriend = selectedIndex;
             return;
         }
 
         if (_friendsListMode == ProfileScreenFriendsMode.Requests)
         {
-            if (index < 0 || index >= _incomingRequests.Count)
+            var selectedIndex = ResolveIncomingRequestRowIndex(input.MousePosition.Y);
+            if (selectedIndex < 0 || selectedIndex >= _incomingRequests.Count)
                 return;
-            _selectedRequest = index;
+            _selectedRequest = selectedIndex;
             return;
         }
 
-        if (index < 0 || index >= _blockedUsers.Count)
+        var blockedIndex = ResolveFriendsRowIndex(input.MousePosition.Y, _blockedUsers.Count);
+        if (blockedIndex < 0 || blockedIndex >= _blockedUsers.Count)
             return;
-        _selectedBlocked = index;
+        _selectedBlocked = blockedIndex;
+    }
+
+    private int ResolveFriendsRowIndex(int mouseY, int count)
+    {
+        var rowHeight = Math.Max(54, (_font.LineHeight * 2) + 14);
+        var startY = _friendsRect.Y + _font.LineHeight + 12;
+        var relY = mouseY - startY;
+        if (relY < 0)
+            return -1;
+
+        var stride = rowHeight + 6;
+        var index = relY / stride;
+        return index >= count ? -1 : index;
+    }
+
+    private int ResolveIncomingRequestRowIndex(int mouseY)
+    {
+        var rowHeight = Math.Max(54, (_font.LineHeight * 2) + 14);
+        var y = _friendsRect.Y + _font.LineHeight + 12;
+        if (_incomingRequests.Count > 0)
+            y += _font.LineHeight + 4;
+
+        var relY = mouseY - y;
+        if (relY < 0)
+            return -1;
+
+        var index = relY / (rowHeight + 6);
+        return index >= _incomingRequests.Count ? -1 : index;
     }
 
     private void OpenAddFriend()
@@ -1383,7 +1581,7 @@ public enum ProfileScreenStartTab
                     _profile.Friends.RemoveAt(_selectedFriend);
                     _selectedFriend = Math.Min(_selectedFriend, _profile.Friends.Count - 1);
                     _profile.Save(_log);
-                    SetStatus($"Removed {PlayerProfile.ShortId(entry.UserId)} (local fallback).");
+                    SetStatus($"Removed {ResolveFriendUsername(entry)} (local fallback).");
                     return;
                 }
                 SetStatus(string.IsNullOrWhiteSpace(remove.Message) ? "Failed to remove friend." : remove.Message);
@@ -1393,14 +1591,14 @@ public enum ProfileScreenStartTab
 
             await SyncCanonicalFriendsAsync(seedFromLocal: false);
             _selectedFriend = Math.Min(_selectedFriend, _profile.Friends.Count - 1);
-            SetStatus($"Removed {PlayerProfile.ShortId(entry.UserId)}.");
+            SetStatus($"Removed {ResolveFriendUsername(entry)}.");
             return;
         }
 
         _profile.Friends.RemoveAt(_selectedFriend);
         _selectedFriend = Math.Min(_selectedFriend, _profile.Friends.Count - 1);
         _profile.Save(_log);
-        SetStatus($"Removed {PlayerProfile.ShortId(entry.UserId)}.");
+        SetStatus($"Removed {ResolveFriendUsername(entry)}.");
     }
 
     private async Task AcceptRequestAsync()
@@ -1420,7 +1618,7 @@ public enum ProfileScreenStartTab
         }
 
         await SyncCanonicalFriendsAsync(seedFromLocal: false);
-        SetStatus($"Accepted {req.User.DisplayName}.");
+        SetStatus($"Accepted {ResolveGateUsername(req.User)}.");
     }
 
     private async Task DenyRequestAsync()
@@ -1440,7 +1638,7 @@ public enum ProfileScreenStartTab
         }
 
         await SyncCanonicalFriendsAsync(seedFromLocal: false);
-        SetStatus($"Denied {req.User.DisplayName}.");
+        SetStatus($"Denied {ResolveGateUsername(req.User)}.");
     }
 
     private async Task BlockSelectedUserAsync()
@@ -1676,11 +1874,6 @@ public enum ProfileScreenStartTab
         _nextFriendsSyncUtc = DateTime.UtcNow.AddSeconds(45);
     }
 
-    private async Task RefreshProfileDataAsync()
-    {
-        await SyncCanonicalFriendsAsync(seedFromLocal: false);
-    }
-
     private static bool IsMissingFriendsEndpointError(string? message)
     {
         var value = (message ?? string.Empty).Trim();
@@ -1689,27 +1882,6 @@ public enum ProfileScreenStartTab
 
         return value.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase)
             || value.Contains("Not Found", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void CopyLocalId()
-    {
-        var id = (_eos?.LocalProductUserId ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(id))
-        {
-            SetStatus("ID unavailable right now.");
-            return;
-        }
-
-        try
-        {
-            WinClipboard.SetText(id);
-            SetStatus("Copied ID to clipboard.");
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"ProfileScreen copy ID failed: {ex.Message}");
-            SetStatus("Clipboard copy failed.");
-        }
     }
 
     private void SetStatus(string msg, double seconds = 3.0)

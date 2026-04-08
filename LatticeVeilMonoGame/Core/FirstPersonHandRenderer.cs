@@ -22,6 +22,9 @@ public sealed class FirstPersonHandRenderer : IDisposable
     private const float ArmPostSwingYawDeg = -45f;
     private const float ArmSwingPitchDeg = -42f;
     private const float HeldBlockRightOffset = 0.30f;
+    private const float DamageKickYawDeg = -12f;
+    private const float DamageKickPitchDeg = 15f;
+    private const float DamageKickRollDeg = 11f;
 
     private readonly GraphicsDevice _device;
     private readonly BasicEffect _handEffect;
@@ -95,7 +98,8 @@ public sealed class FirstPersonHandRenderer : IDisposable
         bool isFlying,
         bool isGrounded,
         float verticalVelocity,
-        float actionSwingProgress)
+        float actionSwingProgress,
+        float damageKickProgress)
     {
         _ = isGrounded;
         _ = verticalVelocity;
@@ -125,20 +129,24 @@ public sealed class FirstPersonHandRenderer : IDisposable
 
         var handAlpha = 1f;
         var swing = Math.Clamp(actionSwingProgress, 0f, 1f);
+        var damageKick = MathF.Sin(Math.Clamp(damageKickProgress, 0f, 1f) * MathF.PI * 0.5f);
         var swingRoot = MathF.Sqrt(swing);
         var swingSin = MathF.Sin(swing * MathF.PI);
         var swingSquaredSin = MathF.Sin(swing * swing * MathF.PI);
         var swingRootSin = MathF.Sin(swingRoot * MathF.PI);
         var swingRootDoubleSin = MathF.Sin(swingRoot * MathF.PI * 2f);
+        var damageKickPosX = -0.07f * damageKick;
+        var damageKickPosY = 0.08f * damageKick;
+        var damageKickPosZ = 0.12f * damageKick;
         if (!hasHeldBlock)
         {
             var equipProgress = _holdPoseBlend;
 
             var local = Matrix.Identity;
             local *= Matrix.CreateTranslation(
-                ArmSwingXPosScale * swingRootSin,
-                ArmSwingYPosScale * swingRootDoubleSin + (isFlying ? MathF.Sin(worldTimeSeconds * 2.8f) * 0.02f : 0f),
-                ArmSwingZPosScale * swingSin);
+                ArmSwingXPosScale * swingRootSin + damageKickPosX,
+                ArmSwingYPosScale * swingRootDoubleSin + (isFlying ? MathF.Sin(worldTimeSeconds * 2.8f) * 0.02f : 0f) + damageKickPosY,
+                ArmSwingZPosScale * swingSin + damageKickPosZ);
             local *= Matrix.CreateTranslation(walkBobX, walkBobY, 0f);
             local *= Matrix.CreateTranslation(
                 ArmPosX,
@@ -148,6 +156,9 @@ public sealed class FirstPersonHandRenderer : IDisposable
             local *= Matrix.CreateRotationY(MathHelper.ToRadians(ArmSwingYawAmountDeg * swingSquaredSin));
             local *= Matrix.CreateRotationZ(MathHelper.ToRadians(ArmSwingRollAmountDeg * swingRootSin));
             local *= Matrix.CreateRotationX(MathHelper.ToRadians(ArmSwingPitchDeg * swingRootSin));
+            local *= Matrix.CreateRotationY(MathHelper.ToRadians(DamageKickYawDeg * damageKick));
+            local *= Matrix.CreateRotationX(MathHelper.ToRadians(DamageKickPitchDeg * damageKick));
+            local *= Matrix.CreateRotationZ(MathHelper.ToRadians(DamageKickRollDeg * damageKick));
             local *= Matrix.CreateRotationY(MathHelper.ToRadians(ArmPostSwingYawDeg));
 
             var handScale = (Scale.HandScale * 2.32f) * Scale.BlockSize;
@@ -189,9 +200,9 @@ public sealed class FirstPersonHandRenderer : IDisposable
             return;
 
         var blockPos = camPos
-            + forward * (0.66f * Scale.BlockSize)
+            + forward * ((0.66f + (0.08f * damageKick)) * Scale.BlockSize)
             + right * (HeldBlockRightOffset * Scale.BlockSize)
-            - up * ((0.40f - (0.16f * _holdPoseBlend)) * Scale.BlockSize);
+            - up * ((0.40f - (0.16f * _holdPoseBlend) - (0.05f * damageKick)) * Scale.BlockSize);
 
         Matrix display;
         if (model != null && model.TryGetDisplayTransform(BlockModelContext.FirstPersonRightHand, out var displayTransform))
@@ -199,8 +210,9 @@ public sealed class FirstPersonHandRenderer : IDisposable
         else
             display = Matrix.CreateScale(Scale.HeldBlockScale * Scale.BlockSize);
 
-        var blockRot = Matrix.CreateRotationX(0.22f - (swingRootSin * 0.30f));
-        blockRot *= Matrix.CreateRotationY(-0.36f + (swingSquaredSin * 0.10f));
+        var blockRot = Matrix.CreateRotationX(0.22f - (swingRootSin * 0.30f) + MathHelper.ToRadians(DamageKickPitchDeg * damageKick));
+        blockRot *= Matrix.CreateRotationY(-0.36f + (swingSquaredSin * 0.10f) + MathHelper.ToRadians(DamageKickYawDeg * damageKick));
+        blockRot *= Matrix.CreateRotationZ(MathHelper.ToRadians(DamageKickRollDeg * damageKick));
         var blockWorld = display * blockRot * basis * Matrix.CreateTranslation(blockPos);
         var layer = BlockRegistry.Get(heldBlock).RenderLayer;
 

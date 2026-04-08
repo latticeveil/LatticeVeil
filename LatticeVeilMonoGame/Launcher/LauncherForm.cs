@@ -245,6 +245,7 @@ public sealed class LauncherForm : Form
         _officialBuildVerifier = new OfficialBuildVerifier(_log, GetGameHashesGetUrl(), GetSupabaseAnonKey());
         _assetInstaller = new AssetPackInstaller(_log);
         _gameReleaseUpdater = new GameReleaseUpdater(_log);
+        _gameReleaseUpdater.CleanupTransientStorage();
         _logFilePath = _log.LogFilePath;
         ResetLogSessionDate(_logFilePath);
         _log.Info($"Auth storage path: {VeilnetAuthPath}");

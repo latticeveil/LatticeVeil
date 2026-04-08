@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using WinClipboard = System.Windows.Forms.Clipboard;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -237,13 +236,13 @@ public sealed class InviteFriendsScreen : IScreen
         sb.Draw(_pixel, _listRect, new Color(20, 20, 20, 200));
         DrawBorder(sb, _listRect, Color.White);
 
-        _font.DrawString(sb, "FRIENDS (CODES / USERNAMES)", new Vector2(_listRect.X + 4, _listRect.Y + 2), Color.White);
-        _font.DrawString(sb, "ADD FRIEND (CODE OR USERNAME)", new Vector2(_addFriendInputRect.X, _addFriendInputRect.Y - _font.LineHeight - 2), new Color(220, 220, 220));
+        _font.DrawString(sb, "FRIENDS", new Vector2(_listRect.X + 4, _listRect.Y + 2), Color.White);
+        _font.DrawString(sb, "ADD FRIEND BY USERNAME", new Vector2(_addFriendInputRect.X, _addFriendInputRect.Y - _font.LineHeight - 2), new Color(220, 220, 220));
 
         sb.Draw(_pixel, _addFriendInputRect, _addFriendActive ? new Color(36, 36, 36, 240) : new Color(24, 24, 24, 240));
         DrawBorder(sb, _addFriendInputRect, Color.White);
 
-        var inputLabel = string.IsNullOrWhiteSpace(_addFriendQuery) ? "(type RC-code or reserved username)" : _addFriendQuery;
+        var inputLabel = string.IsNullOrWhiteSpace(_addFriendQuery) ? "(type Veilnet username)" : _addFriendQuery;
         _font.DrawString(
             sb,
             inputLabel,
@@ -272,11 +271,10 @@ public sealed class InviteFriendsScreen : IScreen
 
             var f = _friends[i];
             var name = string.IsNullOrWhiteSpace(f.DisplayName) ? PlayerProfile.ShortId(f.ProductUserId) : f.DisplayName;
-            var code = string.IsNullOrWhiteSpace(f.FriendCode) ? EosIdentityStore.GenerateFriendCode(f.ProductUserId) : f.FriendCode;
             var state = f.IsHosting
                 ? $"HOSTING {f.WorldName}"
                 : (string.IsNullOrWhiteSpace(f.Presence) ? "ONLINE" : f.Presence.ToUpperInvariant());
-            var text = $"{name} ({code}) | {state}";
+            var text = $"{name} | {state}";
             DrawTextBold(sb, Truncate(text, 96), new Vector2(_listBodyRect.X + 4, rowY), Color.White);
             rowY += rowH;
             if (rowY > _listBodyRect.Bottom - rowH)
@@ -412,7 +410,6 @@ public sealed class InviteFriendsScreen : IScreen
                     {
                         ProductUserId = id,
                         DisplayName = string.IsNullOrWhiteSpace(presence.DisplayName) ? friend.Label : presence.DisplayName,
-                        FriendCode = string.IsNullOrWhiteSpace(presence.FriendCode) ? EosIdentityStore.GenerateFriendCode(id) : presence.FriendCode,
                         Presence = presence.Status,
                         IsHosting = presence.IsHosting,
                         WorldName = string.IsNullOrWhiteSpace(presence.WorldName) ? "WORLD" : presence.WorldName
@@ -427,7 +424,6 @@ public sealed class InviteFriendsScreen : IScreen
                     {
                         ProductUserId = id,
                         DisplayName = fallbackName,
-                        FriendCode = EosIdentityStore.GenerateFriendCode(id),
                         Presence = string.IsNullOrWhiteSpace(friend.LastKnownPresence) ? "offline" : friend.LastKnownPresence,
                         IsHosting = false,
                         WorldName = "WORLD"
@@ -488,10 +484,10 @@ public sealed class InviteFriendsScreen : IScreen
             return;
         }
 
-        var hostCode = (eos.LocalProductUserId ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(hostCode))
+        var hostUserId = (eos.LocalProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostUserId))
         {
-            SetStatus("Host code unavailable.");
+            SetStatus("World hosting is not ready yet.");
             return;
         }
 
@@ -501,26 +497,19 @@ public sealed class InviteFriendsScreen : IScreen
             RefreshIdentityStore(eos);
             var displayName = _identityStore.GetDisplayNameOrDefault(_profile.GetDisplayUsername());
             await _gate.UpsertPresenceAsync(
-                productUserId: hostCode,
+                productUserId: hostUserId,
                 displayName: displayName,
                 isHosting: true,
                 worldName: _worldName,
                 gameMode: "Survival", // Default or resolve from world
-                joinTarget: hostCode,
+                joinTarget: hostUserId,
                 status: $"hosting {_worldName}",
                 cheats: false, // TODO: derive from world/host settings
                 playerCount: 1, // TODO: derive from current player count
                 maxPlayers: 8); // TODO: derive from world/host settings
 
-            try
-            {
-                WinClipboard.SetText(hostCode);
-                SetStatus("Host code copied. Share it with your friend.", 3);
-            }
-            catch
-            {
-                SetStatus("Invite ready. Share your host code.", 3);
-            }
+            var friendName = _friends[_selectedFriend].DisplayName;
+            SetStatus($"World hosted. {friendName} can join from friends.", 3);
         }
         catch (Exception ex)
         {
@@ -541,7 +530,7 @@ public sealed class InviteFriendsScreen : IScreen
         var query = (_addFriendQuery ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(query))
         {
-            SetStatus("Enter a friend code or username first.");
+            SetStatus("Enter a Veilnet username first.");
             return;
         }
 
@@ -804,7 +793,6 @@ public sealed class InviteFriendsScreen : IScreen
     {
         public string ProductUserId { get; init; } = string.Empty;
         public string DisplayName { get; init; } = string.Empty;
-        public string FriendCode { get; init; } = string.Empty;
         public string Presence { get; init; } = string.Empty;
         public bool IsHosting { get; init; }
         public string WorldName { get; init; } = "WORLD";

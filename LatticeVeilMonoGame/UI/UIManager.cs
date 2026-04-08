@@ -4,13 +4,12 @@ namespace LatticeVeilMonoGame.UI;
 
 public class UIManager
 {
-    private readonly Rectangle _virtualViewport;
+    private readonly Rectangle _uiViewport;
     private readonly Dictionary<string, UIManagerElement> _elements = new();
     
-    public UIManager(Rectangle actualViewport)
+    public UIManager(Rectangle uiViewport)
     {
-        // Convert actual viewport to virtual viewport
-        _virtualViewport = VirtualResolution.ToVirtual(actualViewport);
+        _uiViewport = uiViewport;
     }
     
     public void AddButton(string name, Rectangle bounds, string? description = null)
@@ -34,18 +33,15 @@ public class UIManager
     public Rectangle GetButtonBounds(string name)
     {
         if (_elements.TryGetValue(name, out var element))
-        {
-            // Convert virtual coordinates to screen coordinates
-            return VirtualResolution.ToScreen(element.Bounds);
-        }
+            return element.Bounds;
         return Rectangle.Empty;
     }
     
     // Layout helpers for easy positioning
     public Rectangle CenterButton(Rectangle buttonSize, int yOffset)
     {
-        var centerX = _virtualViewport.X + _virtualViewport.Width / 2;
-        var centerY = _virtualViewport.Y + _virtualViewport.Height / 2;
+        var centerX = _uiViewport.X + _uiViewport.Width / 2;
+        var centerY = _uiViewport.Y + _uiViewport.Height / 2;
         return new Rectangle(
             centerX - buttonSize.Width / 2,
             centerY - buttonSize.Height / 2 + yOffset,
@@ -68,16 +64,31 @@ public class UIManager
     
     public void CreateMainMenuLayout()
     {
-        var buttonSize = new Rectangle(0, 0, 560, 200);
-        var spacing = 2;
-        
-        // Use virtual resolution coordinates (1920x1080)
-        var centerX = VirtualResolution.VirtualWidth / 2;
+        var width = Math.Max(1, _uiViewport.Width);
+        var height = Math.Max(1, _uiViewport.Height);
+        var centerX = _uiViewport.X + width / 2;
+
+        var footerMarginX = Math.Clamp(width / 48, 14, 28);
+        var footerMarginY = Math.Clamp(height / 40, 14, 24);
+        var footerButtonSizeValue = Math.Clamp(Math.Min(width, height) / 10, 72, 108);
+        var footerButtonSize = new Rectangle(0, 0, footerButtonSizeValue, footerButtonSizeValue);
+
+        var topMargin = Math.Clamp(height / 10, 56, 112);
+        var gapToFooter = Math.Clamp(height / 24, 24, 42);
+        var spacing = Math.Clamp(height / 70, 10, 18);
         var buttonsCount = 4;
-        var totalHeight = buttonSize.Height * buttonsCount + spacing * (buttonsCount - 1);
-        var startY = Math.Max(90, (VirtualResolution.VirtualHeight - totalHeight) / 2 - 10);
-        
-        // Main menu buttons - properly spaced in virtual coordinates
+        var bottomReserved = footerButtonSizeValue + footerMarginY + gapToFooter;
+        var availableHeight = Math.Max(280, height - topMargin - bottomReserved);
+        var buttonHeight = Math.Clamp((availableHeight - spacing * (buttonsCount - 1)) / buttonsCount, 78, 120);
+        var preferredButtonWidth = (int)Math.Round(buttonHeight * 3.0f);
+        var maxButtonWidth = Math.Max(240, Math.Min(460, width - 140));
+        var minButtonWidth = Math.Min(300, maxButtonWidth);
+        var buttonWidth = Math.Clamp(preferredButtonWidth, minButtonWidth, maxButtonWidth);
+        var totalHeight = buttonHeight * buttonsCount + spacing * (buttonsCount - 1);
+        var startY = _uiViewport.Y + Math.Max(topMargin, (height - bottomReserved - totalHeight) / 2);
+
+        var buttonSize = new Rectangle(0, 0, buttonWidth, buttonHeight);
+
         AddButton("singleplayer", new Rectangle(
             centerX - buttonSize.Width / 2,
             startY,
@@ -106,21 +117,16 @@ public class UIManager
             buttonSize.Height
         ), "Quit button - bottom of main buttons");
         
-        // Profile button - bottom left in virtual coordinates (perfect square, bigger)
-        var footerMarginX = 18;
-        var footerMarginY = 18;
-        var footerButtonSize = new Rectangle(0, 0, 136, 136);
         AddButton("profile", new Rectangle(
             footerMarginX,
-            VirtualResolution.VirtualHeight - footerButtonSize.Height - footerMarginY,
+            _uiViewport.Bottom - footerButtonSize.Height - footerMarginY,
             footerButtonSize.Width,
             footerButtonSize.Height
         ), "Profile button - bottom left corner");
         
-        // Screenshots button - bottom right in virtual coordinates
         AddButton("screenshots", new Rectangle(
-            VirtualResolution.VirtualWidth - footerButtonSize.Width - footerMarginX,
-            VirtualResolution.VirtualHeight - footerButtonSize.Height - footerMarginY,
+            _uiViewport.Right - footerButtonSize.Width - footerMarginX,
+            _uiViewport.Bottom - footerButtonSize.Height - footerMarginY,
             footerButtonSize.Width,
             footerButtonSize.Height
         ), "Screenshots button - bottom right corner");

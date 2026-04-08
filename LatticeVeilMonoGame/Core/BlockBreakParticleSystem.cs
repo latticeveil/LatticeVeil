@@ -73,13 +73,14 @@ public sealed class BlockBreakParticleSystem
         if (_spawnCount <= 0 || _maxParticles <= 0)
             return;
 
+        var overflow = (_particles.Count + _spawnCount) - _maxParticles;
+        if (overflow > 0)
+            _particles.RemoveRange(0, Math.Min(overflow, _particles.Count));
+
         var baseColor = ResolveParticleColor(blockId);
         var center = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
         for (var i = 0; i < _spawnCount; i++)
         {
-            if (_particles.Count >= _maxParticles)
-                _particles.RemoveAt(0);
-
             var jitter = new Vector3(
                 NextRange(-0.38f, 0.38f),
                 NextRange(-0.38f, 0.38f),

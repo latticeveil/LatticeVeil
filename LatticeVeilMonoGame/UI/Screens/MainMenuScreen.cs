@@ -82,8 +82,8 @@ public sealed class MainMenuScreen : IScreen
         if (!string.IsNullOrWhiteSpace(veilnetName))
             _profile.Username = veilnetName;
 
-        // Initialize UI manager for precise positioning
-        _uiManager = new UIManager(_viewport);
+        // Initialize UI manager for precise positioning in UI-layout coordinates.
+        _uiManager = new UIManager(UiLayout.Viewport);
         _uiManager.CreateMainMenuLayout();
         _log.Info("UI Manager initialized with tight button spacing");
 
@@ -105,6 +105,9 @@ public sealed class MainMenuScreen : IScreen
 
         _screenshotBtn = new Button("SCREENSHOTS", () => _menus.Push(new ScreenshotsScreen(_menus, _assets, _font, _pixel, _log), _viewport));
         _screenshotBtn.Bounds = _uiManager.GetButtonBounds("screenshots");
+
+        _viewport = UiLayout.WindowViewport;
+        OnResize(_viewport);
 
         try
         {
@@ -143,16 +146,13 @@ public sealed class MainMenuScreen : IScreen
     {
         _viewport = viewport;
         
-        // Update virtual resolution system
-        VirtualResolution.Update(viewport);
-        
-        // Update UI manager with new viewport
+        // Update UI manager with the current UI-layout viewport so draw + click math stay aligned.
         if (_uiManager != null)
         {
-            _uiManager = new UIManager(_viewport);
+            _uiManager = new UIManager(UiLayout.Viewport);
             _uiManager.CreateMainMenuLayout();
             
-            // Update button bounds with new positions (already converted to screen coords)
+            // Update button bounds in UI-space. They are drawn under UiLayout.Transform.
             _singleBtn.Bounds = _uiManager.GetButtonBounds("singleplayer");
             _multiBtn.Bounds = _uiManager.GetButtonBounds("multiplayer");
             _optionsBtn.Bounds = _uiManager.GetButtonBounds("options");
@@ -160,8 +160,7 @@ public sealed class MainMenuScreen : IScreen
             _profileBtn.Bounds = _uiManager.GetButtonBounds("profile");
             _screenshotBtn.Bounds = _uiManager.GetButtonBounds("screenshots");
             
-            _log.Info($"Virtual Resolution updated: {VirtualResolution.VirtualWidth}x{VirtualResolution.VirtualHeight} -> {viewport.Width}x{viewport.Height}");
-            _log.Info($"Scale: {VirtualResolution.ScaleX:F2}x{VirtualResolution.ScaleY:F2}");
+            _log.Info($"Main menu UI viewport updated: {UiLayout.Viewport.Width}x{UiLayout.Viewport.Height} (window {viewport.Width}x{viewport.Height}, scale {UiLayout.Scale:F2})");
             _log.Info(_uiManager.GetLayoutInfo());
         }
     }
@@ -202,7 +201,7 @@ public sealed class MainMenuScreen : IScreen
 
         sb.End();
 
-        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: VirtualResolution.ScaleMatrix);
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
 
         _singleBtn.Draw(sb, _pixel, _font);
         _multiBtn.Draw(sb, _pixel, _font);

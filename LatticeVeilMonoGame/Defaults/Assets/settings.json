@@ -8,7 +8,7 @@
   "Brightness": 1,
   "FieldOfView": 70,
   "RenderDistanceChunks": 10,
-  "KeepLauncherOpen": true,
+  "KeepLauncherOpen": false,
   "DarkMode": true,
   "MasterVolume": 1,
   "MusicVolume": 1,
