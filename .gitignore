@@ -1,0 +1,120 @@
+# LatticeVeil Project .gitignore
+# This file ensures only necessary source code is tracked
+# All sensitive, local, and build artifacts are excluded
+
+# Release and Development builds (NEVER push these)
+RELEASE/
+DEV/
+Builds/
+FINAL/
+
+# Plans and documentation (internal use only)
+plans/
+docs/
+*.md
+!README.md
+
+# IDE and editor files
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs and temporary files
+bin/
+obj/
+*.pdb
+*.exe
+*.dll
+*.cache
+*.log
+*.tmp
+*.temp
+
+# Node modules and package manager files
+node_modules/
+package-lock.json
+yarn.lock
+
+# Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Local configuration and secrets
+*.private.json
+*.private.example.json
+eos.private.*
+supabase_secrets_list.json
+.env
+.env.local
+.env.*.local
+
+# AI and development tools
+.ollama/
+.gemini/
+ai-notes/
+ai-logs/
+.codex-dotnet/
+
+# Logs and debugging
+logs/
+*.log
+debug/
+crash-dumps/
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Installer build artifacts
+installer/*/bin/
+installer/*/obj/
+installer/*/Properties/
+installers/
+*.msi
+*.msm
+*.msp
+
+# Supabase local development
+supabase/.temp/
+supabase/functions/_build/
+supabase/migrations/*.sql
+!supabase/migrations/001_cleanup_and_setup.sql
+!supabase/migrations/002_add_sha256_column.sql
+
+# Third party binaries and SDKs
+ThirdParty/EOSSDK-Win64-Shipping.dll
+
+# Test outputs
+test-results/
+coverage/
+.coverage
+
+# Backup and temporary files
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+
+# Local shortcuts and utilities
+*.lnk
+run_local.*
+BuildGUI.*
+
+# Memory and cache directories
+.memory/
+.cache/
+.builder/
+
+# Build stamps and markers
+.build_stamp

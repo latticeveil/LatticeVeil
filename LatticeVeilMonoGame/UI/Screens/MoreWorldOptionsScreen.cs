@@ -9,8 +9,8 @@ namespace LatticeVeilMonoGame.UI.Screens;
 
 public sealed class MoreWorldOptionsScreen : IScreen
 {
-    private const int PanelMaxWidth = 1300;
-    private const int PanelMaxHeight = 700;
+    private const int PanelMaxWidth = 1248;
+    private const int PanelMaxHeight = 680;
 
     private enum Tab
     {

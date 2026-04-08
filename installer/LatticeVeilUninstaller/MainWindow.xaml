@@ -1,0 +1,284 @@
+<Window x:Class="LatticeVeilUninstaller.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="LatticeVeil Uninstaller" Height="600" Width="800"
+        WindowStyle="None" AllowsTransparency="False"
+        Background="#1A1A1A" WindowStartupLocation="CenterScreen"
+        MouseDown="Window_MouseDown"
+        ResizeMode="NoResize">
+
+    <Window.Resources>
+        <Style x:Key="ModernButton" TargetType="Button">
+            <Setter Property="Background" Value="#262626"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#5A5A5A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="20,10"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8"
+                                SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#404040"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#1E1E1E"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#1A1A1A"/>
+                                <Setter Property="Foreground" Value="#666666"/>
+                                <Setter Property="BorderBrush" Value="#333333"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="ModernTextBlock" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+        </Style>
+
+        <Style x:Key="TitleTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="24"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+        </Style>
+
+        <Style x:Key="SubtitleTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+
+        <Style x:Key="BodyTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="TextWrapping" Value="Wrap"/>
+        </Style>
+
+        <Style x:Key="ModernCheckBox" TargetType="CheckBox">
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#5A5A5A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border Background="Transparent" SnapsToDevicePixels="True">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border x:Name="CheckBorder"
+                                        Width="16" Height="16"
+                                        Background="White"
+                                        BorderBrush="#5A5A5A"
+                                        BorderThickness="1"
+                                        CornerRadius="2"
+                                        Margin="0,0,8,0"
+                                        VerticalAlignment="Center">
+                                    <Path x:Name="CheckMark"
+                                          Stroke="Black"
+                                          StrokeThickness="2"
+                                          Fill="Black"
+                                          Data="M 3,7 L 6,10 L 13,3"
+                                          Visibility="Collapsed"
+                                          SnapsToDevicePixels="True"/>
+                                </Border>
+                                <ContentPresenter Grid.Column="1"
+                                                  VerticalAlignment="Center"
+                                                  RecognizesAccessKey="True"/>
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#888888"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#00FF00"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="CheckBorder" Property="Background" Value="#CCCCCC"/>
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#666666"/>
+                                <Setter Property="Foreground" Value="#666666"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="44"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="80"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="#080808" BorderBrush="#1A1A1A" BorderThickness="0,0,0,1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+                    <TextBlock Text="LATTICEVEIL UNINSTALLER" Style="{StaticResource TitleTextBlock}" VerticalAlignment="Center" FontSize="18"/>
+                    <TextBlock x:Name="VersionIndicator" Text="" Style="{StaticResource BodyTextBlock}" VerticalAlignment="Center" Margin="20,0,0,0" Foreground="#00FF00"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <Button x:Name="MinimizeBtn" Content="−" Background="#202020" Foreground="White" Width="46" Height="34" BorderThickness="0" Style="{StaticResource ModernButton}" Click="MinimizeBtn_Click"/>
+                    <Button x:Name="CloseBtn" Content="✕" Background="#202020" Foreground="White" Width="46" Height="34" BorderThickness="0" Style="{StaticResource ModernButton}" Click="CloseBtn_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid x:Name="MainContentGrid" Grid.Row="1">
+            <Grid x:Name="InitializingPage">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="Initializing Uninstaller..." Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+                    <TextBlock x:Name="SplashMessage" Text="Sadly saying goodbye to LatticeVeil..." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+                    <ProgressBar x:Name="InitProgress" Height="4" Width="300" Background="#1A1A1A" Foreground="#00FF00" Maximum="100" Value="0"/>
+                    <TextBlock x:Name="InitializationStatus" Text="Preparing uninstaller..." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,16,0,0" Foreground="#AAAAAA"/>
+                </StackPanel>
+            </Grid>
+
+            <Grid x:Name="OptionsPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="620">
+                    <TextBlock Text="Uninstall Options" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+
+                    <Border Background="#141414" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="8" Padding="24">
+                        <StackPanel>
+                            <CheckBox x:Name="DeleteTokenCheckBox"
+                                      Content="Delete account login token"
+                                      Style="{StaticResource ModernCheckBox}"
+                                      Margin="0,0,0,20"
+                                      IsChecked="False"/>
+                            <CheckBox x:Name="DeleteDocumentsCheckBox"
+                                      Content="Also delete Documents\LatticeVeil folder entirely (including all worlds and saves)"
+                                      Style="{StaticResource ModernCheckBox}"
+                                      IsChecked="False"/>
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock Text="Choose what else should be removed before continuing." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,20,0,0" Foreground="#AAAAAA"/>
+                </StackPanel>
+            </Grid>
+
+            <Grid x:Name="WorldBackupPage" Visibility="Collapsed" Margin="40,20,40,20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Text="World Backup" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,16"/>
+                <Grid Grid.Row="1" Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock x:Name="WorldBackupDescription"
+                               Grid.Column="0"
+                               Text="Select any worlds you want backed up before LatticeVeil is removed."
+                               Style="{StaticResource BodyTextBlock}"
+                               Foreground="#AAAAAA"
+                               VerticalAlignment="Center"/>
+                    <Button x:Name="BackupAllBtn"
+                            Grid.Column="1"
+                            Content="BACKUP ALL"
+                            Style="{StaticResource ModernButton}"
+                            Click="BackupAllBtn_Click"/>
+                </Grid>
+
+                <Grid Grid.Row="2" Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="BackupPathBox"
+                             Grid.Column="0"
+                             Background="#1A1A1A"
+                             Foreground="White"
+                             BorderBrush="#5A5A5A"
+                             Padding="10,8"/>
+                    <Button x:Name="BrowseBackupPathBtn"
+                            Grid.Column="1"
+                            Content="Browse..."
+                            Margin="8,0,0,0"
+                            Style="{StaticResource ModernButton}"
+                            Click="BrowseBackupPathBtn_Click"/>
+                </Grid>
+
+                <Border Grid.Row="3" Background="#141414" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="8">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+                        <StackPanel x:Name="WorldsList"/>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+
+            <Grid x:Name="ConfirmationPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="620">
+                    <TextBlock Text="Confirm Uninstallation" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,30"/>
+                    <Border Background="#141414" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="8" Padding="24">
+                        <TextBlock x:Name="ConfirmationText" Style="{StaticResource BodyTextBlock}" Foreground="White"/>
+                    </Border>
+                </StackPanel>
+            </Grid>
+
+            <Grid x:Name="ProgressPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock Text="Uninstalling LatticeVeil" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+
+                    <TextBlock x:Name="UninstallStatus" Text="Preparing to uninstall..." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+
+                    <ProgressBar x:Name="UninstallProgressBar" Height="8" Width="400" Background="#1A1A1A" Foreground="#00FF00" Maximum="100" Margin="0,0,0,20"/>
+
+                    <TextBlock x:Name="UninstallProgressText" Text="0%" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+
+            <Grid x:Name="CompletePage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock Text="Uninstallation complete!" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20" Foreground="#00FF00"/>
+                    <TextBlock Text="LatticeVeil has been removed from this system." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40" Foreground="#AAAAAA"/>
+                    <Button x:Name="FinishBtn" Content="FINISH" Style="{StaticResource ModernButton}" Click="FinishBtn_Click"/>
+                </StackPanel>
+            </Grid>
+        </Grid>
+
+        <Border x:Name="NavigationBorder" Grid.Row="2" Background="#080808" BorderBrush="#1A1A1A" BorderThickness="0,1,0,0">
+            <Grid Margin="20,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="PreviousBtn" Content="PREVIOUS" Grid.Column="0" Style="{StaticResource ModernButton}" HorizontalAlignment="Left" Click="PreviousBtn_Click" IsEnabled="False"/>
+                <Button x:Name="CancelBtn" Content="CANCEL" Grid.Column="1" Style="{StaticResource ModernButton}" Margin="8,0" Click="CancelBtn_Click"/>
+                <Button x:Name="NextBtn" Content="NEXT" Grid.Column="2" Style="{StaticResource ModernButton}" Click="NextBtn_Click"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

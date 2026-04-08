@@ -248,6 +248,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _survivalWasGrounded;
     private float _survivalPeakAirY;
     private bool _sigilPowerEnabled = true;
+    private bool _giveItemsEnabled = true;
     private float _sigilPositiveTargetFraction;
     private float _sigilNegativeTargetFraction;
     private float _damageFlashTimer;
@@ -520,6 +521,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int ChatOverlayHudClearance = 28;
     private const string OperatorSyncPrefix = "__lv_opsync__:";
     private const string GameModeSyncPrefix = "__lv_gamemode__:";
+    private const string DifficultyRequestPrefix = "__lv_diff_req__:";
+    private const string DifficultySyncPrefix = "__lv_diff_sync__:";
     private const string RuleRequestPrefix = "__lv_rule_req__:";
     private const string RuleSyncPrefix = "__lv_rule_sync__:";
     private const string InventoryClearSyncPrefix = "__lv_invclear__:";
@@ -556,6 +559,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         "help",
         "accept",
         "reject",
+        "spawn",
+        "sethome",
+        "home",
+        "inv",
+        "pos",
+        "biome",
+        "structure",
+        "seed",
+        "difficulty",
+        "rules",
         "op",
         "deop",
         "kick",
@@ -2037,6 +2050,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _gameMode = _meta.CurrentWorldGameMode;
         _playerCollisionEnabled = _meta.PlayerCollision;
         _sigilPowerEnabled = _meta.Gameplay?.EnableSigilPower ?? true;
+        _giveItemsEnabled = _meta.Gameplay?.EnableGiveItems ?? true;
         _timeCycleEnabled = _meta.Gameplay?.TimeCycleEnabled ?? _meta.TimeCycleEnabled;
         _weatherCycleEnabled = _meta.Gameplay?.WeatherCycleEnabled ?? _meta.WeatherCycleEnabled;
         _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_meta.Gameplay?.TimeOfDayTicks ?? _meta.TimeOfDayTicks);
@@ -3910,7 +3924,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var moving = _player.MoveIntent.LengthSquared() > 0.01f && !_player.IsFlying;
         var previousHealth = _survivalVitals.Health;
-        var tickResult = _survivalVitals.Tick(dt, moving, _player.IsSprinting && moving);
+        var tickResult = _survivalVitals.Tick(dt, moving, _player.IsSprinting && moving, _difficultyLevel);
         if (tickResult.AnyChange)
             MarkPlayerStateDirty();
         if (_survivalVitals.Health < previousHealth)
@@ -4478,6 +4492,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen || _inventoryOpen || _lanSession == null || _gameMode != GameMode.Veilwalker)
             return;
 
+        if (!_giveItemsEnabled)
+            return;
+
         if (_inventory.SelectedId == BlockId.Air || _inventory.SelectedCount <= 0)
             return;
 
@@ -4617,6 +4634,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void HandleDropAndGive(InputState input)
     {
         if (_pauseMenuOpen || _inventoryOpen || _gameMode != GameMode.Veilwalker)
+            return;
+
+        if (!_giveItemsEnabled)
             return;
 
         if (_inventory.SelectedId == BlockId.Air || _inventory.SelectedCount <= 0)
@@ -7177,7 +7197,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             $"TIME: {_timeOfDayTicks} | WEATHER: {_weatherState.ToUpperInvariant()}",
             $"RULES: COLLISION {(_playerCollisionEnabled ? "ON" : "OFF")} | SIGIL {(_sigilPowerEnabled ? "ON" : "OFF")}",
             $"CYCLES: TIME {(_timeCycleEnabled ? "ON" : "OFF")} | WEATHER {(_weatherCycleEnabled ? "ON" : "OFF")}",
-            $"DIFFICULTY: {GetDifficultyLabel(_difficultyLevel).ToUpperInvariant()}",
+            $"DIFFICULTY: {GetDifficultyDisplayLabel(_difficultyLevel).ToUpperInvariant()}",
             $"UI: PAUSE {_pauseMenuOpen} | INV {_inventoryOpen} | CHAT {_chatInputActive} | CMD {_commandInputActive}",
             $"STREAMING: {_activeRadiusChunks}/{_targetActiveRadiusChunks} CHUNKS"
         };
@@ -8187,16 +8207,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _pauseOpenLan.Enabled = canOpenLan;
         _pauseHostOnline.Enabled = canOpenOnline;
 
-        var panelW = Math.Clamp((int)(_viewport.Width * 0.42f), 320, _viewport.Width - 40);
-        var buttonW = Math.Clamp((int)(panelW * 0.6f), 160, 320);
+        var panelW = Math.Clamp((int)(_viewport.Width * 0.5f), 420, _viewport.Width - 40);
+        var buttonW = Math.Clamp((int)(_viewport.Width * 0.252f), 160, 320);
         var buttonH = Math.Clamp((int)(buttonW * 0.22f), 36, 60);
         var gap = 14;
-        var titleH = _font.LineHeight + 14;
-        var padding = 18;
+        var titleH = _font.LineHeight + 18;
+        var padding = 28;
         var estimatedButtonCount = _pauseHostOptionsOpen ? 3 : 5;
         var totalButtonsH = buttonH * estimatedButtonCount + gap * (estimatedButtonCount - 1);
-        var contentH = titleH + totalButtonsH + padding * 2;
-        var panelH = Math.Clamp(contentH, 220, _viewport.Height - 40);
+        var contentH = titleH + totalButtonsH + padding * 2 + 76;
+        var panelH = Math.Clamp(contentH, 320, _viewport.Height - 40);
         _pauseRect = new Rectangle(
             _viewport.X + (_viewport.Width - panelW) / 2,
             _viewport.Y + (_viewport.Height - panelH) / 2,
@@ -8210,7 +8230,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _pauseRect.Width - padding * 2,
             titleH);
 
-        var available = _pauseRect.Height - padding * 2 - titleH;
+        var available = _pauseRect.Height - padding * 2 - titleH - 8;
         var centerX = _pauseRect.X + (_pauseRect.Width - buttonW) / 2;
 
         if (_pauseHostOptionsOpen)
@@ -8226,7 +8246,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var subButtonCount = 3;
             var subTotalButtonsH = buttonH * subButtonCount + gap * (subButtonCount - 1);
-            var subStartY = _pauseRect.Y + padding + titleH + Math.Max(0, (available - subTotalButtonsH) / 2);
+            var subStartY = _pauseRect.Y + padding + titleH + 8 + Math.Max(0, (available - subTotalButtonsH) / 2);
             var row = 0;
             _pauseOpenLan.Bounds = new Rectangle(centerX, subStartY + (buttonH + gap) * row++, buttonW, buttonH);
             _pauseHostOnline.Bounds = new Rectangle(centerX, subStartY + (buttonH + gap) * row++, buttonW, buttonH);
@@ -8245,7 +8265,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var buttonCount = 5;
         totalButtonsH = buttonH * buttonCount + gap * (buttonCount - 1);
-        var startY = _pauseRect.Y + padding + titleH + Math.Max(0, (available - totalButtonsH) / 2);
+        var startY = _pauseRect.Y + padding + titleH + 8 + Math.Max(0, (available - totalButtonsH) / 2);
 
         var mainRow = 0;
         _pauseResume.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow++, buttonW, buttonH);
@@ -8260,10 +8280,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         UpdatePauseMenuLayout();
 
-        sb.Begin(samplerState: SamplerState.PointClamp);
-        sb.Draw(_pixel, UiLayout.WindowViewport, new Color(0, 0, 0, 140));
-        sb.End();
-
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
 
         if (_pausePanel is not null)
@@ -8273,8 +8289,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var title = _pauseHostOptionsOpen ? "HOST WORLD" : "PAUSED";
         var size = _font.MeasureString(title);
-        sb.Draw(_pixel, _pauseHeaderRect, new Color(0, 0, 0, 80));
-        var titlePos = new Vector2(_pauseHeaderRect.Center.X - size.X / 2f, _pauseHeaderRect.Y + (_pauseHeaderRect.Height - _font.LineHeight) / 2f);
+        var titleAnchorButton = _pauseHostOptionsOpen ? _pauseOpenLan.Bounds : _pauseResume.Bounds;
+        var titlePos = new Vector2(
+            titleAnchorButton.Center.X - size.X / 2f,
+            titleAnchorButton.Y - _font.LineHeight - 16);
         _font.DrawString(sb, title, titlePos + new Vector2(1, 1), Color.Black);
         _font.DrawString(sb, title, titlePos, Color.White);
 
@@ -8374,23 +8392,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void UpdatePauseButtons(InputState input)
     {
-        if (!input.IsNewLeftClick())
-            return;
-
-        var p = input.MousePosition;
         if (_pauseHostOptionsOpen)
         {
-            if (_pauseOpenLan.TryClick(p)) return;
-            if (_pauseHostOnline.TryClick(p)) return;
-            _pauseHostBack.TryClick(p);
+            _pauseOpenLan.Update(input);
+            _pauseHostOnline.Update(input);
+            _pauseHostBack.Update(input);
             return;
         }
 
-        if (_pauseResume.TryClick(p)) return;
-        if (_pauseHost.TryClick(p)) return;
-        if (_pauseProfileIcon.TryClick(p)) return;
-        if (_pauseSettings.TryClick(p)) return;
-        _pauseSaveExit.TryClick(p);
+        _pauseResume.Update(input);
+        _pauseHost.Update(input);
+        _pauseProfileIcon.Update(input);
+        _pauseSettings.Update(input);
+        _pauseSaveExit.Update(input);
     }
 
 
@@ -12669,6 +12683,7 @@ private float FindSafeSpawnHeight(float x, float z)
                         "timecycle",
                         "weathercycle",
                         "sigil",
+                        "giveitem",
                         "enablemultiplehomes",
                         "maxhomesperplayer",
                         "homes",
@@ -13673,9 +13688,6 @@ private float FindSafeSpawnHeight(float x, float z)
     private bool IsCommandAllowedWithCheatsSetting(CommandDescriptor descriptor)
     {
         if (_meta?.EnableCheats ?? true)
-            return true;
-
-        if (descriptor.Permission == CommandPermission.Everyone)
             return true;
 
         return CheatsDisabledAllowedCommands.Contains(descriptor.Name);
@@ -14761,7 +14773,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus($"Current difficulty: {GetDifficultyLabel(_difficultyLevel)}.");
+            SetCommandStatus($"Current difficulty: {GetDifficultyDisplayLabel(_difficultyLevel)}.");
             return;
         }
 
@@ -14771,13 +14783,30 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
+        if (_lanSession != null && _lanSession.IsConnected && !_lanSession.IsHost)
+        {
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = -1,
+                Kind = LanChatKind.System,
+                Text = $"{DifficultyRequestPrefix}{difficulty}",
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            SetCommandStatus($"Requested difficulty = {GetDifficultyDisplayLabel(difficulty)} from host.");
+            return;
+        }
+
         _difficultyLevel = difficulty;
         if (_meta != null)
         {
             _meta.DifficultyLevel = _difficultyLevel;
             _meta.Save(_metaPath, _log);
         }
-        SetCommandStatus($"Difficulty set to {GetDifficultyLabel(_difficultyLevel).ToUpperInvariant()}.");
+        if (_lanSession != null && _lanSession.IsConnected && _lanSession.IsHost)
+            BroadcastDifficultySync(_difficultyLevel);
+
+        SetCommandStatus($"Difficulty set to {GetDifficultyDisplayLabel(_difficultyLevel)}.");
     }
 
     private void ExecuteSeedCommand(string[] _)
@@ -14868,9 +14897,10 @@ private float FindSafeSpawnHeight(float x, float z)
         TryGetWorldRuleValue("timecycle", out var timeCycle);
         TryGetWorldRuleValue("weathercycle", out var weatherCycle);
         TryGetWorldRuleValue("sigil", out var sigil);
+        TryGetWorldRuleValue("giveitem", out var giveItems);
         TryGetWorldRuleValue("enablemultiplehomes", out var multipleHomes);
         TryGetWorldRuleValue("maxhomesperplayer", out var maxHomes);
-        return $"Rules: playercollision={playerCollision} | timecycle={timeCycle} | weathercycle={weatherCycle} | sigil={sigil} | enablemultiplehomes={multipleHomes} | maxhomesperplayer={maxHomes}";
+        return $"Rules: playercollision={playerCollision} | timecycle={timeCycle} | weathercycle={weatherCycle} | sigil={sigil} | giveitem={giveItems} | enablemultiplehomes={multipleHomes} | maxhomesperplayer={maxHomes}";
     }
 
     private static string NormalizeWorldRuleKey(string rawKey)
@@ -14883,6 +14913,8 @@ private float FindSafeSpawnHeight(float x, float z)
             "timecycle" => "timecycle",
             "weathercycle" => "weathercycle",
             "sigil" => "sigil",
+            "giveitem" => "giveitem",
+            "giveitems" => "giveitem",
             "enablemultiplehomes" => "enablemultiplehomes",
             "homes" => "enablemultiplehomes",
             "maxhomesperplayer" => "maxhomesperplayer",
@@ -14893,7 +14925,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private static bool IsBooleanWorldRule(string ruleKey)
     {
-        return ruleKey is "playercollision" or "timecycle" or "weathercycle" or "sigil" or "enablemultiplehomes";
+        return ruleKey is "playercollision" or "timecycle" or "weathercycle" or "sigil" or "giveitem" or "enablemultiplehomes";
     }
 
     private static bool TryParseRuleBoolToken(string token, out bool enabled)
@@ -14985,6 +15017,14 @@ private float FindSafeSpawnHeight(float x, float z)
                 appliedValue = _sigilPowerEnabled ? "on" : "off";
                 status = _sigilPowerEnabled ? "Sigil power enabled." : "Sigil power disabled.";
                 break;
+            case "giveitem":
+                _giveItemsEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _giveItemsEnabled ? "on" : "off";
+                status = _giveItemsEnabled ? "Item giving enabled." : "Item giving disabled.";
+                _handoffPromptVisible = false;
+                _handoffTargetId = -1;
+                _handoffTargetName = string.Empty;
+                break;
             case "enablemultiplehomes":
                 _meta.EnableMultipleHomes = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
                 if (!_meta.EnableMultipleHomes)
@@ -15033,6 +15073,9 @@ private float FindSafeSpawnHeight(float x, float z)
             case "sigil":
                 value = _sigilPowerEnabled ? "on" : "off";
                 return true;
+            case "giveitem":
+                value = _giveItemsEnabled ? "on" : "off";
+                return true;
             case "enablemultiplehomes":
                 value = _meta.EnableMultipleHomes ? "on" : "off";
                 return true;
@@ -15065,6 +15108,7 @@ private float FindSafeSpawnHeight(float x, float z)
         _meta.Gameplay ??= new GameplaySettings();
 
         _meta.Player.PlayerCollision = _meta.PlayerCollision;
+        _meta.Gameplay.EnableGiveItems = _giveItemsEnabled;
         _meta.Gameplay.EnableSigilPower = _sigilPowerEnabled;
         _meta.Gameplay.EnableMultipleHomes = _meta.EnableMultipleHomes;
         _meta.Gameplay.MaxHomesPerPlayer = _meta.MaxHomesPerPlayer;
@@ -16350,6 +16394,12 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private void ExecuteGiveCommand(string[] commandParts)
     {
+        if (!_giveItemsEnabled)
+        {
+            SetCommandStatus("Item giving is disabled in this world. Use /rule giveitem on to enable it.");
+            return;
+        }
+
         if (commandParts.Length < 2)
         {
             SetCommandSyntax("give");
@@ -17274,6 +17324,21 @@ private float FindSafeSpawnHeight(float x, float z)
         });
     }
 
+    private void BroadcastDifficultySync(int difficulty)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = -1,
+            Kind = LanChatKind.System,
+            Text = $"{DifficultySyncPrefix}{WorldDifficulty.Clamp(difficulty)}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
     private void SendRuleStatusToPlayer(int targetPlayerId, string text)
     {
         if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
@@ -17337,6 +17402,43 @@ private float FindSafeSpawnHeight(float x, float z)
         return true;
     }
 
+    private bool TryHandleDifficultyRequestMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(DifficultyRequestPrefix, StringComparison.Ordinal))
+            return false;
+
+        if (!_lanSession.IsHost)
+            return true;
+
+        if (!TryCanPlayerEditRules(message.FromPlayerId))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, "You do not have permission to change difficulty.");
+            return true;
+        }
+
+        var payload = text.Substring(DifficultyRequestPrefix.Length);
+        if (!TryParseDifficultyToken(payload, out var difficulty))
+        {
+            SendRuleStatusToPlayer(message.FromPlayerId, "Difficulty must be peaceful, easy, normal, or hard.");
+            return true;
+        }
+
+        _difficultyLevel = difficulty;
+        if (_meta != null)
+        {
+            _meta.DifficultyLevel = difficulty;
+            _meta.Save(_metaPath, _log);
+        }
+
+        BroadcastDifficultySync(difficulty);
+        SendRuleStatusToPlayer(message.FromPlayerId, $"Difficulty set to {GetDifficultyDisplayLabel(difficulty)}.");
+        return true;
+    }
+
     private bool TryHandleRuleSyncMessage(LanChatMessage message)
     {
         if (_lanSession == null || message.Kind != LanChatKind.System)
@@ -17360,6 +17462,29 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (message.FromPlayerId != _lanSession.LocalPlayerId)
             SetCommandStatus($"Rule synced: {ruleKey} = {appliedValue}.", 4f, echoToChat: false);
+
+        return true;
+    }
+
+    private bool TryHandleDifficultySyncMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(DifficultySyncPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(DifficultySyncPrefix.Length);
+        if (!TryParseDifficultyToken(payload, out var difficulty))
+            return true;
+
+        _difficultyLevel = difficulty;
+        if (_meta != null)
+            _meta.DifficultyLevel = difficulty;
+
+        if (message.FromPlayerId != _lanSession.LocalPlayerId)
+            SetCommandStatus($"Difficulty synced: {GetDifficultyDisplayLabel(difficulty)}.", 4f, echoToChat: false);
 
         return true;
     }
@@ -17427,6 +17552,8 @@ private float FindSafeSpawnHeight(float x, float z)
             return false;
         if (message.FromPlayerId != 0)
             return false;
+        if (!_giveItemsEnabled)
+            return true;
 
         var text = message.Text ?? string.Empty;
         if (!text.StartsWith(InventoryGiveSyncPrefix, StringComparison.Ordinal))
@@ -17458,6 +17585,10 @@ private float FindSafeSpawnHeight(float x, float z)
         if (TryHandleOperatorSyncMessage(message))
             return;
         if (TryHandleGameModeSyncMessage(message))
+            return;
+        if (TryHandleDifficultyRequestMessage(message))
+            return;
+        if (TryHandleDifficultySyncMessage(message))
             return;
         if (TryHandleRuleRequestMessage(message))
             return;
@@ -18017,16 +18148,11 @@ private float FindSafeSpawnHeight(float x, float z)
         }
     }
 
+    private static string GetDifficultyDisplayLabel(int difficulty) => WorldDifficulty.GetDisplayLabel(difficulty);
+
     private static string GetDifficultyLabel(int difficulty)
     {
-        return difficulty switch
-        {
-            0 => "Peaceful",
-            1 => "Easy",
-            2 => "Normal",
-            3 => "Hard",
-            _ => "Easy"
-        };
+        return WorldDifficulty.GetClassicLabel(difficulty);
     }
 
     private bool TryFindNearestBiome(string targetBiomeToken, int originX, int originZ, int maxRadius, out int foundX, out int foundZ, out float distance)

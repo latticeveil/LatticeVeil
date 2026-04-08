@@ -10,16 +10,16 @@
 using System;
 using System.Reflection;
 
-[assembly: System.Reflection.AssemblyMetadataAttribute("BuildNonce", "20260222231057888-b165104b16")]
+[assembly: System.Reflection.AssemblyMetadataAttribute("BuildNonce", "stable")]
 [assembly: System.Reflection.AssemblyCompanyAttribute("LatticeVeil")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyCopyrightAttribute("Copyright © 2026")]
 [assembly: System.Reflection.AssemblyDescriptionAttribute("LatticeVeil MonoGame Client")]
-[assembly: System.Reflection.AssemblyFileVersionAttribute("9.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("9.0.0+319218e6dc3cd3fd280b19628104a9c7ff3a6f3a")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("14.0.1.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("14.0.1+e1c379a63a4f926e719931df424fd350bed820e6")]
 [assembly: System.Reflection.AssemblyProductAttribute("LatticeVeil")]
 [assembly: System.Reflection.AssemblyTitleAttribute("LatticeVeilMonoGame")]
-[assembly: System.Reflection.AssemblyVersionAttribute("9.0.0.0")]
+[assembly: System.Reflection.AssemblyVersionAttribute("14.0.1.0")]
 [assembly: System.Runtime.Versioning.TargetPlatformAttribute("Windows7.0")]
 [assembly: System.Runtime.Versioning.SupportedOSPlatformAttribute("Windows7.0")]
 

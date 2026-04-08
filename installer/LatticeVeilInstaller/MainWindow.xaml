@@ -1,0 +1,311 @@
+<Window x:Class="LatticeVeilInstaller.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="LatticeVeil Installer" Height="600" Width="800"
+        WindowStyle="None" AllowsTransparency="False"
+        Background="#1A1A1A" WindowStartupLocation="CenterScreen"
+        MouseDown="Window_MouseDown"
+        ResizeMode="NoResize">
+    
+    <Window.Resources>
+        <Style x:Key="ModernButton" TargetType="Button">
+            <Setter Property="Background" Value="#262626"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#5A5A5A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="20,10"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" 
+                                BorderBrush="{TemplateBinding BorderBrush}" 
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8"
+                                SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#404040"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#1E1E1E"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#1A1A1A"/>
+                                <Setter Property="Foreground" Value="#666666"/>
+                                <Setter Property="BorderBrush" Value="#333333"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        
+        <Style x:Key="ModernTextBlock" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+        </Style>
+        
+        <Style x:Key="TitleTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="24"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+        </Style>
+        
+        <Style x:Key="SubtitleTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+        
+        <Style x:Key="BodyTextBlock" TargetType="TextBlock" BasedOn="{StaticResource ModernTextBlock}">
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="TextWrapping" Value="Wrap"/>
+        </Style>
+        
+        <Style x:Key="ModernCheckBox" TargetType="CheckBox">
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#5A5A5A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border Background="Transparent" 
+                                SnapsToDevicePixels="True">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border x:Name="CheckBorder" 
+                                        Width="16" Height="16" 
+                                        Background="White" 
+                                        BorderBrush="#5A5A5A" 
+                                        BorderThickness="1" 
+                                        CornerRadius="2"
+                                        Margin="0,0,8,0"
+                                        VerticalAlignment="Center">
+                                    <Path x:Name="CheckMark" 
+                                          Stroke="Black" 
+                                          StrokeThickness="2" 
+                                          Fill="Black"
+                                          Data="M 3,7 L 6,10 L 13,3"
+                                          Visibility="Collapsed"
+                                          SnapsToDevicePixels="True"/>
+                                </Border>
+                                <ContentPresenter Grid.Column="1" 
+                                                  VerticalAlignment="Center" 
+                                                  RecognizesAccessKey="True"/>
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#888888"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#00FF00"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="CheckBorder" Property="Background" Value="#CCCCCC"/>
+                                <Setter TargetName="CheckBorder" Property="BorderBrush" Value="#666666"/>
+                                <Setter Property="Foreground" Value="#666666"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="44"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="80"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Custom Title Bar -->
+        <Border Grid.Row="0" Background="#080808" BorderBrush="#1A1A1A" BorderThickness="0,0,0,1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+                    <TextBlock Text="LATTICEVEIL INSTALLER" Style="{StaticResource TitleTextBlock}" VerticalAlignment="Center" FontSize="18"/>
+                </StackPanel>
+
+                <TextBlock x:Name="VersionIndicator"
+                           Grid.Column="1"
+                           Text="Loading latest release..."
+                           Style="{StaticResource BodyTextBlock}"
+                           VerticalAlignment="Center"
+                           HorizontalAlignment="Center"
+                           Foreground="#00FF00"
+                           FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis"
+                           Margin="20,0"/>
+                
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button x:Name="MinimizeBtn" Content="−" Background="#202020" Foreground="White" Width="46" Height="34" BorderThickness="0" Style="{StaticResource ModernButton}"/>
+                    <Button x:Name="CloseBtn" Content="✕" Background="#202020" Foreground="White" Width="46" Height="34" BorderThickness="0" Style="{StaticResource ModernButton}" Click="CloseBtn_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+        
+        <!-- Main Content Area -->
+        <Grid x:Name="MainContentGrid" Grid.Row="1">
+            <Grid x:Name="InitializingPage">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="Initializing Installer..." Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+                    <TextBlock x:Name="SplashMessage" Text="Preparing your LatticeVeil experience..." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+                    <ProgressBar x:Name="InitProgress" Height="4" Width="300" Background="#1A1A1A" Foreground="#00FF00" IsIndeterminate="True"/>
+                </StackPanel>
+            </Grid>
+            
+            <Grid x:Name="SplashPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock x:Name="SplashTitle" Text="Latest version: Loading..." Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+                    <TextBlock x:Name="SplashPageMessage" Text="Welcome to LatticeVeil!" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40" TextWrapping="Wrap"/>
+                    <TextBlock Text="Click NEXT to continue with installation" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40" Foreground="#AAAAAA"/>
+                </StackPanel>
+            </Grid>
+            
+            <Grid x:Name="DestinationPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock x:Name="DestinationTitleText" Text="Installation Destination" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,10"/>
+                    <TextBlock x:Name="DestinationStatusText" Text="" Style="{StaticResource SubtitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,30" Foreground="#00FF00" Visibility="Collapsed"/>
+                    <TextBlock x:Name="CurrentInstalledVersionText" Text="" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20" Foreground="#AAAAAA" Visibility="Collapsed"/>
+                    
+                    <Grid Margin="0,0,0,20">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="InstallPathBox" Text="C:\Program Files\LatticeVeil" Background="#1A1A1A" Foreground="White" BorderBrush="#5A5A5A" Padding="10,8" Grid.Column="0"/>
+                        <Button x:Name="BrowseBtn" Content="Browse..." Grid.Column="1" Margin="8,0,0,0" Style="{StaticResource ModernButton}" Click="BrowseBtn_Click"/>
+                    </Grid>
+                    
+                    <TextBlock x:Name="DestinationDescriptionText" Text="Select folder where LatticeVeil will be installed" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20" Foreground="#AAAAAA"/>
+                    
+                    <CheckBox x:Name="ImportWorldsCheckBox" Content="Import previous world backups (.lvworld files)" 
+                             Style="{StaticResource ModernCheckBox}" 
+                             Margin="0,20,0,20"/>
+                </StackPanel>
+            </Grid>
+            
+            <Grid x:Name="TosPage" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                
+                <StackPanel Grid.Row="0" HorizontalAlignment="Center" Margin="0,20,0,20">
+                    <TextBlock Text="Terms of Service &amp; Privacy Policy" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center"/>
+                </StackPanel>
+                
+                <Grid Grid.Row="1" Margin="40,0,40,20">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="20"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    
+                    <!-- Terms of Service Column -->
+                    <StackPanel Grid.Column="0" Grid.Row="0">
+                        <TextBlock Text="TERMS OF SERVICE" Style="{StaticResource SubtitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,10"/>
+                        <ProgressBar x:Name="TosProgressBar" Height="4" Background="#1A1A1A" Foreground="#00FF00" Maximum="100" Margin="0,0,0,10"/>
+                    </StackPanel>
+                    
+                    <Border Grid.Column="0" Grid.Row="1" Background="#1A1A1A" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="4">
+                        <WebBrowser x:Name="TosWebBrowser" Margin="0" LoadCompleted="TosWebBrowser_LoadCompleted"/>
+                    </Border>
+                    
+                    <StackPanel Grid.Column="0" Grid.Row="2" Margin="0,10,0,0">
+                        <CheckBox x:Name="TosCheckBox" Content="I have read and agree to the Terms of Service" Style="{StaticResource ModernCheckBox}" IsEnabled="False" Checked="TosCheckBox_Checked" Unchecked="TosCheckBox_Unchecked"/>
+                    </StackPanel>
+                    
+                    <!-- Privacy Policy Column -->
+                    <StackPanel Grid.Column="2" Grid.Row="0">
+                        <TextBlock Text="PRIVACY POLICY" Style="{StaticResource SubtitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,10"/>
+                        <ProgressBar x:Name="PrivacyProgressBar" Height="4" Background="#1A1A1A" Foreground="#00FF00" Maximum="100" Margin="0,0,0,10"/>
+                    </StackPanel>
+                    
+                    <Border Grid.Column="2" Grid.Row="1" Background="#1A1A1A" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="4">
+                        <WebBrowser x:Name="PrivacyWebBrowser" Margin="0" LoadCompleted="PrivacyWebBrowser_LoadCompleted"/>
+                    </Border>
+                    
+                    <StackPanel Grid.Column="2" Grid.Row="2" Margin="0,10,0,0">
+                        <CheckBox x:Name="PrivacyCheckBox" Content="I have read and agree to the Privacy Policy" Style="{StaticResource ModernCheckBox}" IsEnabled="False" Checked="PrivacyCheckBox_Checked" Unchecked="PrivacyCheckBox_Unchecked"/>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+            
+            <Grid x:Name="InstallPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock x:Name="InstallPageTitleText" Text="Installing LatticeVeil" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+                    
+                    <TextBlock x:Name="InstallStatus" Text="Ready to install..." Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+                    
+                    <ProgressBar x:Name="InstallProgressBar" Height="8" Width="400" Background="#1A1A1A" Foreground="#00FF00" Maximum="100" Margin="0,0,0,20"/>
+                    
+                    <TextBlock x:Name="InstallProgressText" Text="0%" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+                    
+                    <Button x:Name="InstallBtn" Content="INSTALL" Style="{StaticResource ModernButton}" Click="InstallBtn_Click"/>
+                </StackPanel>
+            </Grid>
+            
+            <Grid x:Name="FinishPage" Visibility="Collapsed">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+                    <TextBlock x:Name="FinishTitleText" Text="THANKS FOR INSTALLING ❤️" Style="{StaticResource TitleTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40"/>
+                    
+                    <Grid Margin="0,0,0,40">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Launch Game Automatically" Style="{StaticResource BodyTextBlock}" VerticalAlignment="Center" Grid.Column="0"/>
+                        <CheckBox x:Name="LaunchGameCheckBox" Grid.Column="1" Margin="20,0,0,0" IsChecked="True" Foreground="White"/>
+                    </Grid>
+                    
+                    <TextBlock x:Name="FinishDescriptionText" Text="Click NEXT to finish installation" Style="{StaticResource BodyTextBlock}" HorizontalAlignment="Center" Margin="0,0,0,40" Foreground="#AAAAAA"/>
+                </StackPanel>
+            </Grid>
+        </Grid>
+        
+        <!-- Bottom Navigation -->
+        <Border Grid.Row="2" Background="#080808" BorderBrush="#1A1A1A" BorderThickness="0,1,0,0">
+            <Grid Margin="20,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                
+                <Button x:Name="PreviousBtn" Content="PREVIOUS" Grid.Column="0" Style="{StaticResource ModernButton}" HorizontalAlignment="Left" Click="PreviousBtn_Click" IsEnabled="False"/>
+                <Button x:Name="CancelBtn" Content="CANCEL" Grid.Column="3" Style="{StaticResource ModernButton}" Margin="8,0" Click="CancelBtn_Click"/>
+                <Button x:Name="NextBtn" Content="NEXT" Grid.Column="4" Style="{StaticResource ModernButton}" Click="NextBtn_Click"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

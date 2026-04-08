@@ -22,26 +22,13 @@ public static class WorldCreator
         {
             // Create world directory
             Directory.CreateDirectory(worldPath);
-            
-            // Create world.lvc manifest with required keys
-            var worldManifestContent = $@"format=LVWORLD
-format_version=2
-world_name=""{worldName}""
-created_utc={DateTimeOffset.UtcNow:yyyy-MM-ddTHH\:mm\:ss.fffZ}
-seed={seed}
-generator_id=""terrain""
-world_type=terrain
-generator=terrain
-region_size_chunks=32
-spawn_x=0
-spawn_y=64
-spawn_z=0
-game_mode={gameMode}
-difficulty=1
-cheats_enabled=false";
-            
-            var worldManifestPath = FileConventions.GetWorldManifestPath(worldPath);
-            File.WriteAllText(worldManifestPath, worldManifestContent);
+
+            var meta = WorldMeta.CreateTerrain(worldName, gameMode, 4096, 256, 4096, seed);
+            meta.Player.HasCustomSpawn = true;
+            meta.Player.SpawnX = 0;
+            meta.Player.SpawnY = 64;
+            meta.Player.SpawnZ = 0;
+            meta.Save(FileConventions.GetWorldManifestPath(worldPath), new Logger("WorldCreator"));
             
             // Create required directories (lowercase regions only)
             Directory.CreateDirectory(Path.Combine(worldPath, "regions"));

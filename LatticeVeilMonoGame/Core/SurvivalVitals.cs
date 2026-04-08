@@ -9,10 +9,6 @@ public sealed class SurvivalVitals
 {
     public const int MaxHealth = 20;
     public const int MaxHunger = 20;
-    public const float IdleHungerIntervalSeconds = 90f;
-    public const float WalkHungerIntervalSeconds = 45f;
-    public const float SprintHungerIntervalSeconds = 22f;
-    public const float RegenerationIntervalSeconds = 8f;
     public const float StarvationIntervalSeconds = 4f;
     public const float SafeFallDistance = 4.25f;
 
@@ -23,7 +19,6 @@ public sealed class SurvivalVitals
     public int Health { get; private set; } = MaxHealth;
     public int Hunger { get; private set; } = MaxHunger;
     public bool IsDead => Health <= 0;
-    public bool CanRegenerate => Hunger >= 18 && Health < MaxHealth;
 
     public void Load(int health, int hunger)
     {
@@ -39,47 +34,58 @@ public sealed class SurvivalVitals
         ResetTransientTimers();
     }
 
-    public SurvivalTickResult Tick(float dt, bool isMoving, bool isSprinting)
+    public SurvivalTickResult Tick(float dt, bool isMoving, bool isSprinting, int difficulty)
     {
         if (dt <= 0f || IsDead)
             return default;
 
         var healthChanged = false;
         var hungerChanged = false;
+        var tuning = WorldDifficulty.GetTuning(difficulty);
 
-        _hungerTickSeconds += dt;
-        var hungerInterval = isSprinting && isMoving
-            ? SprintHungerIntervalSeconds
-            : isMoving
-                ? WalkHungerIntervalSeconds
-                : IdleHungerIntervalSeconds;
-
-        while (_hungerTickSeconds >= hungerInterval)
+        if (tuning.AutoRefillHunger && Hunger < MaxHunger)
         {
-            _hungerTickSeconds -= hungerInterval;
-            if (Hunger <= 0)
-                break;
-
-            Hunger = ClampHunger(Hunger - 1);
+            Hunger = MaxHunger;
             hungerChanged = true;
+            _hungerTickSeconds = 0f;
+        }
+        else
+        {
+            _hungerTickSeconds += dt;
+            var hungerInterval = isSprinting && isMoving
+                ? tuning.SprintHungerIntervalSeconds
+                : isMoving
+                    ? tuning.WalkHungerIntervalSeconds
+                    : tuning.IdleHungerIntervalSeconds;
+
+            while (_hungerTickSeconds >= hungerInterval)
+            {
+                _hungerTickSeconds -= hungerInterval;
+                if (Hunger <= 0)
+                    break;
+
+                Hunger = ClampHunger(Hunger - 1);
+                hungerChanged = true;
+            }
         }
 
-        if (CanRegenerate)
+        var canRegenerate = Hunger >= tuning.RegenerationThreshold && Health < MaxHealth;
+        if (canRegenerate)
         {
             _regenTickSeconds += dt;
-            while (_regenTickSeconds >= RegenerationIntervalSeconds && Health < MaxHealth)
+            while (_regenTickSeconds >= tuning.RegenerationIntervalSeconds && Health < MaxHealth)
             {
-                _regenTickSeconds -= RegenerationIntervalSeconds;
+                _regenTickSeconds -= tuning.RegenerationIntervalSeconds;
                 Health = ClampHealth(Health + 1);
                 healthChanged = true;
             }
 
             _starvationTickSeconds = 0f;
         }
-        else if (Hunger <= 0)
+        else if (Hunger <= 0 && tuning.StarvationEnabled)
         {
             _starvationTickSeconds += dt;
-            while (_starvationTickSeconds >= StarvationIntervalSeconds && Health > 0)
+            while (_starvationTickSeconds >= StarvationIntervalSeconds && Health > tuning.StarvationHealthFloor)
             {
                 _starvationTickSeconds -= StarvationIntervalSeconds;
                 Health = ClampHealth(Health - 1);

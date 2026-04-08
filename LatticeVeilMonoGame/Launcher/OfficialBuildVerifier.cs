@@ -60,7 +60,7 @@ internal sealed class OfficialBuildVerifier
     {
         var version = Assembly.GetExecutingAssembly()
             .GetName()
-            .Version?.ToString() ?? "13.0.0";
+            .Version?.ToString() ?? "14.0.1";
         return version.StartsWith("v") ? version : $"v{version}";
     }
 

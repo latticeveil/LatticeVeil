@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <AssemblyTitle>LatticeVeil Uninstaller</AssemblyTitle>
+    <AssemblyDescription>Custom uninstaller for LatticeVeil</AssemblyDescription>
+    <AssemblyVersion>14.0.1.0</AssemblyVersion>
+    <FileVersion>14.0.1.0</FileVersion>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\LatticeVeilInstaller\Icon.ico</ApplicationIcon>
+    <StartupObject>LatticeVeilUninstaller.Program</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Compression" Version="4.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Page Include="MainWindow.xaml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="DeleteLatticeVeil.bat" />
+    <Resource Include="..\LatticeVeilInstaller\Icon.ico" Link="Icon.ico" />
+  </ItemGroup>
+
+</Project>

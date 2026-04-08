@@ -25,10 +25,10 @@ public sealed class SingleplayerScreen : IScreen
 
     private Texture2D? _bg;
     private Texture2D? _panel;
+    private Texture2D? _deleteIconTexture;
 
     private readonly Button _createBtn;
     private readonly Button _resumeBtn;
-    private readonly Button _deleteBtn;
     private readonly Button _backBtn;
     private readonly Button _confirmDeleteBtn;
     private readonly Button _cancelDeleteBtn;
@@ -55,6 +55,8 @@ public sealed class SingleplayerScreen : IScreen
     private readonly HashSet<string> _previewLoadFailures = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> _seedRevealByWorld = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, Rectangle> _seedEyeRects = new();
+    private readonly Dictionary<int, Rectangle> _rowPlayRects = new();
+    private readonly Dictionary<int, Rectangle> _rowDeleteRects = new();
 
     private List<WorldListEntry> _worlds = new();
 
@@ -72,7 +74,6 @@ public sealed class SingleplayerScreen : IScreen
 
         _createBtn = new Button("CREATE WORLD", OpenCreateWorld);
         _resumeBtn = new Button("RESUME GENERATION", ResumeSelectedWorldGeneration);
-        _deleteBtn = new Button("DELETE WORLD", DeleteSelectedWorld);
         _backBtn = new Button("BACK", () => _menus.Pop());
         _confirmDeleteBtn = new Button("DELETE", ConfirmDeleteSelectedWorld) { BoldText = true, BackgroundColor = new Color(100, 26, 26) };
         _cancelDeleteBtn = new Button("CANCEL", CancelDeleteSelectedWorld) { BoldText = true };
@@ -83,7 +84,7 @@ public sealed class SingleplayerScreen : IScreen
             _bg = _assets.LoadTexture("textures/menu/backgrounds/singleplayer_bg.png");
             _panel = _assets.LoadTexture("textures/menu/GUIS/Singleplayer_GUI.png");
             _createBtn.Texture = _assets.LoadTexture("textures/menu/buttons/CreateWorld.png");
-            _deleteBtn.Texture = _assets.LoadTexture("textures/menu/buttons/DeleteDefault.png");
+            _deleteIconTexture = _assets.LoadTexture("textures/menu/buttons/DeleteDefault.png");
             _backBtn.Texture = _assets.LoadTexture("textures/menu/buttons/Back.png");
             
             _log.Info($"SingleplayerScreen - Assets loaded successfully. Panel: {(_panel != null ? "LOADED" : "NULL")}");
@@ -104,8 +105,8 @@ public sealed class SingleplayerScreen : IScreen
         // Log viewport and panel sizing
         _log.Info($"SingleplayerScreen OnResize - Viewport: {viewport.Width}x{viewport.Height}");
         
-        var panelW = Math.Min(1300, viewport.Width - 20); // Match options screen
-        var panelH = Math.Min(700, viewport.Height - 30); // Match options screen
+        var panelW = Math.Min(1248, viewport.Width - 20); // Match settings screen
+        var panelH = Math.Min(680, viewport.Height - 30); // Match settings screen
         _panelRect = new Rectangle(
             viewport.X + (viewport.Width - panelW) / 2,
             viewport.Y + (viewport.Height - panelH) / 2,
@@ -114,8 +115,8 @@ public sealed class SingleplayerScreen : IScreen
         
         _log.Info($"SingleplayerScreen - Panel: {_panelRect.Width}x{_panelRect.Height} at ({_panelRect.X},{_panelRect.Y})");
 
-        var margin = 24; // Reduced from 32 to give more space
-        var headerH = _font.LineHeight * 2 + 40; // Increased spacing to ensure title doesn't get covered
+        var margin = 24;
+        var headerH = _font.LineHeight * 2 + 40;
         var buttonAreaH = Math.Clamp((int)(panelH * 0.2f), 60, 90);
         
         // Calculate proper content area inside 9-patch borders
@@ -130,34 +131,16 @@ public sealed class SingleplayerScreen : IScreen
         _log.Info($"SingleplayerScreen - ContentArea: {contentArea.Width}x{contentArea.Height} at ({contentArea.X},{contentArea.Y})");
         
         _listRect = new Rectangle(
-            contentArea.X + margin + 45, // Move right by 45 pixels (shrink more)
-            contentArea.Y + headerH + 80, // Move down by 80 pixels (2.7 inches total)
-            contentArea.Width - margin * 2 - 90, // Shrink width by 90 pixels total
-            contentArea.Height - headerH - buttonAreaH - margin - 60 - 20); // Reduce height by 60 pixels + 20 for title offset
+            contentArea.X + margin + 45,
+            contentArea.Y + headerH + 80,
+            contentArea.Width - margin * 2 - 90,
+            contentArea.Height - headerH - buttonAreaH - margin - 60 - 20);
         
         _log.Info($"SingleplayerScreen - ListRect: {_listRect.Width}x{_listRect.Height} at ({_listRect.X},{_listRect.Y})");
 
         _rowHeight = Math.Max(_rowFont.LineHeight + 18, 60);  // Make entries shorter vertically
 
-        var buttonW = Math.Clamp((int)(_panelRect.Width * 0.28f), 160, 260);
-        var buttonH = Math.Clamp((int)(buttonW * 0.28f), 40, 70);
         var gap = 16;
-        var available = _panelRect.Width - margin * 2;
-        var deleteSize = buttonH;
-        var createSize = buttonW;
-        var backSize = buttonW;
-
-        var deleteX = _panelRect.X + margin;
-        var deleteY = _panelRect.Bottom - margin - deleteSize;
-        _deleteBtn.Bounds = new Rectangle(deleteX, deleteY, deleteSize, deleteSize);
-
-        var createX = _panelRect.Right - margin - createSize;
-        var createY = _panelRect.Bottom - margin - buttonH;
-        _createBtn.Bounds = new Rectangle(createX, createY, createSize, buttonH);
-
-        var backX = _panelRect.X + margin;
-        var backY = _panelRect.Bottom - margin - backSize;
-        _backBtn.Bounds = new Rectangle(backX, backY, backSize, backSize);
 
         var backBtnMargin = 20;
         var backBtnBaseW = Math.Max(_backBtn.Texture?.Width ?? 0, 320);
@@ -172,15 +155,14 @@ public sealed class SingleplayerScreen : IScreen
             backBtnH
         );
         
-        // Center create button on the GUI backdrop
-        var createBtnW = panelW / 3 - 15; // Match options screen apply button size
-        var createBtnH = (int)(createBtnW * 0.25f); // Match options screen apply button ratio
-        deleteSize = createBtnH;
-        var actionsTotal = createBtnW + deleteSize + gap;
-        var actionsStartX = _panelRect.X + (_panelRect.Width - actionsTotal) / 2;
-        _createBtn.Bounds = new Rectangle(actionsStartX, createY, createBtnW, createBtnH);
-        _deleteBtn.Bounds = new Rectangle(_createBtn.Bounds.Right + gap, createY, deleteSize, deleteSize);
-        _resumeBtn.Bounds = new Rectangle(_createBtn.Bounds.X - createBtnW - gap, createY, createBtnW, createBtnH);
+        // Match the create-world screen footer anchor exactly.
+        var createBtnW = Math.Min(320, panelW / 4);
+        var createBtnH = Math.Max(44, (int)(createBtnW * 0.22f));
+        var createBtnX = viewport.Center.X - createBtnW / 2;
+        var createBtnY = viewport.Bottom - 20 - createBtnH;
+        _createBtn.Bounds = new Rectangle(createBtnX, createBtnY, createBtnW, createBtnH);
+
+        _resumeBtn.Bounds = new Rectangle(_createBtn.Bounds.X - createBtnW - gap, createBtnY, createBtnW, createBtnH);
 
         ClampScroll();
         LayoutDeleteConfirmOverlay();
@@ -214,7 +196,6 @@ public sealed class SingleplayerScreen : IScreen
         _createBtn.Update(input);
         SyncActionButtons();
         _resumeBtn.Update(input);
-        _deleteBtn.Update(input);
         _backBtn.Update(input);
         _overlayMousePos = input.MousePosition;
         HandleListInput(input);
@@ -261,7 +242,6 @@ public sealed class SingleplayerScreen : IScreen
 
         _createBtn.Draw(sb, _pixel, _font);
         _resumeBtn.Draw(sb, _pixel, _font);
-        _deleteBtn.Draw(sb, _pixel, _font);
         _backBtn.Draw(sb, _pixel, _font);
 
         DrawWorldHoverTooltip(sb);
@@ -329,6 +309,8 @@ public sealed class SingleplayerScreen : IScreen
     {
         _hoverWorldIndex = -1;
         _seedEyeRects.Clear();
+        _rowPlayRects.Clear();
+        _rowDeleteRects.Clear();
         if (_worlds.Count == 0)
         {
             var msg = "NO WORLDS FOUND";
@@ -352,13 +334,19 @@ public sealed class SingleplayerScreen : IScreen
             DrawBorder(sb, rowRect, Color.White);
 
             var entry = _worlds[i];
+            var actionSize = Math.Max(24, rowRect.Height - 18);
+            var deleteRect = new Rectangle(rowRect.Right - 8 - actionSize, rowRect.Y + (rowRect.Height - actionSize) / 2, actionSize, actionSize);
+            var playRect = new Rectangle(deleteRect.X - 8 - actionSize, deleteRect.Y, actionSize, actionSize);
+            _rowPlayRects[i] = playRect;
+            _rowDeleteRects[i] = deleteRect;
+
             var previewSize = rowRect.Height - 12 - 30;  // Make smaller by an inch (30 pixels)
             var previewRect = new Rectangle(rowRect.X + 6, rowRect.Y + (rowRect.Height - previewSize) / 2, previewSize, previewSize);
             DrawWorldPreviewTile(sb, entry, previewRect);
 
             var seedSectionWidth = 230; // Always show seed info
             var textLeft = previewRect.Right + 10;
-            var textWidth = Math.Max(40, rowRect.Right - textLeft - 10 - seedSectionWidth);
+            var textWidth = Math.Max(40, playRect.X - textLeft - 18 - seedSectionWidth);
             var titleText = TruncateToWidth(entry.Name, textWidth, _rowFont);
             var subtitle = $"MODE: {entry.CurrentMode.ToString().ToUpperInvariant()}";
             subtitle = TruncateToWidth(subtitle, textWidth, _font);
@@ -394,7 +382,7 @@ public sealed class SingleplayerScreen : IScreen
             }
 
             // Always show seed info section
-            var seedRect = new Rectangle(rowRect.Right - seedSectionWidth, rowRect.Y + 4, seedSectionWidth - 6, rowRect.Height - 8);
+            var seedRect = new Rectangle(playRect.X - 12 - seedSectionWidth, rowRect.Y + 4, seedSectionWidth - 6, rowRect.Height - 8);
             sb.Draw(_pixel, seedRect, new Color(12, 12, 12, 170));
             DrawBorder(sb, seedRect, new Color(180, 180, 180));
 
@@ -408,6 +396,11 @@ public sealed class SingleplayerScreen : IScreen
 
             var seedValue = revealed ? ShortSeed(entry.Seed) : "HIDDEN";
             _font.DrawString(sb, seedValue, new Vector2(seedRect.X + 8, seedRect.Bottom - _font.LineHeight - 6), Color.White);
+
+            var playHovered = playRect.Contains(_overlayMousePos);
+            var deleteHovered = deleteRect.Contains(_overlayMousePos);
+            DrawRowPlayButton(sb, playRect, playHovered, entry.ValidationStatus == WorldValidationStatus.IncompleteGeneration);
+            DrawRowDeleteButton(sb, deleteRect, deleteHovered);
 
             if (rowRect.Contains(_overlayMousePos) && revealed)
                 _hoverWorldIndex = i;
@@ -539,6 +532,32 @@ public sealed class SingleplayerScreen : IScreen
                 return;
             }
 
+            foreach (var pair in _rowPlayRects)
+            {
+                if (!pair.Value.Contains(input.MousePosition))
+                    continue;
+
+                _selectedIndex = pair.Key;
+                if (pair.Key >= 0 && pair.Key < _worlds.Count)
+                {
+                    if (_worlds[pair.Key].ValidationStatus == WorldValidationStatus.IncompleteGeneration)
+                        ResumeWorldGeneration(pair.Key);
+                    else
+                        JoinWorld(pair.Key);
+                }
+                return;
+            }
+
+            foreach (var pair in _rowDeleteRects)
+            {
+                if (!pair.Value.Contains(input.MousePosition))
+                    continue;
+
+                _selectedIndex = pair.Key;
+                OpenDeleteConfirm(pair.Key);
+                return;
+            }
+
             var idx = (int)((input.MousePosition.Y - _listRect.Y + _scroll) / _rowHeight);
             if (idx >= 0 && idx < _worlds.Count)
             {
@@ -619,8 +638,7 @@ public sealed class SingleplayerScreen : IScreen
             return;
         }
 
-        var entry = _worlds[_selectedIndex];
-        _menus.Push(new CreateWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, OnWorldCreated, entry.WorldPath), _viewport);
+        ResumeWorldGeneration(_selectedIndex);
     }
 
     private void OnWorldCreated(string worldName)
@@ -634,18 +652,18 @@ public sealed class SingleplayerScreen : IScreen
         }
     }
 
-    private void DeleteSelectedWorld()
+    private void OpenDeleteConfirm(int index)
     {
-        if (_selectedIndex < 0 || _selectedIndex >= _worlds.Count)
+        if (index < 0 || index >= _worlds.Count)
         {
             ShowStatus("SELECT A WORLD TO DELETE");
             return;
         }
 
-        var entry = _worlds[_selectedIndex];
+        var entry = _worlds[index];
         var name = entry.Name;
         _deleteConfirmOpen = true;
-        _deleteConfirmIndex = _selectedIndex;
+        _deleteConfirmIndex = index;
         _log.Info($"Delete world requested: {name}");
     }
 
@@ -748,7 +766,24 @@ public sealed class SingleplayerScreen : IScreen
             return;
         }
 
-        var entry = _worlds[_selectedIndex];
+        JoinWorld(_selectedIndex);
+    }
+
+    private void ResumeWorldGeneration(int index)
+    {
+        if (index < 0 || index >= _worlds.Count)
+            return;
+
+        var entry = _worlds[index];
+        _menus.Push(new CreateWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, OnWorldCreated, entry.WorldPath), _viewport);
+    }
+
+    private void JoinWorld(int index)
+    {
+        if (index < 0 || index >= _worlds.Count)
+            return;
+
+        var entry = _worlds[index];
         var name = entry.Name;
         var worldPath = entry.WorldPath;
         
@@ -770,7 +805,7 @@ public sealed class SingleplayerScreen : IScreen
                 break;
 
             case WorldValidationStatus.IncompleteGeneration:
-                ResumeSelectedWorldGeneration();
+                ResumeWorldGeneration(index);
                 break;
                 
             case WorldValidationStatus.LegacyDetected:
@@ -821,7 +856,43 @@ public sealed class SingleplayerScreen : IScreen
         var showResume = IsSelectedIncompleteWorld();
         _resumeBtn.Visible = showResume;
         _resumeBtn.Enabled = showResume;
-        _deleteBtn.Label = showResume ? "DELETE PARTIAL" : "DELETE WORLD";
+    }
+
+    private void DrawRowPlayButton(SpriteBatch sb, Rectangle rect, bool hovered, bool resumeAction)
+    {
+        var bg = hovered ? new Color(68, 120, 186, 230) : new Color(38, 78, 128, 215);
+        if (resumeAction)
+            bg = hovered ? new Color(150, 112, 44, 230) : new Color(116, 82, 28, 215);
+
+        sb.Draw(_pixel, rect, bg);
+        DrawBorder(sb, rect, new Color(230, 240, 255));
+
+        var triangleWidth = Math.Max(8, rect.Width / 3);
+        var triangleHeight = Math.Max(10, rect.Height / 2);
+        var left = rect.Center.X - triangleWidth / 2;
+        for (var x = 0; x < triangleWidth; x++)
+        {
+            var currentHeight = Math.Max(1, (int)Math.Round((triangleWidth - x) / (float)triangleWidth * triangleHeight));
+            var bar = new Rectangle(left + x, rect.Center.Y - currentHeight / 2, 1, currentHeight);
+            sb.Draw(_pixel, bar, Color.White);
+        }
+    }
+
+    private void DrawRowDeleteButton(SpriteBatch sb, Rectangle rect, bool hovered)
+    {
+        var bg = hovered ? new Color(150, 50, 50, 230) : new Color(100, 34, 34, 215);
+        sb.Draw(_pixel, rect, bg);
+        DrawBorder(sb, rect, new Color(255, 220, 220));
+        if (_deleteIconTexture is not null)
+        {
+            var inset = Math.Max(2, rect.Width / 8);
+            var iconRect = new Rectangle(
+                rect.X + inset,
+                rect.Y + inset,
+                Math.Max(1, rect.Width - inset * 2),
+                Math.Max(1, rect.Height - inset * 2));
+            sb.Draw(_deleteIconTexture, iconRect, hovered ? Color.White : new Color(240, 240, 240));
+        }
     }
 
     private void LayoutDeleteConfirmOverlay()

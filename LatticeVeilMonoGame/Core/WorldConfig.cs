@@ -30,30 +30,23 @@ public sealed class WorldConfig
         try
         {
             var worldFile = Path.Combine(worldPath, "world.lvc");
-            if (!File.Exists(worldFile))
-            {
-                log.Warn($"World file not found: {worldFile}");
-                return null;
-            }
-
-            // Reject JSON format
-            if (LvcSerializer.IsJsonFormat(worldFile))
-                throw new LvcSerializer.LegacyFormatException($"Legacy JSON world detected: {worldFile}");
-
             // Fail-fast if legacy files exist
             var legacyLevel = Path.Combine(worldPath, "level.lvc");
             var legacyCfg = Path.Combine(worldPath, "world_config.lvc");
             var legacyChunks = Path.Combine(worldPath, "chunks");
             var legacyMeshcache = Path.Combine(worldPath, "meshcache");
 
-            if (File.Exists(legacyLevel))
-                throw new LvcSerializer.LegacyFormatException($"Legacy world detected: level.lvc found");
-            if (File.Exists(legacyCfg))
-                throw new LvcSerializer.LegacyFormatException($"Legacy world detected: world_config.lvc found");
-            if (Directory.Exists(legacyChunks))
-                throw new LvcSerializer.LegacyFormatException($"Legacy world detected: chunks/ folder found");
-            if (Directory.Exists(legacyMeshcache))
-                throw new LvcSerializer.LegacyFormatException($"Legacy world detected: meshcache/ folder found");
+            if (!File.Exists(worldFile))
+            {
+                if (File.Exists(legacyLevel) || File.Exists(legacyCfg) || Directory.Exists(legacyChunks) || Directory.Exists(legacyMeshcache))
+                    throw new LvcSerializer.LegacyFormatException($"Legacy world detected with no world.lvc manifest: {worldPath}");
+
+                log.Warn($"World file not found: {worldFile}");
+                return null;
+            }
+
+            if (File.Exists(legacyLevel) || File.Exists(legacyCfg) || Directory.Exists(legacyChunks) || Directory.Exists(legacyMeshcache))
+                log.Warn($"Legacy world sidecar data detected in {worldPath}; loading canonical world.lvc manifest and ignoring legacy sidecars.");
 
             var meta = WorldMeta.Load(worldFile, log);
             if (meta == null)
@@ -113,6 +106,8 @@ public sealed class WorldSizeSettings
 public sealed class GameplaySettings
 {
     public bool EnableCheats { get; set; } = false;
+    public bool CheatsEverEnabled { get; set; } = false;
+    public bool EnableGiveItems { get; set; } = true;
     public bool EnableMultipleHomes { get; set; } = true;
     public bool EnableSigilPower { get; set; } = true;
     public int MaxHomesPerPlayer { get; set; } = 8;

@@ -39,9 +39,9 @@ public sealed class OptionsScreen : IScreen
     };
     private static readonly (float value, string label)[] GuiScaleCandidates = new[]
     {
-        (0.75f, "0.75X"),
-        (0.85f, "0.85X"),
-        (1.0f, "1.0X")
+        (1.0f, "1X"),
+        (1.5f, "1.5X"),
+        (2.0f, "2X")
     };
     private static readonly string[] GuiScaleLabels = GuiScaleCandidates.Select(c => c.label).ToArray();
     private static readonly string[] QualityPresets = { "LOW", "MEDIUM", "HIGH", "ULTRA" };
@@ -1538,7 +1538,7 @@ public sealed class OptionsScreen : IScreen
         if (_applyFeedbackTimer <= 0f || string.IsNullOrWhiteSpace(_applyFeedbackText))
             return;
 
-        var alpha = Math.Clamp(_applyFeedbackTimer / 1.8f, 0f, 1f);
+        var alpha = Math.Clamp(_applyFeedbackTimer / 2.4f, 0f, 1f);
         var border = _applyFeedbackIsError
             ? new Color(255, 138, 138, Math.Clamp((int)(220f * alpha), 0, 255))
             : new Color(168, 242, 186, Math.Clamp((int)(220f * alpha), 0, 255));
@@ -1548,12 +1548,14 @@ public sealed class OptionsScreen : IScreen
         var bg = new Color(0, 0, 0, Math.Clamp((int)(168f * alpha), 0, 255));
 
         var size = _font.MeasureString(_applyFeedbackText);
-        var width = (int)Math.Ceiling(size.X) + 22;
-        var height = _font.LineHeight + 12;
-        var rect = new Rectangle(_apply.Bounds.Center.X - width / 2, _apply.Bounds.Bottom + 10, width, height);
+        var width = (int)Math.Ceiling(size.X) + 28;
+        var height = _font.LineHeight + 14;
+        var rect = new Rectangle(_apply.Bounds.Center.X - width / 2, _apply.Bounds.Y - height - 12, width, height);
         sb.Draw(_pixel, rect, bg);
         DrawBorder(sb, rect, border, 1);
-        _font.DrawString(sb, _applyFeedbackText, new Vector2(rect.X + 11, rect.Y + 6), textColor);
+        var textPos = new Vector2(rect.X + 14, rect.Y + 7);
+        _font.DrawString(sb, _applyFeedbackText, textPos, textColor);
+        _font.DrawString(sb, _applyFeedbackText, textPos + new Vector2(1, 0), textColor);
     }
 
     private void RefreshPacks()
@@ -2773,8 +2775,8 @@ public sealed class OptionsScreen : IScreen
 
             // We do apply audio immediately.
             _working.ApplyAudio();
-            _applyFeedbackText = "APPLIED";
-            _applyFeedbackTimer = 1.8f;
+            _applyFeedbackText = "SETTINGS APPLIED";
+            _applyFeedbackTimer = 2.4f;
             _applyFeedbackIsError = false;
         }
         catch (Exception ex)

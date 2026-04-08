@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 
 namespace LatticeVeilMonoGame.Core;
 
@@ -26,7 +27,34 @@ public static class LvcSerializer
             using var fs = File.OpenRead(path);
             int b;
             do { b = fs.ReadByte(); } while (b != -1 && char.IsWhiteSpace((char)b));
-            return b == '{' || b == '[';
+            if (b == '{')
+                return true;
+
+            if (b != '[')
+                return false;
+
+            // Sectioned .lvc manifests start with headers like [WORLD], not JSON arrays.
+            var sectionProbe = new StringBuilder();
+            while (true)
+            {
+                b = fs.ReadByte();
+                if (b == -1 || b == '\r' || b == '\n')
+                    break;
+
+                sectionProbe.Append((char)b);
+                if (sectionProbe.Length >= 64)
+                    break;
+            }
+
+            var probeText = sectionProbe.ToString().Trim();
+            if (probeText.Length > 0 && probeText.EndsWith("]", StringComparison.Ordinal))
+            {
+                var sectionName = probeText.Substring(0, probeText.Length - 1).Trim();
+                if (sectionName.Length > 0 && sectionName.All(ch => char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' || ch == '.'))
+                    return false;
+            }
+
+            return true;
         }
         catch
         {

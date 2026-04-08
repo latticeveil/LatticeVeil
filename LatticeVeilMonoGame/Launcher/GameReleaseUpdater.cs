@@ -121,7 +121,9 @@ public sealed class GameReleaseUpdater
                 statusMessage: "Release found, but no matching EXE asset was detected.");
         }
 
-        var updateAvailable = remoteVersion != null && remoteVersion > localVersion;
+        var comparableLocalVersion = NormalizeComparableVersion(localVersion);
+        var comparableRemoteVersion = remoteVersion == null ? null : NormalizeComparableVersion(remoteVersion);
+        var updateAvailable = comparableRemoteVersion != null && comparableRemoteVersion > comparableLocalVersion;
         var remoteVersionText = remoteVersion == null ? releaseTitle : $"v{NormalizeVersion(remoteVersion)}";
         var message = updateAvailable
             ? $"Update available: {remoteVersionText}"
@@ -303,6 +305,14 @@ public sealed class GameReleaseUpdater
         if (version.Revision < 0)
             return $"{version.Major}.{version.Minor}.{version.Build}";
         return version.ToString();
+    }
+
+    private static Version NormalizeComparableVersion(Version version)
+    {
+        // Treat missing build/revision components as zero so 14.0.0 and 14.0.0.0 compare as equal.
+        var build = version.Build < 0 ? 0 : version.Build;
+        var revision = version.Revision < 0 ? 0 : version.Revision;
+        return new Version(version.Major, version.Minor, build, revision);
     }
 
     private static GitHubAsset? FindBestExecutableAsset(GitHubRelease release, string currentExecutableName)

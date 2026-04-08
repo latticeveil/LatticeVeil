@@ -73,7 +73,7 @@ public sealed class GameSettings
     public bool VSync { get; set; } = true;
     public int ResolutionWidth { get; set; } = 1280;
     public int ResolutionHeight { get; set; } = 720;
-    public float GuiScale { get; set; } = 1f;
+    public float GuiScale { get; set; } = 2f;
     public string QualityPreset { get; set; } = "MEDIUM";
     public float Brightness { get; set; } = 1f;
     public int FieldOfView { get; set; } = 70;
@@ -191,7 +191,7 @@ public sealed class GameSettings
         s.MasterVolume = Clamp01(s.MasterVolume);
         s.MusicVolume = Clamp01(s.MusicVolume);
         s.SfxVolume = Clamp01(s.SfxVolume);
-        s.GuiScale = ClampRange(s.GuiScale, 0.75f, 1.0f);
+        s.GuiScale = NormalizeGuiScale(s.GuiScale);
         s.Brightness = ClampRange(s.Brightness, 0.5f, 1.5f);
         s.FieldOfView = Math.Clamp(s.FieldOfView, 60, 110);
         s.RenderDistanceChunks = Math.Clamp(s.RenderDistanceChunks, RenderDistanceMin, EngineRenderDistanceMax);
@@ -224,6 +224,17 @@ public sealed class GameSettings
 
     private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
     private static float ClampRange(float v, float min, float max) => v < min ? min : (v > max ? max : v);
+    private static float NormalizeGuiScale(float value)
+    {
+        // Migrate legacy 0.75x-1.0x values into the new 1x-2x user-facing range.
+        if (value <= 1.0f)
+        {
+            var legacy = ClampRange(value, 0.75f, 1.0f);
+            return 1.0f + ((legacy - 0.75f) / 0.25f);
+        }
+
+        return ClampRange(value, 1.0f, 2.0f);
+    }
     private const int ReticleSizeMin = 2;
     private const int ReticleSizeMax = 32;
     private const int ReticleThicknessMin = 1;

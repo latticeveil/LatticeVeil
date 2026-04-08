@@ -2,15 +2,6 @@
   "version": 3,
   "targets": {
     "net8.0-windows7.0": {
-      "DotnetNoise/1.0.0": {
-        "type": "package",
-        "compile": {
-          "lib/netstandard2.0/DotnetNoise.dll": {}
-        },
-        "runtime": {
-          "lib/netstandard2.0/DotnetNoise.dll": {}
-        }
-      },
       "GeonBit.UI/4.3.0.4": {
         "type": "package",
         "compile": {
@@ -18,19 +9,6 @@
         },
         "runtime": {
           "lib/net7.0-windows/GeonBit.UI.dll": {}
-        }
-      },
-      "LibNoise/0.2.0": {
-        "type": "package",
-        "compile": {
-          "lib/NET45/LibNoise.dll": {
-            "related": ".XML"
-          }
-        },
-        "runtime": {
-          "lib/NET45/LibNoise.dll": {
-            "related": ".XML"
-          }
         }
       },
       "Microsoft.Bcl.AsyncInterfaces/8.0.0": {
@@ -46,7 +24,7 @@
           }
         }
       },
-      "Microsoft.NET.ILLink.Tasks/8.0.24": {
+      "Microsoft.NET.ILLink.Tasks/8.0.25": {
         "type": "package",
         "build": {
           "build/Microsoft.NET.ILLink.Tasks.props": {}
@@ -338,19 +316,6 @@
         },
         "runtime": {
           "lib/netstandard2.0/NVorbis.dll": {
-            "related": ".xml"
-          }
-        }
-      },
-      "SharpNoise/0.12.1.1": {
-        "type": "package",
-        "compile": {
-          "lib/netstandard2.0/SharpNoise.dll": {
-            "related": ".xml"
-          }
-        },
-        "runtime": {
-          "lib/netstandard2.0/SharpNoise.dll": {
             "related": ".xml"
           }
         }
@@ -749,15 +714,6 @@
       }
     },
     "net8.0-windows7.0/win-x64": {
-      "DotnetNoise/1.0.0": {
-        "type": "package",
-        "compile": {
-          "lib/netstandard2.0/DotnetNoise.dll": {}
-        },
-        "runtime": {
-          "lib/netstandard2.0/DotnetNoise.dll": {}
-        }
-      },
       "GeonBit.UI/4.3.0.4": {
         "type": "package",
         "compile": {
@@ -765,19 +721,6 @@
         },
         "runtime": {
           "lib/net7.0-windows/GeonBit.UI.dll": {}
-        }
-      },
-      "LibNoise/0.2.0": {
-        "type": "package",
-        "compile": {
-          "lib/NET45/LibNoise.dll": {
-            "related": ".XML"
-          }
-        },
-        "runtime": {
-          "lib/NET45/LibNoise.dll": {
-            "related": ".XML"
-          }
         }
       },
       "Microsoft.Bcl.AsyncInterfaces/8.0.0": {
@@ -793,7 +736,7 @@
           }
         }
       },
-      "Microsoft.NET.ILLink.Tasks/8.0.24": {
+      "Microsoft.NET.ILLink.Tasks/8.0.25": {
         "type": "package",
         "build": {
           "build/Microsoft.NET.ILLink.Tasks.props": {}
@@ -1134,19 +1077,6 @@
         },
         "runtime": {
           "runtimes/win/lib/netstandard1.5/System.Runtime.Extensions.dll": {}
-        }
-      },
-      "SharpNoise/0.12.1.1": {
-        "type": "package",
-        "compile": {
-          "lib/netstandard2.0/SharpNoise.dll": {
-            "related": ".xml"
-          }
-        },
-        "runtime": {
-          "lib/netstandard2.0/SharpNoise.dll": {
-            "related": ".xml"
-          }
         }
       },
       "System.CodeDom/8.0.0": {
@@ -1544,19 +1474,6 @@
     }
   },
   "libraries": {
-    "DotnetNoise/1.0.0": {
-      "sha512": "GdEL8YZXceS39AsanUUwZCX/lRseX26xhbQIhB0/+yz4+rx8eWy+0vkP6isPuAecEvd0PVkXO4peNRW0wMlzhg==",
-      "type": "package",
-      "path": "dotnetnoise/1.0.0",
-      "files": [
-        ".nupkg.metadata",
-        ".signature.p7s",
-        "LICENSE",
-        "dotnetnoise.1.0.0.nupkg.sha512",
-        "dotnetnoise.nuspec",
-        "lib/netstandard2.0/DotnetNoise.dll"
-      ]
-    },
     "GeonBit.UI/4.3.0.4": {
       "sha512": "minQC9hUEXY1OdEsIaynIFuPoMIK4CKpszmVNUqc99Y/8DsTIog5Utn7wHIXb96m7CbIMH0FlmeTwC0cnjUmPQ==",
       "type": "package",
@@ -2173,23 +2090,6 @@
         "readme.txt"
       ]
     },
-    "LibNoise/0.2.0": {
-      "sha512": "tdYokEHB4QmTtM05X3ITNTaDv5odD+pOkzyemHBlVqLVTyfXwWl+l9qz81ZSBTGnQn0gkxgH1q5iXGwlT8GKjg==",
-      "type": "package",
-      "path": "libnoise/0.2.0",
-      "files": [
-        ".nupkg.metadata",
-        ".signature.p7s",
-        "lib/NET35/LibNoise.XML",
-        "lib/NET35/LibNoise.dll",
-        "lib/NET40/LibNoise.XML",
-        "lib/NET40/LibNoise.dll",
-        "lib/NET45/LibNoise.XML",
-        "lib/NET45/LibNoise.dll",
-        "libnoise.0.2.0.nupkg.sha512",
-        "libnoise.nuspec"
-      ]
-    },
     "Microsoft.Bcl.AsyncInterfaces/8.0.0": {
       "sha512": "3WA9q9yVqJp222P3x1wYIGDAkpjAku0TMUaaQV22g6L67AI0LdOIrVS7Ht2vJfLHGSPVuqN94vIr15qn+HEkHw==",
       "type": "package",
@@ -2214,10 +2114,10 @@
         "useSharedDesignerContext.txt"
       ]
     },
-    "Microsoft.NET.ILLink.Tasks/8.0.24": {
-      "sha512": "1gnadp//+DoGJvV4AFdzPqYPxkypaWYjYMCr7KAacV0iadsHz1nU+rrkoxBCna4FCmeKH49CisEwa7g94/MbEg==",
+    "Microsoft.NET.ILLink.Tasks/8.0.25": {
+      "sha512": "sqX4nmBft05ivqKvUT4nxaN8rT3apCLt9SWFkfRrQPwra1zPwFknQAw1lleuMCKOCLvVmOWwrC2iPSm9RiXZUg==",
       "type": "package",
-      "path": "microsoft.net.illink.tasks/8.0.24",
+      "path": "microsoft.net.illink.tasks/8.0.25",
       "hasTools": true,
       "files": [
         ".nupkg.metadata",
@@ -2231,7 +2131,7 @@
         "build/Microsoft.NET.ILLink.Analyzers.props",
         "build/Microsoft.NET.ILLink.Tasks.props",
         "build/Microsoft.NET.ILLink.targets",
-        "microsoft.net.illink.tasks.8.0.24.nupkg.sha512",
+        "microsoft.net.illink.tasks.8.0.25.nupkg.sha512",
         "microsoft.net.illink.tasks.nuspec",
         "tools/net472/ILLink.Tasks.dll",
         "tools/net472/ILLink.Tasks.dll.config",
@@ -2869,20 +2769,6 @@
         "runtimes/win/lib/net/_._",
         "runtimes/win/lib/netcore50/System.Runtime.Extensions.dll",
         "runtimes/win/lib/netstandard1.5/System.Runtime.Extensions.dll"
-      ]
-    },
-    "SharpNoise/0.12.1.1": {
-      "sha512": "YU87vP4pCJpEtu+yigyZFEzZPy02rf49v3YfrTN/f9YTfk1SZFfOTUKYhPcP4r1+4MpNNOBbu7UNlTvcwpx5Ww==",
-      "type": "package",
-      "path": "sharpnoise/0.12.1.1",
-      "files": [
-        ".nupkg.metadata",
-        ".signature.p7s",
-        "LICENSE",
-        "lib/netstandard2.0/SharpNoise.dll",
-        "lib/netstandard2.0/SharpNoise.xml",
-        "sharpnoise.0.12.1.1.nupkg.sha512",
-        "sharpnoise.nuspec"
       ]
     },
     "System.CodeDom/8.0.0": {
@@ -4337,16 +4223,13 @@
   },
   "projectFileDependencyGroups": {
     "net8.0-windows7.0": [
-      "DotnetNoise >= 1.0.0",
       "GeonBit.UI >= 4.3.0.4",
-      "LibNoise >= 0.2.0",
       "Microsoft.Bcl.AsyncInterfaces >= 8.0.0",
-      "Microsoft.NET.ILLink.Tasks >= 8.0.24",
+      "Microsoft.NET.ILLink.Tasks >= 8.0.25",
       "MonoGame.Framework.DesktopGL >= 3.8.4.1",
       "MonoGame.Library.OpenAL >= 1.24.3.2",
       "NAudio >= 2.2.1",
       "NVorbis >= 0.10.4",
-      "SharpNoise >= 0.12.1.1",
       "System.Collections.Concurrent >= 4.3.0",
       "System.Drawing.Common >= 10.0.2",
       "System.Management >= 8.0.0",
@@ -4361,7 +4244,7 @@
     "C:\\Users\\Redacted\\.nuget\\packages\\": {}
   },
   "project": {
-    "version": "9.0.0",
+    "version": "14.0.0",
     "restore": {
       "projectUniqueName": "C:\\Users\\Redacted\\Documents\\LatticeVeil_project\\LatticeVeilMonoGame\\LatticeVeilMonoGame.csproj",
       "projectName": "LatticeVeilMonoGame",
@@ -4403,17 +4286,9 @@
       "net8.0-windows7.0": {
         "targetAlias": "net8.0-windows",
         "dependencies": {
-          "DotnetNoise": {
-            "target": "Package",
-            "version": "[1.0.0, )"
-          },
           "GeonBit.UI": {
             "target": "Package",
             "version": "[4.3.0.4, )"
-          },
-          "LibNoise": {
-            "target": "Package",
-            "version": "[0.2.0, )"
           },
           "Microsoft.Bcl.AsyncInterfaces": {
             "target": "Package",
@@ -4422,7 +4297,7 @@
           "Microsoft.NET.ILLink.Tasks": {
             "suppressParent": "All",
             "target": "Package",
-            "version": "[8.0.24, )",
+            "version": "[8.0.25, )",
             "autoReferenced": true
           },
           "MonoGame.Framework.DesktopGL": {
@@ -4440,10 +4315,6 @@
           "NVorbis": {
             "target": "Package",
             "version": "[0.10.4, )"
-          },
-          "SharpNoise": {
-            "target": "Package",
-            "version": "[0.12.1.1, )"
           },
           "System.Collections.Concurrent": {
             "target": "Package",
@@ -4492,31 +4363,35 @@
         "downloadDependencies": [
           {
             "name": "Microsoft.AspNetCore.App.Ref",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
+          },
+          {
+            "name": "Microsoft.NETCore.App.Crossgen2.win-x64",
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.NETCore.App.Host.win-x64",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.NETCore.App.Ref",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.NETCore.App.Runtime.win-x64",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.WindowsDesktop.App.Ref",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           },
           {
             "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
-            "version": "[8.0.24, 8.0.24]"
+            "version": "[8.0.25, 8.0.25]"
           }
         ],
         "frameworkReferences": {
@@ -4527,7 +4402,7 @@
             "privateAssets": "none"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.103/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.104/PortableRuntimeIdentifierGraph.json"
       }
     },
     "runtimes": {

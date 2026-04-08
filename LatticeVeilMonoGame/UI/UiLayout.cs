@@ -8,6 +8,8 @@ public static class UiLayout
     public const float BaseScale = 0.8f;
     public const float MinScale = 0.6f;
     public const float MaxScale = 1.0f;
+    public const float MinUserScale = 1.0f;
+    public const float MaxUserScale = 2.0f;
 
     public static float Scale { get; private set; } = 1f;
     public static Point Offset { get; private set; } = Point.Zero;
@@ -17,8 +19,9 @@ public static class UiLayout
 
     public static float GetEffectiveScale(float userScale)
     {
-        var scale = Math.Clamp(userScale, MinScale, MaxScale);
-        return scale * BaseScale;
+        var normalized = Math.Clamp(userScale, MinUserScale, MaxUserScale);
+        var legacyScale = 0.75f + ((normalized - MinUserScale) / (MaxUserScale - MinUserScale)) * 0.25f;
+        return legacyScale * BaseScale;
     }
 
     public static bool Update(Rectangle windowViewport, float effectiveScale)

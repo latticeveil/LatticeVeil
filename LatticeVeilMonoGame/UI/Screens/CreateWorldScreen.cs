@@ -14,8 +14,8 @@ namespace LatticeVeilMonoGame.UI.Screens;
 public sealed class CreateWorldScreen : IScreen
 {
     private const int MaxWorldNameLength = 32;
-    private const int PanelMaxWidth = 1300;
-    private const int PanelMaxHeight = 700;
+    private const int PanelMaxWidth = 1248;
+    private const int PanelMaxHeight = 680;
     private const int ControlShrinkPixels = 60; // ~2 inches at 30 px/in
     private const int ContentDownShiftPixels = 30; // ~1 inch at 30 px/in
 
@@ -254,24 +254,23 @@ public sealed class CreateWorldScreen : IScreen
         _veilwalkerBtn.Bounds = new Rectangle(modeStartX + modeButtonW + modeButtonGap, modeY, modeButtonW, modeButtonH);
         _veilseerBtn.Bounds = new Rectangle(modeStartX + (modeButtonW + modeButtonGap) * 2, modeY, modeButtonW, modeButtonH);
 
-        var checkboxY = _artificerBtn.Bounds.Bottom + 42;
-
-        // Keep the three world toggles centered and side-by-side.
-        var sideBySideY = checkboxY - 34 + 40;
+        var difficultyHeaderY = _artificerBtn.Bounds.Bottom + 52;
         const int buttonH = 30;
         const int buttonSpacing = 20;
-        const int toggleCount = 3;
+        const int toggleCount = 2;
         var availableWidth = Math.Max(420, _contentArea.Width - 24);
         var buttonW = Math.Clamp((availableWidth - (buttonSpacing * (toggleCount - 1))) / toggleCount, 140, 220);
         var totalWidth = buttonW * toggleCount + buttonSpacing * (toggleCount - 1);
         var startX = _contentArea.Center.X - totalWidth / 2;
 
-        _difficultyBtn.Bounds = new Rectangle(startX, sideBySideY, buttonW, buttonH);
-        _enableHomesBtn.Bounds = new Rectangle(startX + buttonW + buttonSpacing, sideBySideY, buttonW, buttonH);
-        _enableCheatsBtn.Bounds = new Rectangle(startX + ((buttonW + buttonSpacing) * 2), sideBySideY, buttonW, buttonH);
+        _difficultyBtn.Bounds = new Rectangle(_contentArea.Center.X - 260, difficultyHeaderY + 24, 520, 34);
+
+        var coreRulesY = _difficultyBtn.Bounds.Bottom + 92;
+        _enableHomesBtn.Bounds = new Rectangle(startX, coreRulesY + 24, buttonW, buttonH);
+        _enableCheatsBtn.Bounds = new Rectangle(startX + buttonW + buttonSpacing, coreRulesY + 24, buttonW, buttonH);
         
         // More World Options below them
-        var moreOptionsY = sideBySideY + 60;  // 60 pixels below moved buttons
+        var moreOptionsY = _enableHomesBtn.Bounds.Bottom + 42;
         _moreWorldOptionsBtn.Bounds = new Rectangle(
             _contentArea.Center.X - 130,
             moreOptionsY,
@@ -280,13 +279,11 @@ public sealed class CreateWorldScreen : IScreen
             
         RebuildDropdownLayouts();
 
-        // Match Singleplayer world-list screen create button sizing/placement.
-        var rowButtonW = Math.Clamp((int)(_panelRect.Width * 0.28f), 160, 260);
-        var rowButtonH = Math.Clamp((int)(rowButtonW * 0.28f), 40, 70);
-        var buttonY = _panelRect.Bottom - 24 - rowButtonH - 76 - 60;  // Move down 60 pixels to avoid overlap
-        var createBtnW = panelW / 3 - 15;
-        var createBtnH = (int)(createBtnW * 0.25f);
-        var createBtnX = _panelRect.X + (_panelRect.Width - createBtnW) / 2;
+        // Keep create anchored to the bottom-center of the full screen so world options remain visible.
+        var createBtnW = Math.Min(320, panelW / 4);
+        var createBtnH = Math.Max(44, (int)(createBtnW * 0.22f));
+        var createBtnX = viewport.Center.X - createBtnW / 2;
+        var buttonY = viewport.Bottom - 20 - createBtnH;
         _createBtn.Bounds = new Rectangle(createBtnX, buttonY, createBtnW, createBtnH);
 
         // Match Options screen back button position (bottom-left of full screen) - use same logic as SingleplayerScreen
@@ -471,7 +468,13 @@ public sealed class CreateWorldScreen : IScreen
         _veilseerBtn.Draw(sb, _pixel, _font);
 
         DrawModeDescriptionBox(sb);
+        DrawSectionHeader(sb, "DIFFICULTY", new Vector2(_difficultyBtn.Bounds.X, _difficultyBtn.Bounds.Y - _font.LineHeight - 6));
         _difficultyBtn.Draw(sb, _pixel, _font);
+        DrawDifficultyInfoBox(sb);
+        var coreRulesLabel = "CORE RULES";
+        var coreRulesSize = _font.MeasureString(coreRulesLabel);
+        var coreRulesX = _contentArea.Center.X - coreRulesSize.X / 2f;
+        DrawSectionHeader(sb, coreRulesLabel, new Vector2(coreRulesX, _enableHomesBtn.Bounds.Y - _font.LineHeight - 18));
         _enableHomesBtn.Draw(sb, _pixel, _font);
         _enableCheatsBtn.Draw(sb, _pixel, _font);
         _moreWorldOptionsBtn.Draw(sb, _pixel, _font);
@@ -501,16 +504,11 @@ public sealed class CreateWorldScreen : IScreen
 
     private string GetDifficultyLabel() => GetDifficultyLabel(_difficulty);
 
+    private string GetDifficultyDescription() => WorldDifficulty.GetDescription(_difficulty);
+
     private static string GetDifficultyLabel(int difficulty)
     {
-        return difficulty switch
-        {
-            0 => "Peaceful",
-            1 => "Easy",
-            2 => "Normal",
-            3 => "Hard",
-            _ => "Normal"
-        };
+        return WorldDifficulty.GetDisplayLabel(difficulty);
     }
 
     private void SetGameMode(Core.GameMode mode)
@@ -1446,7 +1444,7 @@ public sealed class CreateWorldScreen : IScreen
     private void SyncDifficultyLabel()
     {
         _difficulty = Math.Clamp(_difficulty, 0, 3);
-        _difficultyBtn.Label = $"DIFFICULTY: {GetDifficultyLabel().ToUpperInvariant()}";
+        _difficultyBtn.Label = GetDifficultyLabel().ToUpperInvariant();
     }
 
     private string ResolveHoveredModeDescription(Point mousePos)
@@ -1499,6 +1497,65 @@ public sealed class CreateWorldScreen : IScreen
             DrawBorder(sb, rect, selected ? new Color(150, 220, 255) : new Color(120, 120, 120));
             _font.DrawString(sb, GetDifficultyLabel(i).ToUpperInvariant(), new Vector2(rect.X + 8, rect.Y + 6), Color.White);
         }
+    }
+
+    private void DrawDifficultyInfoBox(SpriteBatch sb)
+    {
+        var rect = new Rectangle(
+            _difficultyBtn.Bounds.X,
+            _difficultyBtn.Bounds.Bottom + 10,
+            _difficultyBtn.Bounds.Width,
+            56);
+        sb.Draw(_pixel, rect, new Color(14, 14, 14, 220));
+        DrawBorder(sb, rect, new Color(110, 110, 110));
+        var wrapped = WrapText(GetDifficultyDescription().ToUpperInvariant(), rect.Width - 16);
+        var y = rect.Y + 6;
+        for (var i = 0; i < wrapped.Count; i++)
+        {
+            if (y + _font.LineHeight > rect.Bottom - 4)
+                break;
+            _font.DrawString(sb, wrapped[i], new Vector2(rect.X + 8, y), new Color(220, 220, 220));
+            y += _font.LineHeight + 2;
+        }
+    }
+
+    private void DrawSectionHeader(SpriteBatch sb, string text, Vector2 position)
+    {
+        _font.DrawString(sb, text, position, new Color(235, 235, 235));
+    }
+
+    private List<string> WrapText(string text, int maxWidth)
+    {
+        var lines = new List<string>();
+        var content = string.IsNullOrWhiteSpace(text) ? string.Empty : text.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            lines.Add(string.Empty);
+            return lines;
+        }
+
+        var words = content.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var current = string.Empty;
+        for (var i = 0; i < words.Length; i++)
+        {
+            var word = words[i];
+            var candidate = string.IsNullOrWhiteSpace(current) ? word : $"{current} {word}";
+            if (_font.MeasureString(candidate).X <= maxWidth)
+            {
+                current = candidate;
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(current))
+                lines.Add(current);
+
+            current = word;
+        }
+
+        if (!string.IsNullOrWhiteSpace(current))
+            lines.Add(current);
+
+        return lines;
     }
 
     private (int width, int height, int depth) GetWorldDimensions()
