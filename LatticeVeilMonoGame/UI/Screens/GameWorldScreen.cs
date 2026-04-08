@@ -188,6 +188,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private static readonly Vector2[] ReticleCirclePoints = BuildReticleCirclePoints(32);
 
     private readonly PlayerController _player = new();
+    private readonly SurvivalVitals _survivalVitals = new();
     private readonly Inventory _inventory = new();
     private Rectangle _hotbarRect;
     private readonly Rectangle[] _hotbarSlots = new Rectangle[Inventory.HotbarSize];
@@ -208,6 +209,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Keys _inventoryKey = Keys.E;
     private Keys _dropKey = Keys.Q;
     private Keys _giveKey = Keys.F;
+    private Keys _useItemKey = Keys.R;
     private Keys _stackModifierKey = Keys.LeftShift;
     private Keys _sprintKey = Keys.LeftControl;
     private Keys _flyDescendKey = Keys.LeftShift;
@@ -241,6 +243,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _handoffFullStack;
     private bool _handoffPromptVisible;
     private readonly List<PlayerHomeEntry> _homes = new();
+    private bool _survivalRespawnPending;
+    private float _survivalRespawnTimer;
+    private bool _survivalWasGrounded;
+    private float _survivalPeakAirY;
+    private bool _sigilPowerEnabled = true;
+    private float _sigilPositiveTargetFraction;
+    private float _sigilNegativeTargetFraction;
+    private float _damageFlashTimer;
+    private float _damageFlashStrength;
+    private float _damageHandKickTimer;
+    private float _damageHandKickStrength;
+    private float _damageCameraKickTimer;
+    private float _damageCameraKickStrength;
     private int _selectedHomeIndex = -1;
     private bool _hasHome;
     private Vector3 _homePosition;
@@ -287,7 +302,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Button _structureFinderFindBtn;
     private readonly Button _structureFinderCloseBtn;
 
-    public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen && !_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && _hasLoadedWorld && !_worldSyncInProgress && _spawnPrewarmComplete;
+    public bool WantsMouseCapture => !_pauseMenuOpen && !_inventoryOpen && !_homeGuiOpen && !_structureFinderOpen && !_attunementWipPopupVisible && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && _hasLoadedWorld && !_worldSyncInProgress && _spawnPrewarmComplete;
     public bool WorldReady => !_worldSyncInProgress && _hasLoadedWorld && _spawnPrewarmComplete;
     private bool IsJoinedClientSession => _lanSession != null && !_lanSession.IsHost;
     private bool IsTextInputActive => _commandInputActive || _chatInputActive;
@@ -299,6 +314,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _pauseMenuOpen;
     private bool _pauseHostOptionsOpen;
     private Texture2D? _pausePanel;
+    private Texture2D? _healthHudTexture;
+    private Texture2D? _hungerHudTexture;
+    private Texture2D? _sigilHudTexture;
+    private const int SigilHudCellSize = 96;
+    private const int SigilHudFrameCount = 101;
+    private const float SigilHudAnimationLerp = 8.5f;
+    private static readonly Color CommandErrorColor = new(255, 110, 110);
+    private const string SigilPositiveLabel = "ATONEMENT";
+    private const string SigilNegativeLabel = "CURSE";
+    private float _debugSigilPositiveFraction;
+    private float _debugSigilNegativeFraction;
+    private readonly bool _showAttunementWipPopupOnLoad;
+    private bool _hasSeenAttunementWipPopup;
+    private bool _attunementWipPopupVisible;
+    private Rectangle _attunementWipPopupRect;
     private Rectangle _pauseRect;
     private Rectangle _pauseHeaderRect;
     private Rectangle _pauseSubpanelRect;
@@ -362,6 +392,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const float PlayerPushStrength = 6.0f * Scale.BlockSize;
     private const float PlayerPushMaxStep = 0.08f * Scale.BlockSize;
     private const float PlayerPushSkin = 0.01f * Scale.BlockSize;
+    private const float SurvivalRespawnDelaySeconds = 2.5f;
+    private const float DamageFlashDurationSeconds = 0.24f;
+    private const float DamageHandKickDurationSeconds = 0.20f;
+    private const float DamageCameraKickDurationSeconds = 0.16f;
 
     private float _fpsTimer;
     private float _fps;
@@ -480,9 +514,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int MaxCommandPredictions = 5;
     private const int ChatHistoryScrollStep = 6;
     private const int CommandInputMaxLength = 96;
-    private const float ChatOverlayWidthRatio = 0.52f;
-    private const int ChatOverlayMinWidth = 420;
-    private const int ChatOverlayMaxWidth = 900;
+    private const float ChatOverlayWidthRatio = 0.42f;
+    private const int ChatOverlayMinWidth = 320;
+    private const int ChatOverlayMaxWidth = 720;
+    private const int ChatOverlayHudClearance = 28;
     private const string OperatorSyncPrefix = "__lv_opsync__:";
     private const string GameModeSyncPrefix = "__lv_gamemode__:";
     private const string RuleRequestPrefix = "__lv_rule_req__:";
@@ -519,7 +554,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private static readonly HashSet<string> CheatsDisabledAllowedCommands = new(StringComparer.OrdinalIgnoreCase)
     {
         "help",
-        "seed",
+        "accept",
+        "reject",
         "op",
         "deop",
         "kick",
@@ -528,7 +564,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         "chatclear",
         "commandclear",
         "whitelist",
-        "rules"
+        "broadcast"
     };
     private const float LiveInventoryPushIntervalSeconds = 0.10f;
     private int _liveInventoryTargetPlayerId = -1;
@@ -620,7 +656,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         ScissorTestEnable = true
     };
 
-    public GameWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, string worldPath, string metaPath, ILanSession? lanSession = null, VoxelWorld? preloadedWorld = null)
+    public GameWorldScreen(MenuStack menus, AssetLoader assets, PixelFont font, Texture2D pixel, Logger log, PlayerProfile profile, global::Microsoft.Xna.Framework.GraphicsDeviceManager graphics, string worldPath, string metaPath, ILanSession? lanSession = null, VoxelWorld? preloadedWorld = null, bool startPaused = false, bool showAttunementWipPopup = false)
     {
         _menus = menus;
         _assets = assets;
@@ -632,6 +668,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _graphics = graphics;
         _worldPath = worldPath;
         _metaPath = metaPath;
+        _showAttunementWipPopupOnLoad = showAttunementWipPopup;
+        _attunementWipPopupVisible = false;
         _lanSession = lanSession;
         _persistenceSendAccumulator = _lanSession != null && !_lanSession.IsHost
             ? PersistenceSendIntervalSeconds
@@ -642,26 +680,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _targetActiveRadiusChunks = Math.Clamp(_settings.RenderDistanceChunks, 4, MaxRuntimeActiveRadius);
         _activeRadiusChunks = GetInitialActiveRadius(_targetActiveRadiusChunks);
         UpdateReticleSettings();
-        _inventoryKey = GetKeybind("Inventory", Keys.E);
-        _dropKey = GetKeybind("DropItem", Keys.Q);
-        _giveKey = GetKeybind("GiveItem", Keys.F);
-        _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
-        _sprintKey = GetKeybind("Sprint", Keys.LeftControl);
-        _flyDescendKey = GetKeybind("FlyDescend", Keys.LeftShift);
-        _chatKey = GetKeybind("Chat", Keys.T);
-        _commandKey = GetKeybind("Command", Keys.OemQuestion);
-        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
-        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
-        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
-        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
-        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
-        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
-        _player.CrouchKey = _stackModifierKey;
-        _player.SprintKey = _sprintKey;
-        _player.FlyDescendKey = _flyDescendKey;
-        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
-        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
-        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        ApplyRuntimeInputBindingsFromSettings();
         _indicatorsEnabled = _settings.IndicatorsEnabled;
         _nametagMode = NormalizeNametagMode(_settings.NametagMode);
         _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
@@ -701,11 +720,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _structureFinderFindBtn = new Button("FIND", ExecuteStructureFinderSearchFromGui);
         _structureFinderCloseBtn = new Button("CLOSE", () => _structureFinderOpen = false);
         SyncStructureFinderRadiusLabel();
+        _pauseMenuOpen = startPaused;
 
         try
         {
             _pausePanel = _assets.LoadTexture("textures/menu/GUIS/Pause_GUI.png");
             _pauseProfileIcon.Texture = _assets.LoadTexture("textures/menu/buttons/Profile.png");
+            _healthHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/health.png");
+            _hungerHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/hunger.png");
+            _sigilHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/sigil_balance_mockup.png");
         }
         catch (Exception ex)
         {
@@ -727,6 +750,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         UpdateHotbarLayout();
         UpdateInventoryLayout();
         LayoutStructureFinderGui();
+        UpdateAttunementWipPopupLayout();
     }
 
     private DateTime _nextSessionHeartbeatUtc = DateTime.MinValue;
@@ -814,7 +838,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (_localActionSwingTimer > 0f)
             _localActionSwingTimer = Math.Max(0f, _localActionSwingTimer - rawDt);
+        if (_damageFlashTimer > 0f)
+            _damageFlashTimer = Math.Max(0f, _damageFlashTimer - rawDt);
+        if (_damageHandKickTimer > 0f)
+            _damageHandKickTimer = Math.Max(0f, _damageHandKickTimer - rawDt);
+        if (_damageCameraKickTimer > 0f)
+            _damageCameraKickTimer = Math.Max(0f, _damageCameraKickTimer - rawDt);
 
+        UpdateSigilHudAnimation(rawDt);
         UpdateWorldRuleCycles(rawDt);
 
         if (_veilseerSpectatePopupTimer > 0f)
@@ -838,6 +869,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         UpdateInviteQuickAction(input, rawDt);
         _overlayMousePos = input.MousePosition;
+        if (_attunementWipPopupVisible)
+        {
+            UpdateAttunementWipPopup(input);
+            return;
+        }
+
         UpdateChatLines(rawDt);
         HandleChatOverlayActions(input);
 
@@ -945,7 +982,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (!_pauseMenuOpen && !_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_inventoryKey))
+        if (!_pauseMenuOpen && !_homeGuiOpen && !_structureFinderOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && IsNewActionPress(input, "Inventory", Keys.E))
         {
             _inventoryOpen = true;
             _inventoryCatalogSearchFocused = false;
@@ -992,13 +1029,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_homeGuiKey))
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && IsNewActionPress(input, "HomeGui", Keys.H))
         {
             OpenHomeGui();
             return;
         }
 
-        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && input.IsNewKeyPress(_structureFinderKey))
+        if (!_pauseMenuOpen && !IsAnyTextCaptureActive && !_gamemodeWheelVisible && IsNewActionPress(input, "StructureFinder", Keys.B))
         {
             OpenStructureFinderGui(openStructuresTab: false);
             return;
@@ -1039,7 +1076,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (_gameMode == GameMode.Veilseer && input.IsNewKeyPress(_veilseerXrayToggleKey))
+        if (_gameMode == GameMode.Veilseer && IsNewActionPress(input, "VeilseerXrayToggle", Keys.X))
         {
             _veilseerXrayEnabled = !_veilseerXrayEnabled;
             SetCommandStatus(_veilseerXrayEnabled ? "VeilSeer Xray enabled." : "VeilSeer Xray disabled.", 3f);
@@ -1054,13 +1091,25 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 #endif
 
         UpdatePlayer(gameTime, dt, input);
+        UpdateVeilwalkerSurvival(dt);
         ApplyPlayerSeparation(dt);
         UpdateActiveRadiusRamp(dt);
         UpdateActiveChunks(force: false);
         ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+
+        if (_survivalRespawnPending)
+        {
+            ProcessStreamingResults();
+            QueueDirtyChunks();
+            ProcessMeshBuildQueue();
+            WarmBlockIcons();
+            return;
+        }
+
         HandleHotbarInput(input);
         UpdateSelectionTimer(dt);
         UpdateHandoffTarget(input);
+        HandleUseItem(input);
         HandleDropAndGive(input);
         UpdateWorldItems();
         HandleBlockInteraction(gameTime, input);
@@ -1103,7 +1152,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (TryGetPendingQuickConfirmation(out var confirmToken, out var cancelToken, out var confirmPrompt))
         {
-            if (input.IsNewKeyPress(_inviteQuickActionKey))
+            if (IsNewActionPress(input, "InviteQuickAction", Keys.Y))
             {
                 _inviteQuickHoldActive = true;
                 _inviteQuickHoldAccepted = false;
@@ -1117,7 +1166,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (!_inviteQuickHoldActive)
                 return;
 
-            var confirmKeyDown = input.IsKeyDown(_inviteQuickActionKey);
+            var confirmKeyDown = IsActionDown(input, "InviteQuickAction", Keys.Y);
             if (confirmKeyDown)
             {
                 _inviteQuickHoldElapsed += dt;
@@ -1165,7 +1214,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (input.IsNewKeyPress(_inviteQuickActionKey))
+        if (IsNewActionPress(input, "InviteQuickAction", Keys.Y))
         {
             _inviteQuickHoldActive = true;
             _inviteQuickHoldAccepted = false;
@@ -1185,7 +1234,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        var keyDown = input.IsKeyDown(_inviteQuickActionKey);
+        var keyDown = IsActionDown(input, "InviteQuickAction", Keys.Y);
         if (keyDown)
         {
             _inviteQuickHoldElapsed += dt;
@@ -1739,24 +1788,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         else
             _highlightActive = false;
 
-        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend, transformMatrix: UiLayout.Transform);
         DrawReticle(sb);
-        var name = _meta?.Name ?? "WORLD";
-        var mode = _gameMode;
-        _font.DrawString(sb, $"WORLD: {name}", new Vector2(_viewport.X + 20, _viewport.Y + 20), Color.White);
-        _font.DrawString(sb, $"MODE: {mode.ToString().ToUpperInvariant()}", new Vector2(_viewport.X + 20, _viewport.Y + 20 + _font.LineHeight + 4), Color.White);
-        var modeCombo = $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)}";
-        var finderKey = FormatKeyLabel(_structureFinderKey);
-        var crouchKeyLabel = FormatKeyLabel(_stackModifierKey);
-        var sprintKeyLabel = FormatKeyLabel(_sprintKey);
-        var descendKeyLabel = FormatKeyLabel(_flyDescendKey);
-        var controlsHint = _gameMode == GameMode.Veilseer
-            ? $"VEILSEER: 1-9 SPECTATE | 0/{crouchKeyLabel} DETACH | {FormatKeyLabel(_veilseerXrayToggleKey)} XRAY | WHEEL FLY SPEED | {modeCombo} MODE/CYCLE | ESC PAUSE"
-            : $"WASD MOVE | SPACE JUMP | {crouchKeyLabel} SNEAK | {sprintKeyLabel} SPRINT | {descendKeyLabel} FLY DOWN | WHEEL HOTBAR | {FormatKeyLabel(_gamemodeModifierKey)}+WHEEL(FLY)=SPEED | F5 VIEW | HOLD {FormatKeyLabel(_gamemodeModifierKey)}+MOUSE FREE LOOK (3RD) | {modeCombo} MODE/CYCLE | {finderKey} FINDER | ESC PAUSE";
-        _font.DrawString(sb, controlsHint, new Vector2(_viewport.X + 20, _viewport.Y + 20 + (_font.LineHeight + 4) * 2), Color.White);
-        
         if (_gameMode != GameMode.Veilseer)
             DrawHotbar(sb);
+        DrawSurvivalHud(sb);
         DrawContextIndicators(sb);
         DrawSelectedBlockName(sb);
         DrawWorldNametags(sb, device, view, proj);
@@ -1773,10 +1809,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             DrawStructureFinderGui(sb);
         if (_debugHudVisible)
             DrawDevOverlay(sb);
+        DrawDamageOverlay(sb);
         DrawFaceOverlay(sb);
         DrawPlayerList(sb);
+        DrawRespawnOverlay(sb);
         sb.End();
 
+        if (_attunementWipPopupVisible)
+            DrawAttunementWipPopup(sb);
         if (_pauseMenuOpen)
             DrawPauseMenu(sb);
         if (_inventoryOpen)
@@ -1967,6 +2007,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         try
         {
             MigrateLegacyWorldTextFiles();
+            LoadCommandInputHistory();
             _whitelist = LoadWhitelistEntries();
             if (PruneWhitelistIdentityTokens())
                 SaveWhitelist();
@@ -1995,6 +2036,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _meta = _world.Meta;
         _gameMode = _meta.CurrentWorldGameMode;
         _playerCollisionEnabled = _meta.PlayerCollision;
+        _sigilPowerEnabled = _meta.Gameplay?.EnableSigilPower ?? true;
         _timeCycleEnabled = _meta.Gameplay?.TimeCycleEnabled ?? _meta.TimeCycleEnabled;
         _weatherCycleEnabled = _meta.Gameplay?.WeatherCycleEnabled ?? _meta.WeatherCycleEnabled;
         _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_meta.Gameplay?.TimeOfDayTicks ?? _meta.TimeOfDayTicks);
@@ -2786,26 +2828,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _log.Info($"Render distance capped at {MaxRuntimeActiveRadius} (requested {requestedRadius}) to reduce in-world lag.");
         }
         var newQuality = _settings.QualityPreset;
-        _inventoryKey = GetKeybind("Inventory", Keys.E);
-        _dropKey = GetKeybind("DropItem", Keys.Q);
-        _giveKey = GetKeybind("GiveItem", Keys.F);
-        _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
-        _sprintKey = GetKeybind("Sprint", Keys.LeftControl);
-        _flyDescendKey = GetKeybind("FlyDescend", Keys.LeftShift);
-        _chatKey = GetKeybind("Chat", Keys.T);
-        _commandKey = GetKeybind("Command", Keys.OemQuestion);
-        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
-        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
-        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
-        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
-        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
-        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
-        _player.CrouchKey = _stackModifierKey;
-        _player.SprintKey = _sprintKey;
-        _player.FlyDescendKey = _flyDescendKey;
-        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
-        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
-        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+        ApplyRuntimeInputBindingsFromSettings();
         _indicatorsEnabled = _settings.IndicatorsEnabled;
         _nametagMode = NormalizeNametagMode(_settings.NametagMode);
         _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
@@ -2986,11 +3009,121 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void ApplyRuntimeInputBindingsFromSettings()
+    {
+        _inventoryKey = GetKeybind("Inventory", Keys.E);
+        _dropKey = GetKeybind("DropItem", Keys.Q);
+        _giveKey = GetKeybind("GiveItem", Keys.F);
+        _useItemKey = GetKeybind("UseItem", Keys.R);
+        _stackModifierKey = GetKeybind("Crouch", Keys.LeftShift);
+        _sprintKey = GetKeybind("Sprint", Keys.LeftControl);
+        _flyDescendKey = GetKeybind("FlyDescend", Keys.LeftShift);
+        _chatKey = GetKeybind("Chat", Keys.T);
+        _commandKey = GetKeybind("Command", Keys.OemQuestion);
+        _homeGuiKey = GetKeybind("HomeGui", Keys.H);
+        _structureFinderKey = GetKeybind("StructureFinder", Keys.B);
+        _gamemodeModifierKey = GetKeybind("GamemodeModifier", Keys.LeftAlt);
+        _gamemodeWheelKey = GetKeybind("GamemodeWheel", Keys.G);
+        _veilseerXrayToggleKey = GetKeybind("VeilseerXrayToggle", Keys.X);
+        _inviteQuickActionKey = GetKeybind("InviteQuickAction", Keys.Y);
+
+        _player.CrouchKey = _stackModifierKey;
+        _player.SprintKey = _sprintKey;
+        _player.FlyDescendKey = _flyDescendKey;
+        _player.MoveUpKey = GetKeybind("MoveUp", Keys.W);
+        _player.MoveDownKey = GetKeybind("MoveDown", Keys.S);
+        _player.MoveLeftKey = GetKeybind("MoveLeft", Keys.A);
+        _player.MoveRightKey = GetKeybind("MoveRight", Keys.D);
+        _player.JumpKey = GetKeybind("Jump", Keys.Space);
+        _player.MoveUpMouseBind = GetMouseBind("MoveUp");
+        _player.MoveDownMouseBind = GetMouseBind("MoveDown");
+        _player.MoveLeftMouseBind = GetMouseBind("MoveLeft");
+        _player.MoveRightMouseBind = GetMouseBind("MoveRight");
+        _player.JumpMouseBind = GetMouseBind("Jump");
+        _player.CrouchMouseBind = GetMouseBind("Crouch");
+        _player.SprintMouseBind = GetMouseBind("Sprint");
+        _player.FlyDescendMouseBind = GetMouseBind("FlyDescend");
+        _player.ToggleCrouchEnabled = _settings.ToggleCrouchEnabled;
+        _player.SprintLatchEnabled = _settings.SprintLatchEnabled;
+        _player.AllowCrouch = _gameMode != GameMode.Veilseer;
+    }
+
     private Keys GetKeybind(string action, Keys fallback)
     {
         if (_settings.Keybinds != null && _settings.Keybinds.TryGetValue(action, out var key))
             return key;
         return fallback;
+    }
+
+    private string? GetMouseBind(string action)
+    {
+        if (_settings.MouseBinds != null && _settings.MouseBinds.TryGetValue(action, out var bind))
+        {
+            var normalized = NormalizeMouseBindToken(bind);
+            if (!string.IsNullOrWhiteSpace(normalized))
+                return normalized;
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeMouseBindToken(string? token)
+    {
+        var value = (token ?? string.Empty).Trim().ToLowerInvariant();
+        return value switch
+        {
+            "mouseleft" or "left" => "mouseleft",
+            "mouseright" or "right" => "mouseright",
+            "mousemiddle" or "middle" => "mousemiddle",
+            "mousex1" or "mouse4" or "x1" => "mousex1",
+            "mousex2" or "mouse5" or "x2" => "mousex2",
+            _ => null
+        };
+    }
+
+    private bool IsNewActionPress(InputState input, string action, Keys fallback)
+    {
+        if (input.IsNewKeyPress(GetKeybind(action, fallback)))
+            return true;
+
+        return GetMouseBind(action) switch
+        {
+            "mouseleft" => input.IsNewLeftClick(),
+            "mouseright" => input.IsNewRightClick(),
+            "mousemiddle" => input.IsNewMiddleClick(),
+            "mousex1" => input.IsNewXButton1Click(),
+            "mousex2" => input.IsNewXButton2Click(),
+            _ => false
+        };
+    }
+
+    private bool IsActionDown(InputState input, string action, Keys fallback)
+    {
+        if (input.IsKeyDown(GetKeybind(action, fallback)))
+            return true;
+
+        return GetMouseBind(action) switch
+        {
+            "mouseleft" => input.IsLeftDown(),
+            "mouseright" => input.IsRightDown(),
+            "mousemiddle" => input.IsMiddleDown(),
+            "mousex1" => input.IsXButton1Down(),
+            "mousex2" => input.IsXButton2Down(),
+            _ => false
+        };
+    }
+
+    private string FormatBindingLabel(string action, Keys fallback)
+    {
+        return GetMouseBind(action) switch
+        {
+            "mouseleft" => "MOUSE1",
+            "mouseright" => "MOUSE2",
+            "mousemiddle" => "MOUSE3",
+            "mousex1" => "MOUSE4",
+            "mousex2" => "MOUSE5",
+            _ => FormatKeyLabel(GetKeybind(action, fallback))
+        };
     }
 
     private static string NormalizeNametagMode(string? mode)
@@ -3115,12 +3248,36 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var coord = VoxelWorld.WorldToChunk(wx, wy, wz, out var lx, out var ly, out var lz);
         QueuePriorityMeshBuild(coord);
 
-        if (lx == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X - 1, coord.Y, coord.Z));
-        if (lx == VoxelChunkData.ChunkSizeX - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X + 1, coord.Y, coord.Z));
-        if (ly == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y - 1, coord.Z));
-        if (ly == VoxelChunkData.ChunkSizeY - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y + 1, coord.Z));
-        if (lz == 0) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y, coord.Z - 1));
-        if (lz == VoxelChunkData.ChunkSizeZ - 1) QueuePriorityMeshBuild(new ChunkCoord(coord.X, coord.Y, coord.Z + 1));
+        if (lx == 0)
+        {
+            var neighbor = new ChunkCoord(coord.X - 1, coord.Y, coord.Z);
+            QueuePriorityMeshBuild(neighbor);
+        }
+        if (lx == VoxelChunkData.ChunkSizeX - 1)
+        {
+            var neighbor = new ChunkCoord(coord.X + 1, coord.Y, coord.Z);
+            QueuePriorityMeshBuild(neighbor);
+        }
+        if (ly == 0)
+        {
+            var neighbor = new ChunkCoord(coord.X, coord.Y - 1, coord.Z);
+            QueuePriorityMeshBuild(neighbor);
+        }
+        if (ly == VoxelChunkData.ChunkSizeY - 1)
+        {
+            var neighbor = new ChunkCoord(coord.X, coord.Y + 1, coord.Z);
+            QueuePriorityMeshBuild(neighbor);
+        }
+        if (lz == 0)
+        {
+            var neighbor = new ChunkCoord(coord.X, coord.Y, coord.Z - 1);
+            QueuePriorityMeshBuild(neighbor);
+        }
+        if (lz == VoxelChunkData.ChunkSizeZ - 1)
+        {
+            var neighbor = new ChunkCoord(coord.X, coord.Y, coord.Z + 1);
+            QueuePriorityMeshBuild(neighbor);
+        }
     }
 
     private bool TryDequeuePriorityMeshBuildCandidate(VoxelWorld world, out ChunkCoord coord, out VoxelChunkData chunk)
@@ -3675,7 +3832,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (thirdPersonActive)
         {
             var look = input.LookDelta;
-            var freeLookHeld = input.IsKeyDown(_gamemodeModifierKey);
+            var freeLookHeld = IsActionDown(input, "GamemodeModifier", Keys.LeftAlt);
             var wasFreeLookHeld = _thirdPersonFreeLookHeld;
             _thirdPersonFreeLookHeld = freeLookHeld;
             _player.SuppressLookInput = true;
@@ -3730,6 +3887,137 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         ClampPlayerToWorldBounds();
+    }
+
+    private void UpdateVeilwalkerSurvival(float dt)
+    {
+        if (_gameMode != GameMode.Veilwalker)
+        {
+            _survivalRespawnPending = false;
+            _survivalRespawnTimer = 0f;
+            _survivalWasGrounded = _player.IsGrounded;
+            _survivalPeakAirY = _player.Position.Y;
+            return;
+        }
+
+        if (_survivalRespawnPending)
+        {
+            _survivalRespawnTimer = Math.Max(0f, _survivalRespawnTimer - dt);
+            if (_survivalRespawnTimer <= 0f)
+                RespawnVeilwalkerPlayer();
+            return;
+        }
+
+        var moving = _player.MoveIntent.LengthSquared() > 0.01f && !_player.IsFlying;
+        var previousHealth = _survivalVitals.Health;
+        var tickResult = _survivalVitals.Tick(dt, moving, _player.IsSprinting && moving);
+        if (tickResult.AnyChange)
+            MarkPlayerStateDirty();
+        if (_survivalVitals.Health < previousHealth)
+            TriggerDamageFeedback(previousHealth - _survivalVitals.Health);
+
+        TrackVeilwalkerFallDamage();
+
+        if (_survivalVitals.IsDead)
+            BeginVeilwalkerRespawn();
+    }
+
+    private void TrackVeilwalkerFallDamage()
+    {
+        if (_player.IsFlying)
+        {
+            _survivalWasGrounded = false;
+            _survivalPeakAirY = _player.Position.Y;
+            return;
+        }
+
+        if (!_player.IsGrounded)
+        {
+            if (_survivalWasGrounded)
+            {
+                _survivalWasGrounded = false;
+                _survivalPeakAirY = _player.Position.Y;
+            }
+            else if (_player.Position.Y > _survivalPeakAirY)
+            {
+                _survivalPeakAirY = _player.Position.Y;
+            }
+
+            return;
+        }
+
+        if (!_survivalWasGrounded)
+        {
+            var fallDistance = _survivalPeakAirY - _player.Position.Y;
+            var damage = _survivalVitals.CalculateFallDamage(fallDistance / Scale.BlockSize);
+            if (damage > 0 && _survivalVitals.ApplyDamage(damage))
+            {
+                TriggerDamageFeedback(damage);
+                MarkPlayerStateDirty();
+                SetCommandStatus($"Took {damage} fall damage.", 2.2f, echoToChat: false);
+            }
+
+            if (_survivalVitals.IsDead)
+                BeginVeilwalkerRespawn();
+        }
+
+        _survivalWasGrounded = true;
+        _survivalPeakAirY = _player.Position.Y;
+    }
+
+    private void TriggerDamageFeedback(int damage)
+    {
+        if (damage <= 0)
+            return;
+
+        var normalized = Math.Clamp(damage / 8f, 0.18f, 0.65f);
+        _damageFlashTimer = DamageFlashDurationSeconds;
+        _damageFlashStrength = Math.Max(_damageFlashStrength, normalized);
+        _damageHandKickTimer = DamageHandKickDurationSeconds;
+        _damageHandKickStrength = Math.Max(_damageHandKickStrength, normalized);
+        _damageCameraKickTimer = DamageCameraKickDurationSeconds;
+        _damageCameraKickStrength = Math.Max(_damageCameraKickStrength, normalized);
+    }
+
+    private void BeginVeilwalkerRespawn()
+    {
+        if (_survivalRespawnPending)
+            return;
+
+        _survivalRespawnPending = true;
+        _survivalRespawnTimer = SurvivalRespawnDelaySeconds;
+        _player.Velocity = Vector3.Zero;
+        MarkPlayerStateDirty();
+        SetCommandStatus("You died. Respawning...", SurvivalRespawnDelaySeconds + 0.5f, echoToChat: false);
+    }
+
+    private void RespawnVeilwalkerPlayer()
+    {
+        _survivalRespawnPending = false;
+        _survivalRespawnTimer = 0f;
+        _player.Velocity = Vector3.Zero;
+        _player.SetFlying(false);
+
+        Vector3 respawnPosition;
+        if (_hasHome)
+        {
+            respawnPosition = _homePosition;
+        }
+        else
+        {
+            var spawnPoint = GetWorldSpawnPoint();
+            var safeHeight = FindSafeSpawnHeight(spawnPoint.X, spawnPoint.Y);
+            respawnPosition = new Vector3(spawnPoint.X, Math.Max(safeHeight + 2f, 6f), spawnPoint.Y);
+        }
+
+        _player.Position = respawnPosition;
+        _survivalVitals.RestoreToFull();
+        _survivalWasGrounded = false;
+        _survivalPeakAirY = respawnPosition.Y;
+        EnsurePlayerNotInsideSolid(forceLog: false);
+        MarkPlayerStateDirty();
+        SavePlayerState();
+        SetCommandStatus("Respawned.", 2f, echoToChat: false);
     }
 
     private void ClampPlayerToWorldBounds()
@@ -3926,7 +4214,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 if (_player.AdjustFlySpeedMultiplier(speedStep))
                     ShowFlySpeedToast();
             }
-            else if (_player.IsFlying && input.IsKeyDown(_gamemodeModifierKey))
+            else if (_player.IsFlying && IsActionDown(input, "GamemodeModifier", Keys.LeftAlt))
             {
                 var speedStep = input.ScrollDelta > 0 ? 1 : -1;
                 if (_player.AdjustFlySpeedMultiplier(speedStep))
@@ -4233,6 +4521,99 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void HandleUseItem(InputState input)
+    {
+        if (_pauseMenuOpen || _inventoryOpen || _gameMode != GameMode.Veilwalker)
+            return;
+
+        if (!IsNewActionPress(input, "UseItem", Keys.R))
+            return;
+
+        if (!TryConsumeHeldVeilwalkerItem())
+            SetCommandStatus("That item is not usable yet.", 1.8f, echoToChat: false);
+    }
+
+    private bool TryConsumeHeldVeilwalkerItem()
+    {
+        var selected = _inventory.SelectedId;
+        if (selected == BlockId.Air || _inventory.SelectedCount <= 0)
+            return false;
+
+        if (!TryGetConsumableEffects(selected, out var hungerRestore, out var healthRestore, out var returnsPhial))
+            return false;
+
+        if (_survivalVitals.Hunger >= SurvivalVitals.MaxHunger && _survivalVitals.Health >= SurvivalVitals.MaxHealth)
+        {
+            SetCommandStatus("You are already fully recovered.", 1.8f, echoToChat: false);
+            return true;
+        }
+
+        if (!_inventory.TryConsumeSelected(1))
+            return false;
+
+        var hungerChanged = _survivalVitals.RestoreHunger(hungerRestore);
+        var healthChanged = _survivalVitals.RestoreHealth(healthRestore);
+        if (returnsPhial)
+            _inventory.Add(BlockId.CleanPhial, 1);
+
+        MarkPlayerStateDirty();
+        var effectParts = new List<string>(2);
+        if (hungerChanged && hungerRestore > 0)
+            effectParts.Add($"+{hungerRestore} hunger");
+        if (healthChanged && healthRestore > 0)
+            effectParts.Add($"+{healthRestore} health");
+        if (effectParts.Count == 0)
+            effectParts.Add("no effect");
+
+        var itemName = BlockRegistry.Get(selected).Name;
+        SetCommandStatus($"{itemName}: {string.Join(", ", effectParts)}.", 2.2f, echoToChat: false);
+        return true;
+    }
+
+    private static bool TryGetConsumableEffects(BlockId item, out int hungerRestore, out int healthRestore, out bool returnsPhial)
+    {
+        returnsPhial = false;
+        switch (item)
+        {
+            case BlockId.Swiftleaf:
+                hungerRestore = 3;
+                healthRestore = 0;
+                return true;
+            case BlockId.Driftcap:
+                hungerRestore = 4;
+                healthRestore = 0;
+                return true;
+            case BlockId.EchoBloom:
+                hungerRestore = 2;
+                healthRestore = 1;
+                return true;
+            case BlockId.FleetstepDraught:
+                hungerRestore = 3;
+                healthRestore = 1;
+                returnsPhial = true;
+                return true;
+            case BlockId.SkyboundPhilter:
+                hungerRestore = 2;
+                healthRestore = 2;
+                returnsPhial = true;
+                return true;
+            case BlockId.PyroskinTonic:
+                hungerRestore = 1;
+                healthRestore = 3;
+                returnsPhial = true;
+                return true;
+            case BlockId.BrineveilElixir:
+                hungerRestore = 0;
+                healthRestore = 5;
+                returnsPhial = true;
+                return true;
+            default:
+                hungerRestore = 0;
+                healthRestore = 0;
+                return false;
+        }
+    }
+
     private void HandleDropAndGive(InputState input)
     {
         if (_pauseMenuOpen || _inventoryOpen || _gameMode != GameMode.Veilwalker)
@@ -4243,7 +4624,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var fullStack = IsStackModifierDown(input);
 
-        if (_handoffTargetId >= 0 && input.IsNewKeyPress(_giveKey))
+        if (_handoffTargetId >= 0 && IsNewActionPress(input, "GiveItem", Keys.F))
         {
             var amount = fullStack ? _inventory.SelectedCount : 1;
             var id = _inventory.SelectedId;
@@ -4272,7 +4653,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (input.IsNewKeyPress(_dropKey))
+        if (IsNewActionPress(input, "DropItem", Keys.Q))
         {
             var amount = fullStack ? _inventory.SelectedCount : 1;
             var id = _inventory.SelectedId;
@@ -4287,7 +4668,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_stackModifierKey == Keys.LeftShift || _stackModifierKey == Keys.RightShift)
             return input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
-        return input.IsKeyDown(_stackModifierKey);
+        return IsActionDown(input, "Crouch", Keys.LeftShift);
     }
 
     private bool TryGetHandoffTargetPosition(int targetId, out Vector3 position)
@@ -4727,7 +5108,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        if (input.IsNewKeyPress(_inventoryKey))
+        if (IsNewActionPress(input, "Inventory", Keys.E))
         {
             CloseInventory();
             return;
@@ -5752,6 +6133,595 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void DrawSurvivalHud(SpriteBatch sb)
+    {
+        if (_gameMode != GameMode.Veilwalker || _hotbarRect.Width <= 0)
+            return;
+
+        const int segmentCount = 10;
+        const int healthSegmentWidth = 24;
+        const int healthSegmentHeight = 27;
+        const int healthSegmentGap = 2;
+        const int hungerSegmentWidth = 24;
+        const int hungerSegmentHeight = 27;
+        const int hungerSegmentGap = 2;
+        var hungerClusterWidth = segmentCount * hungerSegmentWidth + (segmentCount - 1) * hungerSegmentGap;
+        var top = GetSurvivalHudTop(healthSegmentHeight, hungerSegmentHeight);
+        var leftStartX = _hotbarRect.X;
+        var rightStartX = _hotbarRect.Right - hungerClusterWidth;
+
+        if (TryGetSigilHudRect(out var sigilRect))
+        {
+            DrawSigilMeter(sb, sigilRect, _debugSigilPositiveFraction, _debugSigilNegativeFraction);
+            DrawSigilHoverLabel(sb, sigilRect, _debugSigilPositiveFraction, _debugSigilNegativeFraction);
+        }
+
+        DrawSurvivalSegments(
+            sb,
+            leftStartX,
+            top,
+            _survivalVitals.Health,
+            new Color(74, 12, 18, 210),
+            new Color(236, 72, 98),
+            new Color(255, 214, 220),
+            alignRight: false,
+            healthSegmentWidth,
+            healthSegmentHeight,
+            healthSegmentGap,
+            SurvivalPipStyle.Diamond,
+            _healthHudTexture,
+            HealthFullIconSource,
+            HealthEmptyIconSource);
+
+        DrawSurvivalSegments(
+            sb,
+            rightStartX,
+            top,
+            _survivalVitals.Hunger,
+            new Color(76, 48, 10, 210),
+            new Color(244, 180, 60),
+            new Color(255, 236, 190),
+            alignRight: true,
+            hungerSegmentWidth,
+            hungerSegmentHeight,
+            hungerSegmentGap,
+            SurvivalPipStyle.Cookie,
+            _hungerHudTexture,
+            HungerFullIconSource,
+            HungerEmptyIconSource);
+    }
+
+    private int GetSurvivalHudTop(int healthSegmentHeight, int hungerSegmentHeight)
+    {
+        return _hotbarRect.Y - Math.Max(healthSegmentHeight, hungerSegmentHeight) - 8;
+    }
+
+    private bool TryGetSigilHudRect(out Rectangle rect)
+    {
+        rect = Rectangle.Empty;
+        if (_gameMode != GameMode.Veilwalker || _hotbarRect.Width <= 0 || !_sigilPowerEnabled)
+            return false;
+
+        const int sigilSize = 132;
+        var top = _hotbarRect.Y - sigilSize - 10;
+        rect = new Rectangle(_hotbarRect.Center.X - sigilSize / 2, top, sigilSize, sigilSize);
+        return true;
+    }
+
+    private void DrawSigilMeter(SpriteBatch sb, Rectangle rect, float positiveFraction, float negativeFraction)
+    {
+        var positive = Math.Clamp(positiveFraction, 0f, 1f);
+        var negative = Math.Clamp(negativeFraction, 0f, 1f);
+        if (_sigilHudTexture != null)
+        {
+            var baseSrc = new Rectangle(0, 0, SigilHudCellSize, SigilHudCellSize);
+            sb.Draw(_sigilHudTexture, rect, baseSrc, Color.White);
+
+            var positiveFrame = GetSigilFillFrameIndex(positive);
+            if (positiveFrame > 0)
+            {
+                var positiveSrc = new Rectangle(positiveFrame * SigilHudCellSize, SigilHudCellSize, SigilHudCellSize, SigilHudCellSize);
+                sb.Draw(_sigilHudTexture, rect, positiveSrc, Color.White);
+            }
+
+            var negativeFrame = GetSigilFillFrameIndex(negative);
+            if (negativeFrame > 0)
+            {
+                var negativeSrc = new Rectangle(negativeFrame * SigilHudCellSize, SigilHudCellSize * 2, SigilHudCellSize, SigilHudCellSize);
+                sb.Draw(_sigilHudTexture, rect, negativeSrc, Color.White);
+            }
+            return;
+        }
+
+        var outerColor = new Color(188, 196, 220);
+        var innerColor = new Color(66, 74, 104);
+        var positiveFill = new Color(92, 188, 228);
+        var positiveGlow = new Color(216, 250, 255);
+        var negativeFill = new Color(204, 76, 88);
+        var negativeGlow = new Color(255, 212, 132);
+        var backingColor = new Color(8, 8, 14, 150);
+
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Y + 2, rect.Width, rect.Height - 4), backingColor);
+        var outer = new Rectangle(rect.X + 3, rect.Y + 4, rect.Width - 6, rect.Height - 10);
+        var inner = new Rectangle(rect.X + 9, rect.Y + 8, rect.Width - 18, rect.Height - 18);
+        DrawBorder(sb, outer, outerColor);
+        DrawBorder(sb, inner, innerColor);
+        sb.Draw(_pixel, new Rectangle(rect.Center.X - 1, inner.Y + 1, 3, inner.Height - 2), outerColor);
+        sb.Draw(_pixel, new Rectangle(inner.X + 1, rect.Center.Y - 4, inner.Width - 2, 2), outerColor);
+        sb.Draw(_pixel, new Rectangle(inner.X + 1, rect.Center.Y + 3, inner.Width - 2, 2), outerColor);
+
+        var leftArea = new Rectangle(inner.X + 1, inner.Y + 2, Math.Max(1, rect.Center.X - (inner.X + 2)), inner.Height - 4);
+        var positiveWidth = Math.Clamp((int)MathF.Round(leftArea.Width * positive), 0, leftArea.Width);
+        if (positiveWidth > 0)
+        {
+            var fillRect = new Rectangle(leftArea.Right - positiveWidth, leftArea.Y, positiveWidth, leftArea.Height);
+            sb.Draw(_pixel, fillRect, positiveFill);
+            sb.Draw(_pixel, new Rectangle(fillRect.X, fillRect.Y, Math.Min(3, fillRect.Width), fillRect.Height), positiveGlow);
+        }
+
+        var rightArea = new Rectangle(rect.Center.X + 2, inner.Y + 2, Math.Max(1, inner.Right - rect.Center.X - 3), inner.Height - 4);
+        var negativeWidth = Math.Clamp((int)MathF.Round(rightArea.Width * negative), 0, rightArea.Width);
+        if (negativeWidth > 0)
+        {
+            var fillRect = new Rectangle(rightArea.X, rightArea.Y, negativeWidth, rightArea.Height);
+            sb.Draw(_pixel, fillRect, negativeFill);
+            sb.Draw(_pixel, new Rectangle(Math.Max(fillRect.Right - 3, fillRect.X), fillRect.Y, Math.Min(3, fillRect.Width), fillRect.Height), negativeGlow);
+        }
+
+        var coreColor = positive >= negative ? positiveGlow : negativeGlow;
+        sb.Draw(_pixel, new Rectangle(rect.Center.X - 2, rect.Center.Y - 2, 5, 5), coreColor);
+    }
+
+    private void DrawSigilHoverLabel(SpriteBatch sb, Rectangle rect, float positiveFraction, float negativeFraction)
+    {
+        if (!rect.Contains(_overlayMousePos))
+            return;
+
+        var label = _overlayMousePos.X < rect.Center.X ? SigilPositiveLabel : SigilNegativeLabel;
+        var fraction = _overlayMousePos.X < rect.Center.X ? positiveFraction : negativeFraction;
+        var text = $"{label} {MathF.Round(Math.Clamp(fraction, 0f, 1f) * 100f):0}%";
+        var size = _font.MeasureString(text);
+        var width = (int)Math.Ceiling(size.X) + 14;
+        var height = _font.LineHeight + 8;
+        var panelRect = new Rectangle(rect.Center.X - width / 2, rect.Y + 8, width, height);
+
+        sb.Draw(_pixel, panelRect, new Color(232, 232, 224, 210));
+        DrawBorder(sb, panelRect, new Color(84, 86, 90, 225));
+        _font.DrawString(sb, text, new Vector2(panelRect.X + 7, panelRect.Y + 4), new Color(36, 38, 42));
+    }
+
+    private static int GetSigilFillFrameIndex(float fraction)
+    {
+        var clamped = Math.Clamp(fraction, 0f, 1f);
+        if (clamped <= 0f)
+            return 0;
+
+        return Math.Clamp((int)MathF.Ceiling(clamped * (SigilHudFrameCount - 1)), 1, SigilHudFrameCount - 1);
+    }
+
+    private void GetChatOverlayLayout(out int x, out int overlayWidth, out int overlayTop, out int overlayBottom)
+    {
+        x = _viewport.X + 20;
+        overlayWidth = Math.Clamp((int)MathF.Round(_viewport.Width * ChatOverlayWidthRatio), ChatOverlayMinWidth, ChatOverlayMaxWidth);
+
+        var bottomLimit = _hotbarRect.Y > 0
+            ? _hotbarRect.Y - 92
+            : _viewport.Bottom - 20;
+
+        if (TryGetSigilHudRect(out var sigilRect))
+        {
+            bottomLimit = Math.Min(bottomLimit, sigilRect.Y - ChatOverlayHudClearance);
+            var safeRight = sigilRect.X - ChatOverlayHudClearance;
+            var maxWidthBeforeHud = safeRight - x;
+            if (maxWidthBeforeHud > 220)
+                overlayWidth = Math.Min(overlayWidth, maxWidthBeforeHud);
+        }
+
+        overlayBottom = Math.Min(_viewport.Bottom - 20, bottomLimit);
+        overlayBottom = Math.Max(_viewport.Y + 160, overlayBottom);
+        overlayTop = _viewport.Y + 120;
+    }
+
+    private void UpdateAttunementWipPopupLayout()
+    {
+        if (_viewport.Width <= 0 || _viewport.Height <= 0)
+        {
+            _attunementWipPopupRect = Rectangle.Empty;
+            return;
+        }
+
+        var width = Math.Clamp(_viewport.Width - 240, 480, 800);
+        var height = 250;
+        _attunementWipPopupRect = new Rectangle(
+            _viewport.Center.X - width / 2,
+            _viewport.Center.Y - height / 2,
+            width,
+            height);
+    }
+
+    private void UpdateAttunementWipPopup(InputState input)
+    {
+        if (input.IsNewLeftClick()
+            || input.IsNewKeyPress(Keys.Enter)
+            || input.IsNewKeyPress(Keys.Space)
+            || input.IsNewKeyPress(Keys.Escape))
+        {
+            _attunementWipPopupVisible = false;
+            if (!_hasSeenAttunementWipPopup)
+            {
+                _hasSeenAttunementWipPopup = true;
+                MarkPlayerStateDirty();
+                SavePlayerState();
+            }
+        }
+    }
+
+    private void TryShowAttunementWipPopup()
+    {
+        if (_gameMode != GameMode.Veilwalker || _hasSeenAttunementWipPopup)
+            return;
+
+        _attunementWipPopupVisible = true;
+        UpdateAttunementWipPopupLayout();
+    }
+
+    private void DrawAttunementWipPopup(SpriteBatch sb)
+    {
+        UpdateAttunementWipPopupLayout();
+        if (_attunementWipPopupRect == Rectangle.Empty)
+            return;
+
+        sb.Begin(samplerState: SamplerState.PointClamp);
+        sb.Draw(_pixel, UiLayout.WindowViewport, new Color(0, 0, 0, 168));
+        sb.End();
+
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        sb.Draw(_pixel, _attunementWipPopupRect, new Color(222, 216, 202, 236));
+        DrawBorder(sb, _attunementWipPopupRect, Color.Black);
+
+        var title = "ATTUNEMENT BAR (WIP)";
+        _font.DrawString(sb, title, new Vector2(_attunementWipPopupRect.X + 18, _attunementWipPopupRect.Y + 16), new Color(28, 28, 28));
+
+        var previewRect = new Rectangle(_attunementWipPopupRect.X + 24, _attunementWipPopupRect.Y + 58, 96, 96);
+        if (_sigilHudTexture != null)
+        {
+            GetAttunementPopupPreviewFractions(out var previewPositiveFraction, out var previewNegativeFraction);
+            DrawSigilMeter(sb, previewRect, previewPositiveFraction, previewNegativeFraction);
+        }
+        else
+        {
+            sb.Draw(_pixel, previewRect, new Color(34, 34, 38));
+            DrawBorder(sb, previewRect, Color.Black);
+        }
+
+        var textX = previewRect.Right + 18;
+        var bodyMaxWidth = Math.Max(120, _attunementWipPopupRect.Right - textX - 18);
+        var bodyLines = new List<string>();
+        bodyLines.AddRange(WrapOverlayText("The Attunement bar is still work in progress.", bodyMaxWidth));
+        bodyLines.Add(string.Empty);
+        bodyLines.AddRange(WrapOverlayText("It will not be finalized until the default gameplay loop is complete.", bodyMaxWidth));
+        bodyLines.Add(string.Empty);
+        bodyLines.AddRange(WrapOverlayText("Atonement and Curse values are temporary placeholder-facing systems.", bodyMaxWidth));
+
+        var bodyLineHeight = _font.LineHeight + 4;
+        var bodyBlockHeight = Math.Max(0, bodyLines.Count * bodyLineHeight - 4);
+        var textY = previewRect.Y + Math.Max(0, (previewRect.Height - bodyBlockHeight) / 2);
+        for (int i = 0; i < bodyLines.Count; i++)
+            _font.DrawString(sb, bodyLines[i], new Vector2(textX, textY + i * bodyLineHeight), new Color(38, 38, 42));
+
+        var footer = "PRESS ENTER, SPACE, ESC, OR CLICK TO CONTINUE";
+        var footerLines = WrapOverlayText(footer, _attunementWipPopupRect.Width - 36);
+        var footerTop = _attunementWipPopupRect.Bottom - footerLines.Count * _font.LineHeight - 28;
+        for (int i = 0; i < footerLines.Count; i++)
+        {
+            var footerLine = footerLines[i];
+            var footerSize = _font.MeasureString(footerLine);
+            _font.DrawString(
+                sb,
+                footerLine,
+                new Vector2(_attunementWipPopupRect.Center.X - footerSize.X / 2f, footerTop + i * _font.LineHeight),
+                new Color(54, 54, 58));
+        }
+        sb.End();
+    }
+
+    private void GetAttunementPopupPreviewFractions(out float positiveFraction, out float negativeFraction)
+    {
+        const float stageDuration = 1.6f;
+        const float holdDuration = 0.45f;
+        var cycle = stageDuration * 2f + holdDuration * 2f;
+        var time = cycle <= 0f ? 0f : _worldTimeSeconds % cycle;
+
+        if (time < stageDuration)
+        {
+            positiveFraction = Math.Clamp(time / stageDuration, 0f, 1f);
+            negativeFraction = 0f;
+            return;
+        }
+
+        time -= stageDuration;
+        if (time < holdDuration)
+        {
+            positiveFraction = 1f;
+            negativeFraction = 0f;
+            return;
+        }
+
+        time -= holdDuration;
+        if (time < stageDuration)
+        {
+            positiveFraction = 0f;
+            negativeFraction = Math.Clamp(time / stageDuration, 0f, 1f);
+            return;
+        }
+
+        positiveFraction = 0f;
+        negativeFraction = 1f;
+    }
+
+    private enum SurvivalPipStyle
+    {
+        Diamond,
+        Cookie
+    }
+
+    private static readonly Rectangle HealthFullIconSource = new(0, 458, 136, 152);
+    private static readonly Rectangle HealthEmptyIconSource = new(800, 458, 139, 146);
+    private static readonly Rectangle HungerFullIconSource = new(3, 459, 56, 62);
+    private static readonly Rectangle HungerEmptyIconSource = new(800, 459, 56, 62);
+
+    private void DrawSurvivalSegments(
+        SpriteBatch sb,
+        int startX,
+        int top,
+        int value,
+        Color emptyColor,
+        Color fillColor,
+        Color shineColor,
+        bool alignRight,
+        int segmentWidth,
+        int segmentHeight,
+        int segmentGap,
+        SurvivalPipStyle pipStyle,
+        Texture2D? hudTexture,
+        Rectangle fullIconSource,
+        Rectangle emptyIconSource)
+    {
+        const int segmentCount = 10;
+        const int segmentsPerRow = 10;
+
+        var filledSegments = Math.Clamp((int)MathF.Ceiling(value / 2f), 0, segmentCount);
+        var halfFilled = value % 2 == 1;
+
+        for (var i = 0; i < segmentCount; i++)
+        {
+            var column = i % segmentsPerRow;
+            var drawColumn = alignRight ? (segmentsPerRow - 1 - column) : column;
+            var drawIndex = alignRight ? (segmentCount - 1 - i) : i;
+            var x = startX + (drawColumn * (segmentWidth + segmentGap));
+            var y = top;
+            var rect = new Rectangle(x, y, segmentWidth, segmentHeight);
+            var fillFraction = drawIndex < filledSegments
+                ? (halfFilled && drawIndex == filledSegments - 1 ? 0.5f : 1f)
+                : 0f;
+            if (hudTexture != null)
+            {
+                DrawHudAssetPip(sb, hudTexture, rect, fillFraction, fullIconSource, emptyIconSource, alignRight);
+                continue;
+            }
+            switch (pipStyle)
+            {
+                case SurvivalPipStyle.Cookie:
+                    DrawCookiePip(sb, rect, fillFraction, emptyColor, fillColor, shineColor, alignRight);
+                    break;
+                default:
+                    DrawDiamondPip(sb, rect, fillFraction, emptyColor, fillColor, shineColor, alignRight);
+                    break;
+            }
+        }
+    }
+
+    private void DrawDiamondPip(SpriteBatch sb, Rectangle rect, float fillFraction, Color emptyColor, Color fillColor, Color shineColor, bool alignRight)
+    {
+        ReadOnlySpan<int> insets = [10, 8, 6, 4, 2, 2, 4, 6, 8, 10];
+        var frameColor = new Color(10, 12, 18, 220);
+        var darkEdge = new Color(24, 27, 34, 220);
+        var fill = Math.Clamp(fillFraction, 0f, 1f);
+
+        for (var row = 0; row < insets.Length; row++)
+        {
+            var inset = insets[row];
+            var rowY = rect.Y + row + 1;
+            var rowWidth = rect.Width - (inset * 2);
+            if (rowWidth <= 0 || rowY >= rect.Bottom - 1)
+                continue;
+
+            var rowX = rect.X + inset;
+            sb.Draw(_pixel, new Rectangle(rowX - 1, rowY, rowWidth + 2, 1), frameColor);
+            sb.Draw(_pixel, new Rectangle(rowX, rowY, rowWidth, 1), emptyColor);
+
+            if (fill > 0f)
+            {
+                var filledWidth = Math.Clamp((int)MathF.Round(rowWidth * fill), 0, rowWidth);
+                if (filledWidth > 0)
+                {
+                    var fillX = alignRight ? rowX + rowWidth - filledWidth : rowX;
+                    sb.Draw(_pixel, new Rectangle(fillX, rowY, filledWidth, 1), fillColor);
+
+                    var shineWidth = Math.Max(1, filledWidth - 1);
+                    if (row <= 2 && shineWidth > 0)
+                    {
+                        var shineX = alignRight ? fillX + filledWidth - shineWidth : fillX;
+                        sb.Draw(_pixel, new Rectangle(shineX, rowY, shineWidth, 1), shineColor);
+                    }
+                }
+            }
+        }
+
+        var cutWidth = 3;
+        var cutHeight = 2;
+        var cutX = rect.Center.X - (cutWidth / 2);
+        var cutY = rect.Center.Y - (cutHeight / 2);
+        sb.Draw(_pixel, new Rectangle(cutX, cutY, cutWidth, cutHeight), frameColor);
+
+        sb.Draw(_pixel, new Rectangle(rect.Center.X - 3, rect.Y + 2, 6, 1), darkEdge);
+        sb.Draw(_pixel, new Rectangle(rect.Center.X - 3, rect.Bottom - 3, 6, 1), darkEdge);
+    }
+
+    private void DrawHudAssetPip(SpriteBatch sb, Texture2D texture, Rectangle rect, float fillFraction, Rectangle fullSource, Rectangle emptySource, bool alignRight)
+    {
+        sb.Draw(texture, rect, emptySource, Color.White);
+
+        var fill = Math.Clamp(fillFraction, 0f, 1f);
+        if (fill <= 0f)
+            return;
+
+        var srcWidth = Math.Max(1, (int)MathF.Round(fullSource.Width * fill));
+        var dstWidth = Math.Max(1, (int)MathF.Round(rect.Width * fill));
+        Rectangle src;
+        Rectangle dst;
+        if (alignRight)
+        {
+            src = new Rectangle(fullSource.Right - srcWidth, fullSource.Y, srcWidth, fullSource.Height);
+            dst = new Rectangle(rect.Right - dstWidth, rect.Y, dstWidth, rect.Height);
+        }
+        else
+        {
+            src = new Rectangle(fullSource.X, fullSource.Y, srcWidth, fullSource.Height);
+            dst = new Rectangle(rect.X, rect.Y, dstWidth, rect.Height);
+        }
+
+        sb.Draw(texture, dst, src, Color.White);
+    }
+
+    private void DrawCookiePip(SpriteBatch sb, Rectangle rect, float fillFraction, Color emptyColor, Color fillColor, Color shineColor, bool alignRight)
+    {
+        var frameColor = new Color(58, 36, 12, 230);
+        var fill = Math.Clamp(fillFraction, 0f, 1f);
+        var body = new Rectangle(rect.X + 1, rect.Y + 2, rect.Width - 2, rect.Height - 4);
+
+        for (var row = 0; row < body.Height; row++)
+        {
+            var curve = row switch
+            {
+                0 or 1 or 2 or 10 or 11 => 4,
+                3 or 9 => 2,
+                _ => 1
+            };
+            var biteTrim = row switch
+            {
+                3 or 4 => 2,
+                5 or 6 or 7 => 4,
+                8 => 2,
+                _ => 0
+            };
+            var rowY = body.Y + row;
+            var rowX = body.X + curve + (alignRight ? biteTrim : 0);
+            var rowWidth = body.Width - (curve * 2) - biteTrim;
+            if (rowWidth <= 0)
+                continue;
+
+            sb.Draw(_pixel, new Rectangle(rowX - 1, rowY, rowWidth + 2, 1), frameColor);
+            sb.Draw(_pixel, new Rectangle(rowX, rowY, rowWidth, 1), emptyColor);
+
+            if (fill > 0f)
+            {
+                var filledWidth = Math.Clamp((int)MathF.Round(rowWidth * fill), 0, rowWidth);
+                if (filledWidth > 0)
+                {
+                    var fillX = alignRight ? rowX + rowWidth - filledWidth : rowX;
+                    sb.Draw(_pixel, new Rectangle(fillX, rowY, filledWidth, 1), fillColor);
+                    if (row <= 3)
+                    {
+                        var shineWidth = Math.Max(1, filledWidth - 2);
+                        var shineX = alignRight ? fillX + filledWidth - shineWidth : fillX + 1;
+                        sb.Draw(_pixel, new Rectangle(shineX, rowY, shineWidth, 1), shineColor);
+                    }
+                }
+            }
+        }
+
+        DrawCookieChip(sb, rect.X + 6, rect.Y + 5, new Color(122, 72, 24));
+        DrawCookieChip(sb, rect.Center.X - 1, rect.Y + 8, new Color(126, 76, 26));
+        DrawCookieChip(sb, rect.Right - 8, rect.Y + 6, new Color(128, 78, 28));
+    }
+
+    private void DrawCookieChip(SpriteBatch sb, int x, int y, Color color)
+    {
+        sb.Draw(_pixel, new Rectangle(x, y, 2, 2), color);
+        sb.Draw(_pixel, new Rectangle(x + 1, y + 1, 1, 1), new Color(152, 96, 40));
+    }
+
+    private void DrawRespawnOverlay(SpriteBatch sb)
+    {
+        if (!_survivalRespawnPending)
+            return;
+
+        var overlay = new Rectangle(_viewport.X, _viewport.Y, _viewport.Width, _viewport.Height);
+        sb.Draw(_pixel, overlay, new Color(0, 0, 0, 110));
+
+        var seconds = MathF.Ceiling(_survivalRespawnTimer);
+        var text = $"RESPAWNING IN {seconds:0}";
+        var size = _font.MeasureString(text);
+        var pos = new Vector2(_viewport.X + (_viewport.Width - size.X) * 0.5f, _viewport.Y + (_viewport.Height - size.Y) * 0.5f);
+        _font.DrawString(sb, text, pos, new Color(255, 220, 220));
+    }
+
+    private void DrawDamageOverlay(SpriteBatch sb)
+    {
+        if (_damageFlashTimer <= 0f || _damageFlashStrength <= 0f)
+            return;
+
+        var normalized = Math.Clamp(_damageFlashTimer / DamageFlashDurationSeconds, 0f, 1f);
+        var fade = MathF.Sin(normalized * MathF.PI);
+        var alpha = MathF.Pow(fade, 1.6f) * _damageFlashStrength;
+        var layers = 6;
+        var maxThickness = Math.Max(18, Math.Min(_viewport.Width, _viewport.Height) / 18);
+        var cornerSpanX = Math.Max(64, _viewport.Width / 5);
+        var cornerSpanY = Math.Max(48, _viewport.Height / 5);
+        for (var i = 0; i < layers; i++)
+        {
+            var t = i / (float)(layers - 1);
+            var thickness = Math.Max(2, (int)MathF.Round(MathHelper.Lerp(maxThickness, 2f, t)));
+            var inset = (int)MathF.Round(t * maxThickness * 1.85f);
+            var layerAlpha = Math.Clamp((int)((1f - t) * (1f - t) * alpha * 8f), 0, 8);
+            if (layerAlpha <= 0)
+                continue;
+
+            var tint = new Color(160, 24, 30, layerAlpha);
+            var left = _viewport.X + inset;
+            var top = _viewport.Y + inset;
+            var width = _viewport.Width - (inset * 2);
+            var height = _viewport.Height - (inset * 2);
+            if (width <= 0 || height <= 0)
+                break;
+
+            var spanX = Math.Min(cornerSpanX, width / 2);
+            var spanY = Math.Min(cornerSpanY, height / 2);
+
+            sb.Draw(_pixel, new Rectangle(left, top, spanX, thickness), tint);
+            sb.Draw(_pixel, new Rectangle(left, top, thickness, spanY), tint);
+
+            sb.Draw(_pixel, new Rectangle(left + width - spanX, top, spanX, thickness), tint);
+            sb.Draw(_pixel, new Rectangle(left + width - thickness, top, thickness, spanY), tint);
+
+            sb.Draw(_pixel, new Rectangle(left, top + height - thickness, spanX, thickness), tint);
+            sb.Draw(_pixel, new Rectangle(left, top + height - spanY, thickness, spanY), tint);
+
+            sb.Draw(_pixel, new Rectangle(left + width - spanX, top + height - thickness, spanX, thickness), tint);
+            sb.Draw(_pixel, new Rectangle(left + width - thickness, top + height - spanY, thickness, spanY), tint);
+        }
+    }
+
+    private float GetDamageCameraKickAmount()
+    {
+        if (_damageCameraKickTimer <= 0f || _damageCameraKickStrength <= 0f)
+            return 0f;
+
+        var normalized = Math.Clamp(_damageCameraKickTimer / DamageCameraKickDurationSeconds, 0f, 1f);
+        return MathF.Sin(normalized * MathF.PI) * _damageCameraKickStrength;
+    }
+
     private void DrawContextIndicators(SpriteBatch sb)
     {
         if (!_indicatorsEnabled)
@@ -6188,14 +7158,28 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         var pos = _player.Position;
         var vel = _player.Velocity;
-        var lines = new List<string>
+        var leftLines = new List<string>
         {
-            "DEV HUD (F3)",
             $"FPS: {_fps:0}",
+            $"WORLD: {(_meta?.Name ?? "WORLD")}",
+            $"MODE: {_gameMode.ToString().ToUpperInvariant()}",
             $"POS: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
             $"VEL: {vel.X:0.00}, {vel.Y:0.00}, {vel.Z:0.00}",
             $"CHUNK: {_playerChunkCoord}",
-            $"FLY: {_player.IsFlying}  GND: {_player.IsGrounded}"
+            $"STATE: FLY {_player.IsFlying} | GROUND {_player.IsGrounded}",
+            $"VITALS: HP {_survivalVitals.Health}/{SurvivalVitals.MaxHealth} | HUNGER {_survivalVitals.Hunger}/{SurvivalVitals.MaxHunger}",
+            $"SIGIL: ATONEMENT {MathF.Round(_sigilPositiveTargetFraction * 100f):0}% | CURSE {MathF.Round(_sigilNegativeTargetFraction * 100f):0}%",
+            $"HELD: {BlockRegistry.Get(_inventory.SelectedId).Name} ({_inventory.SelectedId})"
+        };
+
+        var rightLines = new List<string>
+        {
+            $"TIME: {_timeOfDayTicks} | WEATHER: {_weatherState.ToUpperInvariant()}",
+            $"RULES: COLLISION {(_playerCollisionEnabled ? "ON" : "OFF")} | SIGIL {(_sigilPowerEnabled ? "ON" : "OFF")}",
+            $"CYCLES: TIME {(_timeCycleEnabled ? "ON" : "OFF")} | WEATHER {(_weatherCycleEnabled ? "ON" : "OFF")}",
+            $"DIFFICULTY: {GetDifficultyLabel(_difficultyLevel).ToUpperInvariant()}",
+            $"UI: PAUSE {_pauseMenuOpen} | INV {_inventoryOpen} | CHAT {_chatInputActive} | CMD {_commandInputActive}",
+            $"STREAMING: {_activeRadiusChunks}/{_targetActiveRadiusChunks} CHUNKS"
         };
 
         if (_world != null)
@@ -6204,33 +7188,57 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var wz = (int)MathF.Floor(pos.Z);
             var biomeName = _world.GetBiomeNameAt(wx, wz);
             var desertWeight = _world.GetDesertWeightAt(wx, wz);
-            lines.Add($"BIOME: {biomeName} (DesertWeight {desertWeight:0.00}) @ {wx},{wz}");
+            leftLines.Add($"BIOME: {biomeName} ({desertWeight:0.00}) @ {wx},{wz}");
 
             var origin = _player.Position + _player.HeadOffset;
             if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
             {
                 var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
                 var def = BlockRegistry.Get(id);
-                lines.Add($"LOOKING: {def.Name} ({id}) @ {hit.X},{hit.Y},{hit.Z}");
+                leftLines.Add($"LOOKING: {def.Name} ({id}) @ {hit.X},{hit.Y},{hit.Z}");
             }
         }
 
         if (_streamingService != null && _world != null)
         {
             var (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
-            lines.Add($"LOADED CHUNKS: {_world.ChunkCount}");
-            lines.Add($"QUEUES L/M/S: {loadQueue}/{meshQueue}/{saveQueue}");
-            lines.Add($"PREWARM: {(_spawnPrewarmComplete ? "DONE" : $"{_prewarmReadyCount}/{_prewarmTargetCount}")}");
+            rightLines.Add($"LOADED CHUNKS: {_world.ChunkCount}");
+            rightLines.Add($"QUEUES: LOAD {loadQueue} | MESH {meshQueue} | SAVE {saveQueue}");
+            rightLines.Add($"PREWARM: {(_spawnPrewarmComplete ? "DONE" : $"{_prewarmReadyCount}/{_prewarmTargetCount}")}");
         }
 
         var metrics = AdvancedPerformanceOptimizer.GetCurrentMetrics();
         var (ramUsed, _, vramUsed, _) = SimpleMemoryManager.GetMemoryStats();
-        lines.Add($"PERF CPU:{metrics.CpuUsage:F1}% RAM:{ramUsed / 1024 / 1024}MB VRAM:{vramUsed / 1024 / 1024}MB");
+        rightLines.Add($"PERF: CPU {metrics.CpuUsage:F1}% | RAM {ramUsed / 1024 / 1024}MB | VRAM {vramUsed / 1024 / 1024}MB");
 
-        var x = _viewport.X + 20;
-        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
-        for (var i = 0; i < lines.Count; i++)
-            _font.DrawString(sb, lines[i], new Vector2(x, y + i * (_font.LineHeight + 2)), Color.White);
+        var padding = 20;
+        var gap = 24;
+        var lineHeight = _font.LineHeight + 2;
+        var panelWidth = Math.Clamp((_viewport.Width - padding * 2 - gap) / 2, 220, 460);
+        var textWidth = Math.Max(120, panelWidth - 20);
+        var wrappedLeftLines = new List<string>();
+        var wrappedRightLines = new List<string>();
+
+        foreach (var line in leftLines)
+            wrappedLeftLines.AddRange(WrapOverlayText(line, textWidth));
+        foreach (var line in rightLines)
+            wrappedRightLines.AddRange(WrapOverlayText(line, textWidth));
+
+        var leftRect = new Rectangle(_viewport.X + padding, _viewport.Y + padding, panelWidth, 22 + wrappedLeftLines.Count * lineHeight);
+        var rightRect = new Rectangle(_viewport.Right - padding - panelWidth, _viewport.Y + padding, panelWidth, 22 + wrappedRightLines.Count * lineHeight);
+
+        sb.Draw(_pixel, leftRect, new Color(0, 0, 0, 124));
+        sb.Draw(_pixel, rightRect, new Color(0, 0, 0, 124));
+        DrawBorder(sb, leftRect, new Color(220, 220, 220, 220));
+        DrawBorder(sb, rightRect, new Color(220, 220, 220, 220));
+
+        _font.DrawString(sb, "WORLD / PLAYER", new Vector2(leftRect.X + 10, leftRect.Y + 8), Color.White);
+        _font.DrawString(sb, "RENDER / SYSTEMS", new Vector2(rightRect.X + 10, rightRect.Y + 8), Color.White);
+
+        for (int i = 0; i < wrappedLeftLines.Count; i++)
+            _font.DrawString(sb, wrappedLeftLines[i], new Vector2(leftRect.X + 10, leftRect.Y + 8 + (i + 1) * lineHeight), Color.White);
+        for (int i = 0; i < wrappedRightLines.Count; i++)
+            _font.DrawString(sb, wrappedRightLines[i], new Vector2(rightRect.X + 10, rightRect.Y + 8 + (i + 1) * lineHeight), Color.White);
     }
 
 #if DEBUG
@@ -6397,7 +7405,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!_handoffPromptVisible || _pauseMenuOpen || _inventoryOpen)
             return;
 
-        var giveKey = FormatKeyLabel(_giveKey);
+        var giveKey = FormatBindingLabel("GiveItem", Keys.F);
         var displayName = string.IsNullOrWhiteSpace(_handoffTargetName)
             ? "PLAYER"
             : _handoffTargetName.Trim();
@@ -6499,6 +7507,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         var eye = _player.Position + _player.HeadOffset;
         var forward = _player.Forward;
+        var damageKick = GetDamageCameraKickAmount();
+        var viewUp = Vector3.Up;
         if (_gameMode == GameMode.Veilseer
             && _veilseerSpectateTargetPlayerId >= 0
             && _remotePlayers.TryGetValue(_veilseerSpectateTargetPlayerId, out var observed))
@@ -6508,7 +7518,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _cameraPosition = eye;
             _thirdPersonCameraDistance = 0f;
             var observedTarget = eye + forward;
-            return Matrix.CreateLookAt(eye, observedTarget, Vector3.Up);
+            return Matrix.CreateLookAt(eye, observedTarget, viewUp);
         }
 
         if (IsThirdPersonCameraActive())
@@ -6524,13 +7534,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var target = focus + orbitForward * (0.08f * Scale.BlockSize);
             _cameraPosition = eye;
             _thirdPersonCameraDistance = Vector3.Distance(eye, focus);
-            return Matrix.CreateLookAt(eye, target, Vector3.Up);
+            return Matrix.CreateLookAt(eye, target, viewUp);
+        }
+
+        if (damageKick > 0f)
+        {
+            var pitch = MathHelper.ToRadians(-1.6f * damageKick);
+            var yaw = MathHelper.ToRadians(0.45f * damageKick);
+            var roll = MathHelper.ToRadians(-1.3f * damageKick);
+            var kickRotation = Matrix.CreateFromYawPitchRoll(yaw, pitch, roll);
+            forward = Vector3.Normalize(Vector3.TransformNormal(forward, kickRotation));
+            viewUp = Vector3.Normalize(Vector3.TransformNormal(Vector3.Up, kickRotation));
+            eye += Vector3.TransformNormal(new Vector3(-0.006f, 0.008f, 0f) * Scale.BlockSize * damageKick, kickRotation);
         }
 
         _cameraPosition = eye;
         _thirdPersonCameraDistance = 0f;
         var firstPersonTarget = eye + forward;
-        return Matrix.CreateLookAt(eye, firstPersonTarget, Vector3.Up);
+        return Matrix.CreateLookAt(eye, firstPersonTarget, viewUp);
     }
 
     private Vector3 ResolveThirdPersonCameraPosition(Vector3 focus, Vector3 desiredEye)
@@ -6850,6 +7871,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var actionSwingProgress = _localActionSwingTimer > 0f
             ? Math.Clamp(1f - (_localActionSwingTimer / 0.26f), 0f, 1f)
             : 0f;
+        var damageKickProgress = _damageHandKickTimer > 0f
+            ? Math.Clamp(_damageHandKickTimer / DamageHandKickDurationSeconds, 0f, 1f) * _damageHandKickStrength
+            : 0f;
         _handRenderer.Draw(
             view,
             proj,
@@ -6864,7 +7888,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             isFlying,
             isGrounded,
             velocityY,
-            actionSwingProgress);
+            actionSwingProgress,
+            damageKickProgress);
         device.DepthStencilState = DepthStencilState.Default;
         device.RasterizerState = prevRaster;
     }
@@ -7469,48 +8494,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void AnnounceOnlineHostShare(EosClient? eos, bool tryCopyToClipboard)
     {
-        var hostCode = (eos?.LocalProductUserId ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(hostCode))
+        var hostUserId = (eos?.LocalProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(hostUserId))
         {
-            SetCommandStatus("Online hosting enabled, but host code is unavailable.", 7f);
+            SetCommandStatus("World hosted, but online presence is still syncing.", 7f);
             return;
         }
 
-        var status = "Online hosting enabled. Share your host code with friends.";
-        if (tryCopyToClipboard)
-        {
-            if (TryCopyToClipboard(hostCode, out _))
-                status = "Online hosting enabled. Host code copied to clipboard.";
-            else
-                status = "Online hosting enabled. Host code ready (clipboard copy failed).";
-        }
-
-        SetCommandStatus(status, 7f, echoToChat: false);
+        SetCommandStatus("World hosted. Friends can join from your online friends list.", 7f, echoToChat: false);
         AddChatLine(
-            $"HOST CODE: {hostCode}",
+            "WORLD HOSTED: Friends can join from your online friends list.",
             isSystem: true,
-            hoverText: "Click COPY CODE to copy host code.",
-            copyText: hostCode,
-            actionLabel: "COPY CODE");
-
-        if (_settings.EnableInviteLinks)
-        {
-            var hostLink = BuildHostJoinLink(hostCode);
-            AddChatLine(
-                $"HOST LINK: {hostLink}",
-                isSystem: true,
-                hoverText: "Click COPY LINK to copy host link.",
-                copyText: hostLink,
-                actionLabel: "COPY LINK");
-        }
-    }
-
-    private static string BuildHostJoinLink(string hostCode)
-    {
-        var safeHostCode = (hostCode ?? string.Empty).Trim();
-        return string.IsNullOrWhiteSpace(safeHostCode)
-            ? string.Empty
-            : $"lattice://join/{safeHostCode}";
+            hoverText: "Friends can join from their multiplayer or friends screens.");
     }
 
     private bool TryCopyToClipboard(string value, out string error)
@@ -7590,7 +8585,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        SetCommandStatus("Join by code functionality removed.");
+        SetCommandStatus("Friends join through the online friends list.");
         return;
     }
 
@@ -8597,7 +9592,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void AddJoinRequestChatPrompt(string peerId, string displayName)
     {
         RememberPendingJoinRequester(peerId, displayName);
-        var hotkeyHint = FormatKeyLabel(_inviteQuickActionKey);
+        var hotkeyHint = FormatBindingLabel("InviteQuickAction", Keys.Y);
         AddChatLine(
             $"{displayName} wants to join! Accept? (Tap {hotkeyHint}=decline, hold {hotkeyHint}=accept)",
             isSystem: true,
@@ -8864,7 +9859,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var state = new PlayerWorldState
         {
             Username = username,
-            CurrentGameMode = _meta?.CurrentWorldGameMode ?? GameMode.Artificer
+            CurrentGameMode = _meta?.CurrentWorldGameMode ?? GameMode.Artificer,
+            Health = SurvivalVitals.MaxHealth,
+            Hunger = SurvivalVitals.MaxHunger,
+            SigilAtonement = 0f,
+            SigilCurse = 0f
         };
 
         if (_meta == null)
@@ -10187,6 +11186,16 @@ private float FindSafeSpawnHeight(float x, float z)
         _player.Pitch = state.Pitch;
         _player.Velocity = Vector3.Zero;
         _player.SetFlying(_player.AllowFlying && state.IsFlying);
+        _survivalVitals.Load(state.Health, state.Hunger);
+        _sigilPositiveTargetFraction = Math.Clamp(state.SigilAtonement, 0f, 1f);
+        _sigilNegativeTargetFraction = Math.Clamp(state.SigilCurse, 0f, 1f);
+        _debugSigilPositiveFraction = _sigilPositiveTargetFraction;
+        _debugSigilNegativeFraction = _sigilNegativeTargetFraction;
+        _hasSeenAttunementWipPopup = state.HasSeenAttunementWipPopup;
+        _survivalRespawnPending = false;
+        _survivalRespawnTimer = 0f;
+        _survivalWasGrounded = _player.IsGrounded;
+        _survivalPeakAirY = _player.Position.Y;
         _homes.Clear();
         if (state.Homes != null)
         {
@@ -10254,6 +11263,9 @@ private float FindSafeSpawnHeight(float x, float z)
         
         // Mark player state as clean after successful load
         _playerStateDirty = false;
+
+        if (_showAttunementWipPopupOnLoad)
+            TryShowAttunementWipPopup();
     }
     
     /// <summary>
@@ -10284,7 +11296,12 @@ private float FindSafeSpawnHeight(float x, float z)
             SelectedIndex = _inventory.SelectedIndex,
             Hotbar = _inventory.GetHotbarData(),
             InventoryGrid = _inventory.GetGridData(),
-            ArtificerFavoriteBlockIds = _inventory.GetSandboxCatalogFavoriteBlockIds()
+            ArtificerFavoriteBlockIds = _inventory.GetSandboxCatalogFavoriteBlockIds(),
+            Health = _survivalVitals.Health,
+            Hunger = _survivalVitals.Hunger,
+            SigilAtonement = _sigilPositiveTargetFraction,
+            SigilCurse = _sigilNegativeTargetFraction,
+            HasSeenAttunementWipPopup = _hasSeenAttunementWipPopup
         };
     }
 
@@ -10937,12 +11954,12 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private bool IsChatOpenKeyPressed(InputState input)
     {
-        return input.IsNewKeyPress(_chatKey);
+        return IsNewActionPress(input, "Chat", Keys.T);
     }
 
     private bool IsCommandOpenKeyPressed(InputState input)
     {
-        if (input.IsNewKeyPress(_commandKey))
+        if (IsNewActionPress(input, "Command", Keys.OemQuestion))
             return true;
 
         // Always keep slash as a direct command opener even when rebound.
@@ -11236,7 +12253,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private bool TryOpenInventoryFromTextInput(InputState input, bool commandMode, string activeText)
     {
-        if (!input.IsNewKeyPress(_inventoryKey))
+        if (!IsNewActionPress(input, "Inventory", Keys.E))
             return false;
 
         var forceOpen = input.IsKeyDown(Keys.LeftControl) || input.IsKeyDown(Keys.RightControl);
@@ -11651,6 +12668,7 @@ private float FindSafeSpawnHeight(float x, float z)
                         "playercollision",
                         "timecycle",
                         "weathercycle",
+                        "sigil",
                         "enablemultiplehomes",
                         "maxhomesperplayer",
                         "homes",
@@ -11664,9 +12682,26 @@ private float FindSafeSpawnHeight(float x, float z)
                         break;
 
                     if (IsBooleanWorldRule(ruleKey))
-                        values.AddRange(new[] { "on", "off" });
+                        values.AddRange(new[] { "enabled", "disabled", "on", "off" });
                     else if (string.Equals(ruleKey, "maxhomesperplayer", StringComparison.Ordinal))
                         values.AddRange(new[] { "1", "2", "4", "8", "12", "16", "24", "32" });
+                }
+                break;
+
+            case "sigil":
+                if (tokenIndex == 1)
+                {
+                    values.AddRange(new[] { "empty", "positive", "negative", "set" });
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    var sub = tokens[1].ToLowerInvariant();
+                    if (sub is "positive" or "negative" or "set")
+                        values.AddRange(new[] { "0", "10", "25", "50", "75", "100" });
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length && string.Equals(tokens[1], "set", StringComparison.OrdinalIgnoreCase))
+                {
+                    values.AddRange(new[] { "0", "10", "25", "50", "75", "100" });
                 }
                 break;
 
@@ -12463,59 +13498,151 @@ private float FindSafeSpawnHeight(float x, float z)
         }
     }
 
+    private void LoadCommandInputHistory()
+    {
+        _textInputHistory.Clear();
+
+        try
+        {
+            if (!File.Exists(CommandHistoryLogPath))
+            {
+                BeginTextInputHistorySession(string.Empty);
+                return;
+            }
+
+            string[] lines;
+            lock (_historyFileLock)
+                lines = File.ReadAllLines(CommandHistoryLogPath);
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (!TryExtractHistoryPayload(lines[i], "CMD", out var command))
+                    continue;
+                if (!command.StartsWith("/", StringComparison.Ordinal))
+                    continue;
+
+                if (_textInputHistory.Count > 0 && string.Equals(_textInputHistory[^1], command, StringComparison.Ordinal))
+                    continue;
+
+                _textInputHistory.Add(command);
+            }
+
+            if (_textInputHistory.Count > MaxTextInputHistory)
+                _textInputHistory.RemoveRange(0, _textInputHistory.Count - MaxTextInputHistory);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load command history: {ex.Message}");
+        }
+
+        BeginTextInputHistorySession(string.Empty);
+    }
+
+    private static bool TryExtractHistoryPayload(string line, string category, out string payload)
+    {
+        payload = string.Empty;
+        var value = (line ?? string.Empty).Trim();
+        if (value.Length == 0)
+            return false;
+
+        var categoryToken = $"] [{category}] [";
+        var categoryIndex = value.IndexOf(categoryToken, StringComparison.OrdinalIgnoreCase);
+        if (categoryIndex >= 0)
+        {
+            var payloadStart = value.IndexOf("] ", categoryIndex + categoryToken.Length, StringComparison.Ordinal);
+            if (payloadStart >= 0 && payloadStart + 2 <= value.Length)
+            {
+                payload = value[(payloadStart + 2)..].Trim();
+                return payload.Length > 0;
+            }
+        }
+
+        if (value.StartsWith("/", StringComparison.Ordinal))
+        {
+            payload = value;
+            return true;
+        }
+
+        return false;
+    }
+
     private void EnsureCommandRegistry()
     {
         if (_commandsInitialized)
             return;
 
         _commandsInitialized = true;
-        RegisterCommand("help", new[] { "?" }, "/help", "Show command help.", CommandPermission.Everyone, ExecuteHelpCommand);
-        RegisterCommand("biome", new[] { "biomes" }, "/biome [list|here|<desert|forest|hills|grasslands|ocean> [radius]]", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
-        RegisterCommand("accept", Array.Empty<string>(), "/accept <username>", "Accept a world join invite.", CommandPermission.Everyone, ExecuteAcceptInviteCommand);
-        RegisterCommand("reject", Array.Empty<string>(), "/reject <username>", "Reject a world join invite.", CommandPermission.Everyone, ExecuteRejectInviteCommand);
-        RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list> [username]", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
-        RegisterCommand("structure", Array.Empty<string>(), "/structure <locate|list> [name]", "Structure lookup command (no GUI).", CommandPermission.Everyone, ExecuteStructureCommand);
-        RegisterCommand("tp", new[] { "teleport" }, "/tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>", "Teleport players by absolute/relative coords or player target.", CommandPermission.Operator, ExecuteTeleportCommand);
-        RegisterCommand("gamemode", new[] { "gm" }, "/gamemode <artificer|veilwalker|veilseer|gui> [player]", "Change gamemode or open selector.", CommandPermission.Operator, ExecuteGameModeCommand);
-        RegisterCommand("artificer", new[] { "gma", "gmc" }, "/artificer [player]", "Set ARTIFICER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Artificer, parts));
-        RegisterCommand("veilwalker", new[] { "gmvw", "gms" }, "/veilwalker [player]", "Set VEILWALKER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilwalker, parts));
-        RegisterCommand("veilseer", new[] { "gmvs", "gmsp" }, "/veilseer [player]", "Set VEILSEER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilseer, parts));
-        RegisterCommand("difficulty", new[] { "diff" }, "/difficulty <peaceful|easy|normal|hard>", "Set difficulty.", CommandPermission.Operator, ExecuteDifficultyCommand);
-        RegisterCommand("seed", Array.Empty<string>(), "/seed", "Show current world seed.", CommandPermission.Operator, ExecuteSeedCommand);
-        RegisterCommand("rules", new[] { "rule" }, "/rules [<rule> [value]]", "Inspect or set world rules.", CommandPermission.Operator, ExecuteRulesCommand);
-        RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <ticks>]", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
-        RegisterCommand("weather", Array.Empty<string>(), "/weather [query|clear|rain|storm]", "Set or inspect weather.", CommandPermission.Operator, ExecuteWeatherCommand);
-        RegisterCommand("setspawn", Array.Empty<string>(), "/setspawn [x y z]", "Set world spawn.", CommandPermission.Operator, ExecuteSetSpawnCommand);
-        RegisterCommand("op", Array.Empty<string>(), "/op <player>", "Grant operator permissions to a player.", CommandPermission.HostOnly, ExecuteOpCommand);
-        RegisterCommand("deop", Array.Empty<string>(), "/deop <player>", "Revoke operator permissions from a player.", CommandPermission.HostOnly, ExecuteDeopCommand);
-        RegisterCommand("kick", Array.Empty<string>(), "/kick <player> [reason]", "Kick a player from the current hosted world.", CommandPermission.HostOnly, ExecuteKickCommand);
-        RegisterCommand("spawn", Array.Empty<string>(), "/spawn", "Teleport to world spawn.", CommandPermission.Everyone, ExecuteSpawnCommand);
-        RegisterCommand("sethome", Array.Empty<string>(), "/sethome [name]", "Set or update a named home.", CommandPermission.Everyone, ExecuteSetHomeCommand);
-        RegisterCommand("home", Array.Empty<string>(), "/home [name|list|gui|set|rename|delete|icon]", "Teleport/manage homes.", CommandPermission.Everyone, ExecuteHomeCommand);
-        RegisterCommand("me", Array.Empty<string>(), "/me <action>", "Broadcast an action message.", CommandPermission.Everyone, ExecuteMeCommand);
-        RegisterCommand("msg", Array.Empty<string>(), "/msg <player> <message>", "Send a private message.", CommandPermission.Everyone, ExecuteMsgCommand);
-        RegisterCommand("chatclear", new[] { "clearchat", "cc" }, "/chatclear", "Clear chat history (with confirmation).", CommandPermission.Everyone, ExecuteChatClearCommand);
-        RegisterCommand("give", Array.Empty<string>(), "/give [player] <item|id> [amount]", "Give an item/block by token or numeric id.", CommandPermission.Operator, ExecuteGiveCommand);
-        RegisterCommand("clear", Array.Empty<string>(), "/clear [player] [item|id]", "Clear whole inventory (confirmation) or clear a specific item.", CommandPermission.Operator, ExecuteClearInventoryCommand);
-        RegisterCommand("inv", new[] { "inventory" }, "/inv [clear|player]", "View live inventory or clear inventory view.", CommandPermission.Everyone, ExecuteInvCommand);
-        RegisterCommand("pos", Array.Empty<string>(), "/pos [player]", "Show player's exact coordinates with one-click copy.", CommandPermission.Everyone, ExecutePosCommand);
-        RegisterCommand("broadcast", new[] { "bc" }, "/broadcast <message>", "Send a broadcast message to everyone.", CommandPermission.Everyone, ExecuteBroadcastCommand);
-        RegisterCommand("commandclear", Array.Empty<string>(), "/commandclear", "Clear command entries from shared input history.", CommandPermission.Everyone, ExecuteCommandClearCommand);
+        RegisterCommand("help", new[] { "?" }, "/help", "/help", "Show command help.", CommandPermission.Everyone, ExecuteHelpCommand);
+        RegisterCommand("biome", new[] { "biomes" }, "/biome [list|here|<desert|forest|hills|grasslands|ocean> [radius]]", "/biome desert 4000", "Find or inspect biomes.", CommandPermission.Everyone, ExecuteBiomeCommand);
+        RegisterCommand("accept", Array.Empty<string>(), "/accept <username>", "/accept Redacted", "Accept a world join invite.", CommandPermission.Everyone, ExecuteAcceptInviteCommand);
+        RegisterCommand("reject", Array.Empty<string>(), "/reject <username>", "/reject Redacted", "Reject a world join invite.", CommandPermission.Everyone, ExecuteRejectInviteCommand);
+        RegisterCommand("whitelist", new[] { "wl" }, "/whitelist <add|remove|list> [username]", "/whitelist add Redacted", "Manage world join whitelist.", CommandPermission.Everyone, ExecuteWhitelistCommand);
+        RegisterCommand("structure", Array.Empty<string>(), "/structure <locate|list> [name]", "/structure list", "Structure lookup command (no GUI).", CommandPermission.Everyone, ExecuteStructureCommand);
+        RegisterCommand("tp", new[] { "teleport" }, "/tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>", "/tp 128 70 128", "Teleport players by absolute/relative coords or player target.", CommandPermission.Operator, ExecuteTeleportCommand);
+        RegisterCommand("gamemode", new[] { "gm" }, "/gamemode <artificer|veilwalker|veilseer|gui> [player]", "/gamemode veilwalker", "Change gamemode or open selector.", CommandPermission.Operator, ExecuteGameModeCommand);
+        RegisterCommand("artificer", new[] { "gma", "gmc" }, "/artificer [player]", "/artificer", "Set ARTIFICER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Artificer, parts));
+        RegisterCommand("veilwalker", new[] { "gmvw", "gms" }, "/veilwalker [player]", "/veilwalker", "Set VEILWALKER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilwalker, parts));
+        RegisterCommand("veilseer", new[] { "gmvs", "gmsp" }, "/veilseer [player]", "/veilseer", "Set VEILSEER mode.", CommandPermission.Operator, parts => ExecuteDirectGameMode(GameMode.Veilseer, parts));
+        RegisterCommand("difficulty", new[] { "diff" }, "/difficulty <peaceful|easy|normal|hard>", "/difficulty normal", "Set difficulty.", CommandPermission.Operator, ExecuteDifficultyCommand);
+        RegisterCommand("seed", Array.Empty<string>(), "/seed", "/seed", "Show current world seed.", CommandPermission.Operator, ExecuteSeedCommand);
+        RegisterCommand("rules", new[] { "rule" }, "/rules [<rule> [value]]", "/rules sigil on", "Inspect or set world rules.", CommandPermission.Operator, ExecuteRulesCommand);
+        RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <ticks>]", "/time set 6000", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
+        RegisterCommand("weather", Array.Empty<string>(), "/weather [query|clear|rain|storm]", "/weather rain", "Set or inspect weather.", CommandPermission.Operator, ExecuteWeatherCommand);
+        RegisterCommand("setspawn", Array.Empty<string>(), "/setspawn [x y z]", "/setspawn 128 70 128", "Set world spawn.", CommandPermission.Operator, ExecuteSetSpawnCommand);
+        RegisterCommand("op", Array.Empty<string>(), "/op <player>", "/op Redacted", "Grant operator permissions to a player.", CommandPermission.HostOnly, ExecuteOpCommand);
+        RegisterCommand("deop", Array.Empty<string>(), "/deop <player>", "/deop Redacted", "Revoke operator permissions from a player.", CommandPermission.HostOnly, ExecuteDeopCommand);
+        RegisterCommand("kick", Array.Empty<string>(), "/kick <player> [reason]", "/kick Redacted griefing", "Kick a player from the current hosted world.", CommandPermission.HostOnly, ExecuteKickCommand);
+        RegisterCommand("spawn", Array.Empty<string>(), "/spawn", "/spawn", "Teleport to world spawn.", CommandPermission.Everyone, ExecuteSpawnCommand);
+        RegisterCommand("sethome", Array.Empty<string>(), "/sethome [name]", "/sethome base", "Set or update a named home.", CommandPermission.Everyone, ExecuteSetHomeCommand);
+        RegisterCommand("home", Array.Empty<string>(), "/home [name|list|gui|set|rename|delete|icon]", "/home set base", "Teleport/manage homes.", CommandPermission.Everyone, ExecuteHomeCommand);
+        RegisterCommand("me", Array.Empty<string>(), "/me <action>", "/me waves", "Broadcast an action message.", CommandPermission.Everyone, ExecuteMeCommand);
+        RegisterCommand("msg", Array.Empty<string>(), "/msg <player> <message>", "/msg Redacted meet at spawn", "Send a private message.", CommandPermission.Everyone, ExecuteMsgCommand);
+        RegisterCommand("chatclear", new[] { "clearchat", "cc" }, "/chatclear", "/chatclear", "Clear chat history (with confirmation).", CommandPermission.Everyone, ExecuteChatClearCommand);
+        RegisterCommand("give", Array.Empty<string>(), "/give [player] <item|id> [amount]", "/give stone 64", "Give an item/block by token or numeric id.", CommandPermission.Operator, ExecuteGiveCommand);
+        RegisterCommand("clear", Array.Empty<string>(), "/clear [player] [item|id]", "/clear Redacted", "Clear whole inventory (confirmation) or clear a specific item.", CommandPermission.Operator, ExecuteClearInventoryCommand);
+        RegisterCommand("inv", new[] { "inventory" }, "/inv [clear|player]", "/inv Redacted", "View live inventory or clear inventory view.", CommandPermission.Everyone, ExecuteInvCommand);
+        RegisterCommand("pos", Array.Empty<string>(), "/pos [player]", "/pos", "Show player's exact coordinates with one-click copy.", CommandPermission.Everyone, ExecutePosCommand);
+        RegisterCommand("broadcast", new[] { "bc" }, "/broadcast <message>", "/broadcast Server restart soon", "Send a broadcast message to everyone.", CommandPermission.Everyone, ExecuteBroadcastCommand);
+        RegisterCommand("sigil", Array.Empty<string>(), "/sigil <empty|positive <0-100>|negative <0-100>|set <atonement> <curse>>", "/sigil set 35 10", "Debug the split sigil HUD Atonement/Curse amounts.", CommandPermission.Operator, ExecuteSigilCommand);
+        RegisterCommand("commandclear", Array.Empty<string>(), "/commandclear", "/commandclear", "Clear command entries from shared input history.", CommandPermission.Everyone, ExecuteCommandClearCommand);
     }
 
     private void RegisterCommand(
         string name,
         string[] aliases,
         string usage,
+        string example,
         string description,
         CommandPermission permission,
         Action<string[]> handler)
     {
-        var descriptor = new CommandDescriptor(name, aliases, usage, description, permission, handler);
+        var descriptor = new CommandDescriptor(name, aliases, usage, example, description, permission, handler);
         _commandDescriptors.Add(descriptor);
         _commandLookup[name] = descriptor;
         for (var i = 0; i < aliases.Length; i++)
             _commandLookup[aliases[i]] = descriptor;
+    }
+
+    private void SetCommandSyntax(string commandName, string? detail = null, bool echoToChat = true)
+    {
+        if (!_commandLookup.TryGetValue(commandName, out var descriptor))
+        {
+            SetCommandError(detail ?? "Command syntax is invalid. Use /help.", echoToChat: echoToChat);
+            return;
+        }
+
+        var message = string.IsNullOrWhiteSpace(detail)
+            ? $"Command syntax is invalid. Usage: {descriptor.Usage} Example: {descriptor.Example}"
+            : $"{detail} Usage: {descriptor.Usage} Example: {descriptor.Example}";
+        SetCommandError(message, echoToChat: echoToChat);
+    }
+
+    private void SetCommandError(string text, float seconds = 5f, bool echoToChat = true)
+    {
+        _commandStatusText = text;
+        _commandStatusTimer = Math.Max(0f, seconds);
+        if (echoToChat)
+            AddChatLine(text, isSystem: true, textColorOverride: CommandErrorColor);
     }
 
     private bool HasHostPermissions()
@@ -12567,7 +13694,6 @@ private float FindSafeSpawnHeight(float x, float z)
         var echoed = commandText.StartsWith("/", StringComparison.Ordinal) ? commandText : "/" + commandText;
         var username = _profile.GetDisplayUsername();
         AppendCommandHistoryRecord($"{username}: {echoed}");
-        AddChatLine($"{username}: {echoed}", isSystem: false, trackAsChatHistory: false);
 
         if (commandText.StartsWith("/", StringComparison.Ordinal))
             commandText = commandText.Substring(1);
@@ -12582,13 +13708,13 @@ private float FindSafeSpawnHeight(float x, float z)
         var commandName = parts[0].ToLowerInvariant();
         if (commandName == "findbiome")
         {
-            SetCommandStatus("Unknown command: /findbiome. Use /biome.");
+            SetCommandSyntax("biome", "Unknown command: /findbiome. Use /biome.");
             return;
         }
 
         if (!_commandLookup.TryGetValue(commandName, out var descriptor))
         {
-            SetCommandStatus($"Unknown command: /{commandName}. Use /help.");
+            SetCommandError($"Unknown command: /{commandName}. This is not a real command. Try /help.");
             return;
         }
 
@@ -12611,7 +13737,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /accept <username>");
+            SetCommandSyntax("accept");
             return;
         }
         _ = RespondToPendingJoinRequestAsync(commandParts[1], accept: true);
@@ -12621,7 +13747,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /reject <username>");
+            SetCommandSyntax("reject");
             return;
         }
         _ = RespondToPendingJoinRequestAsync(commandParts[1], accept: false);
@@ -12686,7 +13812,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (parts.Length < 2)
         {
-            SetCommandStatus("Usage: /whitelist <add|remove|list> [username]");
+            SetCommandSyntax("whitelist");
             return;
         }
 
@@ -12740,7 +13866,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (parts.Length < 3)
         {
-            SetCommandStatus($"Usage: /whitelist {sub} <username>");
+            SetCommandSyntax("whitelist", $"Whitelist syntax is invalid for '{sub}'.");
             return;
         }
 
@@ -13015,7 +14141,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (!TryResolveBiome(commandParts[1], out var targetBiomeToken, out var targetBiomeLabel))
         {
-            SetCommandStatus("Biome must be one of: desert, forest, hills, grasslands, ocean. Use /biome list.");
+            SetCommandSyntax("biome", "Unknown biome. Valid values: desert, forest, hills, grasslands, ocean.");
             return;
         }
 
@@ -13024,7 +14150,7 @@ private float FindSafeSpawnHeight(float x, float z)
         {
             if (!int.TryParse(commandParts[2], out maxRadius))
             {
-                SetCommandStatus("Radius must be a number.");
+                SetCommandSyntax("biome", "Biome radius must be a number.");
                 return;
             }
 
@@ -13039,7 +14165,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /structure <locate|list> [name]");
+            SetCommandSyntax("structure");
             return;
         }
 
@@ -13059,7 +14185,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
-        SetCommandStatus("Usage: /structure <locate|list> [name]");
+        SetCommandSyntax("structure", $"Unknown structure subcommand: {commandParts[1]}.");
     }
 
     private bool TryReportBiomeLocation(string targetBiomeToken, string targetBiomeLabel, int maxRadius)
@@ -13376,7 +14502,7 @@ private float FindSafeSpawnHeight(float x, float z)
                 !TryParseTeleportCoordinateToken(commandParts[2], baseY, out var parsedY) ||
                 !TryParseTeleportCoordinateToken(commandParts[3], baseZ, out var z))
             {
-                SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+                SetCommandSyntax("tp", "Teleport syntax is invalid.");
                 return;
             }
 
@@ -13390,7 +14516,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
-        SetCommandStatus("Usage: /tp <x|~dx> <z|~dz> | /tp <x|~dx> <y|~dy> <z|~dz> | /tp <player> | /tp <fromPlayer> <toPlayer>");
+        SetCommandSyntax("tp");
     }
 
     private static bool TryParseTeleportCoordinateToken(string token, int baseValue, out int result)
@@ -13524,7 +14650,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /gamemode <artificer|veilwalker|veilseer|gui> [player]");
+            SetCommandSyntax("gamemode");
             return;
         }
 
@@ -13537,7 +14663,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (!TryParseGameModeToken(commandParts[1], out var mode))
         {
-            SetCommandStatus("Gamemode must be artificer, veilwalker, or veilseer.");
+            SetCommandSyntax("gamemode", "Gamemode must be artificer, veilwalker, veilseer, or gui.");
             return;
         }
 
@@ -13641,7 +14767,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (!TryParseDifficultyToken(commandParts[1], out var difficulty))
         {
-            SetCommandStatus("Difficulty must be peaceful, easy, normal, or hard.");
+            SetCommandSyntax("difficulty", "Difficulty must be peaceful, easy, normal, or hard.");
             return;
         }
 
@@ -13682,7 +14808,7 @@ private float FindSafeSpawnHeight(float x, float z)
         var ruleKey = NormalizeWorldRuleKey(commandParts[1]);
         if (string.IsNullOrWhiteSpace(ruleKey))
         {
-            SetCommandStatus("Unknown rule. Use /rules to list available rules.");
+            SetCommandSyntax("rules", "Unknown rule.");
             return;
         }
 
@@ -13700,13 +14826,13 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (commandParts.Length > 3)
         {
-            SetCommandStatus("Usage: /rules [<rule> [value]]");
+            SetCommandSyntax("rules");
             return;
         }
 
         if (!TryNormalizeWorldRuleValue(ruleKey, commandParts[2], out var normalizedValue, out var normalizeError))
         {
-            SetCommandStatus(normalizeError);
+            SetCommandSyntax("rules", normalizeError);
             return;
         }
 
@@ -13741,9 +14867,10 @@ private float FindSafeSpawnHeight(float x, float z)
         TryGetWorldRuleValue("playercollision", out var playerCollision);
         TryGetWorldRuleValue("timecycle", out var timeCycle);
         TryGetWorldRuleValue("weathercycle", out var weatherCycle);
+        TryGetWorldRuleValue("sigil", out var sigil);
         TryGetWorldRuleValue("enablemultiplehomes", out var multipleHomes);
         TryGetWorldRuleValue("maxhomesperplayer", out var maxHomes);
-        return $"Rules: playercollision={playerCollision} | timecycle={timeCycle} | weathercycle={weatherCycle} | enablemultiplehomes={multipleHomes} | maxhomesperplayer={maxHomes}";
+        return $"Rules: playercollision={playerCollision} | timecycle={timeCycle} | weathercycle={weatherCycle} | sigil={sigil} | enablemultiplehomes={multipleHomes} | maxhomesperplayer={maxHomes}";
     }
 
     private static string NormalizeWorldRuleKey(string rawKey)
@@ -13755,6 +14882,7 @@ private float FindSafeSpawnHeight(float x, float z)
             "collision" => "playercollision",
             "timecycle" => "timecycle",
             "weathercycle" => "weathercycle",
+            "sigil" => "sigil",
             "enablemultiplehomes" => "enablemultiplehomes",
             "homes" => "enablemultiplehomes",
             "maxhomesperplayer" => "maxhomesperplayer",
@@ -13765,7 +14893,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private static bool IsBooleanWorldRule(string ruleKey)
     {
-        return ruleKey is "playercollision" or "timecycle" or "weathercycle" or "enablemultiplehomes";
+        return ruleKey is "playercollision" or "timecycle" or "weathercycle" or "sigil" or "enablemultiplehomes";
     }
 
     private static bool TryParseRuleBoolToken(string token, out bool enabled)
@@ -13852,6 +14980,11 @@ private float FindSafeSpawnHeight(float x, float z)
                 appliedValue = _weatherCycleEnabled ? "on" : "off";
                 status = _weatherCycleEnabled ? "Weather cycle enabled." : "Weather cycle disabled.";
                 break;
+            case "sigil":
+                _sigilPowerEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _sigilPowerEnabled ? "on" : "off";
+                status = _sigilPowerEnabled ? "Sigil power enabled." : "Sigil power disabled.";
+                break;
             case "enablemultiplehomes":
                 _meta.EnableMultipleHomes = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
                 if (!_meta.EnableMultipleHomes)
@@ -13897,6 +15030,9 @@ private float FindSafeSpawnHeight(float x, float z)
             case "weathercycle":
                 value = _weatherCycleEnabled ? "on" : "off";
                 return true;
+            case "sigil":
+                value = _sigilPowerEnabled ? "on" : "off";
+                return true;
             case "enablemultiplehomes":
                 value = _meta.EnableMultipleHomes ? "on" : "off";
                 return true;
@@ -13929,6 +15065,7 @@ private float FindSafeSpawnHeight(float x, float z)
         _meta.Gameplay ??= new GameplaySettings();
 
         _meta.Player.PlayerCollision = _meta.PlayerCollision;
+        _meta.Gameplay.EnableSigilPower = _sigilPowerEnabled;
         _meta.Gameplay.EnableMultipleHomes = _meta.EnableMultipleHomes;
         _meta.Gameplay.MaxHomesPerPlayer = _meta.MaxHomesPerPlayer;
         _meta.Gameplay.TimeCycleEnabled = _meta.TimeCycleEnabled;
@@ -13938,6 +15075,21 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (persist)
             _meta.Save(_metaPath, _log);
+    }
+
+    private void UpdateSigilHudAnimation(float dt)
+    {
+        if (dt <= 0f)
+            return;
+
+        var lerpAmount = 1f - MathF.Exp(-SigilHudAnimationLerp * dt);
+        _debugSigilPositiveFraction = MathHelper.Lerp(_debugSigilPositiveFraction, _sigilPositiveTargetFraction, lerpAmount);
+        _debugSigilNegativeFraction = MathHelper.Lerp(_debugSigilNegativeFraction, _sigilNegativeTargetFraction, lerpAmount);
+
+        if (MathF.Abs(_debugSigilPositiveFraction - _sigilPositiveTargetFraction) <= 0.0025f)
+            _debugSigilPositiveFraction = _sigilPositiveTargetFraction;
+        if (MathF.Abs(_debugSigilNegativeFraction - _sigilNegativeTargetFraction) <= 0.0025f)
+            _debugSigilNegativeFraction = _sigilNegativeTargetFraction;
     }
 
     private void UpdateWorldRuleCycles(float dt)
@@ -14009,7 +15161,7 @@ private float FindSafeSpawnHeight(float x, float z)
             case "set":
                 if (commandParts.Length < 3 || !int.TryParse(commandParts[2], out var ticks))
                 {
-                    SetCommandStatus("Usage: /time set <ticks>");
+                    SetCommandSyntax("time", "Time set syntax is invalid.");
                     return;
                 }
 
@@ -14018,7 +15170,7 @@ private float FindSafeSpawnHeight(float x, float z)
                 SetCommandStatus($"Time set to {_timeOfDayTicks}.");
                 return;
             default:
-                SetCommandStatus("Usage: /time [query|day|night|set <ticks>]");
+                SetCommandSyntax("time", $"Unknown time action: {commandParts[1]}.");
                 return;
         }
     }
@@ -14053,7 +15205,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
-        SetCommandStatus("Usage: /weather [query|clear|rain|storm]");
+        SetCommandSyntax("weather", $"Unknown weather action: {commandParts[1]}.");
     }
 
     private void ExecuteSetSpawnCommand(string[] commandParts)
@@ -14071,7 +15223,7 @@ private float FindSafeSpawnHeight(float x, float z)
         {
             if (!int.TryParse(commandParts[1], out x) || !int.TryParse(commandParts[2], out y) || !int.TryParse(commandParts[3], out z))
             {
-                SetCommandStatus("Usage: /setspawn [x y z]");
+                SetCommandSyntax("setspawn", "Setspawn coordinates must be whole numbers.");
                 return;
             }
         }
@@ -14094,7 +15246,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /op <player>");
+            SetCommandSyntax("op");
             return;
         }
 
@@ -14120,7 +15272,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /deop <player>");
+            SetCommandSyntax("deop");
             return;
         }
 
@@ -14145,7 +15297,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /kick <player> [reason]");
+            SetCommandSyntax("kick");
             return;
         }
 
@@ -14263,7 +15415,7 @@ private float FindSafeSpawnHeight(float x, float z)
             case "set":
                 if (commandParts.Length < 3)
                 {
-                    SetCommandStatus("Usage: /home set <name>");
+                    SetCommandSyntax("home", "Home set syntax is invalid.");
                     return;
                 }
 
@@ -14278,7 +15430,7 @@ private float FindSafeSpawnHeight(float x, float z)
             case "rename":
                 if (commandParts.Length < 4)
                 {
-                    SetCommandStatus("Usage: /home rename <old> <new>");
+                    SetCommandSyntax("home", "Home rename syntax is invalid.");
                     return;
                 }
 
@@ -14307,7 +15459,7 @@ private float FindSafeSpawnHeight(float x, float z)
             case "remove":
                 if (commandParts.Length < 3)
                 {
-                    SetCommandStatus("Usage: /home delete <name>");
+                    SetCommandSyntax("home", "Home delete syntax is invalid.");
                     return;
                 }
 
@@ -14327,7 +15479,7 @@ private float FindSafeSpawnHeight(float x, float z)
             case "icon":
                 if (commandParts.Length < 4)
                 {
-                    SetCommandStatus("Usage: /home icon <name> <block|auto>");
+                    SetCommandSyntax("home", "Home icon syntax is invalid.");
                     return;
                 }
 
@@ -14455,7 +15607,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
-        if (input.IsNewKeyPress(_homeGuiKey) && !_homeGuiNameInputFocused && _homeGuiEditIndex < 0)
+        if (IsNewActionPress(input, "HomeGui", Keys.H) && !_homeGuiNameInputFocused && _homeGuiEditIndex < 0)
         {
             _homeGuiOpen = false;
             _homeGuiNameInputFocused = false;
@@ -14989,7 +16141,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
-        if (input.IsNewKeyPress(_structureFinderKey))
+        if (IsNewActionPress(input, "StructureFinder", Keys.B))
         {
             _structureFinderOpen = false;
             return;
@@ -15111,7 +16263,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /me <action>");
+            SetCommandSyntax("me");
             return;
         }
 
@@ -15137,7 +16289,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 3)
         {
-            SetCommandStatus("Usage: /msg <player> <message>");
+            SetCommandSyntax("msg");
             return;
         }
 
@@ -15200,7 +16352,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /give [player] <item_name|id> [amount]. Use TAB for autocomplete.");
+            SetCommandSyntax("give");
             return;
         }
 
@@ -15242,7 +16394,7 @@ private float FindSafeSpawnHeight(float x, float z)
         itemToken = string.Join(" ", itemParts);
         if (!TryResolveInventoryItemToken(itemToken, out var itemId))
         {
-            SetCommandStatus($"Unknown item/block: {itemToken}");
+            SetCommandSyntax("give", $"Unknown item or block: {itemToken}.");
             return;
         }
 
@@ -15305,7 +16457,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
             if (!TryResolvePlayerTarget(args[0], out targetId, out targetName))
             {
-                SetCommandStatus($"Player not found or invalid item: {args[0]}");
+                SetCommandSyntax("clear", $"Unknown player or item: {args[0]}.");
                 return;
             }
         }
@@ -15515,14 +16667,14 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2)
         {
-            SetCommandStatus("Usage: /broadcast <message>");
+            SetCommandSyntax("broadcast");
             return;
         }
 
         var text = string.Join(" ", commandParts.Skip(1)).Trim();
         if (string.IsNullOrWhiteSpace(text))
         {
-            SetCommandStatus("Usage: /broadcast <message>");
+            SetCommandSyntax("broadcast");
             return;
         }
 
@@ -15544,6 +16696,97 @@ private float FindSafeSpawnHeight(float x, float z)
 
         AddChatLine(line, isSystem: true);
         SetCommandStatus("Broadcast sent.", 3f, echoToChat: false);
+    }
+
+    private void ExecuteSigilCommand(string[] commandParts)
+    {
+        if (!_sigilPowerEnabled)
+        {
+            SetCommandStatus("Sigil power is disabled in this world. Use /rule sigil enabled to turn it back on.", 4f, echoToChat: false);
+            return;
+        }
+
+        if (commandParts.Length < 2)
+        {
+            SetCommandSyntax("sigil", echoToChat: false);
+            return;
+        }
+
+        switch (commandParts[1].ToLowerInvariant())
+        {
+            case "empty":
+            case "clear":
+                _sigilPositiveTargetFraction = 0f;
+                _sigilNegativeTargetFraction = 0f;
+                MarkPlayerStateDirty();
+                SavePlayerState();
+                SetCommandStatus("Sigil meter reset to EMPTY.", 3f, echoToChat: false);
+                return;
+
+            case "positive":
+                if (commandParts.Length < 3 || !TryParseSigilPercent(commandParts[2], out var positiveValue))
+                {
+                    SetCommandSyntax("sigil", "Sigil positive syntax is invalid.", echoToChat: false);
+                    return;
+                }
+
+                _sigilPositiveTargetFraction = positiveValue;
+                MarkPlayerStateDirty();
+                SavePlayerState();
+                SetCommandStatus($"Sigil {SigilPositiveLabel} target set to {MathF.Round(_sigilPositiveTargetFraction * 100f):0}%.", 3f, echoToChat: false);
+                return;
+
+            case "negative":
+                if (commandParts.Length < 3 || !TryParseSigilPercent(commandParts[2], out var negativeValue))
+                {
+                    SetCommandSyntax("sigil", "Sigil negative syntax is invalid.", echoToChat: false);
+                    return;
+                }
+
+                _sigilNegativeTargetFraction = negativeValue;
+                MarkPlayerStateDirty();
+                SavePlayerState();
+                SetCommandStatus($"Sigil {SigilNegativeLabel} target set to {MathF.Round(_sigilNegativeTargetFraction * 100f):0}%.", 3f, echoToChat: false);
+                return;
+
+            case "set":
+                if (commandParts.Length < 4
+                    || !TryParseSigilPercent(commandParts[2], out var positiveSetValue)
+                    || !TryParseSigilPercent(commandParts[3], out var negativeSetValue))
+                {
+                    SetCommandSyntax("sigil", "Sigil set syntax is invalid.", echoToChat: false);
+                    return;
+                }
+
+                _sigilPositiveTargetFraction = positiveSetValue;
+                _sigilNegativeTargetFraction = negativeSetValue;
+                MarkPlayerStateDirty();
+                SavePlayerState();
+                SetCommandStatus(
+                    $"Sigil set: {SigilPositiveLabel} {MathF.Round(_sigilPositiveTargetFraction * 100f):0}% | {SigilNegativeLabel} {MathF.Round(_sigilNegativeTargetFraction * 100f):0}%.",
+                    4f,
+                    echoToChat: false);
+                return;
+        }
+
+        SetCommandSyntax("sigil", echoToChat: false);
+    }
+
+    private static bool TryParseSigilPercent(string token, out float fraction)
+    {
+        fraction = 0f;
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        token = token.Trim();
+        if (token.EndsWith('%'))
+            token = token[..^1];
+
+        if (!float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+            return false;
+
+        fraction = Math.Clamp(percent / 100f, 0f, 1f);
+        return true;
     }
 
     private void ExecuteInvCommand(string[] commandParts)
@@ -16396,6 +17639,9 @@ private float FindSafeSpawnHeight(float x, float z)
         if (persistImmediately)
             SavePlayerState();
 
+        if (modeChanged && target == GameMode.Veilwalker && source != GameModeChangeSource.Load)
+            TryShowAttunementWipPopup();
+
         if (!emitFeedback || !modeChanged)
             return;
 
@@ -16417,8 +17663,8 @@ private float FindSafeSpawnHeight(float x, float z)
         if (_pauseMenuOpen || _inventoryOpen || _homeGuiOpen || _chatInputActive || _commandInputActive)
             return false;
 
-        var modifierDown = input.IsKeyDown(_gamemodeModifierKey);
-        var wheelKeyPressed = input.IsNewKeyPress(_gamemodeWheelKey);
+        var modifierDown = IsActionDown(input, "GamemodeModifier", Keys.LeftAlt);
+        var wheelKeyPressed = IsNewActionPress(input, "GamemodeWheel", Keys.G);
         if (modifierDown && wheelKeyPressed && !IsGamemodeWheelAllowedWithCheats())
         {
             _gamemodeWheelVisible = false;
@@ -16595,7 +17841,7 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
 
         var label = _thirdPersonFreeLookHeld
-            ? $"FREE LOOK ({FormatKeyLabel(_gamemodeModifierKey)} HELD)"
+            ? $"FREE LOOK ({FormatBindingLabel("GamemodeModifier", Keys.LeftAlt)} HELD)"
             : "FOLLOW CAMERA";
         var borderColor = _thirdPersonFreeLookHeld
             ? new Color(250, 220, 120, 210)
@@ -16660,7 +17906,7 @@ private float FindSafeSpawnHeight(float x, float z)
         }
 
         var help = _gamemodeWheelHoldToOpen
-            ? $"{FormatKeyLabel(_gamemodeModifierKey)}+{FormatKeyLabel(_gamemodeWheelKey)} HOLD: release to apply | HOLD {FormatKeyLabel(_gamemodeModifierKey)} + TAP {FormatKeyLabel(_gamemodeWheelKey)}: cycle"
+            ? $"{FormatBindingLabel("GamemodeModifier", Keys.LeftAlt)}+{FormatBindingLabel("GamemodeWheel", Keys.G)} HOLD: release to apply | HOLD {FormatBindingLabel("GamemodeModifier", Keys.LeftAlt)} + TAP {FormatBindingLabel("GamemodeWheel", Keys.G)}: cycle"
             : "Click or Enter to apply | Esc to cancel";
         var helpSize = _font.MeasureString(help);
         _font.DrawString(sb, help, new Vector2(center.X - helpSize.X / 2f, center.Y - _font.LineHeight / 2f), new Color(235, 235, 235));
@@ -17340,12 +18586,7 @@ private float FindSafeSpawnHeight(float x, float z)
         if (!IsTextInputActive && !hasVisibleChatLines && !hasInviteQuickOverlay)
             return;
 
-        var x = _viewport.X + 20;
-        var overlayWidth = Math.Clamp((int)MathF.Round(_viewport.Width * ChatOverlayWidthRatio), ChatOverlayMinWidth, ChatOverlayMaxWidth);
-        var reservedAboveBottomUi = _hotbarRect.Y > 0 ? _hotbarRect.Y - 92 : _viewport.Bottom - 20;
-        var y = Math.Min(_viewport.Bottom - 20, reservedAboveBottomUi);
-        y = Math.Max(_viewport.Y + 160, y);
-        var overlayTop = _viewport.Y + 120;
+        GetChatOverlayLayout(out var x, out var overlayWidth, out var overlayTop, out var y);
         if (IsTextInputActive)
         {
             var tintRect = new Rectangle(x - 8, overlayTop, overlayWidth + 16, Math.Max(24, y - overlayTop + 10));
@@ -17391,7 +18632,7 @@ private float FindSafeSpawnHeight(float x, float z)
         {
             var hasPendingJoin = TryGetNewestPendingJoinRequest(out var pendingPeerId, out var pendingDisplay);
             var inviteName = hasPendingJoin ? pendingDisplay : "PLAYER";
-            var keyLabel = FormatKeyLabel(_inviteQuickActionKey);
+            var keyLabel = FormatBindingLabel("InviteQuickAction", Keys.Y);
             string inviteText;
             if (_inviteQuickStatusTimer > 0f && !string.IsNullOrWhiteSpace(_inviteQuickStatusText))
             {
@@ -18024,12 +19265,13 @@ private float FindSafeSpawnHeight(float x, float z)
 
         var text = _displayName.ToUpperInvariant();
         var size = _font.MeasureString(text);
-        
-        // Draw above hotbar
         var alpha = Math.Min(1.0f, _selectedNameTimer);
-        var pos = new Vector2((_viewport.Width - size.X) / 2f, _hotbarRect.Y - size.Y - 10f);
+        Vector2 pos;
+        if (TryGetSigilHudRect(out var sigilRect))
+            pos = new Vector2((_viewport.Width - size.X) / 2f, sigilRect.Y - size.Y - 8f);
+        else
+            pos = new Vector2((_viewport.Width - size.X) / 2f, _hotbarRect.Y - size.Y - 10f);
         
-        // Shadow/Glow effect
         _font.DrawString(sb, text, pos + new Vector2(2, 2), Color.Black * 0.6f * alpha);
         _font.DrawString(sb, text, pos, Color.White * alpha);
     }
@@ -18098,6 +19340,7 @@ private float FindSafeSpawnHeight(float x, float z)
             string name,
             string[] aliases,
             string usage,
+            string example,
             string description,
             CommandPermission permission,
             Action<string[]> handler)
@@ -18105,6 +19348,7 @@ private float FindSafeSpawnHeight(float x, float z)
             Name = name;
             Aliases = aliases;
             Usage = usage;
+            Example = example;
             Description = description;
             Permission = permission;
             Handler = handler;
@@ -18113,6 +19357,7 @@ private float FindSafeSpawnHeight(float x, float z)
         public string Name { get; }
         public string[] Aliases { get; }
         public string Usage { get; }
+        public string Example { get; }
         public string Description { get; }
         public CommandPermission Permission { get; }
         public Action<string[]> Handler { get; }

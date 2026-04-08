@@ -72,6 +72,14 @@ public sealed class InputState
 
     public bool IsNewMiddleClick() => _mouse.MiddleButton == global::Microsoft.Xna.Framework.Input.ButtonState.Pressed && _prevMouse.MiddleButton == global::Microsoft.Xna.Framework.Input.ButtonState.Released;
 
+    public bool IsXButton1Down() => _mouse.XButton1 == global::Microsoft.Xna.Framework.Input.ButtonState.Pressed;
+
+    public bool IsNewXButton1Click() => _mouse.XButton1 == global::Microsoft.Xna.Framework.Input.ButtonState.Pressed && _prevMouse.XButton1 == global::Microsoft.Xna.Framework.Input.ButtonState.Released;
+
+    public bool IsXButton2Down() => _mouse.XButton2 == global::Microsoft.Xna.Framework.Input.ButtonState.Pressed;
+
+    public bool IsNewXButton2Click() => _mouse.XButton2 == global::Microsoft.Xna.Framework.Input.ButtonState.Pressed && _prevMouse.XButton2 == global::Microsoft.Xna.Framework.Input.ButtonState.Released;
+
     public void SetUiTransform(float scale, Point offset)
     {
         _uiScale = scale <= 0.01f ? 1f : scale;

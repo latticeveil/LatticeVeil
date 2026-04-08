@@ -504,6 +504,7 @@ public static class Program
             Directory.CreateDirectory(Paths.ScreenshotsDir);
             Directory.CreateDirectory(Paths.WorldsDir);
             Directory.CreateDirectory(Paths.MultiplayerWorldsDir);
+            JoinedWorldCache.TryClearAll(log);
             DeleteLegacyMultiplayerWorldCaches(log);
             DeleteLegacyConfigFolder(log);
 

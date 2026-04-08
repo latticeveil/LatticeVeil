@@ -7,7 +7,7 @@ namespace LatticeVeilMonoGame.Core;
 
 public sealed class PlayerWorldState
 {
-    private const int CurrentVersion = 6;
+    private const int CurrentVersion = 9;
 
     public int Version { get; set; } = CurrentVersion;
     public string Username { get; set; } = "";
@@ -27,6 +27,11 @@ public sealed class PlayerWorldState
     public HotbarSlot[] Hotbar { get; set; } = new HotbarSlot[Inventory.HotbarSize];
     public HotbarSlot[] InventoryGrid { get; set; } = new HotbarSlot[Inventory.GridSize];
     public int[] ArtificerFavoriteBlockIds { get; set; } = Array.Empty<int>();
+    public int Health { get; set; } = SurvivalVitals.MaxHealth;
+    public int Hunger { get; set; } = SurvivalVitals.MaxHunger;
+    public float SigilAtonement { get; set; }
+    public float SigilCurse { get; set; }
+    public bool HasSeenAttunementWipPopup { get; set; }
 
     public static PlayerWorldState LoadOrDefault(string worldPath, string username, Func<PlayerWorldState> defaultFactory, Logger log)
     {
@@ -75,6 +80,16 @@ public sealed class PlayerWorldState
                         state.HomeZ = homeZ;
                     if (int.TryParse(data.GetValueOrDefault("selectedIndex"), out var selectedIndex))
                         state.SelectedIndex = selectedIndex;
+                    if (int.TryParse(data.GetValueOrDefault("health"), out var health))
+                        state.Health = health;
+                    if (int.TryParse(data.GetValueOrDefault("hunger"), out var hunger))
+                        state.Hunger = hunger;
+                    if (float.TryParse(data.GetValueOrDefault("sigilAtonement"), out var sigilAtonement))
+                        state.SigilAtonement = sigilAtonement;
+                    if (float.TryParse(data.GetValueOrDefault("sigilCurse"), out var sigilCurse))
+                        state.SigilCurse = sigilCurse;
+                    if (bool.TryParse(data.GetValueOrDefault("hasSeenAttunementWipPopup"), out var hasSeenAttunementWipPopup))
+                        state.HasSeenAttunementWipPopup = hasSeenAttunementWipPopup;
                     
                     // Load homes
                     if (int.TryParse(data.GetValueOrDefault("homesCount"), out var homesCount) && homesCount > 0)
@@ -193,7 +208,12 @@ public sealed class PlayerWorldState
                 ["homeX"] = HomeX.ToString("F6"),
                 ["homeY"] = HomeY.ToString("F6"),
                 ["homeZ"] = HomeZ.ToString("F6"),
-                ["selectedIndex"] = SelectedIndex.ToString()
+                ["selectedIndex"] = SelectedIndex.ToString(),
+                ["health"] = Health.ToString(),
+                ["hunger"] = Hunger.ToString(),
+                ["sigilAtonement"] = SigilAtonement.ToString("F6"),
+                ["sigilCurse"] = SigilCurse.ToString("F6"),
+                ["hasSeenAttunementWipPopup"] = HasSeenAttunementWipPopup.ToString()
             };
             
             // Save homes
@@ -304,6 +324,11 @@ public sealed class PlayerWorldState
         bw.Write(HomeY);
         bw.Write(HomeZ);
         bw.Write(SelectedIndex);
+        bw.Write(Health);
+        bw.Write(Hunger);
+        bw.Write(SigilAtonement);
+        bw.Write(SigilCurse);
+        bw.Write(HasSeenAttunementWipPopup);
 
         var hotbarSlots = Hotbar ?? Array.Empty<HotbarSlot>();
         var hotbarCount = Math.Min(hotbarSlots.Length, Inventory.HotbarSize);
@@ -399,6 +424,20 @@ public sealed class PlayerWorldState
             state.HomeY = br.ReadSingle();
             state.HomeZ = br.ReadSingle();
             state.SelectedIndex = br.ReadInt32();
+            if (version >= 7)
+            {
+                state.Health = br.ReadInt32();
+                state.Hunger = br.ReadInt32();
+            }
+
+            if (version >= 8)
+            {
+                state.SigilAtonement = br.ReadSingle();
+                state.SigilCurse = br.ReadSingle();
+            }
+
+            if (version >= 9)
+                state.HasSeenAttunementWipPopup = br.ReadBoolean();
 
             var hotbarCount = br.ReadByte();
             state.Hotbar = new HotbarSlot[Inventory.HotbarSize];

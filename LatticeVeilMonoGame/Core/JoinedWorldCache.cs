@@ -8,6 +8,24 @@ namespace LatticeVeilMonoGame.Core;
 
 public static class JoinedWorldCache
 {
+    public static void TryClearAll(Logger log)
+    {
+        var root = Path.Combine(Paths.MultiplayerWorldsDir, "Joined");
+        if (!Directory.Exists(root))
+            return;
+
+        try
+        {
+            Directory.Delete(root, recursive: true);
+            log.Info($"Cleared joined world cache: {root}");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to clear joined world cache '{root}': {ex.Message}");
+            TryCleanDirectoryContents(root, log);
+        }
+    }
+
     public static string PrepareJoinedWorldPath(LanWorldInfo info, Logger log)
     {
         var root = Path.Combine(Paths.MultiplayerWorldsDir, "Joined");

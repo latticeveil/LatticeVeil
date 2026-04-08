@@ -16,6 +16,7 @@ public sealed class Game1 : Game
     // Optional global time hook for screens that want a stable animation clock without threading GameTime everywhere.
     // (Some experimental UI code references this; keep it lightweight.)
     public static TimeSpan TotalGameTime { get; private set; }
+    public static bool WindowIsActive { get; private set; } = true;
 
     private readonly GameStartOptions? _startOptions;
 
@@ -51,8 +52,9 @@ public sealed class Game1 : Game
     private const double StallThresholdSeconds = 2.0;
     private const double StallLogCooldownSeconds = 10.0;
     private Vector2 _smoothedLookDelta = Vector2.Zero;
-    private const float CaptureDeltaSmoothing = 0.85f; // Reduced smoothing for responsiveness
+    private const float CaptureDeltaSmoothing = 0.70f;
     private const int CaptureDeltaClampPixels = 200;
+    private const int CaptureDeltaDeadzonePixels = 2;
     private const float CaptureDeltaClampRadians = 0.45f;
 
 	public PlayerProfile Profile => _profile;
@@ -213,6 +215,7 @@ public sealed class Game1 : Game
         // Input is suppressed while inactive, but loading/network/refresh continue.
         if (!IsActive)
         {
+            WindowIsActive = false;
             if (_wasActive)
             {
                 _log.Info("Window lost focus - releasing mouse capture and resetting input");
@@ -221,10 +224,12 @@ public sealed class Game1 : Game
             _input.Reset();
             _wasActive = false;
             _lastUpdateSeconds = gameTime.TotalGameTime.TotalSeconds;
+            _menus.Update(gameTime, _input);
             base.Update(gameTime);
             return;
         }
 
+        WindowIsActive = true;
         if (!_wasActive)
         {
             _log.Info("Window gained focus - reinitializing input");
@@ -427,20 +432,25 @@ public sealed class Game1 : Game
                 var clampedPxX = Math.Clamp(deltaPx.X, -CaptureDeltaClampPixels, CaptureDeltaClampPixels);
                 var clampedPxY = Math.Clamp(deltaPx.Y, -CaptureDeltaClampPixels, CaptureDeltaClampPixels);
                 
-                // Reduce deadzone to prevent sticky movement
-                if (Math.Abs(clampedPxX) <= 0.5f) clampedPxX = 0;
-                if (Math.Abs(clampedPxY) <= 0.5f) clampedPxY = 0;
-                
+                if (Math.Abs(clampedPxX) <= CaptureDeltaDeadzonePixels) clampedPxX = 0;
+                if (Math.Abs(clampedPxY) <= CaptureDeltaDeadzonePixels) clampedPxY = 0;
+
+                if (clampedPxX == 0 && clampedPxY == 0)
+                {
+                    _smoothedLookDelta = Vector2.Zero;
+                    _input.SetLookDelta(Vector2.Zero);
+                    Mouse.SetPosition(_captureCenter.X, _captureCenter.Y);
+                    return;
+                }
+
                 var delta = new Vector2(clampedPxX * sensitivity, clampedPxY * sensitivity);
                 delta.X = Math.Clamp(delta.X, -CaptureDeltaClampRadians, CaptureDeltaClampRadians);
                 delta.Y = Math.Clamp(delta.Y, -CaptureDeltaClampRadians, CaptureDeltaClampRadians);
-                
-                // Apply lighter smoothing to maintain responsiveness
+
                 _smoothedLookDelta = Vector2.Lerp(_smoothedLookDelta, delta, CaptureDeltaSmoothing);
                 _input.SetLookDelta(_smoothedLookDelta);
             }
-            
-            // Recenter mouse AFTER reading state and computing delta
+
             Mouse.SetPosition(_captureCenter.X, _captureCenter.Y);
         }
         else

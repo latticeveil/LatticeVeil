@@ -1250,8 +1250,9 @@ public sealed class CreateWorldScreen : IScreen
             _log.Info($"World created successfully: {result.WorldName}.");
             _onWorldCreated?.Invoke(result.WorldName);
             var metaPath = Paths.ResolveWorldMetaPath(result.WorldPath);
+            var startPaused = !global::LatticeVeilMonoGame.Game1.WindowIsActive;
             _menus.Pop();
-            _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, result.WorldPath, metaPath), _viewport);
+            _menus.Push(new GameWorldScreen(_menus, _assets, _font, _pixel, _log, _profile, _graphics, result.WorldPath, metaPath, startPaused: startPaused, showAttunementWipPopup: _selectedGameMode == Core.GameMode.Veilwalker), _viewport);
             return;
         }
 

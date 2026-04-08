@@ -1,6 +1,5 @@
 using System;
 using System.Threading.Tasks;
-using WinClipboard = System.Windows.Forms.Clipboard;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -22,8 +21,6 @@ public sealed class AddFriendScreen : IScreen
     private readonly Logger _log;
     private readonly PlayerProfile _profile;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
-    private readonly EosClient? _eos;
-
     private readonly Button _addBtn;
     private readonly Button _backBtn;
 
@@ -55,7 +52,6 @@ public sealed class AddFriendScreen : IScreen
         _log = log;
         _profile = profile;
         _graphics = graphics;
-        _eos = eos;
 
         _addBtn = new Button("ADD", () => _ = SendRequestAsync()) { BoldText = true };
         _backBtn = new Button("BACK", () => _menus.Pop()) { BoldText = true };
@@ -180,17 +176,10 @@ public sealed class AddFriendScreen : IScreen
         DrawBorder(sb, _infoRect, new Color(100, 100, 100));
         if (_lastLookupFound && _lastLookupUser != null)
         {
-            var lookupName = string.IsNullOrWhiteSpace(_lastLookupUser.DisplayName)
-                ? (_lastLookupUser.Username ?? string.Empty)
-                : _lastLookupUser.DisplayName;
+            var lookupName = (_lastLookupUser.Username ?? string.Empty).Trim();
             _font.DrawString(sb, "FOUND USER", new Vector2(_infoRect.X + 8, _infoRect.Y + 8), new Color(130, 230, 160));
             _font.DrawString(sb, lookupName, new Vector2(_infoRect.X + 8, _infoRect.Y + 8 + _font.LineHeight + 2), Color.White);
-            var id = (_lastLookupUser.ProductUserId ?? string.Empty).Trim();
-            if (!string.IsNullOrWhiteSpace(id))
-            {
-                var shortId = id.Length > 12 ? id[..12] : id;
-                _font.DrawString(sb, $"ID: {shortId}", new Vector2(_infoRect.X + 8, _infoRect.Y + 8 + ((_font.LineHeight + 2) * 2)), new Color(170, 178, 196));
-            }
+            _font.DrawString(sb, "READY TO SEND FRIEND REQUEST", new Vector2(_infoRect.X + 8, _infoRect.Y + 8 + ((_font.LineHeight + 2) * 2)), new Color(170, 178, 196));
         }
         else
         {

@@ -41,6 +41,9 @@ public static class Paths
     public static string AssetsDir =>
         Path.Combine(RootDir, "Assets");
 
+    public static string PacksDir =>
+        Path.Combine(RootDir, "Packs");
+
     /// <summary>
     /// Local development assets directory for dev builds.
     /// </summary>
@@ -148,6 +151,15 @@ public static class Paths
     public static string LegacyFriendLabelsJsonPath =>
         Path.Combine(RootDir, "friend_labels.json");
 
+    public static string VeilnetProfileCachePath =>
+        Path.Combine(RootDir, "veilnet_profile_cache.lvc");
+
+    public static string VeilnetAvatarCachePath =>
+        Path.Combine(RootDir, "veilnet_avatar_cache.bin");
+
+    public static string VeilnetBannerCachePath =>
+        Path.Combine(RootDir, "veilnet_banner_cache.bin");
+
     public static string GetWorldMetaPath(string worldPath) =>
         Path.Combine(worldPath, WorldMetaFileName);
 
@@ -172,16 +184,38 @@ public static class Paths
         try
         {
             Directory.CreateDirectory(AssetsDir);
+            Directory.CreateDirectory(PacksDir);
             Directory.CreateDirectory(TexturesDir);
             Directory.CreateDirectory(MenuTexturesDir);
             Directory.CreateDirectory(BlocksTexturesDir);
             Directory.CreateDirectory(Path.Combine(AssetsDir, "Models", "Blocks"));
+            EnsurePacksReadme(log);
 
             WarnIfLegacyAssetFoldersExist(log);
         }
         catch (Exception ex)
         {
             log.Warn($"Failed to create asset directories: {ex.Message}");
+        }
+    }
+
+    private static void EnsurePacksReadme(Logger log)
+    {
+        try
+        {
+            var readmePath = Path.Combine(PacksDir, "README.txt");
+            if (File.Exists(readmePath))
+                return;
+
+            File.WriteAllText(
+                readmePath,
+                "Drop content packs into this folder.\r\n" +
+                "Folder: Documents/LatticeVeil/Packs\r\n" +
+                "Each pack should live in its own subfolder.\r\n");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to create packs README: {ex.Message}");
         }
     }
 

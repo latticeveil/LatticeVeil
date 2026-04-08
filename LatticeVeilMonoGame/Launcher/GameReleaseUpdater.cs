@@ -62,6 +62,18 @@ public sealed class GameReleaseUpdater
     public static string UpdatesDir => Path.Combine(Paths.RootDir, "_updates");
     public static string DownloadsDir => Path.Combine(Paths.RootDir, "_downloads");
 
+    public void CleanupTransientStorage()
+    {
+        TryDeleteTransientFiles(DownloadsDir, "*.part");
+        TryDeleteTransientFiles(DownloadsDir, "*.update.exe");
+        TryDeleteTransientFiles(DownloadsDir, "*.update.part");
+        TryDeleteTransientFiles(UpdatesDir, "*.cmd");
+        TryDeleteTransientFiles(UpdatesDir, "*.bat");
+
+        TryDeleteEmptyDirectory(DownloadsDir);
+        TryDeleteEmptyDirectory(UpdatesDir);
+    }
+
     public static string GetCurrentVersionLabel()
     {
         var version = GetCurrentExecutableVersion(ResolveCurrentExecutablePath());
@@ -209,9 +221,12 @@ public sealed class GameReleaseUpdater
 
         Process.Start(new ProcessStartInfo
         {
-            FileName = scriptPath,
+            FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+            Arguments = $"/c \"\"{scriptPath}\"\"",
             WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? AppContext.BaseDirectory,
-            UseShellExecute = true
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
         });
     }
 
@@ -340,16 +355,22 @@ public sealed class GameReleaseUpdater
         sb.AppendLine($"set \"LV_PID={currentProcessId}\"");
         sb.AppendLine($"set \"LV_SRC={sourcePath}\"");
         sb.AppendLine($"set \"LV_DST={targetPath}\"");
+        sb.AppendLine("for %%I in (\"%LV_SRC%\") do set \"LV_DOWNLOADS=%%~dpI\"");
+        sb.AppendLine("for %%I in (\"%~f0\") do set \"LV_UPDATES=%%~dpI\"");
         sb.AppendLine(":wait_for_launcher");
         sb.AppendLine("tasklist /FI \"PID eq %LV_PID%\" | find /I \"%LV_PID%\" >nul");
         sb.AppendLine("if not errorlevel 1 (");
         sb.AppendLine("  timeout /t 1 /nobreak >nul");
         sb.AppendLine("  goto wait_for_launcher");
         sb.AppendLine(")");
-        sb.AppendLine($"copy /Y {quotedSource} {quotedTarget} >nul");
+        sb.AppendLine($"if exist {quotedTarget} del /F /Q {quotedTarget} >nul 2>nul");
+        sb.AppendLine($"move /Y {quotedSource} {quotedTarget} >nul");
         sb.AppendLine("if errorlevel 1 exit /b 1");
-        sb.AppendLine($"del /F /Q {quotedSource} >nul 2>nul");
+        sb.AppendLine("if exist \"%LV_SRC%\" del /F /Q \"%LV_SRC%\" >nul 2>nul");
+        sb.AppendLine("2>nul rd \"%LV_DOWNLOADS%\"");
         sb.AppendLine($"start \"\" {quotedTarget}{quotedRestartArgs}");
+        sb.AppendLine("start \"\" /B cmd /c \"ping 127.0.0.1 -n 2 >nul & del /F /Q \"%~f0\" >nul 2>nul & rd \"%LV_UPDATES%\" >nul 2>nul\"");
+        sb.AppendLine("exit /b 0");
         return sb.ToString();
     }
 
@@ -378,6 +399,40 @@ public sealed class GameReleaseUpdater
         {
             if (File.Exists(path))
                 File.Delete(path);
+        }
+        catch
+        {
+            // Best effort only.
+        }
+    }
+
+    private static void TryDeleteTransientFiles(string directory, string searchPattern)
+    {
+        try
+        {
+            if (!Directory.Exists(directory))
+                return;
+
+            foreach (var file in Directory.GetFiles(directory, searchPattern, SearchOption.TopDirectoryOnly))
+                TryDeleteFile(file);
+        }
+        catch
+        {
+            // Best effort only.
+        }
+    }
+
+    private static void TryDeleteEmptyDirectory(string path)
+    {
+        try
+        {
+            if (!Directory.Exists(path))
+                return;
+
+            if (Directory.EnumerateFileSystemEntries(path).Any())
+                return;
+
+            Directory.Delete(path, recursive: false);
         }
         catch
         {
