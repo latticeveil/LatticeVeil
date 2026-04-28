@@ -146,6 +146,7 @@ public sealed class GameReleaseUpdater
         if (check.Asset == null || string.IsNullOrWhiteSpace(check.Asset.browser_download_url))
             throw new InvalidOperationException("No downloadable EXE asset was available for the latest release.");
 
+        EnsureWritableDirectory(Path.GetDirectoryName(check.CurrentExecutablePath) ?? AppContext.BaseDirectory, "game install directory");
         EnsureWritableDirectory(DownloadsDir, "Documents\\LatticeVeil\\_downloads");
         Directory.CreateDirectory(DownloadsDir);
 
@@ -202,6 +203,7 @@ public sealed class GameReleaseUpdater
 
         Directory.CreateDirectory(UpdatesDir);
         EnsureWritableDirectory(UpdatesDir, "Documents\\LatticeVeil\\_updates");
+        EnsureWritableDirectory(Path.GetDirectoryName(currentExecutablePath) ?? AppContext.BaseDirectory, "game install directory");
 
         var scriptPath = Path.Combine(UpdatesDir, "apply_game_update.cmd");
         var script = BuildUpdateScript(
@@ -360,8 +362,6 @@ public sealed class GameReleaseUpdater
         var sb = new StringBuilder();
         sb.AppendLine("@echo off");
         sb.AppendLine("setlocal");
-        sb.AppendLine("set \"LV_ELEVATED=0\"");
-        sb.AppendLine("if /I \"%~1\"==\"--elevated\" set \"LV_ELEVATED=1\"");
         sb.AppendLine($"set \"LV_PID={currentProcessId}\"");
         sb.AppendLine($"set \"LV_SRC={sourcePath}\"");
         sb.AppendLine($"set \"LV_DST={targetPath}\"");
@@ -375,11 +375,7 @@ public sealed class GameReleaseUpdater
         sb.AppendLine(")");
         sb.AppendLine($"if exist {quotedTarget} del /F /Q {quotedTarget} >nul 2>nul");
         sb.AppendLine($"move /Y {quotedSource} {quotedTarget} >nul");
-        sb.AppendLine("if errorlevel 1 (");
-        sb.AppendLine("  if \"%LV_ELEVATED%\"==\"1\" exit /b 1");
-        sb.AppendLine("  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process -FilePath $env:ComSpec -ArgumentList '/c \"\"%~f0\"\" --elevated' -Verb RunAs\" >nul 2>nul");
-        sb.AppendLine("  exit /b 0");
-        sb.AppendLine(")");
+        sb.AppendLine("if errorlevel 1 exit /b 1");
         sb.AppendLine("if exist \"%LV_SRC%\" del /F /Q \"%LV_SRC%\" >nul 2>nul");
         sb.AppendLine("2>nul rd \"%LV_DOWNLOADS%\"");
         sb.AppendLine($"start \"\" {quotedTarget}{quotedRestartArgs}");
