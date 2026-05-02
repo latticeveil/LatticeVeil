@@ -1,0 +1,2988 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using LatticeVeilMonoGame.Core;
+using LatticeVeilMonoGame.Online.Eos;
+
+namespace LatticeVeilMonoGame.Online.Gate;
+
+public class OnlineGateClient
+{
+    private static readonly object Sync = new();
+    private static readonly object TicketSync = new();
+    private static readonly HttpClient Http = CreateHttpClient();
+    private static OnlineGateClient? _instance;
+    private const string DefaultGateUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
+    private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
+    private const string DefaultVeilnetUrl = "https://latticeveil.github.io/veilnet";
+    private static readonly TimeSpan DefaultTicketTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan[] TicketRetryDelays =
+    {
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(1500),
+        TimeSpan.FromMilliseconds(3000)
+    };
+
+    /// <summary>
+    /// Admin-only: submits the current build hash for runtime allowlist approval.
+    ///
+    /// Newer EOS-Service versions use POST /admin/allowlist/runtime/current-hash (requires admin bearer token).
+    /// Older builds used POST /admin/allowlist/runtime/submit. We attempt the new endpoint first and fall back on 404.
+    /// </summary>
+    public async Task<dynamic> SubmitHashForApprovalAsync(string hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash)) return new { Ok = false, Message = "Empty hash" };
+
+        var adminToken = (Environment.GetEnvironmentVariable("GATE_ADMIN_TOKEN")
+                          ?? Environment.GetEnvironmentVariable("LV_GATE_ADMIN_TOKEN")
+                          ?? "").Trim();
+
+        var target = _buildFlavor;
+        var v2 = $"{_gateUrl}/admin/allowlist/runtime/current-hash";
+        var legacy = $"{_gateUrl}/admin/allowlist/runtime/submit";
+
+        try
+        {
+            // Try the new endpoint first.
+            var v2Payload = new
+            {
+                hash = hash,
+                platform = BuildPlatform,
+                channel = target,
+                target = target,
+                replaceTargetList = true,
+                clearOtherHashes = false,
+                applyMode = "replace_source"
+            };
+
+            var (ok, msg, status) = await PostJsonWithOptionalBearerAsync(v2, v2Payload, adminToken, default).ConfigureAwait(false);
+            if (!ok && status == HttpStatusCode.NotFound)
+            {
+                // Fall back to the older endpoint (some legacy services accepted { hash } and responded with Ok/Message).
+                var legacyPayload = new { hash = hash };
+                (ok, msg, _) = await PostJsonWithOptionalBearerAsync(legacy, legacyPayload, adminToken, default).ConfigureAwait(false);
+            }
+
+            return new { Ok = ok, Message = msg };
+        }
+        catch (Exception ex)
+        {
+            return new { Ok = false, Message = ex.Message };
+        }
+    }
+
+    private static async Task<(bool Ok, string Message, HttpStatusCode StatusCode)> PostJsonWithOptionalBearerAsync(
+        string url,
+        object payload,
+        string bearerToken,
+        CancellationToken ct)
+    {
+        try
+        {
+            var j = JsonSerializer.Serialize(payload, JsonOptions);
+            using var m = new HttpRequestMessage(HttpMethod.Post, url);
+            if (!string.IsNullOrWhiteSpace(bearerToken))
+            {
+                m.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            }
+
+            m.Content = new StringContent(j, Encoding.UTF8, "application/json");
+
+            var r = await Http.SendAsync(m, ct).ConfigureAwait(false);
+            var body = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            if (!r.IsSuccessStatusCode)
+            {
+                var msg = string.IsNullOrWhiteSpace(body) ? (r.ReasonPhrase ?? "HTTP error") : body;
+                return (false, msg, r.StatusCode);
+            }
+
+            // Accept plain-text or JSON responses.
+            if (string.IsNullOrWhiteSpace(body)) return (true, "", r.StatusCode);
+
+            // If it isn't JSON, treat success as OK.
+            if (!body.TrimStart().StartsWith("{", StringComparison.Ordinal))
+            {
+                return (true, body, r.StatusCode);
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    var ok = TryGetBool(doc.RootElement, "ok", out var ok1) ? ok1 :
+                             TryGetBool(doc.RootElement, "Ok", out ok1) ? ok1 : true;
+
+                    var msg = TryGetString(doc.RootElement, "message")
+                              ?? TryGetString(doc.RootElement, "Message")
+                              ?? "";
+
+                    return (ok, msg, r.StatusCode);
+                }
+            }
+            catch
+            {
+                // Ignore parse errors and return body.
+            }
+
+            return (true, body, r.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message, (HttpStatusCode)0);
+        }
+    }
+
+    private static bool TryGetBool(JsonElement obj, string name, out bool value)
+    {
+        value = false;
+        if (!obj.TryGetProperty(name, out var p)) return false;
+
+        if (p.ValueKind == JsonValueKind.True) { value = true; return true; }
+        if (p.ValueKind == JsonValueKind.False) { value = false; return true; }
+        if (p.ValueKind == JsonValueKind.String && bool.TryParse(p.GetString(), out var b)) { value = b; return true; }
+        return false;
+    }
+
+    private static string? TryGetString(JsonElement obj, string name)
+    {
+        return obj.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
+    }
+
+    private readonly string _gateUrl;
+    private readonly bool _gateRequired;
+    private readonly string _proofPath;
+    private readonly string _buildFlavor;
+    private const string BuildPlatform = "windows";
+
+    private DateTime _ticketExpiresUtc = DateTime.MinValue;
+    private string _ticket = string.Empty;
+    private string _ticketProductUserId = string.Empty;
+    private string _status = "UNVERIFIED";
+    private string _denialReason = string.Empty;
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    public enum TicketCheckStatus
+    {
+        VerifiedAndTicketIssued,
+        HashMismatch,
+        MisconfiguredEndpoint,
+        ServiceUnavailable,
+        Unauthorized,
+        BadResponse
+    }
+
+    public readonly struct TicketCheckResult
+    {
+        public bool Ok { get; init; }
+        public TicketCheckStatus Status { get; init; }
+        public string Message { get; init; }
+    }
+
+    private OnlineGateClient()
+    {
+        _gateUrl = ResolveGateUrl();
+        var requiredValue = Environment.GetEnvironmentVariable("LV_GATE_REQUIRED");
+        _gateRequired = string.IsNullOrWhiteSpace(requiredValue) || ParseBool(requiredValue);
+        _proofPath = Path.Combine(AppContext.BaseDirectory, "official_build.sig");
+        _buildFlavor = Paths.IsDevBuild ? "dev" : "release";
+        TryRestorePreAuthorizedTicketFromEnvironment();
+    }
+
+    public static OnlineGateClient GetOrCreate() { lock (Sync) { _instance ??= new OnlineGateClient(); return _instance; } }
+
+    public bool IsGateRequired => _gateRequired;
+    public bool HasValidTicket => !string.IsNullOrWhiteSpace(_ticket) && DateTime.UtcNow < _ticketExpiresUtc;
+    public string DenialReason => _denialReason;
+
+    public bool TryGetValidTicketForChildProcess(out string ticket, out DateTime expiresUtc)
+    {
+        ticket = string.Empty; expiresUtc = DateTime.MinValue;
+        if (!HasValidTicket) return false;
+        ticket = _ticket; expiresUtc = _ticketExpiresUtc;
+        return true;
+    }
+
+    public void SetTicket(string ticket, DateTime expiresUtc, string? productUserId = null)
+    {
+        _ticket = ticket;
+        _ticketExpiresUtc = expiresUtc;
+        _ticketProductUserId = productUserId ?? "";
+        _status = "VERIFIED";
+    }
+
+    public async Task<bool> ClearOnlineTicketAsync(string? target = null)
+    {
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return false;
+
+        var request = new
+        {
+            target = (target ?? string.Empty).Trim().ToLowerInvariant()
+        };
+
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/online-ticket-clear",
+            $"{_gateUrl}/online_ticket_clear"
+        };
+
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await PostTicketCleanupRequestAsync(endpoints[i], request, accessToken, anonKey, useSupabaseHeaders: false).ConfigureAwait(false);
+            if (result)
+            {
+                InvalidateCachedTicket();
+                return true;
+            }
+
+            var fallback = await PostTicketCleanupRequestAsync(endpoints[i], request, accessToken, anonKey, useSupabaseHeaders: true).ConfigureAwait(false);
+            if (fallback)
+            {
+                InvalidateCachedTicket();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public void ClearOnlineTicketBeforeExit(Logger log, string? target = null, int timeoutMs = 1500)
+    {
+        try
+        {
+            var task = ClearOnlineTicketAsync(target);
+            if (!task.Wait(timeoutMs))
+                log.Warn($"online-ticket-clear timed out after {timeoutMs}ms");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"online-ticket-clear failed: {ex.Message}");
+        }
+    }
+
+    public string? ComputeCurrentHash(Logger log, string? target)
+    {
+        return TryComputeExecutableHash(target, out _, out var hash) ? hash : null;
+    }
+
+    public bool CanUseOfficialOnline(Logger log, out string denialMessage)
+    {
+        denialMessage = string.Empty;
+        if (!IsGateRequired || HasValidTicket) return true;
+        if (EnsureTicket(log)) return true;
+        denialMessage = string.IsNullOrWhiteSpace(_denialReason) ? "Online features unavailable." : _denialReason;
+        return false;
+    }
+
+    public bool EnsureTicket(Logger log, TimeSpan? timeout = null, string? target = null)
+    {
+        return EnsureTicketWithStatus(log, timeout, target).Ok;
+    }
+
+    public TicketCheckResult EnsureTicketWithStatus(Logger log, TimeSpan? timeout = null, string? target = null)
+    {
+        lock (TicketSync)
+        {
+            if (HasUsableTicketForCurrentIdentity())
+            {
+                return new TicketCheckResult
+                {
+                    Ok = true,
+                    Status = TicketCheckStatus.VerifiedAndTicketIssued,
+                    Message = "Ticket already valid."
+                };
+            }
+
+            using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
+            try
+            {
+                var result = Task.Run(() => EnsureTicketAsync(log, cts.Token, target)).GetAwaiter().GetResult();
+                _denialReason = result.Ok ? string.Empty : result.Message;
+                return result;
+            }
+            catch (OperationCanceledException ex)
+            {
+                _denialReason = ex.Message;
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.ServiceUnavailable,
+                    Message = "Ticket request timed out."
+                };
+            }
+            catch (Exception ex)
+            {
+                _denialReason = ex.Message;
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.ServiceUnavailable,
+                    Message = $"Ticket request failed: {ex.Message}"
+                };
+            }
+        }
+    }
+
+    public async Task<GatePresenceQueryResult> QueryPresenceAsync(IReadOnlyCollection<string> friendIds)
+    {
+        var requestedIds = (friendIds ?? Array.Empty<string>())
+            .Select(id => (id ?? string.Empty).Trim())
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        Debug.WriteLine($"[presence-query] request friendIds={requestedIds.Length}");
+        Console.WriteLine($"[presence-query] request friendIds={requestedIds.Length}");
+
+        if (requestedIds.Length == 0)
+            return new GatePresenceQueryResult { Ok = true, Entries = new List<GatePresenceEntry>() };
+
+        var entriesById = new Dictionary<string, GatePresenceEntry>(StringComparer.OrdinalIgnoreCase);
+        var serverResult = await QuerySupabaseGamePresenceAsync(requestedIds).ConfigureAwait(false);
+        if (serverResult.Ok)
+        {
+            for (var i = 0; i < serverResult.Entries.Count; i++)
+            {
+                var entry = serverResult.Entries[i];
+                if (!string.IsNullOrWhiteSpace(entry.ProductUserId))
+                    entriesById[entry.ProductUserId] = entry;
+            }
+        }
+
+        var eos = EosClientProvider.Current;
+        if (eos != null && eos.IsLoggedIn)
+        {
+            try
+            {
+                var lobbies = await eos.FindHostedLobbiesAsync(requestedIds).ConfigureAwait(false);
+                var nowUtc = DateTime.UtcNow;
+                for (var i = 0; i < lobbies.Count; i++)
+                {
+                    var lobby = lobbies[i];
+                    var productUserId = (lobby.HostProductUserId ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(productUserId))
+                        continue;
+                    if ((DateTime.UtcNow - lobby.LastHeartbeatUtc).TotalSeconds > 5.0)
+                        continue;
+
+                    var worldName = (lobby.WorldName ?? string.Empty).Trim();
+                    var displayName = (lobby.HostUsername ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(displayName))
+                        displayName = "PLAYER";
+
+                    if (entriesById.TryGetValue(productUserId, out var existing))
+                    {
+                        existing.IsHosting = lobby.IsHosting || existing.IsHosting;
+                        existing.IsMultiplayer = true;
+                        existing.JoinTarget = productUserId;
+                        existing.LobbyId = (lobby.LobbyId ?? string.Empty).Trim();
+                        existing.Cheats = lobby.Cheats;
+                        existing.PlayerCount = Math.Max(1, lobby.PlayerCount);
+                        existing.MaxPlayers = Math.Max(Math.Max(1, lobby.PlayerCount), lobby.MaxPlayers);
+                        existing.FriendCode = EosIdentityStore.GenerateFriendCode(productUserId);
+                        existing.UpdatedUtc = nowUtc;
+                        existing.ExpiresUtc = nowUtc.AddSeconds(15);
+                        if (string.IsNullOrWhiteSpace(existing.DisplayName))
+                            existing.DisplayName = displayName;
+                        if (string.IsNullOrWhiteSpace(existing.WorldName))
+                            existing.WorldName = worldName;
+                        if (string.IsNullOrWhiteSpace(existing.GameMode))
+                            existing.GameMode = (lobby.GameMode ?? string.Empty).Trim();
+                        continue;
+                    }
+
+                    entriesById[productUserId] = new GatePresenceEntry
+                    {
+                        ProductUserId = productUserId,
+                        DisplayName = displayName,
+                        Status = lobby.IsInWorld ? "IN_WORLD" : "MENU",
+                        IsHosting = lobby.IsHosting,
+                        IsInWorld = lobby.IsInWorld,
+                        IsMultiplayer = true,
+                        WorldName = worldName,
+                        GameMode = (lobby.GameMode ?? string.Empty).Trim(),
+                        JoinTarget = productUserId,
+                        LobbyId = (lobby.LobbyId ?? string.Empty).Trim(),
+                        Cheats = lobby.Cheats,
+                        PlayerCount = Math.Max(1, lobby.PlayerCount),
+                        MaxPlayers = Math.Max(Math.Max(1, lobby.PlayerCount), lobby.MaxPlayers),
+                        FriendCode = EosIdentityStore.GenerateFriendCode(productUserId),
+                        UpdatedUtc = nowUtc,
+                        ExpiresUtc = nowUtc.AddSeconds(15)
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[presence-query] eos supplement failed detail={ex.Message}");
+                Console.WriteLine($"[presence-query] eos supplement failed detail={ex.Message}");
+            }
+        }
+
+        var entries = entriesById.Values.ToList();
+        var ok = serverResult.Ok || entries.Count > 0;
+        Debug.WriteLine($"[presence-query] response activeEntries={entries.Count} source=SUPABASE+EOS");
+        Console.WriteLine($"[presence-query] response activeEntries={entries.Count} source=SUPABASE+EOS");
+        return new GatePresenceQueryResult { Ok = ok, Entries = entries };
+    }
+
+    public async Task<(bool Ok, string Message)> UpsertGamePresenceAsync(
+        string source,
+        string sessionId,
+        string status,
+        bool isInGame,
+        bool isMultiplayer,
+        string? worldName = null,
+        string? gameMode = null)
+    {
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/game-presence-upsert",
+            $"{_gateUrl}/game_presence_upsert"
+        };
+
+        var request = new
+        {
+            source = (source ?? string.Empty).Trim(),
+            sessionId = (sessionId ?? string.Empty).Trim(),
+            status = (status ?? string.Empty).Trim(),
+            isInGame,
+            isMultiplayer,
+            worldName = (worldName ?? string.Empty).Trim(),
+            gameMode = (gameMode ?? string.Empty).Trim(),
+            heartbeatSeconds = 20
+        };
+
+        string lastError = "Presence upsert failed.";
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await PostSupabaseUserAuthorizedAsync<object, GateSimpleMutationResponse>(
+                endpoints[i],
+                request,
+                default).ConfigureAwait(false);
+            if (result.Ok && result.Response?.Ok == true)
+                return (true, result.Response.Message ?? "ok");
+            if (!string.IsNullOrWhiteSpace(result.Error))
+                lastError = result.Error;
+        }
+
+        return (false, lastError);
+    }
+
+    public async Task<bool> ClearGamePresenceAsync(string source, string sessionId)
+    {
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/game-presence-clear",
+            $"{_gateUrl}/game_presence_clear"
+        };
+
+        var request = new
+        {
+            source = (source ?? string.Empty).Trim(),
+            sessionId = (sessionId ?? string.Empty).Trim()
+        };
+
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await PostSupabaseUserAuthorizedAsync<object, GateSimpleMutationResponse>(
+                endpoints[i],
+                request,
+                default).ConfigureAwait(false);
+            if (result.Ok && result.Response?.Ok == true)
+                return true;
+        }
+
+        return false;
+    }
+
+    public async Task<bool> UpsertPresenceAsync(
+        string? productUserId,
+        string? displayName,
+        bool isHosting,
+        string? worldName,
+        string? gameMode,
+        string? joinTarget,
+        string? status,
+        bool cheats = false,
+        int playerCount = 0,
+        int maxPlayers = 0,
+        bool isInWorld = false)
+    {
+        if (!isHosting)
+            return await StopHostingAsync(productUserId).ConfigureAwait(false);
+
+        var eos = EosClientProvider.Current;
+        if (eos == null || !eos.IsLoggedIn)
+            return false;
+
+        var normalizedWorld = (worldName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedWorld))
+            normalizedWorld = "WORLD";
+        var normalizedMode = (gameMode ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedMode))
+            normalizedMode = "Unknown";
+        var normalizedDisplayName = (displayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedDisplayName))
+            normalizedDisplayName = "Host";
+        var normalizedPlayers = Math.Max(1, playerCount);
+        var normalizedMaxPlayers = Math.Max(normalizedPlayers, maxPlayers <= 0 ? 8 : maxPlayers);
+
+        var resultOk = await eos.StartOrUpdateHostedLobbyAsync(
+            worldName: normalizedWorld,
+            gameMode: normalizedMode,
+            cheats: cheats,
+            playerCount: normalizedPlayers,
+            maxPlayers: normalizedMaxPlayers,
+            isInWorld: isInWorld,
+            hostUsername: normalizedDisplayName,
+            worldId: string.Empty).ConfigureAwait(false);
+
+        Debug.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk}");
+        Console.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=true world={normalizedWorld} inWorld={isInWorld} ok={resultOk}");
+        return resultOk;
+    }
+
+    public Task<bool> HeartbeatPresenceAsync(
+        string? productUserId,
+        string? displayName,
+        bool isHosting,
+        string? worldName,
+        string? gameMode,
+        string? joinTarget,
+        string? status,
+        bool isInWorld,
+        bool cheats = false,
+        int playerCount = 0,
+        int maxPlayers = 0)
+    {
+        return UpsertPresenceAsync(
+            productUserId: productUserId,
+            displayName: displayName,
+            isHosting: isHosting,
+            worldName: worldName,
+            gameMode: gameMode,
+            joinTarget: joinTarget,
+            status: status,
+            cheats: cheats,
+            playerCount: playerCount,
+            maxPlayers: maxPlayers,
+            isInWorld: isInWorld);
+    }
+
+    public async Task<bool> StopHostingAsync(string? productUserId)
+    {
+        var eos = EosClientProvider.Current;
+        if (eos == null || !eos.IsLoggedIn)
+            return false;
+
+        var resultOk = await eos.StopHostedLobbyAsync().ConfigureAwait(false);
+        await RevokePendingHostInvitesAsync().ConfigureAwait(false);
+        Debug.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=false ok={resultOk}");
+        Console.WriteLine($"[presence-upsert] source=EOS_LOBBY hosting=false ok={resultOk}");
+        return resultOk;
+    }
+
+    public async Task<bool> SendWorldInviteAsync(string targetProductUserId, string worldName, string? senderJoinTarget = null)
+    {
+        var result = await SendWorldInviteDetailedAsync(targetProductUserId, worldName, senderJoinTarget).ConfigureAwait(false);
+        return result.Ok;
+    }
+
+    public async Task<(bool Ok, string Message)> SendWorldInviteDetailedAsync(string targetProductUserId, string worldName, string? senderJoinTarget = null, string? gameMode = null)
+    {
+        targetProductUserId = (targetProductUserId ?? string.Empty).Trim();
+        worldName = (worldName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(targetProductUserId) || string.IsNullOrWhiteSpace(worldName))
+            return (false, "Missing target or world name.");
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return (false, "Not signed in. Please login with Veilnet.");
+
+        var request = new
+        {
+            targetProductUserId,
+            worldName,
+            senderJoinTarget = (senderJoinTarget ?? string.Empty).Trim()
+        };
+
+        return await PostWorldInviteRequestAsync(
+            $"{_gateUrl}/world-invite-send",
+            request,
+            accessToken,
+            anonKey,
+            useSupabaseHeaders: false).ConfigureAwait(false);
+    }
+
+    public async Task<GateWorldInvitesMeResult> GetMyWorldInvitesAsync()
+    {
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/world-invites-me",
+            $"{_gateUrl}/world_invites_me",
+            $"{_gateUrl}/presence/invites/me"
+        };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await GetWorldInvitesRequestAsync(endpoints[i], accessToken, anonKey, useSupabaseHeaders: false).ConfigureAwait(false);
+            if (result.Ok)
+                return result;
+
+            var fallback = await GetWorldInvitesRequestAsync(endpoints[i], accessToken, anonKey, useSupabaseHeaders: true).ConfigureAwait(false);
+            if (fallback.Ok)
+                return fallback;
+        }
+
+        return new GateWorldInvitesMeResult { Ok = false };
+    }
+
+    public async Task<bool> RespondToWorldInviteAsync(string senderProductUserId, string response)
+    {
+        senderProductUserId = (senderProductUserId ?? string.Empty).Trim();
+        response = (response ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(senderProductUserId) || string.IsNullOrWhiteSpace(response))
+            return false;
+
+        var request = new
+        {
+            senderProductUserId,
+            response
+        };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/world-invite-respond",
+            $"{_gateUrl}/world_invite_respond",
+            $"{_gateUrl}/presence/invite/respond"
+        };
+
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await PostWorldInviteResponseRequestAsync(endpoints[i], request, accessToken, anonKey, useSupabaseHeaders: false).ConfigureAwait(false);
+            if (result)
+                return true;
+
+            var fallback = await PostWorldInviteResponseRequestAsync(endpoints[i], request, accessToken, anonKey, useSupabaseHeaders: true).ConfigureAwait(false);
+            if (fallback)
+                return true;
+        }
+
+        return false;
+    }
+
+    public async Task<GateIdentityResolveResult> ResolveIdentityAsync(string query)
+    {
+        var endpoint = $"{_gateUrl}/identity/resolve";
+        var (ok, res, _) = await PostAuthorizedAsync<GateIdentityResolveRequest, GateIdentityResolveResponse>(endpoint, new GateIdentityResolveRequest { Query = query }, default).ConfigureAwait(false);
+        return new GateIdentityResolveResult { Found = ok && res?.Found == true, User = res?.User, Reason = res?.Reason ?? "" };
+    }
+
+    public async Task<GateIdentityMeResult> GetMyIdentityAsync()
+    {
+        var endpoint = $"{_gateUrl}/identity/me";
+        var (ok, res, err) = await GetAuthorizedAsync<GateIdentityMeResponse>(endpoint, default).ConfigureAwait(false);
+        return new GateIdentityMeResult { Ok = ok, Found = res?.Found == true, User = res?.User, SentRequests = res?.SentRequests ?? Array.Empty<string>(), ReceivedRequests = res?.ReceivedRequests ?? Array.Empty<string>(), Friends = res?.Friends ?? Array.Empty<string>(), Count = res?.Count ?? 0, Reason = res?.Reason ?? "", Message = res?.Reason ?? "" };
+    }
+
+    public async Task<GateIdentityByDeviceResult> GetIdentityByDeviceIdAsync(string deviceId)
+    {
+        var endpoint = $"{_gateUrl}/identity/by-device";
+        var request = new { deviceId = deviceId };
+        var (ok, res, err) = await PostAsync<object, GateIdentityByDeviceResponse>(endpoint, request, default).ConfigureAwait(false);
+        return new GateIdentityByDeviceResult { Ok = ok && res?.Found == true, User = res?.User, Reason = res?.Reason ?? err ?? "" };
+    }
+
+    public async Task<GateIdentityClaimResult> ClaimUsernameAsync(string username, string? displayName, string? productUserId)
+    {
+        var endpoint = $"{_gateUrl}/identity/claim";
+        var request = new GateIdentityClaimRequest { ProductUserId = productUserId, Username = username, DisplayName = displayName };
+        var (ok, res, _) = await PostAuthorizedAsync<GateIdentityClaimRequest, GateIdentityClaimResponse>(endpoint, request, default).ConfigureAwait(false);
+        return new GateIdentityClaimResult { Ok = ok && res?.Ok == true, Code = res?.Code ?? "fail", Message = res?.Message ?? "" };
+    }
+
+    public async Task<GateRecoveryCodeResult> RotateRecoveryCodeAsync()
+    {
+        var endpoint = $"{_gateUrl}/identity/recovery/rotate";
+        var (ok, res, _) = await PostAuthorizedAsync<object, GateRecoveryCodeResponse>(endpoint, new { }, default).ConfigureAwait(false);
+        return new GateRecoveryCodeResult { Ok = ok && res?.Ok == true, RecoveryCode = res?.RecoveryCode ?? "" };
+    }
+
+    public async Task<GateCurrentHashResult> GetCurrentHashAsync(string? target = null)
+    {
+        // Use specific endpoint based on build flavor
+        var endpoint = $"{_gateUrl}/admin/allowlist/current-hash/{(target?.ToLowerInvariant() ?? _buildFlavor?.ToLowerInvariant() ?? "release")}";
+        
+        // Try GET request without authentication first
+        try
+        {
+            using var http = new HttpClient();
+            var response = await http.GetAsync(endpoint);
+            if (response.IsSuccessStatusCode)
+            {
+                var content = await response.Content.ReadAsStringAsync();
+                var res = JsonSerializer.Deserialize<GateCurrentHashResponse>(content, JsonOptions);
+                if (res?.Ok == true)
+                {
+                    return new GateCurrentHashResult { Ok = true, Hash = res.Hash ?? "", Target = target ?? _buildFlavor, Message = res.Message ?? "" };
+                }
+                return new GateCurrentHashResult { Ok = false, Hash = "", Target = target ?? _buildFlavor, Message = "Response indicated failure" };
+            }
+            return new GateCurrentHashResult { Ok = false, Hash = "", Target = target ?? _buildFlavor, Message = $"HTTP request failed: {response.StatusCode}" };
+        }
+        catch (Exception ex)
+        {
+            return new GateCurrentHashResult { Ok = false, Hash = "", Target = target ?? _buildFlavor, Message = ex.Message };
+        }
+    }
+
+    public async Task<bool> VerifyCurrentHashAsync(Logger log, string? target = null)
+    {
+        try
+        {
+            if (!TryComputeExecutableHash(target, out var exePath, out var currentHash))
+            {
+                log.Error("Failed to compute current EXE hash");
+                return false;
+            }
+
+            log.Info($"Executable path used for hash: {Path.GetFileName(exePath)}");
+            log.Info($"Computed EXE SHA256: {ShortId(currentHash)}");
+
+            // Client validation must not call admin endpoints. Ask the gate for a ticket with our EXE hash.
+            // If the gate approves, the hash is valid.
+            var ticket = EnsureTicketWithStatus(log, null, target);
+            if (ticket.Ok)
+            {
+                log.Info("Hash verification successful (ticket approved)");
+                return true;
+            }
+
+            log.Warn($"Hash verification failed (ticket denied): {ticket.Message}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error(ex, "Hash verification failed");
+            return false;
+        }
+    }
+
+    // Back-compat: older launcher code calls this method name.
+    // Semantics are identical to VerifyCurrentHashAsync.
+    public Task<bool> VerifyExecutableHashAsync(Logger log, string? target = null)
+    {
+        return VerifyCurrentHashAsync(log, target);
+    }
+
+    public async Task<GateIdentityTransferResult> TransferIdentityAsync(string query, string recoveryCode, string productUserId)
+    {
+        var endpoint = $"{_gateUrl}/identity/transfer";
+        var request = new GateIdentityTransferRequest { Query = query, RecoveryCode = recoveryCode, ProductUserId = productUserId };
+        var (ok, res, _) = await PostAuthorizedAsync<GateIdentityTransferRequest, GateIdentityTransferResponse>(endpoint, request, default).ConfigureAwait(false);
+        return new GateIdentityTransferResult { Ok = ok && res?.Ok == true, User = res?.User };
+    }
+
+    public async Task<GateFriendsResult> GetFriendsAsync()
+    {
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendsResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoint = $"{_gateUrl}/friend-list";
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        Debug.WriteLine($"[friend-list] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)}");
+
+        try
+        {
+            using var response = await Http.SendAsync(request, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Debug.WriteLine($"[friend-list] response status={(int)response.StatusCode} {SummarizeJsonForLog(body)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return new GateFriendsResult { Ok = false, Message = message };
+            }
+
+            GateFriendsResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendsResponse>(body, JsonOptions); } catch { /* ignore */ }
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? "Friends lookup failed.";
+                return new GateFriendsResult { Ok = false, Message = message };
+            }
+
+            return new GateFriendsResult
+            {
+                Ok = true,
+                Message = parsed.Message ?? "ok",
+                Friends = parsed.Friends ?? new List<GateIdentityUser>(),
+                IncomingRequests = parsed.IncomingRequests ?? new List<GateFriendRequest>(),
+                OutgoingRequests = parsed.OutgoingRequests ?? new List<GateFriendRequest>(),
+                BlockedUsers = parsed.BlockedUsers ?? new List<GateIdentityUser>()
+            };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[friend-list] exception type={ex.GetType().Name} message={ex.Message}");
+            return new GateFriendsResult { Ok = false, Message = ex.Message };
+        }
+    }
+
+    public async Task<GateFriendMutationResult> AddFriendAsync(string query)
+    {
+        query = (query ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(query))
+            return new GateFriendMutationResult { Ok = false, Message = "Enter a username first." };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendMutationResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoint = $"{_gateUrl}/friend-request";
+        object payload = Guid.TryParse(query, out _)
+            ? new { targetId = query }
+            : new { username = query };
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            request.Content = content;
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            Debug.WriteLine($"[friend-request] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} targetKind={(Guid.TryParse(query, out _) ? "id" : "username")}");
+
+            using var response = await Http.SendAsync(request, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Debug.WriteLine($"[friend-request] response status={(int)response.StatusCode} {SummarizeJsonForLog(body)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            GateFriendRequestResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendRequestResponse>(body, JsonOptions); } catch { /* ignore */ }
+
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Message
+                    ?? parsed?.Error
+                    ?? ExtractErrorMessage(body)
+                    ?? "Friend request failed.";
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            var status = (parsed.Status ?? string.Empty).Trim();
+            var msg = !string.IsNullOrWhiteSpace(parsed.Message)
+                ? parsed.Message
+                : status switch
+                {
+                    "accepted" => "Friend added.",
+                    "pending" => "Request sent.",
+                    _ => "Request sent."
+                };
+
+            return new GateFriendMutationResult { Ok = true, Message = msg };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[friend-request] exception type={ex.GetType().Name} message={ex.Message}");
+            return new GateFriendMutationResult { Ok = false, Message = ex.Message };
+        }
+    }
+
+    public async Task<GateFriendMutationResult> AddFriendAsync(GateIdentityUser user)
+    {
+        if (user == null)
+            return new GateFriendMutationResult { Ok = false, Message = "Missing user." };
+
+        var targetId = (user.ProductUserId ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(targetId))
+            return await AddFriendAsync(targetId).ConfigureAwait(false);
+
+        return await AddFriendAsync((user.Username ?? string.Empty).Trim()).ConfigureAwait(false);
+    }
+
+    public async Task<GateFriendLookupResult> LookupVeilnetUserAsync(string username, CancellationToken ct = default)
+    {
+        username = (username ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(username))
+            return new GateFriendLookupResult { Ok = false, Found = false, Message = "Enter a username first." };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendLookupResult { Ok = false, Found = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoint = $"{_gateUrl}/friend-lookup?username={Uri.EscapeDataString(username)}";
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        Debug.WriteLine($"[friend-lookup] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} queryLength={username.Length}");
+
+        try
+        {
+            using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            Debug.WriteLine($"[friend-lookup] response status={(int)response.StatusCode} {SummarizeJsonForLog(body)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return new GateFriendLookupResult { Ok = false, Found = false, Message = message };
+            }
+
+            GateFriendLookupResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendLookupResponse>(body, JsonOptions); } catch { /* ignore */ }
+
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Error
+                    ?? parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? "Lookup failed.";
+                return new GateFriendLookupResult { Ok = false, Found = false, Message = message };
+            }
+
+            if (parsed.Found != true || parsed.Profile == null)
+                return new GateFriendLookupResult { Ok = true, Found = false, Message = "User not found." };
+
+            var id = (parsed.Profile.Id ?? string.Empty).Trim();
+            var uname = (parsed.Profile.Username ?? string.Empty).Trim();
+            var user = new GateIdentityUser
+            {
+                ProductUserId = id,
+                Username = uname,
+                DisplayName = uname,
+                FriendCode = string.IsNullOrWhiteSpace(id) ? string.Empty : EosIdentityStore.GenerateFriendCode(id),
+                PictureUrl = (parsed.Profile.Picture ?? string.Empty).Trim(),
+                BannerUrl = (parsed.Profile.Banner ?? string.Empty).Trim(),
+                AboutMe = (parsed.Profile.AboutMe ?? string.Empty).Trim()
+            };
+
+            return new GateFriendLookupResult { Ok = true, Found = true, User = user, Message = "ok" };
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[friend-lookup] exception type={ex.GetType().Name} message={ex.Message}");
+            return new GateFriendLookupResult { Ok = false, Found = false, Message = ex.Message };
+        }
+    }
+
+    public async Task<GateFriendSearchResult> SearchVeilnetUsersAsync(string query, int limit = 8, CancellationToken ct = default)
+    {
+        query = (query ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(query))
+            return new GateFriendSearchResult { Ok = true, Message = string.Empty };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendSearchResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var safeLimit = Math.Clamp(limit, 1, 20);
+        var escaped = Uri.EscapeDataString(query);
+        var endpoint = $"{_gateUrl}/friend-lookup?query={escaped}&username={escaped}&limit={safeLimit}";
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        try
+        {
+            using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return new GateFriendSearchResult { Ok = false, Message = message };
+            }
+
+            GateFriendLookupResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendLookupResponse>(body, JsonOptions); } catch { }
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Error
+                    ?? parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? "Search failed.";
+                return new GateFriendSearchResult { Ok = false, Message = message };
+            }
+
+            var users = new List<GateIdentityUser>();
+            var profiles = parsed.Profiles ?? new List<GateFriendLookupProfile>();
+            for (var i = 0; i < profiles.Count; i++)
+            {
+                var profile = profiles[i];
+                if (profile == null)
+                    continue;
+
+                var id = (profile.Id ?? string.Empty).Trim();
+                var uname = (profile.Username ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(uname))
+                    continue;
+
+                users.Add(new GateIdentityUser
+                {
+                    ProductUserId = id,
+                    Username = uname,
+                    DisplayName = uname,
+                    FriendCode = string.Empty,
+                    PictureUrl = (profile.Picture ?? string.Empty).Trim(),
+                    BannerUrl = (profile.Banner ?? string.Empty).Trim(),
+                    AboutMe = (profile.AboutMe ?? string.Empty).Trim()
+                });
+            }
+
+            return new GateFriendSearchResult { Ok = true, Users = users, Message = users.Count > 0 ? "ok" : "No users found." };
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new GateFriendSearchResult { Ok = false, Message = ex.Message };
+        }
+    }
+
+    public async Task<(bool Ok, bool Exists, string Message)> VeilnetUserExistsAsync(string username, CancellationToken ct = default)
+    {
+        var result = await LookupVeilnetUserAsync(username, ct).ConfigureAwait(false);
+        if (!result.Ok)
+            return (false, false, result.Message);
+        return (true, result.Found, result.Message);
+    }
+
+    public async Task<GateFriendMutationResult> RemoveFriendAsync(string targetProductUserId)
+    {
+        targetProductUserId = (targetProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(targetProductUserId))
+            return new GateFriendMutationResult { Ok = false, Message = "Missing target id." };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendMutationResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/friend-remove",
+            $"{_gateUrl}/friends-remove",
+            $"{_gateUrl}/friends/remove"
+        };
+
+        var payload = new GateFriendRemoveRequest { ProductUserId = targetProductUserId };
+        string lastError = "Failed to remove friend.";
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoints[i]);
+                var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                request.Content = content;
+                ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                using var response = await Http.SendAsync(request, default).ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    lastError = ExtractErrorMessage(body)
+                        ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                    continue;
+                }
+
+                GateFriendMutationResponse? parsed = null;
+                try { parsed = JsonSerializer.Deserialize<GateFriendMutationResponse>(body, JsonOptions); } catch { }
+                if (parsed?.Ok == true)
+                {
+                    return new GateFriendMutationResult
+                    {
+                        Ok = true,
+                        Message = string.IsNullOrWhiteSpace(parsed.Message) ? "Friend removed." : parsed.Message
+                    };
+                }
+
+                lastError = parsed?.Error
+                    ?? parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? lastError;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex.Message;
+            }
+        }
+
+        return new GateFriendMutationResult { Ok = false, Message = lastError };
+    }
+
+    public async Task<GateFriendMutationResult> RespondToFriendRequestAsync(string requesterProductUserId, bool accept, bool block = false)
+    {
+        requesterProductUserId = (requesterProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(requesterProductUserId))
+            return new GateFriendMutationResult { Ok = false, Message = "Missing requester id." };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendMutationResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoint = accept ? $"{_gateUrl}/friend-request" : $"{_gateUrl}/friend-respond";
+        object payload = accept
+            ? new { targetId = requesterProductUserId }
+            : new { requesterProductUserId, accept = false, block };
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            request.Content = content;
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            Debug.WriteLine($"[friend-respond] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} accept={accept} block={block} target={ShortId(requesterProductUserId)}");
+
+            using var response = await Http.SendAsync(request, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Debug.WriteLine($"[friend-respond] response status={(int)response.StatusCode} {SummarizeJsonForLog(body)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            GateFriendMutationResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendMutationResponse>(body, JsonOptions); } catch { /* ignore */ }
+
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Error
+                    ?? parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? "Friend request update failed.";
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            var messageText = parsed.Message;
+            if (string.IsNullOrWhiteSpace(messageText))
+            {
+                if (accept) messageText = "Friend request accepted.";
+                else if (block) messageText = "User blocked.";
+                else messageText = "Friend request declined.";
+            }
+
+            return new GateFriendMutationResult { Ok = true, Message = messageText ?? "ok" };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[friend-respond] exception type={ex.GetType().Name} message={ex.Message}");
+            return new GateFriendMutationResult { Ok = false, Message = ex.Message };
+        }
+    }
+
+    public async Task<GateFriendMutationResult> CancelOutgoingFriendRequestAsync(string targetProductUserId)
+    {
+        targetProductUserId = (targetProductUserId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(targetProductUserId))
+            return new GateFriendMutationResult { Ok = false, Message = "Missing target id." };
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return new GateFriendMutationResult { Ok = false, Message = "Not signed in. Please login with Veilnet." };
+
+        var endpoint = $"{_gateUrl}/friend-respond";
+        object payload = new { targetProductUserId, cancel = true };
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            request.Content = content;
+            ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            using var response = await Http.SendAsync(request, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var message = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                if (IsLegacyCancelRoutingError(message))
+                    return await TryCancelOutgoingViaRemoveFallbackAsync(targetProductUserId, message).ConfigureAwait(false);
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            GateFriendMutationResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateFriendMutationResponse>(body, JsonOptions); } catch { }
+            if (parsed?.Ok != true)
+            {
+                var message = parsed?.Error
+                    ?? parsed?.Message
+                    ?? ExtractErrorMessage(body)
+                    ?? "Failed to cancel request.";
+                if (IsLegacyCancelRoutingError(message))
+                    return await TryCancelOutgoingViaRemoveFallbackAsync(targetProductUserId, message).ConfigureAwait(false);
+                return new GateFriendMutationResult { Ok = false, Message = message };
+            }
+
+            return new GateFriendMutationResult
+            {
+                Ok = true,
+                Message = string.IsNullOrWhiteSpace(parsed.Message) ? "Friend request cancelled." : parsed.Message
+            };
+        }
+        catch (Exception ex)
+        {
+            return new GateFriendMutationResult { Ok = false, Message = ex.Message };
+        }
+    }
+
+    private async Task<GateFriendMutationResult> TryCancelOutgoingViaRemoveFallbackAsync(string targetProductUserId, string originalMessage)
+    {
+        var remove = await RemoveFriendAsync(targetProductUserId).ConfigureAwait(false);
+        if (remove.Ok)
+        {
+            return new GateFriendMutationResult
+            {
+                Ok = true,
+                Message = "Friend request cancelled."
+            };
+        }
+
+        return new GateFriendMutationResult
+        {
+            Ok = false,
+            Message = string.IsNullOrWhiteSpace(remove.Message) ? originalMessage : remove.Message
+        };
+    }
+
+    private static bool IsLegacyCancelRoutingError(string? message)
+    {
+        var text = (message ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        return text.Contains("invalid_requester", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("invalid requester", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("missing_target", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public async Task<GateFriendMutationResult> BlockUserAsync(string query)
+    {
+        if (!HasUsableTicketForCurrentIdentity())
+        {
+            if (!EnsureTicket(new Logger("Gate")))
+                return new GateFriendMutationResult { Ok = false, Message = string.IsNullOrWhiteSpace(_denialReason) ? "Unauthorized" : _denialReason };
+        }
+        var endpoint = $"{_gateUrl}/friends/block";
+        var (ok, res, _) = await PostAuthorizedAsync<GateFriendBlockRequest, GateFriendMutationResponse>(endpoint, new GateFriendBlockRequest { Query = query }, default).ConfigureAwait(false);
+        return new GateFriendMutationResult { Ok = ok && res?.Ok == true, Message = res?.Message ?? "" };
+    }
+
+    public async Task<GateFriendMutationResult> UnblockUserAsync(string targetProductUserId)
+    {
+        if (!HasUsableTicketForCurrentIdentity())
+        {
+            if (!EnsureTicket(new Logger("Gate")))
+                return new GateFriendMutationResult { Ok = false, Message = string.IsNullOrWhiteSpace(_denialReason) ? "Unauthorized" : _denialReason };
+        }
+        var endpoint = $"{_gateUrl}/friends/unblock";
+        var (ok, res, _) = await PostAuthorizedAsync<GateFriendUnblockRequest, GateFriendMutationResponse>(endpoint, new GateFriendUnblockRequest { ProductUserId = targetProductUserId }, default).ConfigureAwait(false);
+        return new GateFriendMutationResult { Ok = ok && res?.Ok == true, Message = res?.Message ?? "" };
+    }
+
+    public bool IsFriendsTemporarilyUnavailable => false;
+
+    public bool ValidatePeerTicket(string? ticket, Logger log, out string denialReason, TimeSpan? timeout = null)
+    {
+        denialReason = "";
+        if (string.IsNullOrWhiteSpace(ticket))
+        {
+            denialReason = "No ticket";
+            return false;
+        }
+
+        var normalizedTicket = ticket.Trim();
+        var endpoints = new[]
+        {
+            $"{_gateUrl.TrimEnd('/')}/online-ticket-validate"
+        };
+        var requiredChannel = _buildFlavor == "dev" ? "dev" : "release";
+
+        // Prefer local JWT payload checks first so missing validate routes
+        // do not block P2P join for otherwise valid tickets.
+        if (TryValidateTicketLocally(normalizedTicket, requiredChannel, out var localReason))
+            return true;
+
+        try
+        {
+            var anonKey = ResolveSupabaseAnonKey();
+            if (string.IsNullOrWhiteSpace(anonKey))
+            {
+                denialReason = string.IsNullOrWhiteSpace(localReason)
+                    ? "Ticket validation failed."
+                    : localReason;
+                return false;
+            }
+
+            foreach (var endpoint in endpoints)
+            {
+                using var cts = new CancellationTokenSource(timeout ?? DefaultTicketTimeout);
+                var body = JsonSerializer.Serialize(
+                    new GateTicketValidateRequest { Ticket = normalizedTicket, RequiredChannel = requiredChannel },
+                    JsonOptions);
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "application/json")
+                };
+                var accessToken = ResolveVeilnetAccessToken();
+                ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+
+                using var response = Http.SendAsync(request, cts.Token).GetAwaiter().GetResult();
+                var responseBody = response.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.BadRequest or HttpStatusCode.MethodNotAllowed)
+                        continue;
+
+                    denialReason = $"Ticket validation failed (HTTP {(int)response.StatusCode}).";
+                    return false;
+                }
+
+                GateTicketValidateResponse? parsed;
+                try
+                {
+                    parsed = JsonSerializer.Deserialize<GateTicketValidateResponse>(responseBody, JsonOptions);
+                }
+                catch
+                {
+                    denialReason = "Invalid ticket validation response.";
+                    return false;
+                }
+
+                if (parsed?.Ok == true)
+                    return true;
+
+                denialReason = string.IsNullOrWhiteSpace(parsed?.Reason) ? "Invalid ticket" : parsed!.Reason!;
+                return false;
+            }
+
+            denialReason = localReason;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            denialReason = string.IsNullOrWhiteSpace(localReason) ? ex.Message : localReason;
+            return false;
+        }
+    }
+
+    private static bool TryValidateTicketLocally(string ticket, string requiredChannel, out string denialReason)
+    {
+        denialReason = "Ticket validation endpoint unavailable.";
+        try
+        {
+            var parts = ticket.Split('.');
+            if (parts.Length < 2)
+            {
+                denialReason = "Malformed gate ticket.";
+                return false;
+            }
+
+            var payloadBytes = Base64UrlDecode(parts[1]);
+            using var payload = JsonDocument.Parse(payloadBytes);
+            var root = payload.RootElement;
+
+            var typ = root.TryGetProperty("typ", out var typProp) ? (typProp.GetString() ?? string.Empty).Trim() : string.Empty;
+            if (!string.Equals(typ, "gate_ticket", StringComparison.OrdinalIgnoreCase))
+            {
+                denialReason = "Invalid gate ticket type.";
+                return false;
+            }
+
+            if (!root.TryGetProperty("exp", out var expProp) || !expProp.TryGetInt64(out var exp))
+            {
+                denialReason = "Gate ticket expiry missing.";
+                return false;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (exp <= now)
+            {
+                denialReason = "Gate ticket expired.";
+                return false;
+            }
+
+            if (!root.TryGetProperty("target", out var targetProp))
+                return true;
+
+            var target = (targetProp.GetString() ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(target))
+                return true;
+
+            if (!string.Equals(target, requiredChannel, StringComparison.OrdinalIgnoreCase))
+            {
+                denialReason = $"Gate ticket channel mismatch ({target} != {requiredChannel}).";
+                return false;
+            }
+
+            var platform = root.TryGetProperty("platform", out var platformProp)
+                ? (platformProp.GetString() ?? string.Empty).Trim()
+                : string.Empty;
+            if (!string.IsNullOrWhiteSpace(platform)
+                && !string.Equals(platform, BuildPlatform, StringComparison.OrdinalIgnoreCase))
+            {
+                denialReason = $"Gate ticket platform mismatch ({platform} != {BuildPlatform}).";
+                return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            denialReason = "Failed to parse gate ticket.";
+            return false;
+        }
+    }
+
+    private static byte[] Base64UrlDecode(string input)
+    {
+        var s = input.Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4)
+        {
+            case 2:
+                s += "==";
+                break;
+            case 3:
+                s += "=";
+                break;
+        }
+
+        return Convert.FromBase64String(s);
+    }
+
+    private async Task<TicketCheckResult> EnsureTicketAsync(Logger log, CancellationToken ct, string? target)
+    {
+        if (!TryComputeExecutableHash(target, out var executablePath, out var hash))
+        {
+            _denialReason = "Unable to compute executable hash.";
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.BadResponse,
+                Message = _denialReason
+            };
+        }
+
+        log.Info($"Executable path used for hash: {Path.GetFileName(executablePath)}");
+        log.Info($"Computed EXE SHA256: {ShortId(hash)}");
+
+        var channel = _buildFlavor == "dev" ? "dev" : "release";
+        var payload = new
+        {
+            platform = BuildPlatform,
+            channel,
+            target = channel,
+            exe_hash_sha256 = hash,
+            build_hash_sha256 = hash,
+            build_nonce = (Environment.GetEnvironmentVariable("LV_BUILD_NONCE") ?? string.Empty).Trim(),
+            client_version = (Environment.GetEnvironmentVariable("LV_CLIENT_VERSION") ?? string.Empty).Trim()
+        };
+
+        var endpointCandidates = ResolveTicketEndpointCandidates(_gateUrl);
+        if (endpointCandidates.Count == 0)
+        {
+            _denialReason = "Gate endpoint misconfigured: no ticket endpoint URL could be resolved.";
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = _denialReason
+            };
+        }
+
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+        {
+            _denialReason = "Online auth failed: missing Veilnet access token.";
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.Unauthorized,
+                Message = "Online auth failed. Please re-login."
+            };
+        }
+
+        var lastResult = new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.MisconfiguredEndpoint,
+            Message = "Gate endpoint misconfigured."
+        };
+
+        for (var i = 0; i < endpointCandidates.Count; i++)
+        {
+            var endpointUrl = endpointCandidates[i];
+            var isSupabaseFunctions = IsSupabaseFunctionsEndpoint(endpointUrl);
+            if (isSupabaseFunctions && string.IsNullOrWhiteSpace(anonKey))
+            {
+                lastResult = new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.MisconfiguredEndpoint,
+                    Message = "Gate endpoint misconfigured: SUPABASE_ANON_KEY is missing for function invocation."
+                };
+                _denialReason = lastResult.Message;
+                log.Warn($"[gate] ticket config issue endpoint={EndpointLabel(endpointUrl)}: {lastResult.Message}");
+                continue;
+            }
+
+            lastResult = await RequestTicketWithRetriesAsync(
+                log,
+                endpointUrl,
+                payload,
+                isSupabaseFunctions,
+                accessToken,
+                anonKey,
+                ct).ConfigureAwait(false);
+
+            if (lastResult.Ok)
+                return lastResult;
+
+            if (lastResult.Status != TicketCheckStatus.MisconfiguredEndpoint || i == endpointCandidates.Count - 1)
+                return lastResult;
+
+            log.Warn($"[gate] ticket endpoint fallback after misconfigured result at endpoint={EndpointLabel(endpointUrl)}");
+        }
+
+        return lastResult;
+    }
+
+    private async Task<TicketCheckResult> RequestTicketWithRetriesAsync(
+        Logger log,
+        string endpointUrl,
+        object payload,
+        bool isSupabaseFunctions,
+        string accessToken,
+        string anonKey,
+        CancellationToken ct)
+    {
+        var maxAttempts = TicketRetryDelays.Length;
+        TicketCheckResult lastResult = new()
+        {
+            Ok = false,
+            Status = TicketCheckStatus.ServiceUnavailable,
+            Message = "Ticket request failed."
+        };
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            lastResult = await RequestTicketOnceAsync(
+                log,
+                endpointUrl,
+                payload,
+                isSupabaseFunctions,
+                accessToken,
+                anonKey,
+                attempt + 1,
+                maxAttempts,
+                ct).ConfigureAwait(false);
+
+            if (lastResult.Ok)
+                return lastResult;
+
+            if (lastResult.Status != TicketCheckStatus.ServiceUnavailable || attempt == maxAttempts - 1)
+                return lastResult;
+
+            var baseDelay = TicketRetryDelays[attempt];
+            var jitterMs = Random.Shared.Next(50, 250);
+            var retryDelay = baseDelay + TimeSpan.FromMilliseconds(jitterMs);
+            log.Warn($"[gate] ticket retry in {retryDelay.TotalMilliseconds:0}ms after ServiceUnavailable (attempt {attempt + 1}/{maxAttempts}).");
+            await Task.Delay(retryDelay, ct).ConfigureAwait(false);
+        }
+
+        return lastResult;
+    }
+
+    private async Task<TicketCheckResult> RequestTicketOnceAsync(
+        Logger log,
+        string endpointUrl,
+        object payload,
+        bool isSupabaseFunctions,
+        string accessToken,
+        string anonKey,
+        int attempt,
+        int maxAttempts,
+        CancellationToken ct)
+    {
+        var serialized = JsonSerializer.Serialize(payload, JsonOptions);
+        log.Info($"[gate] ticket request attempt {attempt}/{maxAttempts} endpoint={EndpointLabel(endpointUrl)}");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpointUrl)
+        {
+            Content = new StringContent(serialized, Encoding.UTF8, "application/json")
+        };
+
+        if (isSupabaseFunctions)
+        {
+            var authAttached = ApplyTicketFunctionHeaders(request, accessToken, anonKey);
+            log.Info($"[gate] ticket headers apikeyAttached={!string.IsNullOrWhiteSpace(anonKey)} authAttached={authAttached}");
+        }
+
+        try
+        {
+            using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
+            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var statusCode = (int)response.StatusCode;
+            log.Info($"[gate] ticket response endpoint={EndpointLabel(endpointUrl)} status={statusCode} {SummarizeJsonForLog(responseBody)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return BuildStatusFromHttpFailure(response.StatusCode, responseBody);
+            }
+
+            if (string.IsNullOrWhiteSpace(responseBody))
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned an empty response."
+                };
+            }
+
+            GateTicketResponse? parsed;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<GateTicketResponse>(responseBody, JsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                log.Warn($"[gate] ticket parse error ({ex.GetType().Name}): {ex.Message}");
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned non-JSON or malformed JSON."
+                };
+            }
+
+            if (parsed == null)
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket endpoint returned an empty JSON payload."
+                };
+            }
+
+            if (parsed.Ok != true)
+            {
+                var reason = (parsed.Reason ?? parsed.Error ?? parsed.Message ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(reason)
+                    && responseBody.Contains("Hello from Functions", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new TicketCheckResult
+                    {
+                        Ok = false,
+                        Status = TicketCheckStatus.MisconfiguredEndpoint,
+                        Message = "Online ticket service not deployed/configured."
+                    };
+                }
+
+                var mapped = BuildStatusFromReason(reason);
+                return mapped;
+            }
+
+            var ticket = (parsed.Ticket ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(ticket))
+            {
+                var appearsUnimplemented =
+                    responseBody.Contains("Hello from Functions", StringComparison.OrdinalIgnoreCase)
+                    || responseBody.Contains("not deployed", StringComparison.OrdinalIgnoreCase)
+                    || responseBody.Contains("not configured", StringComparison.OrdinalIgnoreCase);
+
+                if (appearsUnimplemented)
+                {
+                    return new TicketCheckResult
+                    {
+                        Ok = false,
+                        Status = TicketCheckStatus.MisconfiguredEndpoint,
+                        Message = "Online ticket service not deployed/configured."
+                    };
+                }
+
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.BadResponse,
+                    Message = "Ticket response is missing the ticket value."
+                };
+            }
+
+            _ticket = ticket;
+            if (DateTimeOffset.TryParse(parsed.ExpiresUtc ?? parsed.ExpiresAt, out var expires))
+                _ticketExpiresUtc = expires.UtcDateTime;
+            else
+                _ticketExpiresUtc = DateTime.UtcNow.AddMinutes(25);
+
+            _ticketProductUserId = EosClientProvider.Current?.LocalProductUserId ?? "";
+            _status = "VERIFIED";
+            _denialReason = string.Empty;
+            ApplyEosConfigFromTicket(parsed.Eos);
+
+            return new TicketCheckResult
+            {
+                Ok = true,
+                Status = TicketCheckStatus.VerifiedAndTicketIssued,
+                Message = "Ticket issued."
+            };
+        }
+        catch (Exception ex)
+        {
+            var status = BuildStatusFromException(ex);
+            log.Warn($"[gate] ticket request exception endpoint={EndpointLabel(endpointUrl)} type={ex.GetType().Name} message={ex.Message}");
+            return status;
+        }
+    }
+
+    private static TicketCheckResult BuildStatusFromHttpFailure(HttpStatusCode statusCode, string body)
+    {
+        var bodyText = (body ?? string.Empty).Trim();
+        var message = $"Ticket request failed (HTTP {(int)statusCode}).";
+
+        if (IsHashMismatchBody(bodyText))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.HashMismatch,
+                Message = "Unofficial build - online disabled."
+            };
+        }
+
+        if (statusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Gate endpoint misconfigured (ticket route missing or wrong HTTP method)."
+            };
+        }
+
+        if (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            if (ContainsAny(bodyText, "invalid_auth_token"))
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.Unauthorized,
+                    Message = "Online ticket auth token invalid (launcher token missing/expired)."
+                };
+            }
+
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.Unauthorized,
+                Message = "Online auth failed. Please re-login."
+            };
+        }
+
+        if (statusCode is HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout
+            or HttpStatusCode.RequestTimeout
+            or HttpStatusCode.TooManyRequests)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if ((int)statusCode >= 500)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if (bodyText.Contains("function not found", StringComparison.OrdinalIgnoreCase)
+            || bodyText.Contains("not deployed", StringComparison.OrdinalIgnoreCase))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Online ticket service not deployed/configured."
+            };
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.BadResponse,
+            Message = message
+        };
+    }
+
+    private static TicketCheckResult BuildStatusFromReason(string reason)
+    {
+        var normalized = (reason ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.BadResponse,
+                Message = "Ticket endpoint denied the request."
+            };
+        }
+
+        if (ContainsAny(normalized, "not found", "route", "endpoint", "method", "not deployed", "not configured"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.MisconfiguredEndpoint,
+                Message = "Gate endpoint misconfigured."
+            };
+        }
+
+        if (ContainsAny(normalized, "unauthorized", "forbidden", "401", "403", "auth"))
+        {
+            if (ContainsAny(normalized, "invalid_auth_token"))
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.Unauthorized,
+                    Message = "Online ticket auth token invalid (launcher token missing/expired)."
+                };
+            }
+
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.Unauthorized,
+                Message = "Online auth failed. Please re-login."
+            };
+        }
+
+        if (ContainsAny(normalized, "service unavailable", "timeout", "timed out", "network", "connection", "temporarily unavailable", "dns", "5"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services unavailable right now."
+            };
+        }
+
+        if (ContainsAny(normalized, "hash_mismatch", "hash", "allowlist", "unofficial", "not allowed", "rejected", "denied"))
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.HashMismatch,
+                Message = string.IsNullOrWhiteSpace(reason) ? "Build hash rejected." : reason
+            };
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.BadResponse,
+            Message = reason
+        };
+    }
+
+    private static TicketCheckResult BuildStatusFromException(Exception ex)
+    {
+        if (ex is TaskCanceledException or OperationCanceledException)
+        {
+            return new TicketCheckResult
+            {
+                Ok = false,
+                Status = TicketCheckStatus.ServiceUnavailable,
+                Message = "Online services timed out."
+            };
+        }
+
+        if (ex is HttpRequestException httpEx)
+        {
+            if (httpEx.StatusCode.HasValue)
+                return BuildStatusFromHttpFailure(httpEx.StatusCode.Value, string.Empty);
+
+            if (httpEx.InnerException is SocketException)
+            {
+                return new TicketCheckResult
+                {
+                    Ok = false,
+                    Status = TicketCheckStatus.ServiceUnavailable,
+                    Message = "Online services are unreachable."
+                };
+            }
+        }
+
+        return new TicketCheckResult
+        {
+            Ok = false,
+            Status = TicketCheckStatus.ServiceUnavailable,
+            Message = "Online services unavailable right now."
+        };
+    }
+
+    private static bool ApplyTicketFunctionHeaders(HttpRequestMessage request, string accessToken, string anonKey)
+    {
+        if (!string.IsNullOrWhiteSpace(anonKey))
+            request.Headers.TryAddWithoutValidation("apikey", anonKey);
+
+        var token = (accessToken ?? string.Empty).Trim();
+        if (!IsUsableAccessToken(token))
+            return false;
+
+        // Use standard Authorization header for our token. 
+        // Supabase gateway will pass this through if verify_jwt = false.
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        
+        // Also keep x-veilnet-auth for functions that specifically look for it.
+        request.Headers.TryAddWithoutValidation("x-veilnet-auth", token);
+        return true;
+    }
+
+    private static List<string> ResolveTicketEndpointCandidates(string baseUrl)
+    {
+        var explicitUrl = (Environment.GetEnvironmentVariable("LV_GATE_TICKET_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(explicitUrl))
+            return new List<string> { explicitUrl.TrimEnd('/') };
+
+        var normalizedBase = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(normalizedBase))
+            return new List<string>();
+
+        if (normalizedBase.EndsWith("/online-ticket", StringComparison.OrdinalIgnoreCase))
+            return new List<string> { normalizedBase };
+
+        return new List<string> { $"{normalizedBase}/online-ticket" };
+    }
+
+    private static bool IsSupabaseFunctionsEndpoint(string url)
+    {
+        var value = (url ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.Contains(".supabase.co/functions/v1", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ResolveSupabaseAnonKey()
+    {
+        var keys = new[]
+        {
+            "LV_SUPABASE_ANON_KEY",
+            "SUPABASE_ANON_KEY",
+            "VEILNET_SUPABASE_ANON_KEY"
+        };
+
+        for (var i = 0; i < keys.Length; i++)
+        {
+            var value = (Environment.GetEnvironmentVariable(keys[i]) ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return DefaultSupabaseAnonKey;
+    }
+
+    private static string ResolveVeilnetAccessToken()
+    {
+        return (Environment.GetEnvironmentVariable("LV_VEILNET_ACCESS_TOKEN") ?? string.Empty).Trim();
+    }
+
+    private static bool IsUsableAccessToken(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        return !string.Equals(token, "null", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(token, "undefined", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string TrimSnippet(string value, int maxLen)
+    {
+        var normalized = RedactSensitiveJsonForLog(value).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (normalized.Length <= maxLen)
+            return normalized;
+        return normalized.Substring(0, maxLen);
+    }
+
+    private static string EndpointLabel(string? url)
+    {
+        var value = (url ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return "unknown";
+
+        try
+        {
+            var uri = new Uri(value, UriKind.Absolute);
+            var path = uri.AbsolutePath.Trim('/');
+            var slash = path.LastIndexOf('/');
+            return slash >= 0 ? path[(slash + 1)..] : path;
+        }
+        catch
+        {
+            var query = value.IndexOf('?');
+            if (query >= 0)
+                value = value[..query];
+            var slash = value.LastIndexOf('/');
+            return slash >= 0 ? value[(slash + 1)..] : value;
+        }
+    }
+
+    private static string ShortId(string? value)
+    {
+        var id = (value ?? string.Empty).Trim();
+        if (id.Length <= 12)
+            return string.IsNullOrWhiteSpace(id) ? "none" : id;
+        return $"{id[..8]}...{id[^4..]}";
+    }
+
+    private static string SummarizeJsonForLog(string? value)
+    {
+        var body = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(body))
+            return "body=empty";
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return $"bodyType={root.ValueKind}";
+
+            var parts = new List<string>();
+            AddScalarLogPart(parts, root, "ok");
+            AddScalarLogPart(parts, root, "status");
+            AddScalarLogPart(parts, root, "found");
+            AddScalarLogPart(parts, root, "count");
+            AddArrayCountLogPart(parts, root, "friends");
+            AddArrayCountLogPart(parts, root, "profiles");
+            AddArrayCountLogPart(parts, root, "incoming");
+            AddArrayCountLogPart(parts, root, "outgoing");
+            AddSafeMessageLogPart(parts, root, "error");
+            AddPresenceLogPart(parts, root, "ticket", "ticketPresent");
+            AddPresenceLogPart(parts, root, "clientSecret", "clientSecretPresent");
+            AddPresenceLogPart(parts, root, "access_token", "accessTokenPresent");
+
+            return parts.Count == 0 ? "body=object" : string.Join(" ", parts);
+        }
+        catch
+        {
+            return $"bodyText={TrimNonJsonForLog(body, 80)}";
+        }
+    }
+
+    private static void AddScalarLogPart(List<string> parts, JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var prop))
+            return;
+
+        switch (prop.ValueKind)
+        {
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+                parts.Add($"{propertyName}={prop.GetBoolean()}");
+                break;
+            case JsonValueKind.Number:
+                if (prop.TryGetInt32(out var intValue))
+                    parts.Add($"{propertyName}={intValue}");
+                break;
+            case JsonValueKind.String:
+                var value = (prop.GetString() ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(value) && !ShouldRedactLogProperty(propertyName))
+                    parts.Add($"{propertyName}={TrimNonJsonForLog(value, 48)}");
+                break;
+        }
+    }
+
+    private static void AddArrayCountLogPart(List<string> parts, JsonElement root, string propertyName)
+    {
+        if (root.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.Array)
+            parts.Add($"{propertyName}Count={prop.GetArrayLength()}");
+    }
+
+    private static void AddSafeMessageLogPart(List<string> parts, JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var prop) || prop.ValueKind != JsonValueKind.String)
+            return;
+
+        var value = (prop.GetString() ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(value))
+            parts.Add($"{propertyName}={TrimNonJsonForLog(value, 72)}");
+    }
+
+    private static void AddPresenceLogPart(List<string> parts, JsonElement root, string propertyName, string label)
+    {
+        if (root.TryGetProperty(propertyName, out var prop))
+        {
+            var present = prop.ValueKind != JsonValueKind.Null
+                && (prop.ValueKind != JsonValueKind.String || !string.IsNullOrWhiteSpace(prop.GetString()));
+            parts.Add($"{label}={present}");
+        }
+    }
+
+    private static string TrimNonJsonForLog(string value, int maxLen)
+    {
+        var normalized = (value ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (normalized.Length <= maxLen)
+            return normalized;
+        return normalized[..maxLen];
+    }
+
+    private static string RedactSensitiveJsonForLog(string? value)
+    {
+        var body = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(body))
+            return string.Empty;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+                WriteRedactedJsonElement(writer, doc.RootElement, null);
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch
+        {
+            return body;
+        }
+    }
+
+    private static void WriteRedactedJsonElement(Utf8JsonWriter writer, JsonElement element, string? propertyName)
+    {
+        if (ShouldRedactLogProperty(propertyName))
+        {
+            writer.WriteStringValue("[redacted]");
+            return;
+        }
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject())
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteRedactedJsonElement(writer, property.Value, property.Name);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                    WriteRedactedJsonElement(writer, item, propertyName);
+                writer.WriteEndArray();
+                break;
+            default:
+                element.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static bool ShouldRedactLogProperty(string? propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(propertyName))
+            return false;
+
+        return propertyName.Equals("ticket", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("access_token", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("refresh_token", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("id_token", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("clientSecret", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("client_secret", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("authorization", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("apikey", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ExtractErrorMessage(string? jsonBody)
+    {
+        var body = (jsonBody ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(body))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var error = root.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.String
+                ? err.GetString()
+                : null;
+            var message = root.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.String
+                ? msg.GetString()
+                : null;
+            var detail = root.TryGetProperty("detail", out var detailProp) && detailProp.ValueKind == JsonValueKind.String
+                ? detailProp.GetString()
+                : null;
+
+            if (!string.IsNullOrWhiteSpace(detail)
+                && (string.Equals(error, "db_error", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(error, "internal_error", StringComparison.OrdinalIgnoreCase)))
+                return detail;
+            if (!string.IsNullOrWhiteSpace(message)
+                && (string.Equals(error, "db_error", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(error, "internal_error", StringComparison.OrdinalIgnoreCase)))
+                return message;
+            if (!string.IsNullOrWhiteSpace(error))
+                return error;
+            if (!string.IsNullOrWhiteSpace(message))
+                return message;
+            if (!string.IsNullOrWhiteSpace(detail))
+                return detail;
+        }
+        catch
+        {
+            // Not JSON; ignore.
+        }
+
+        return null;
+    }
+
+    private static bool ApplySupabaseUserHeaders(HttpRequestMessage request, string accessToken, string anonKey)
+    {
+        if (string.IsNullOrWhiteSpace(request?.RequestUri?.AbsoluteUri))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(anonKey))
+            request.Headers.TryAddWithoutValidation("apikey", anonKey);
+
+        var token = (accessToken ?? string.Empty).Trim();
+        if (!IsUsableAccessToken(token))
+            return false;
+
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        return true;
+    }
+
+    private static bool IsMissingFunctionError(string? message)
+    {
+        var value = (message ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.IndexOf("requested function was not found", StringComparison.OrdinalIgnoreCase) >= 0
+            || value.IndexOf("function was not found", StringComparison.OrdinalIgnoreCase) >= 0
+            || value.IndexOf("HTTP 404", StringComparison.OrdinalIgnoreCase) >= 0
+            || value.IndexOf("Not Found", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private async Task<(bool Ok, string Message)> PostWorldInviteRequestAsync(
+        string endpoint,
+        object request,
+        string accessToken,
+        string anonKey,
+        bool useSupabaseHeaders)
+    {
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var authAttached = useSupabaseHeaders
+                ? ApplySupabaseUserHeaders(message, accessToken, anonKey)
+                : ApplyTicketFunctionHeaders(message, accessToken, anonKey);
+            if (!authAttached)
+                return (false, "Not signed in. Please login with Veilnet.");
+
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            message.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
+            Debug.WriteLine($"[world-invite-send] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} mode={(useSupabaseHeaders ? "supabase-user" : "veilnet-ticket")}");
+            Console.WriteLine($"[world-invite-send] request endpoint={EndpointLabel(endpoint)} hasAuthorization=true hasApikey={!string.IsNullOrWhiteSpace(anonKey)} mode={(useSupabaseHeaders ? "supabase-user" : "veilnet-ticket")}");
+
+            using var response = await Http.SendAsync(message, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var summary = SummarizeJsonForLog(body);
+            Debug.WriteLine($"[world-invite-send] response status={(int)response.StatusCode} {summary}");
+            Console.WriteLine($"[world-invite-send] response status={(int)response.StatusCode} {summary}");
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return (false, string.IsNullOrWhiteSpace(error) ? "Invite failed." : error);
+            }
+
+            GateWorldInviteSendResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateWorldInviteSendResponse>(body, JsonOptions); } catch { /* ignore */ }
+
+            if (parsed?.Ok == true)
+                return (true, string.IsNullOrWhiteSpace(parsed.Message) ? "Invite sent." : parsed.Message!);
+
+            var parsedError = parsed?.Error
+                ?? parsed?.Message
+                ?? ExtractErrorMessage(body)
+                ?? "Invite failed.";
+            return (false, string.IsNullOrWhiteSpace(parsedError) ? "Invite failed." : parsedError);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[world-invite-send] exception type={ex.GetType().Name} message={ex.Message}");
+            Console.WriteLine($"[world-invite-send] exception type={ex.GetType().Name} message={ex.Message}");
+            return (false, ex.Message);
+        }
+    }
+
+    public bool TryExtractPeerTicketUserId(string? ticket, out string userId)
+    {
+        userId = string.Empty;
+        if (string.IsNullOrWhiteSpace(ticket))
+            return false;
+
+        try
+        {
+            var parts = ticket.Trim().Split('.');
+            if (parts.Length < 2)
+                return false;
+
+            var payloadBytes = Base64UrlDecode(parts[1]);
+            using var payload = JsonDocument.Parse(payloadBytes);
+            var root = payload.RootElement;
+            if (!root.TryGetProperty("sub", out var subProp))
+                return false;
+
+            userId = (subProp.GetString() ?? string.Empty).Trim();
+            return !string.IsNullOrWhiteSpace(userId);
+        }
+        catch
+        {
+            userId = string.Empty;
+            return false;
+        }
+    }
+
+    private async Task<GateWorldInvitesMeResult> GetWorldInvitesRequestAsync(
+        string endpoint,
+        string accessToken,
+        string anonKey,
+        bool useSupabaseHeaders)
+    {
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Get, endpoint);
+            var authAttached = useSupabaseHeaders
+                ? ApplySupabaseUserHeaders(message, accessToken, anonKey)
+                : ApplyTicketFunctionHeaders(message, accessToken, anonKey);
+            if (!authAttached)
+                return new GateWorldInvitesMeResult { Ok = false };
+
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            using var response = await Http.SendAsync(message, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return new GateWorldInvitesMeResult { Ok = false };
+
+            GateWorldInvitesMeResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateWorldInvitesMeResponse>(body, JsonOptions); } catch { /* ignore */ }
+            return new GateWorldInvitesMeResult
+            {
+                Ok = parsed?.Ok == true,
+                Incoming = parsed?.Incoming ?? new List<GateWorldInviteEntry>(),
+                Outgoing = parsed?.Outgoing ?? new List<GateWorldInviteEntry>()
+            };
+        }
+        catch
+        {
+            return new GateWorldInvitesMeResult { Ok = false };
+        }
+    }
+
+    private async Task<bool> PostWorldInviteResponseRequestAsync(
+        string endpoint,
+        object request,
+        string accessToken,
+        string anonKey,
+        bool useSupabaseHeaders)
+    {
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var authAttached = useSupabaseHeaders
+                ? ApplySupabaseUserHeaders(message, accessToken, anonKey)
+                : ApplyTicketFunctionHeaders(message, accessToken, anonKey);
+            if (!authAttached)
+                return false;
+
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            message.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
+            using var response = await Http.SendAsync(message, default).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return false;
+
+            GateWorldInviteResponse? parsed = null;
+            try { parsed = JsonSerializer.Deserialize<GateWorldInviteResponse>(body, JsonOptions); } catch { /* ignore */ }
+            return parsed?.Ok == true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task RevokePendingHostInvitesAsync()
+    {
+        var accessToken = ResolveVeilnetAccessToken();
+        var anonKey = ResolveSupabaseAnonKey();
+        if (!IsUsableAccessToken(accessToken))
+            return;
+
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/world-invite-revoke-host",
+            $"{_gateUrl}/world_invite_revoke_host"
+        };
+
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            if (await PostSimpleAuthorizedEndpointAsync(endpoints[i], accessToken, anonKey, useSupabaseHeaders: false).ConfigureAwait(false))
+                return;
+
+            if (await PostSimpleAuthorizedEndpointAsync(endpoints[i], accessToken, anonKey, useSupabaseHeaders: true).ConfigureAwait(false))
+                return;
+        }
+    }
+
+    private async Task<bool> PostSimpleAuthorizedEndpointAsync(
+        string endpoint,
+        string accessToken,
+        string anonKey,
+        bool useSupabaseHeaders)
+    {
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var authAttached = useSupabaseHeaders
+                ? ApplySupabaseUserHeaders(message, accessToken, anonKey)
+                : ApplyTicketFunctionHeaders(message, accessToken, anonKey);
+            if (!authAttached)
+                return false;
+
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            message.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+            using var response = await Http.SendAsync(message, default).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<bool> PostTicketCleanupRequestAsync(
+        string endpoint,
+        object request,
+        string accessToken,
+        string anonKey,
+        bool useSupabaseHeaders)
+    {
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            var authAttached = useSupabaseHeaders
+                ? ApplySupabaseUserHeaders(message, accessToken, anonKey)
+                : ApplyTicketFunctionHeaders(message, accessToken, anonKey);
+            if (!authAttached)
+                return false;
+
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            message.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
+
+            using var response = await Http.SendAsync(message, default).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<(bool Ok, T? Response, string? Error)> PostSupabaseUserAuthorizedAsync<TReq, T>(
+        string url,
+        TReq req,
+        CancellationToken ct) where T : class
+    {
+        var accessToken = ResolveVeilnetAccessToken();
+        if (!IsUsableAccessToken(accessToken))
+            return (false, null, "missing_access_token");
+
+        var anonKey = ResolveSupabaseAnonKey();
+        if (string.IsNullOrWhiteSpace(anonKey))
+            return (false, null, "missing_supabase_anon_key");
+
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, url);
+            var hasAuth = ApplySupabaseUserHeaders(message, accessToken, anonKey);
+            if (!hasAuth)
+                return (false, null, "missing_access_token");
+
+            var json = JsonSerializer.Serialize(req, JsonOptions);
+            message.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var response = await Http.SendAsync(message, ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var err = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return (false, null, err);
+            }
+
+            if (string.IsNullOrWhiteSpace(body))
+                return (true, null, null);
+
+            T? parsed = null;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<T>(body, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"invalid_json:{ex.Message}");
+            }
+
+            return (true, parsed, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, null, ex.Message);
+        }
+    }
+
+    private async Task<(bool Ok, T? Response, string? Error)> GetSupabaseUserAuthorizedAsync<T>(
+        string url,
+        CancellationToken ct) where T : class
+    {
+        var accessToken = ResolveVeilnetAccessToken();
+        if (!IsUsableAccessToken(accessToken))
+            return (false, null, "missing_access_token");
+
+        var anonKey = ResolveSupabaseAnonKey();
+        if (string.IsNullOrWhiteSpace(anonKey))
+            return (false, null, "missing_supabase_anon_key");
+
+        try
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Get, url);
+            var hasAuth = ApplySupabaseUserHeaders(message, accessToken, anonKey);
+            if (!hasAuth)
+                return (false, null, "missing_access_token");
+
+            using var response = await Http.SendAsync(message, ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var err = ExtractErrorMessage(body)
+                    ?? (string.IsNullOrWhiteSpace(response.ReasonPhrase) ? $"HTTP {(int)response.StatusCode}" : response.ReasonPhrase!);
+                return (false, null, err);
+            }
+
+            if (string.IsNullOrWhiteSpace(body))
+                return (true, null, null);
+
+            T? parsed = null;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<T>(body, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"invalid_json:{ex.Message}");
+            }
+
+            return (true, parsed, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, null, ex.Message);
+        }
+    }
+
+    private async Task<GatePresenceQueryResult> QuerySupabaseGamePresenceAsync(IReadOnlyCollection<string> friendIds)
+    {
+        var endpoints = new[]
+        {
+            $"{_gateUrl}/game-presence-query",
+            $"{_gateUrl}/game_presence_query"
+        };
+
+        var request = new { friendIds };
+        for (var i = 0; i < endpoints.Length; i++)
+        {
+            var result = await PostSupabaseUserAuthorizedAsync<object, GatePresenceQueryResponse>(
+                endpoints[i],
+                request,
+                default).ConfigureAwait(false);
+            if (result.Ok && result.Response != null)
+            {
+                return new GatePresenceQueryResult
+                {
+                    Ok = result.Response.Ok,
+                    Entries = result.Response.Entries ?? new List<GatePresenceEntry>()
+                };
+            }
+        }
+
+        return new GatePresenceQueryResult { Ok = false, Entries = new List<GatePresenceEntry>() };
+    }
+
+    private static string ResolveVeilnetUserIdFromAccessToken()
+    {
+        var token = ResolveVeilnetAccessToken();
+        if (!IsUsableAccessToken(token))
+            return string.Empty;
+
+        var parts = token.Split('.');
+        if (parts.Length < 2)
+            return string.Empty;
+
+        try
+        {
+            var payloadBytes = TryBase64UrlDecode(parts[1]);
+            if (payloadBytes == null || payloadBytes.Length == 0)
+                return string.Empty;
+
+            using var doc = JsonDocument.Parse(payloadBytes);
+            if (!doc.RootElement.TryGetProperty("sub", out var sub) || sub.ValueKind != JsonValueKind.String)
+                return string.Empty;
+
+            var value = (sub.GetString() ?? string.Empty).Trim();
+            return Guid.TryParse(value, out _) ? value : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static byte[]? TryBase64UrlDecode(string value)
+    {
+        var normalized = (value ?? string.Empty).Replace('-', '+').Replace('_', '/');
+        var padding = normalized.Length % 4;
+        if (padding == 2) normalized += "==";
+        else if (padding == 3) normalized += "=";
+        else if (padding == 1) return null;
+
+        try
+        {
+            return Convert.FromBase64String(normalized);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<(bool, T?, string?)> PostAsync<TReq, T>(string url, TReq req, CancellationToken ct) where T : class { try { var j = JsonSerializer.Serialize(req, JsonOptions); using var c = new StringContent(j, Encoding.UTF8, "application/json"); var r = await Http.PostAsync(url, c, ct).ConfigureAwait(false); if (!r.IsSuccessStatusCode) return (false, null, r.ReasonPhrase); var b = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false); return (true, JsonSerializer.Deserialize<T>(b, JsonOptions), null); } catch (Exception e) { return (false, null, e.Message); } }
+    private async Task<(bool, T?, string?)> PostAuthorizedAsync<TReq, T>(string url, TReq req, CancellationToken ct) where T : class { if (string.IsNullOrWhiteSpace(_ticket)) return (false, null, "No ticket"); try { var j = JsonSerializer.Serialize(req, JsonOptions); using var m = new HttpRequestMessage(HttpMethod.Post, url); m.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _ticket); m.Content = new StringContent(j, Encoding.UTF8, "application/json"); var r = await Http.SendAsync(m, ct).ConfigureAwait(false); if (!r.IsSuccessStatusCode) return (false, null, r.ReasonPhrase); var b = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false); return (true, JsonSerializer.Deserialize<T>(b, JsonOptions), null); } catch (Exception e) { return (false, null, e.Message); } }
+    private async Task<(bool, T?, string?)> GetAuthorizedAsync<T>(string url, CancellationToken ct) where T : class { if (string.IsNullOrWhiteSpace(_ticket)) return (false, null, "No ticket"); try { using var m = new HttpRequestMessage(HttpMethod.Get, url); m.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _ticket); var r = await Http.SendAsync(m, ct).ConfigureAwait(false); if (!r.IsSuccessStatusCode) return (false, null, r.ReasonPhrase); var b = await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false); return (true, JsonSerializer.Deserialize<T>(b, JsonOptions), null); } catch (Exception e) { return (false, null, e.Message); } }
+
+    private static HttpClient CreateHttpClient() { var h = new HttpClientHandler(); if (h.SupportsAutomaticDecompression) h.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate; return new HttpClient(h) { Timeout = TimeSpan.FromSeconds(30) }; }
+    private static string ResolveGateUrl()
+    {
+        var veilnetFunctions = (Environment.GetEnvironmentVariable("LV_VEILNET_FUNCTIONS_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(veilnetFunctions))
+            return veilnetFunctions.TrimEnd('/');
+
+        var legacyGate = (Environment.GetEnvironmentVariable("LV_GATE_URL") ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(legacyGate) && IsSupabaseFunctionsEndpoint(legacyGate))
+            return legacyGate.TrimEnd('/');
+
+        return DefaultGateUrl;
+    }
+    private static bool ParseBool(string? v) => v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+    private void InvalidateTicket() { _ticket = ""; _ticketExpiresUtc = DateTime.MinValue; }
+    private void InvalidateCachedTicket()
+    {
+        _ticket = string.Empty;
+        _ticketExpiresUtc = DateTime.MinValue;
+        _ticketProductUserId = string.Empty;
+    }
+    private bool HasUsableTicketForCurrentIdentity() => HasValidTicket && string.Equals(_ticketProductUserId, EosClientProvider.Current?.LocalProductUserId ?? "", StringComparison.Ordinal);
+
+    private static bool ContainsAny(string source, params string[] tokens)
+    {
+        for (var i = 0; i < tokens.Length; i++)
+        {
+            if (source.Contains(tokens[i], StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryComputeExecutableHash(string? target, out string executablePath, out string hash)
+    {
+        executablePath = (target ?? string.Empty).Trim();
+        hash = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(executablePath))
+            executablePath = Hashing.ResolveCurrentProcessExecutablePath() ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+            return false;
+
+        try
+        {
+            hash = Hashing.Sha256File(executablePath);
+            return !string.IsNullOrWhiteSpace(hash);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    private void TryRestorePreAuthorizedTicketFromEnvironment() { }
+
+    private static bool IsHashMismatchBody(string body)
+    {
+        return ContainsAny(
+            body ?? string.Empty,
+            "hash_mismatch",
+            "UNOFFICIAL_BUILD",
+            "\"error\":\"hash_mismatch\"",
+            "\"error\":\"UNOFFICIAL_BUILD\"");
+    }
+
+    private static void ApplyEosConfigFromTicket(GateTicketEosPayload? eos)
+    {
+        if (eos == null)
+            return;
+
+        static void SetIfPresent(string key, string? value)
+        {
+            var v = (value ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(v))
+                Environment.SetEnvironmentVariable(key, v);
+        }
+
+        SetIfPresent("EOS_PRODUCT_ID", eos.ProductId);
+        SetIfPresent("EOS_SANDBOX_ID", eos.SandboxId);
+        SetIfPresent("EOS_DEPLOYMENT_ID", eos.DeploymentId);
+        SetIfPresent("EOS_CLIENT_ID", eos.ClientId);
+        SetIfPresent("EOS_PRODUCT_NAME", eos.ProductName);
+        SetIfPresent("EOS_PRODUCT_VERSION", eos.ProductVersion);
+    }
+
+    private class GateTicketResponse
+    {
+        public bool Ok { get; set; }
+        public string? Ticket { get; set; }
+        public string? ExpiresUtc { get; set; }
+        public string? ExpiresAt { get; set; }
+        public string? Reason { get; set; }
+        public string? Error { get; set; }
+        public string? Message { get; set; }
+        public GateTicketEosPayload? Eos { get; set; }
+    }
+    private class GateTicketEosPayload
+    {
+        public string? ProductId { get; set; }
+        public string? SandboxId { get; set; }
+        public string? DeploymentId { get; set; }
+        public string? ClientId { get; set; }
+        public string? ProductName { get; set; }
+        public string? ProductVersion { get; set; }
+    }
+    private class GateBasicOkResponse
+    {
+        public bool Ok { get; set; }
+        public string? Error { get; set; }
+        public string? Message { get; set; }
+    }
+    private class GatePresenceUpsertRequest
+    {
+        public string ProductUserId { get; set; } = string.Empty;
+        public string DisplayName { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public bool IsHosting { get; set; }
+        public bool IsInWorld { get; set; }
+        public string WorldName { get; set; } = string.Empty;
+        public string GameMode { get; set; } = string.Empty;
+        public string JoinTarget { get; set; } = string.Empty;
+        public bool Cheats { get; set; }
+        public int PlayerCount { get; set; }
+        public int MaxPlayers { get; set; }
+    }
+    private class GatePresenceQueryRequest
+    {
+        public IReadOnlyCollection<string> ProductUserIds { get; set; } = Array.Empty<string>();
+    }
+    private class GatePresenceQueryResponse
+    {
+        public bool Ok { get; set; }
+        public List<GatePresenceEntry>? Entries { get; set; }
+        public string? Error { get; set; }
+        public string? Message { get; set; }
+    }
+    private class GateWorldInviteSendRequest
+    {
+        public string? TargetProductUserId { get; set; }
+        public string? WorldName { get; set; }
+        public string? SenderJoinTarget { get; set; }
+    }
+    private class GateWorldInviteSendResponse { public bool Ok { get; set; } public string? Error { get; set; } public string? Message { get; set; } }
+    private class GateWorldInvitesMeResponse
+    {
+        public bool Ok { get; set; }
+        public List<GateWorldInviteEntry>? Incoming { get; set; }
+        public List<GateWorldInviteEntry>? Outgoing { get; set; }
+        public string? Error { get; set; }
+        public string? Message { get; set; }
+    }
+    private class GateWorldInviteResponseRequest { public string? SenderProductUserId { get; set; } public string? Response { get; set; } }
+    private class GateWorldInviteResponse { public bool Ok { get; set; } public string? Error { get; set; } public string? Message { get; set; } }
+    private class GateIdentityResolveRequest { public string? Query { get; set; } }
+    private class GateIdentityResolveResponse { public bool Ok { get; set; } public bool Found { get; set; } public string? Reason { get; set; } public GateIdentityUser? User { get; set; } }
+    private class GateIdentityMeResponse { public bool Ok { get; set; } public bool Found { get; set; } public string? Reason { get; set; } public GateIdentityUser? User { get; set; } public string[]? SentRequests { get; set; } public string[]? ReceivedRequests { get; set; } public string[]? Friends { get; set; } public int Count { get; set; } }
+    private class GateIdentityClaimRequest { public string? ProductUserId { get; set; } public string? Username { get; set; } public string? DisplayName { get; set; } }
+    private class GateIdentityClaimResponse { public bool Ok { get; set; } public string? Code { get; set; } public string? Message { get; set; } public GateIdentityUser? User { get; set; } }
+    private class GateRecoveryCodeResponse { public bool Ok { get; set; } public string? RecoveryCode { get; set; } }
+    private class GateIdentityTransferRequest { public string? Query { get; set; } public string? RecoveryCode { get; set; } public string? ProductUserId { get; set; } }
+    private class GateIdentityTransferResponse { public bool Ok { get; set; } public GateIdentityUser? User { get; set; } }
+    private class GateFriendsResponse { public bool Ok { get; set; } public string? Message { get; set; } public List<GateIdentityUser>? Friends { get; set; } public List<GateFriendRequest>? IncomingRequests { get; set; } public List<GateFriendRequest>? OutgoingRequests { get; set; } public List<GateIdentityUser>? BlockedUsers { get; set; } public int Count { get; set; } }
+    private class GateFriendMutationResponse { public bool Ok { get; set; } public string? Message { get; set; } public string? Error { get; set; } public string? Status { get; set; } }
+    private class GateFriendRequestResponse { public bool Ok { get; set; } public string? Status { get; set; } public string? Message { get; set; } public string? Error { get; set; } }
+    private class GateFriendLookupProfile { public string? Id { get; set; } public string? Username { get; set; } public string? Picture { get; set; } public string? Banner { get; set; } public string? AboutMe { get; set; } }
+    private class GateFriendLookupResponse { public bool Ok { get; set; } public bool Found { get; set; } public GateFriendLookupProfile? Profile { get; set; } public List<GateFriendLookupProfile>? Profiles { get; set; } public string? Error { get; set; } public string? Message { get; set; } }
+    private class GateFriendAddRequest { public string? Query { get; set; } }
+    private class GateFriendRemoveRequest { public string? ProductUserId { get; set; } }
+    private class GateFriendRespondRequest { public string? RequesterProductUserId { get; set; } public bool Accept { get; set; } public bool Block { get; set; } }
+    private class GateFriendBlockRequest { public string? Query { get; set; } }
+    private class GateFriendUnblockRequest { public string? ProductUserId { get; set; } }
+    private class GateTicketValidateRequest
+    {
+        public string Ticket { get; set; } = "";
+        public string RequiredChannel { get; set; } = "release";
+    }
+    private class GateTicketValidateResponse { public bool Ok { get; set; } public string? Reason { get; set; } }
+}
+
+public class GateIdentityUser { public string ProductUserId { get; set; } = ""; public string Username { get; set; } = ""; public string DisplayName { get; set; } = ""; public string FriendCode { get; set; } = ""; public string PictureUrl { get; set; } = ""; public string BannerUrl { get; set; } = ""; public string AboutMe { get; set; } = ""; }
+public class GatePresenceEntry
+{
+    public string ProductUserId { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string Status { get; set; } = "";
+    public bool IsHosting { get; set; }
+    public bool IsInWorld { get; set; }
+    public bool IsMultiplayer { get; set; }
+    public string WorldName { get; set; } = "";
+    public string GameMode { get; set; } = "";
+    public string JoinTarget { get; set; } = "";
+    public string LobbyId { get; set; } = "";
+    public bool Cheats { get; set; }
+    public int PlayerCount { get; set; }
+    public int MaxPlayers { get; set; }
+    public string FriendCode { get; set; } = "";
+    public DateTime UpdatedUtc { get; set; }
+    public DateTime ExpiresUtc { get; set; }
+}
+public class GateFriendRequest { public string ProductUserId { get; set; } = ""; public DateTime RequestedUtc { get; set; } public GateIdentityUser User { get; set; } = new(); }
+public class GatePresenceQueryResult { public bool Ok { get; set; } public List<GatePresenceEntry> Entries { get; set; } = new(); }
+public class GateWorldInviteEntry
+{
+    public string SenderProductUserId { get; set; } = "";
+    public string SenderJoinTarget { get; set; } = "";
+    public string TargetProductUserId { get; set; } = "";
+    public string SenderDisplayName { get; set; } = "";
+    public string SenderPictureUrl { get; set; } = "";
+    public string SenderBannerUrl { get; set; } = "";
+    public string WorldName { get; set; } = "";
+    public string GameMode { get; set; } = "";
+    public string Status { get; set; } = "";
+    public DateTime CreatedUtc { get; set; }
+    public DateTime UpdatedUtc { get; set; }
+    public DateTime ExpiresUtc { get; set; }
+}
+public class GateWorldInvitesMeResult { public bool Ok { get; set; } public List<GateWorldInviteEntry> Incoming { get; set; } = new(); public List<GateWorldInviteEntry> Outgoing { get; set; } = new(); }
+public class GateIdentityResolveResult { public bool Found { get; set; } public GateIdentityUser? User { get; set; } public string Reason { get; set; } = ""; }
+public class GateIdentityMeResult { public bool Ok { get; set; } public bool Found { get; set; } public GateIdentityUser? User { get; set; } public string[]? SentRequests { get; set; } public string[]? ReceivedRequests { get; set; } public string[]? Friends { get; set; } public int Count { get; set; } public string Reason { get; set; } = ""; public string Message { get; set; } = ""; }
+public class GateIdentityClaimResult { public bool Ok { get; set; } public string Code { get; set; } = ""; public string Message { get; set; } = ""; }
+public class GateRecoveryCodeResult { public bool Ok { get; set; } public string RecoveryCode { get; set; } = ""; }
+public class GateIdentityTransferResult { public bool Ok { get; set; } public GateIdentityUser? User { get; set; } }
+public class GateFriendsResult { public bool Ok { get; set; } public List<GateIdentityUser> Friends { get; set; } = new(); public List<GateFriendRequest> IncomingRequests { get; set; } = new(); public List<GateFriendRequest> OutgoingRequests { get; set; } = new(); public List<GateIdentityUser> BlockedUsers { get; set; } = new(); public string Message { get; set; } = ""; }
+public class GateFriendMutationResult { public bool Ok { get; set; } public string Message { get; set; } = ""; }
+public class GateFriendLookupResult { public bool Ok { get; set; } public bool Found { get; set; } public GateIdentityUser? User { get; set; } public string Message { get; set; } = ""; }
+public class GateFriendSearchResult { public bool Ok { get; set; } public List<GateIdentityUser> Users { get; set; } = new(); public string Message { get; set; } = ""; }
+public class GateCurrentHashResult { public bool Ok { get; set; } public string Hash { get; set; } = ""; public string Target { get; set; } = ""; public string Message { get; set; } = ""; }
+public class GateIdentityByDeviceResult { public bool Ok { get; set; } public bool Found { get; set; } public GateIdentityUser? User { get; set; } public string Reason { get; set; } = ""; }
+internal class GateCurrentHashResponse { public bool Ok { get; set; } public string? Hash { get; set; } public string? Target { get; set; } public string? Message { get; set; } }
+internal class GateIdentityByDeviceResponse { public bool Ok { get; set; } public bool Found { get; set; } public GateIdentityUser? User { get; set; } public string? Reason { get; set; } }
+internal class GateSimpleMutationResponse { public bool Ok { get; set; } public string? Message { get; set; } }

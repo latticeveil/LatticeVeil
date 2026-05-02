@@ -1,0 +1,32 @@
+# Keep GitHub "Download ZIP" source archives clean.
+# These rules do not delete local files and do not affect release assets.
+
+/.builder/ export-ignore
+/.codex-dotnet/ export-ignore
+/.dotnet-home/ export-ignore
+/.vscode/ export-ignore
+/ANDROID/ export-ignore
+/Builds/ export-ignore
+/DEV/ export-ignore
+/RELEASE/ export-ignore
+/GateServer/ export-ignore
+/ThirdParty/ export-ignore
+/Tools/DevOnly/ export-ignore
+/eos/ export-ignore
+/installer/ export-ignore
+/node_modules/ export-ignore
+/supabase/ export-ignore
+/test/ export-ignore
+
+LatticeVeilMonoGame/bin/ export-ignore
+LatticeVeilMonoGame/obj/ export-ignore
+LatticeVeilMonoGame/Defaults/eos.public.json export-ignore
+
+*.exe export-ignore
+*.dll export-ignore
+*.pdb export-ignore
+*.zip export-ignore
+*.log export-ignore
+*.lnk export-ignore
+*.env export-ignore
+*.private.json export-ignore
