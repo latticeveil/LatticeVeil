@@ -1,14 +1,49 @@
 {
   "version": "1.0",
-  "release": "v16.1.0",
-  "release_name": "Veilnet Skinlink",
+  "release": "v17.0.0",
+  "release_name": "Veilwalker Survival",
   "base_url": "https://raw.githubusercontent.com/latticeveil/Assets/main/Assets/",
-  "generated_at": "2026-05-02T03:18:57Z",
+  "generated_at": "2026-08-31T22:35:00Z",
   "files": [
     {
+      "path": ".gitattributes",
+      "size": 66,
+      "sha256": "1a1dbe176bc233b499d35a57db7513f2941c99ab9759f177830c9149be99005b"
+    },
+    {
+      "path": ".gitignore",
+      "size": 23,
+      "sha256": "8aa64a6c984afa935a20a5946abe7514860501e7bb3aa6db32bf2d6923aa597e"
+    },
+    {
+      "path": "Models/Blocks/empty_bucket.json",
+      "size": 882,
+      "sha256": "e49d882b12436a2beba5df3f01ffc2cc95f7055a4e880b8107887a40352097da"
+    },
+    {
+      "path": "Models/Blocks/gravestone.json",
+      "size": 727,
+      "sha256": "8ea98b9ddaea88782efd67bcb71e13015de1a7c21aa5ac4c510fb7bb68355b7a"
+    },
+    {
+      "path": "Models/Blocks/torch.json",
+      "size": 4140,
+      "sha256": "9811815d6d9513e7d73b89c86a62123043147ca0d072e138bd8890918c829bfb"
+    },
+    {
+      "path": "Models/Blocks/water_bucket.json",
+      "size": 882,
+      "sha256": "e49d882b12436a2beba5df3f01ffc2cc95f7055a4e880b8107887a40352097da"
+    },
+    {
       "path": "effects/water.fx",
-      "size": 1929,
-      "sha256": "d852f99bfc6ff5ec846630c34fec69fb02c508d59f021010e6bcdbcbe9622c3a"
+      "size": 2442,
+      "sha256": "41c1138485f0807a647b77419f44fdc61d973fdcb08effdd5e3eca1f9616695b"
+    },
+    {
+      "path": "effects/voxel.fx",
+      "size": 2035,
+      "sha256": "6d32b2cc2ca9d821943abfb9a366e8eee1a2320a5e091cce554c9aee95a8bba1"
     },
     {
       "path": "fonts/default.fnt",
@@ -16,9 +51,24 @@
       "sha256": "89f4917a9e34d99cfe082f1fd2d06ca0221762843f085f176ad8bc7c846ca238"
     },
     {
-      "path": "textures/blocks_cubenet_atlas.png",
-      "size": 88666,
-      "sha256": "747c0f1980b122660a51a1cdd1df817db2a090f22f9c4063e9af2da1d6c769aa"
+      "path": "settings.json",
+      "size": 699,
+      "sha256": "cc014cb2fdae2e8edc0e98853886303b5c3f6103d23e7ecbfc48c0b1d40f4091"
+    },
+    {
+      "path": "textures/blocks/advanced_kiln.png",
+      "size": 1192,
+      "sha256": "c9c69c077623624b610173eb870bd2a5bc1a3cf148d46aa7f657d5a75aa0eff3"
+    },
+    {
+      "path": "textures/blocks/advanced_kiln_off.png",
+      "size": 1620,
+      "sha256": "910089cd0b74812e9f6d132916e613818d1d643e7ad73c075cde75380f45408b"
+    },
+    {
+      "path": "textures/blocks/advanced_kiln_on.png",
+      "size": 1823,
+      "sha256": "c01bb483d7044540f2175f50f97e28cfbfd61571f8efa7e157581155207406b8"
     },
     {
       "path": "textures/blocks/air.png",
@@ -26,19 +76,29 @@
       "sha256": "ba46b3feb3a848fd8fc12c309c232eb20e81d6568d4cb908c131eb2b2b53b8b8"
     },
     {
-      "path": "textures/blocks/alignment_matrix_fragment.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/amethyst.png",
+      "size": 2238,
+      "sha256": "6fdaebe6af87e5ab5329244742f01336c1827e79719722460c6070b4f832a356"
     },
     {
-      "path": "textures/blocks/anchoring_alloy.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/amethyst_shard.png",
+      "size": 207,
+      "sha256": "23775ff64e94fab089993b76ff18fa469aeacaf9b48073746dd4c481fa03e521"
     },
     {
-      "path": "textures/blocks/anchoring_salt.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/amethyst_variant_1.png",
+      "size": 2238,
+      "sha256": "6fdaebe6af87e5ab5329244742f01336c1827e79719722460c6070b4f832a356"
+    },
+    {
+      "path": "textures/blocks/amethyst_variant_2.png",
+      "size": 2267,
+      "sha256": "57c5d4f63f8037335a97c4564c0d9506bcb388d7fbac8898831eff07a6bf106f"
+    },
+    {
+      "path": "textures/blocks/amethyst_variant_3.png",
+      "size": 2298,
+      "sha256": "a8adf47762263677f3b907af80d5e3571c5df2c6c60b7a47f7117112a00f36a3"
     },
     {
       "path": "textures/blocks/artificer_bench.png",
@@ -46,24 +106,19 @@
       "sha256": "b9ffad59751c06fdfc148348dd5decf1f8a0728ee0791ebd683f42654590d129"
     },
     {
-      "path": "textures/blocks/attuned_keystone_fragment.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/basic_kiln.png",
+      "size": 2037,
+      "sha256": "fda47e79c4b414268e01b77a6c347a540d4d954963ac2935a9b41e426c825857"
     },
     {
-      "path": "textures/blocks/attuned_keystone.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/basic_kiln_off.png",
+      "size": 2296,
+      "sha256": "09312ccb1704047e2886012d6d71ae9a70951475c073d1c054adbce8116591bc"
     },
     {
-      "path": "textures/blocks/axiom_fulgrite.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/brineveil_elixir.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/basic_kiln_on.png",
+      "size": 2615,
+      "sha256": "b79b7bd741cb355cd58dabe60f1e277fec631f3d7169da1d6aa3b3f7ceaec38c"
     },
     {
       "path": "textures/blocks/chest.png",
@@ -71,29 +126,84 @@
       "sha256": "594a9d4ba82be4720fe4536af880298d299542f06ec532dc55f282ac08dbaed5"
     },
     {
-      "path": "textures/blocks/cinderbranch_staff.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/clean_phial.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
       "path": "textures/blocks/coal.png",
-      "size": 3668,
-      "sha256": "c8d3ede0fad3387b61f470deed8005227716b6ad7f6640604659ca8259a2e8cf"
+      "size": 2157,
+      "sha256": "1bc0635db789df76b2f97c653356760976349fb0f816cada11e9d5314b5054e0"
     },
     {
-      "path": "textures/blocks/copper_wiring.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/coal_variant_1.png",
+      "size": 2157,
+      "sha256": "1bc0635db789df76b2f97c653356760976349fb0f816cada11e9d5314b5054e0"
+    },
+    {
+      "path": "textures/blocks/coal_variant_2.png",
+      "size": 2172,
+      "sha256": "42c7877221d2b32b2a401fb670c23692898c663b00e78fc3bae95e154c7cc7f5"
+    },
+    {
+      "path": "textures/blocks/coal_variant_3.png",
+      "size": 2160,
+      "sha256": "8187abd2e77a3dc327204485097ddc1976362c4aa28f62720c0d9b62d512ecdc"
+    },
+    {
+      "path": "textures/blocks/copper.png",
+      "size": 2227,
+      "sha256": "0a1e1e32dfb70d376beb2fee20084f994f1bb7a0f8a031218a3f6a53c0a30113"
+    },
+    {
+      "path": "textures/blocks/copper_billet.png",
+      "size": 188,
+      "sha256": "07367a47dd09deb21c864558ceab0e6b6e5a0883738cf5588979eadd1e5f8b1a"
+    },
+    {
+      "path": "textures/blocks/copper_cluster.png",
+      "size": 211,
+      "sha256": "cb4c1dbddfcc47086dc1810ab968627141b2c8f8c82e625126b92f7cffacc722"
+    },
+    {
+      "path": "textures/blocks/copper_variant_1.png",
+      "size": 2227,
+      "sha256": "0a1e1e32dfb70d376beb2fee20084f994f1bb7a0f8a031218a3f6a53c0a30113"
+    },
+    {
+      "path": "textures/blocks/copper_variant_2.png",
+      "size": 2270,
+      "sha256": "17c347c8dcd20ab82279d679a37569fdc941f6c8d7fa978810de9221e990ed0d"
+    },
+    {
+      "path": "textures/blocks/copper_variant_3.png",
+      "size": 2278,
+      "sha256": "351fa0f4f395a9846d821497ae5472c5d02135e841b0070ff4812211d6e5617e"
     },
     {
       "path": "textures/blocks/diamond.png",
-      "size": 3966,
-      "sha256": "063ab9f763d11736d81870cf2482f02086ebd82f9cd50666b463ae811ae2bccd"
+      "size": 2239,
+      "sha256": "1dc57fa1abe957cbba508bc592f73f5cda2dee737fffebb1b4ae1fdab704237c"
+    },
+    {
+      "path": "textures/blocks/diamond_block.png",
+      "size": 1199,
+      "sha256": "8a124e982c8ec6a55c5b5f579941f8d4731fe54d9ede4cdd9d095dd5fbb2a55a"
+    },
+    {
+      "path": "textures/blocks/diamond_gem.png",
+      "size": 275,
+      "sha256": "5da9056c6dc29578cbf333caeafc2da6a03a14858b622ec06c948ad18911fa2f"
+    },
+    {
+      "path": "textures/blocks/diamond_variant_1.png",
+      "size": 2239,
+      "sha256": "1dc57fa1abe957cbba508bc592f73f5cda2dee737fffebb1b4ae1fdab704237c"
+    },
+    {
+      "path": "textures/blocks/diamond_variant_2.png",
+      "size": 2265,
+      "sha256": "eb8f8679e0a855f143f6dec7731c85d800445a86c48b1c501bdd6ddab40558e9"
+    },
+    {
+      "path": "textures/blocks/diamond_variant_3.png",
+      "size": 2282,
+      "sha256": "dfc033015d73dd03f96ac297086914b741b5ca2c2977d5a74b2851b02f370e4c"
     },
     {
       "path": "textures/blocks/dirt.png",
@@ -101,44 +211,59 @@
       "sha256": "f987698ce47851c614d27f539b961264beded39ed7fff23bd56b1cf536a08ef3"
     },
     {
-      "path": "textures/blocks/driftcap.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/emerald.png",
+      "size": 2219,
+      "sha256": "9e842a125f738658a6777eb11a836f3750fe73d1b82f7603928274ab46b8db5b"
     },
     {
-      "path": "textures/blocks/echo_bloom.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/emerald_gem.png",
+      "size": 214,
+      "sha256": "5c5c6a5867396989fef8f09dd2bac7da80944ce403d153481952a01cd99a09f4"
     },
     {
-      "path": "textures/blocks/echo_icon_shard.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/emerald_variant_1.png",
+      "size": 2219,
+      "sha256": "9e842a125f738658a6777eb11a836f3750fe73d1b82f7603928274ab46b8db5b"
     },
     {
-      "path": "textures/blocks/embermoss.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/emerald_variant_2.png",
+      "size": 2263,
+      "sha256": "bacdab021cdf4ba82d1469f20198b6b6701dd3a09b603deaa12af31e7abc6375"
     },
     {
-      "path": "textures/blocks/evergate_core_unstable.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/emerald_variant_3.png",
+      "size": 2300,
+      "sha256": "75df9d4f07f6dc8da350c19cc467ca27b61660ef9ee56a8c378afc8302284813"
     },
     {
-      "path": "textures/blocks/evergate_core.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/empty_bucket.png",
+      "size": 262,
+      "sha256": "5730f279c0c6f9da2e6816d99f5068f9fa5831b9e4fb79b139bcb4f12aa56b08"
     },
     {
-      "path": "textures/blocks/fleetstep_draught.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/fiber_wrapped_torch.png",
+      "size": 378,
+      "sha256": "f9129ef2ad1a48872be4b35efa859b22e35d28de5fd8ad504626bd385fdfb387"
     },
     {
-      "path": "textures/blocks/fragment_scrap.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/field_oven.png",
+      "size": 1848,
+      "sha256": "527911d0a8feb71760e84969f6d0f7848a168ac55dead6ab3c9939e4f4b7b1cb"
+    },
+    {
+      "path": "textures/blocks/field_oven_off.png",
+      "size": 2319,
+      "sha256": "2b9608c50616283d4ebe09f340a3797ba3180847c4209ac27e5c3944ee568747"
+    },
+    {
+      "path": "textures/blocks/field_oven_on.png",
+      "size": 2594,
+      "sha256": "83a6572a8fc62b51ff9b32e4061595cf817d221214944efe6a63b9b4ffa73864"
+    },
+    {
+      "path": "textures/blocks/flowing_water.png",
+      "size": 1826,
+      "sha256": "f44b9ba2f9522eeb9b66ebccb4d9acd186e05c4fcd4fa368ae90d918e0950aa6"
     },
     {
       "path": "textures/blocks/glass.png",
@@ -147,18 +272,43 @@
     },
     {
       "path": "textures/blocks/gold.png",
-      "size": 3799,
-      "sha256": "38faf18de7e9afc49f6806c15d774370a732c04ba51055bd9e0d86ca0693748d"
+      "size": 2206,
+      "sha256": "4b1b1c93b3cf628bae79390fa51bef0ef45c68b150c6899f115b7cd6cd0ad85a"
+    },
+    {
+      "path": "textures/blocks/gold_billet.png",
+      "size": 280,
+      "sha256": "036ae2bf25e23438128031c4e9f50f803b30ce64a107faab16bdb01813cbfb48"
+    },
+    {
+      "path": "textures/blocks/gold_block.png",
+      "size": 1224,
+      "sha256": "2fbf8983f3dff4a454c6ba1581f90e3d818473ac9610c652c20e12aa5dfa1f6a"
+    },
+    {
+      "path": "textures/blocks/gold_cluster.png",
+      "size": 417,
+      "sha256": "c9f97527b61f2e2c533bca42386ee22deb4908bb0c586778fc54245dacbd47f8"
+    },
+    {
+      "path": "textures/blocks/gold_variant_1.png",
+      "size": 2206,
+      "sha256": "4b1b1c93b3cf628bae79390fa51bef0ef45c68b150c6899f115b7cd6cd0ad85a"
+    },
+    {
+      "path": "textures/blocks/gold_variant_2.png",
+      "size": 2236,
+      "sha256": "83c095ab7bd90c72bacaedc3644ad8c5506b28677886721fcf64a8a75ceed96c"
+    },
+    {
+      "path": "textures/blocks/gold_variant_3.png",
+      "size": 2261,
+      "sha256": "97997aa8527973f39866bbc98994e395feb863a3699ab2471687c07fd9989cf6"
     },
     {
       "path": "textures/blocks/grass.png",
       "size": 1238,
       "sha256": "21832118c7cc471b765f05e0c0cbbceb8f0bb2db571015c916c74b0a4dad691d"
-    },
-    {
-      "path": "textures/blocks/grave_silt.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
     },
     {
       "path": "textures/blocks/gravel.png",
@@ -171,14 +321,39 @@
       "sha256": "a5e9f6c7078dd2dfcf4008759efb384a7b7c1ef555f00f1dee0634874489c9fc"
     },
     {
-      "path": "textures/blocks/inscribed_tablet.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/iron.png",
+      "size": 2248,
+      "sha256": "79210df18a06fb5e908873ce807d395cf3be2d85631f59a7d899903c4e0ed99a"
     },
     {
-      "path": "textures/blocks/iron.png",
-      "size": 3782,
-      "sha256": "cae47c7d1d8018ccc7906106ab5b84c6998fd246eb0e64f2e1174540ac9f4368"
+      "path": "textures/blocks/iron_billet.png",
+      "size": 279,
+      "sha256": "7fc0621e7ee109a0c5bbfbb7da748bc6a7d40b88ba15187f1cc43dcb7859c84e"
+    },
+    {
+      "path": "textures/blocks/iron_block.png",
+      "size": 1171,
+      "sha256": "bf1ba1cf9ce921709a132d53fb8fc13eef2e4a27c9a97d9596936a491e49f21b"
+    },
+    {
+      "path": "textures/blocks/iron_cluster.png",
+      "size": 410,
+      "sha256": "b1ddeeed78aa775676a50ff333724e8f48c6e1082a312c6b48e4ccbe17eba813"
+    },
+    {
+      "path": "textures/blocks/iron_variant_1.png",
+      "size": 2248,
+      "sha256": "79210df18a06fb5e908873ce807d395cf3be2d85631f59a7d899903c4e0ed99a"
+    },
+    {
+      "path": "textures/blocks/iron_variant_2.png",
+      "size": 2287,
+      "sha256": "c7519d29db91ef852bc51706d2835c504b0d475df4add45bcfb98adfe963a2a0"
+    },
+    {
+      "path": "textures/blocks/iron_variant_3.png",
+      "size": 2314,
+      "sha256": "38e3722b6856b22e37f12e7bf1d0226ab4e3027f666bdc5b14c112823174f890"
     },
     {
       "path": "textures/blocks/leaves.png",
@@ -186,54 +361,49 @@
       "sha256": "dd861bdb9f7b2e1a5d98577220cd522e8546fb9a507e439cd322b2f58252c0b7"
     },
     {
-      "path": "textures/blocks/limiter_sigil.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
       "path": "textures/blocks/nullrock.png",
       "size": 2884,
       "sha256": "545f49c2dd99c9a399885466833b11622fb843f6be132f3b116599ce79562a0d"
     },
     {
-      "path": "textures/blocks/plank.png",
+      "path": "textures/blocks/oak_log.png",
+      "size": 1420,
+      "sha256": "a66d71a5ebef6f4df6640475fc02cbb1d37da705f8c6262900a342f6c56b95a1"
+    },
+    {
+      "path": "textures/blocks/oak_planks.png",
       "size": 3162,
       "sha256": "3a7c3b31a66ae9f7cccb0325784e671fa74f601082be5450b1305306b49583ad"
     },
     {
-      "path": "textures/blocks/pyroskin_tonic.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/pebbles.png",
+      "size": 389,
+      "sha256": "d242e9c8db9aa34c7447cb2d57bd56ed73254a493d4227c3bf5188b61b29be52"
     },
     {
-      "path": "textures/blocks/quiet_alembic.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/ruby.png",
+      "size": 2256,
+      "sha256": "424f950aecf7c7816c3432d75756d4a6fb25d8aea04395abc8e7e0059ccc2f6c"
     },
     {
-      "path": "textures/blocks/regulator_component.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/ruby_stone.png",
+      "size": 211,
+      "sha256": "9dd890d6fac9709939007f8e2f8995447efdfe932c50b4233d84940888f2b25b"
     },
     {
-      "path": "textures/blocks/resonance_core.png",
-      "size": 3494,
-      "sha256": "d8e760da870ff850bd644dbbf46689783f360ab6820e75e0c4d18d29985d7ebe"
+      "path": "textures/blocks/ruby_variant_1.png",
+      "size": 2256,
+      "sha256": "424f950aecf7c7816c3432d75756d4a6fb25d8aea04395abc8e7e0059ccc2f6c"
     },
     {
-      "path": "textures/blocks/runestone_dust.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/ruby_variant_2.png",
+      "size": 2280,
+      "sha256": "d68aef6a499710175382300993a6f52de8a1900785677cd24560d7f15b5d5c20"
     },
     {
-      "path": "textures/blocks/runestone.png",
-      "size": 2601,
-      "sha256": "8ff6568342b81d6718b9c8aaa8afc345ba460ed3d6da6e4c8fa5255813d4ccda"
-    },
-    {
-      "path": "textures/blocks/runic_anvil.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/ruby_variant_3.png",
+      "size": 2302,
+      "sha256": "3d3cfd6baba1e4961e3fa3b5532def888215b332a8daf3bed502f63c34876773"
     },
     {
       "path": "textures/blocks/sand.png",
@@ -241,19 +411,29 @@
       "sha256": "261f2c71391648fb00c8b4c8de7b3dd4f7fc69cfe37816a1b8daba9da8a86b3d"
     },
     {
-      "path": "textures/blocks/sigil_loom.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/sapphire.png",
+      "size": 2208,
+      "sha256": "1c9b128fe26a8a5a0035d05f043d5ac1b8739755dc680c921df85bc0b9a244a1"
     },
     {
-      "path": "textures/blocks/skybound_philter.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/sapphire_gem.png",
+      "size": 211,
+      "sha256": "33c8ce243c0fc35e030b0d4a17a85fbe0d14b2af581e82ddbf6d333ece24c07c"
     },
     {
-      "path": "textures/blocks/stabilized_ash.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/sapphire_variant_1.png",
+      "size": 2208,
+      "sha256": "1c9b128fe26a8a5a0035d05f043d5ac1b8739755dc680c921df85bc0b9a244a1"
+    },
+    {
+      "path": "textures/blocks/sapphire_variant_2.png",
+      "size": 2262,
+      "sha256": "f9acce1787cfe0353fa9e3b9c3d4249a3e64d191613d68464ec411358fbbfd2d"
+    },
+    {
+      "path": "textures/blocks/sapphire_variant_3.png",
+      "size": 2274,
+      "sha256": "983b08f6f14ede289bb9c2a072f87c6f418671d097e3ad0f364d4f786bba699a"
     },
     {
       "path": "textures/blocks/stone.png",
@@ -261,49 +441,14 @@
       "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
     },
     {
-      "path": "textures/blocks/stormreed_staff.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/blocks/torch.png",
+      "size": 350,
+      "sha256": "7eb2123338dde987462157dd425daa838f4e26fa3d3c46de022bd749038901d1"
     },
     {
-      "path": "textures/blocks/swiftleaf.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/timed_limiter.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/transit_regulator_part.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/transit_regulator.png",
-      "size": 3035,
-      "sha256": "2266b233d2474c2de1291923e02d7447c8d500157057fce962c2bdb3a551ba44"
-    },
-    {
-      "path": "textures/blocks/veil_sealstone.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/veilglass.png",
-      "size": 168,
-      "sha256": "a44a3baa3ab33fbb56da3070dc7aeb1a072c6ca2390ac794d14811f7667ab420"
-    },
-    {
-      "path": "textures/blocks/veinstone_crystal.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
-    },
-    {
-      "path": "textures/blocks/veinstone.png",
-      "size": 3309,
-      "sha256": "91b89b54f7f2f2859e8fd72f30b290aa70897ce622e6db25bde101306a2a04c0"
+      "path": "textures/blocks/water.png",
+      "size": 750,
+      "sha256": "00e00742e5c0b4160d8de85317dbedafd5611abc046ca111f77a43d307615658"
     },
     {
       "path": "textures/blocks/water_bucket.png",
@@ -311,34 +456,179 @@
       "sha256": "a0a06f17c37d80f3021bbfdd5d40fc9fa525986ca55731c37161a1a362ecc24a"
     },
     {
-      "path": "textures/blocks/water.png",
-      "size": 3231,
-      "sha256": "3372e7b811fbeeba79ad7a4a1a2bf26832edd05a0ac208c8b649162340c25fea"
+      "path": "textures/items/amethyst_shard.png",
+      "size": 207,
+      "sha256": "23775ff64e94fab089993b76ff18fa469aeacaf9b48073746dd4c481fa03e521"
     },
     {
-      "path": "textures/blocks/waybound_frame.png",
-      "size": 3008,
-      "sha256": "6d653c42e49e2d568ca8e32fac5a5b7469d9c4f8a417caa83be2288d40c51df0"
+      "path": "textures/items/coal_chunk.png",
+      "size": 283,
+      "sha256": "d272dc10169cfc55bcd95d6466ad33012f22f013a01ef6d813b520467b8fdd5c"
     },
     {
-      "path": "textures/blocks/wayfinder_plinth_part.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/items/copper_billet.png",
+      "size": 188,
+      "sha256": "07367a47dd09deb21c864558ceab0e6b6e5a0883738cf5588979eadd1e5f8b1a"
     },
     {
-      "path": "textures/blocks/waygate_plinth.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/items/copper_cluster.png",
+      "size": 211,
+      "sha256": "cb4c1dbddfcc47086dc1810ab968627141b2c8f8c82e625126b92f7cffacc722"
     },
     {
-      "path": "textures/blocks/waygate_rune.png",
-      "size": 3310,
-      "sha256": "35b0e17a99d6e621d3f0256e23d0d29e38fa88fc362854f39009e524e22391b9"
+      "path": "textures/items/diamond_gem.png",
+      "size": 343,
+      "sha256": "16af0edb57e5ef6d5a35256576f9134ddee096a8c6f5d9f3f7ca95b1d44f6833"
     },
     {
-      "path": "textures/blocks/wood.png",
-      "size": 1420,
-      "sha256": "a66d71a5ebef6f4df6640475fc02cbb1d37da705f8c6262900a342f6c56b95a1"
+      "path": "textures/items/emerald_gem.png",
+      "size": 214,
+      "sha256": "5c5c6a5867396989fef8f09dd2bac7da80944ce403d153481952a01cd99a09f4"
+    },
+    {
+      "path": "textures/items/gold_billet.png",
+      "size": 256,
+      "sha256": "8a8b5ea341ce2598a12fbf7ab0d582eb15fb75a59aacb059d0d64196df0771d3"
+    },
+    {
+      "path": "textures/items/gold_cluster.png",
+      "size": 368,
+      "sha256": "f5e227358b2b23ee82107d0f2d876300fde43b3d551ae9cca893e0a4b4c005e2"
+    },
+    {
+      "path": "textures/items/iron_billet.png",
+      "size": 257,
+      "sha256": "fe19b7e638ce74048bad3f9cdaf4eeeaa4f526568439a9331734e5da813a183c"
+    },
+    {
+      "path": "textures/items/iron_cluster.png",
+      "size": 363,
+      "sha256": "043146ae9e379e0f79f71e4bae27a6e5b31e1521ac444b20df087455f9707f12"
+    },
+    {
+      "path": "textures/items/pebbles.png",
+      "size": 337,
+      "sha256": "f79d57d7da8facca8055d7bb6327353d9ae40b9c2bcb9018d178bf625ff812f5"
+    },
+    {
+      "path": "textures/items/plant_fiber.png",
+      "size": 384,
+      "sha256": "54713ab0968f642f56339b66f20988d6e804248d5d7fe9fb4855c06aff795435"
+    },
+    {
+      "path": "textures/items/ruby_stone.png",
+      "size": 211,
+      "sha256": "9dd890d6fac9709939007f8e2f8995447efdfe932c50b4233d84940888f2b25b"
+    },
+    {
+      "path": "textures/items/sapphire_gem.png",
+      "size": 211,
+      "sha256": "33c8ce243c0fc35e030b0d4a17a85fbe0d14b2af581e82ddbf6d333ece24c07c"
+    },
+    {
+      "path": "textures/items/stick.png",
+      "size": 533,
+      "sha256": "889bf0cf051360a87a7b1d63b1c9de3054f82ef5fe6813884f85b4aee8f9776d"
+    },
+    {
+      "path": "textures/items/torch.png",
+      "size": 243,
+      "sha256": "79167b2cd25fe641e0a5e808e075467a3644ada04da329c0b9d9ba33c3f0ea7b"
+    },
+    {
+      "path": "textures/environment/moon.png",
+      "size": 4635,
+      "sha256": "F4F2260753069E479EA9F5E3C73BBE9721DBB3BF761754303E6AC19588F3ABA2"
+    },
+    {
+      "path": "textures/environment/sun.png",
+      "size": 6799,
+      "sha256": "34E216A57E7E966B3CEB54E8CE99003A02662488D7B3766F1E506F2F611DAA3D"
+    },
+    {
+      "path": "textures/menu/GUIS/AddFriend_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/CreateWorld_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/InviteFriends_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/MenuPanel_Base_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/MoreWorldOptions_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/MultiplayerBackground_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/MultiplayerHost_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Multiplayer_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Pause_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Profile_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Screenshots_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Settings_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/Singleplayer_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/WorldGeneration_GUI.png",
+      "size": 2501242,
+      "sha256": "97e1ecf451f1cabd598137e3c654d4de9f0a4c06e2102eb2072538fc074b99ad"
+    },
+    {
+      "path": "textures/menu/GUIS/health.png",
+      "size": 77773,
+      "sha256": "47c71f49a30f772f2998e6d5a5e4e4bf41b9c85aa6dd2ffd2198f4ecd0f5cdd6"
+    },
+    {
+      "path": "textures/menu/GUIS/hunger.png",
+      "size": 89855,
+      "sha256": "53233acb10f2c0a7f644d7f8c136076a78ad28f8d51bb832d8a10a1bd13391a5"
+    },
+    {
+      "path": "textures/menu/GUIS/sigil_balance_mockup.png",
+      "size": 117106,
+      "sha256": "54d7635315a1f6edf665c3954f5c5dbc672770984e968e9576480741f9b3ec1c"
     },
     {
       "path": "textures/menu/backgrounds/CreateWorld_bg.png",
@@ -366,17 +656,17 @@
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
     {
-      "path": "textures/menu/backgrounds/Multiplayer_bg.png",
-      "size": 1863997,
-      "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
-    },
-    {
       "path": "textures/menu/backgrounds/Multiplayer.png",
       "size": 1863997,
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
     {
       "path": "textures/menu/backgrounds/MultiplayerHost_bg.png",
+      "size": 1863997,
+      "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
+    },
+    {
+      "path": "textures/menu/backgrounds/Multiplayer_bg.png",
       "size": 1863997,
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
@@ -396,17 +686,17 @@
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
     {
+      "path": "textures/menu/backgrounds/WorldGeneration_bg.png",
+      "size": 1863997,
+      "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
+    },
+    {
       "path": "textures/menu/backgrounds/singelplayer.png",
       "size": 1863997,
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
     {
       "path": "textures/menu/backgrounds/singleplayer_bg.png",
-      "size": 1863997,
-      "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
-    },
-    {
-      "path": "textures/menu/backgrounds/WorldGeneration_bg.png",
       "size": 1863997,
       "sha256": "a628318b4889f2b827cfa61d4cc0b83e32eb68df0cb768ad87fd7763332b6866"
     },
@@ -481,16 +771,6 @@
       "sha256": "ed0501eff434cad07cc1ec8894aae641dbbf4be52a5ab9730e49b29b246073d7"
     },
     {
-      "path": "textures/menu/buttons/options.png",
-      "size": 202476,
-      "sha256": "d533773eee1fa26f580cfc7bbc0365876cb1117a52043204ee7f1bfd494bb811"
-    },
-    {
-      "path": "textures/menu/buttons/packs.png",
-      "size": 121846,
-      "sha256": "3864738e80248684d0e2c652d38af85212de4c8f14979d189d71e914e6f3c78b"
-    },
-    {
       "path": "textures/menu/buttons/PacksSelected.png",
       "size": 114716,
       "sha256": "372be56245745f788b8b5c21a788dc7a1389a215ed0e690a94d47f5cbcafe01a"
@@ -509,11 +789,6 @@
       "path": "textures/menu/buttons/QuitSelected.png",
       "size": 180922,
       "sha256": "c0d0a13eb48deb2c7fb93436fb9a3144534ffca72ae41b68619e5bfac7ac7ea8"
-    },
-    {
-      "path": "textures/menu/buttons/screenshots.png",
-      "size": 1562354,
-      "sha256": "bae1d8f17b98ad74a6075f49c93618dcc4f55e624aec90906d54047865f56716"
     },
     {
       "path": "textures/menu/buttons/Singleplayer.png",
@@ -551,69 +826,39 @@
       "sha256": "0c82ed62559ff76682f0cf34a2994a572d5f6af962aa38d4277a3b921d9944d9"
     },
     {
-      "path": "textures/menu/GUIS/CreateWorld_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
+      "path": "textures/menu/buttons/options.png",
+      "size": 202476,
+      "sha256": "d533773eee1fa26f580cfc7bbc0365876cb1117a52043204ee7f1bfd494bb811"
     },
     {
-      "path": "textures/menu/GUIS/GUIBOX.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
+      "path": "textures/menu/buttons/packs.png",
+      "size": 121846,
+      "sha256": "3864738e80248684d0e2c652d38af85212de4c8f14979d189d71e914e6f3c78b"
     },
     {
-      "path": "textures/menu/GUIS/health.png",
-      "size": 77773,
-      "sha256": "47c71f49a30f772f2998e6d5a5e4e4bf41b9c85aa6dd2ffd2198f4ecd0f5cdd6"
+      "path": "textures/menu/buttons/screenshots.png",
+      "size": 1562354,
+      "sha256": "bae1d8f17b98ad74a6075f49c93618dcc4f55e624aec90906d54047865f56716"
     },
     {
-      "path": "textures/menu/GUIS/hunger.png",
-      "size": 89855,
-      "sha256": "53233acb10f2c0a7f644d7f8c136076a78ad28f8d51bb832d8a10a1bd13391a5"
-    },
-    {
-      "path": "textures/menu/GUIS/Multiplayer_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/MultiplayerHost_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/Pause_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/Profile_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/Settings_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/sigil_balance_mockup.png",
-      "size": 117106,
-      "sha256": "54d7635315a1f6edf665c3954f5c5dbc672770984e968e9576480741f9b3ec1c"
-    },
-    {
-      "path": "textures/menu/GUIS/Singleplayer_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
-    },
-    {
-      "path": "textures/menu/GUIS/WorldGeneration_GUI.png",
-      "size": 1857548,
-      "sha256": "dc87c41cb04c1b698be29a24834dca40e15c1f4923598d61d1d2c60ef53a7af4"
+      "path": "textures/menu/icons/trashcan.png",
+      "size": 1404,
+      "sha256": "b5c0fa3af8705866ddb2e4b02b66d76a1c7cdb7fa8433194ae8f4ff7f779cb87"
     },
     {
       "path": "textures/missing.png",
       "size": 280,
       "sha256": "5a9bc5bed63433af9f0cfca06bb62ab530cab0c7854fb511d486beee6a23d47f"
+    },
+    {
+      "path": "ui_editor_layouts.json",
+      "size": 177,
+      "sha256": "9b7b4f2a26f1b813b7af1c2c5c7319b4f0a9d80ca9b2f3532be500dd06dfcf0b"
+    },
+    {
+      "path": "ui_layouts.json",
+      "size": 3840,
+      "sha256": "a05c8dd9bce2cb142e993114b11b32ba24dcfe20ffc7367a7b9b575c68f92617"
     }
   ]
 }

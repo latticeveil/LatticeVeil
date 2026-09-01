@@ -39,6 +39,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly PlayerProfile _profile;
     private readonly global::Microsoft.Xna.Framework.GraphicsDeviceManager _graphics;
     private ILanSession? _lanSession;
+    private IntegratedWorldServer? _integratedServer;
     private readonly string _worldPath;
     private readonly string _metaPath;
     private readonly object _historyFileLock = new();
@@ -80,31 +81,43 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private float _activeRadiusRampTimer;
     private const int MaxRuntimeActiveRadius = GameSettings.EngineRenderDistanceMax;
     private const int MaxMeshBuildsPerFrame = 4;
-    private const int StartupActiveRadiusChunks = 5;
+    private const int StartupActiveRadiusChunks = 3;
     private const float ActiveRadiusRampIntervalSeconds = 0.75f;
-    private const int ActiveRadiusRampChunkThreshold = 12;
-    private const int ActiveRadiusRampMeshThreshold = 16;
+    private const int ActiveRadiusRampChunkThreshold = 48;
+    private const int ActiveRadiusRampMeshThreshold = 64;
+    private const float RejoinStreamingThrottleSeconds = 12.0f;
 
     // Chunk streaming constants
-    private const int MaxNewChunkRequestsPerFrame = 2;
-    private const int MaxMeshBuildRequestsPerFrame = 2;
-    private const int MaxApplyCompletedMeshesPerFrame = 3;
-    private const int MaxApplyCompletedChunkLoadsPerFrame = 4;
-    private const int MaxOutstandingChunkJobs = 96;
-    private const int MaxOutstandingMeshJobs = 96;
+    private const int MaxNewChunkRequestsPerFrame = 8;
+    private const int MaxMeshBuildRequestsPerFrame = 8;
+    private const int MaxApplyCompletedMeshesPerFrame = 12;
+    private const int MaxApplyCompletedChunkLoadsPerFrame = 16;
+    private const int MaxOutstandingChunkJobs = 384;
+    private const int MaxOutstandingMeshJobs = 384;
+    private const int HorizonLodRebuildChunkStep = 8;
+    private const int HorizonLodCenterChunkStep = 8;
+    private const int HorizonLodSeaLevel = 64;
+    private const int HorizonLodSkirtDepthBlocks = 48;
+    private const int HorizonLodInnerPaddingChunks = 2;
+    private static readonly bool RuntimeHorizonLodEnabled = false; // Disabled until the distant-terrain overlay is fixed in a dedicated LOD pass.
 
-    private const int KeepRadiusBuffer = 3;
+    private const int KeepRadiusBuffer = 1;
     private const int PrewarmRadius = 8; // Match render distance to prevent post-spawn loading
     private const int PrewarmGateRadius = 3;
     private const int PrewarmVerticalChunkTop = 5;
     private const int PrewarmChunkBudgetPerFrame = 6;
     private const int PrewarmMeshBudgetPerFrame = 4;
     private const double PrewarmTimeoutSeconds = 12.0;
+    private const double HorizonLodPreloadTimeoutSeconds = 18.0;
     private const bool ENABLE_SPAWN_PREWARM = false; // disabled: join/leave should be instant; spawn area is pregenerated on world creation // Gate visibility until spawn-area is generated + meshed
-    private static readonly int RuntimeChunkRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
-    private static readonly int RuntimeMeshRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
-    private static readonly int RuntimeChunkScheduleBudget = Math.Clamp((Environment.ProcessorCount / 3) + 1, 2, 6);
-    private static readonly int RuntimeMeshScheduleBudget = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+    private static readonly int RuntimeChunkRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 3, 8);
+    private static readonly int RuntimeMeshRequestBudget = Math.Clamp(Environment.ProcessorCount / 2, 3, 8);
+    private static readonly int RuntimeChunkScheduleBudget = Math.Clamp((Environment.ProcessorCount / 3) + 1, 2, 8);
+    private static readonly int RuntimeMeshScheduleBudget = Math.Clamp((Environment.ProcessorCount / 3) + 1, 2, 8);
+    private static readonly int StartupChunkRequestBudget = Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
+    private static readonly int StartupMeshRequestBudget = Math.Clamp(Environment.ProcessorCount / 4, 1, 3);
+    private static readonly int StartupChunkScheduleBudget = Math.Clamp(Environment.ProcessorCount / 4, 1, 2);
+    private static readonly int StartupMeshScheduleBudget = Math.Clamp(Environment.ProcessorCount / 4, 1, 2);
 
     // Streaming state
     private ChunkCoord _playerChunkCoord;
@@ -141,6 +154,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly List<ChunkCoord> _streamingFocusChunks = new();
     private readonly List<ChunkCoord> _drawOrderBuffer = new();
     private readonly List<ChunkCoord> _meshRemovalBuffer = new();
+    private int _readyVisualRadiusChunks;
     private readonly Queue<ChunkCoord> _meshQueue = new();
     private readonly HashSet<ChunkCoord> _meshQueued = new();
     private readonly ConcurrentQueue<MeshBuildResult> _completedMeshBuildQueue = new();
@@ -155,11 +169,35 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly SemaphoreSlim _chunkGenerationSemaphore = new(ChunkWorkerCount, ChunkWorkerCount);
     private bool _loggedInvalidChunkMesh;
     private bool _loggedInvalidHandMesh;
+    private readonly object _horizonLodLock = new();
+    private VertexPositionColor[]? _horizonLodVertices;
+    private VertexBuffer? _horizonLodVertexBuffer;
+    private int _horizonLodPrimitiveCount;
+    private Task<HorizonLodBuildResult>? _horizonLodBuildTask;
+    private ChunkCoord _horizonLodCenterChunk;
+    private int _horizonLodInnerRadiusChunks;
+    private int _horizonLodRadiusChunks;
+    private string _horizonLodQuality = string.Empty;
+    private string _horizonLodStatus = "WAITING";
+    private bool _horizonLodHasMesh;
+    private bool _horizonLodBuildQueued;
+    private bool _horizonLodPreloadComplete;
+    private bool _horizonLodPreloadTimedOut;
+    private DateTime _horizonLodPreloadStartTime = DateTime.UtcNow;
 
     private BasicEffect? _effect;
+    private bool _voxelEffectLoadAttempted;
+    private Effect? _voxelEffect;
+    private float SkyLightFactor; // 0..1 time-of-day sky brightness
+    private float BlockLightIntensity; // block light intensity multiplier
+    private float AOStrength; // ambient occlusion strength
+    private Vector3 BlockLightTint; // warm torch-light tint
+    private BasicEffect? _horizonLodEffect;
     private AlphaTestEffect? _cutoutEffect;
     private Effect? _waterEffect;
     private bool _waterEffectLoadAttempted;
+    private int _flowingWaterAnimationFrame = -1;
+    private Color[]? _flowingWaterAnimationPixels;
     private BasicEffect? _lineEffect;
     private SpriteBatch? _worldOverlaySpriteBatch;
     private SamplerState? _samplerLow;
@@ -189,26 +227,106 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int ReticleThicknessMin = 1;
     private const int ReticleThicknessMax = 6;
     private static readonly Vector2[] ReticleCirclePoints = BuildReticleCirclePoints(32);
+    private readonly Dictionary<BlockBreakKey, BlockBreakProgress> _blockBreakProgress = new();
+    private BlockBreakKey _activeBreakKey;
+    private bool _hasActiveBreakProgress;
+    private float _activeBreakProgressFraction;
+    private string _activeBreakBlockName = string.Empty;
 
     private readonly PlayerController _player = new();
     private readonly SurvivalVitals _survivalVitals = new();
+    private readonly Random _lootRandom = new();
     private readonly Inventory _inventory = new();
     private Rectangle _hotbarRect;
     private readonly Rectangle[] _hotbarSlots = new Rectangle[Inventory.HotbarSize];
+    private bool _suppressGameplayPointerUntilRelease = true;
     private readonly Rectangle[] _inventoryGridSlots = new Rectangle[Inventory.GridSize];
     private readonly Rectangle[] _inventoryHotbarSlots = new Rectangle[Inventory.HotbarSize]; // Hotbar slots inside inventory UI
     private Rectangle _inventoryRect;
     private Rectangle _inventoryPanelVisualRect;
     private Rectangle _inventoryCatalogTabRect;
     private Rectangle _inventoryStorageTabRect;
+    private Rectangle _inventoryTrashTabRect;
     private Rectangle _inventoryCatalogHeaderRect;
     private Rectangle _inventoryCatalogSearchRect;
     private Rectangle _inventoryCatalogSearchClearRect;
     private Rectangle _inventoryCatalogFavoritesRect;
     private Rectangle _inventoryCatalogListRect;
+    private Rectangle _inventoryCharacterPanelRect;
+    private Rectangle _inventoryPlayerPreviewRect;
+    private bool _inventoryPlayerPreviewDragging;
+    private int _inventoryPlayerPreviewLastMouseX;
+    private float _inventoryPlayerPreviewYaw = MathHelper.PiOver2;
+    private float _nextInventoryPreviewSkinRefreshTime;
+    private Rectangle _handCraftPanelRect;
+    private Rectangle _handCraftInventoryRect;
+    private Rectangle _handCraftSearchRect;
+    private Rectangle _handCraftSearchClearRect;
+    private Rectangle _handCraftRecipeListRect;
+    private Rectangle _handCraftDetailsRect;
+    private Rectangle _handCraftButtonRect;
+    private readonly Rectangle[] _artificerBenchCraftSlots = new Rectangle[9];
+    private readonly HotbarSlot[] _artificerBenchCraftGrid = new HotbarSlot[9];
+    private readonly Dictionary<BlockBreakKey, HotbarSlot[]> _artificerBenchStoredGrids = new();
+    private Rectangle _artificerBenchOutputSlot;
+    private Rectangle _artificerBenchGridPanelRect;
+    private Rectangle _artificerBenchHandCraftBarRect;
+    private Rectangle _artificerBenchRecipeStageButtonRect;
+    private float _artificerBenchHandCraftScrollOffsetPx;
+    private bool _artificerBenchGuiOpen;
+    private bool _artificerBenchStorageLoaded;
+    private bool _artificerBenchStorageDirty;
+    private float _artificerBenchStorageFlushTimer;
+    private BlockBreakKey _activeArtificerBenchKey;
+    private bool _hasActiveArtificerBenchKey;
+    private readonly Rectangle[] _kilnSlots = new Rectangle[3];
+    private readonly HotbarSlot[] _kilnInventory = new HotbarSlot[3];
+    private readonly Dictionary<BlockBreakKey, HotbarSlot[]> _kilnStoredInventories = new();
+    private readonly HotbarSlot[] _trashInventory = new HotbarSlot[Inventory.GridSize];
+    private readonly Rectangle[] _trashInventorySlots = new Rectangle[Inventory.GridSize];
+    private readonly Rectangle[] _trashPlayerSlots = new Rectangle[Inventory.GridSize];
+    private Rectangle _trashPanelRect;
+    private Rectangle _trashClearButtonRect;
+    private bool _trashGuiOpen;
+    private Rectangle _kilnPanelRect;
+    private Rectangle _kilnSmeltButtonRect;
+    private Rectangle _kilnProgressArrowRect;
+    private bool _kilnGuiOpen;
+    private BlockBreakKey _activeKilnKey;
+    private bool _hasActiveKilnKey;
+    private BlockId _activeKilnBlockId = BlockId.BasicKiln;
+    private bool _activeKilnSmelting;
+    private float _activeKilnProgressSeconds;
+    private float _activeKilnDurationSeconds;
+    private BlockId _activeKilnOutputId = BlockId.Air;
+    private int _selectedHandCraftRecipeIndex = -1;
+    private float _handCraftRecipeScrollOffsetPx;
+    private float _handCraftRecipeScrollVelocityPxPerSec;
+    private string _handCraftSearchQuery = string.Empty;
+    private bool _handCraftSearchFocused;
+    private bool _handCraftSearchSelectAll;
+    private int _handCraftSearchCaret;
+    private readonly HashSet<string> _pinnedHandCraftRecipes = new(StringComparer.Ordinal);
     private bool _inventoryOpen;
     private HotbarSlot _inventoryHeld;
     private bool _inventoryHasHeld;
+    private InventorySlotGroup _lastInventoryDragGroup = InventorySlotGroup.None;
+    private int _lastInventoryDragIndex = -1;
+    private bool _lastInventoryDragWasRight;
+    private InventorySlotGroup _lastInventoryLeftClickGroup = InventorySlotGroup.None;
+    private int _lastInventoryLeftClickIndex = -1;
+    private double _lastInventoryLeftClickTime = -10.0;
+    private double _inventoryPlacementBlockedUntil = -10.0;
+    private Point _lastInventoryMousePos;
+    private bool _hasLastInventoryMousePos;
+    private bool _pendingLeftInventoryPlacement;
+    private InventorySlotGroup _pendingLeftInventoryPlacementGroup = InventorySlotGroup.None;
+    private int _pendingLeftInventoryPlacementIndex = -1;
+    private Point _pendingLeftInventoryPlacementPoint;
+    private readonly List<InventoryDragSlotKey> _leftInventoryDragSlots = new();
+    private readonly List<InventoryDragDistributionSlot> _rightInventoryDragSlots = new();
+    private BlockId _rightInventoryDragItemId = BlockId.Air;
+    private int _rightInventoryDragTotal;
     private Keys _inventoryKey = Keys.E;
     private Keys _dropKey = Keys.Q;
     private Keys _giveKey = Keys.F;
@@ -218,10 +336,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private Keys _flyDescendKey = Keys.LeftShift;
     private readonly Button _inventoryClose;
     private readonly Button _inventoryClear;
+    private readonly Button _inventoryDispose;
     private readonly Button _soulLootClose;
     private readonly Button _soulLootClear;
     private readonly Button _soulLootTakeAll;
     private Point _inventoryMousePos;
+    private bool _inventoryPointerActive;
     private InventorySlotGroup _heldFrom = InventorySlotGroup.None;
     private int _heldIndex = -1;
     private bool _inventoryCatalogSearchFocused;
@@ -230,13 +350,19 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private float _inventoryCatalogScrollOffsetPx;
     private float _inventoryCatalogScrollVelocityPxPerSec;
     private bool _inventoryClearConfirmPending;
+    private bool _trashClearConfirmPending;
     private bool _soulLootClearConfirmPending;
     private bool _soulLootPendingClearRemoval;
     private float _inventoryClearConfirmTimer;
+    private float _trashClearConfirmTimer;
+    private bool _inventoryHoverTooltipVisible;
+    private BlockId _inventoryHoverTooltipId = BlockId.Air;
+    private string _inventoryCustomHoverTooltip = string.Empty;
     private bool _catalogLoreLoaded;
     private readonly Dictionary<BlockId, CatalogLoreEntry> _catalogLoreByBlock = new();
     private FirstPersonHandRenderer? _handRenderer;
     private PlayerModel? _playerModel;
+    private PlayerModel? _inventoryPreviewPlayerModel;
     private PlayerModel? _soulMarkerModel;
     private readonly Dictionary<int, PlayerModel> _remotePlayers = new();
     private readonly Dictionary<int, string> _playerNames = new();
@@ -246,6 +372,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly Dictionary<int, WorldItem> _worldItems = new();
     private readonly List<int> _worldItemRemove = new();
     private readonly Dictionary<BlockId, VertexPositionTexture[]> _itemMeshCache = new();
+    private readonly Dictionary<BlockId, Texture2D?> _itemSpriteCache = new();
     private BasicEffect? _itemEffect;
     private int _nextItemId = 1;
     private float _worldTimeSeconds;
@@ -253,6 +380,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private string _handoffTargetName = "";
     private bool _handoffFullStack;
     private bool _handoffPromptVisible;
+    private bool _autoAcceptItemHandoffs;
+    private readonly Dictionary<string, PendingItemHandoffOffer> _localOutgoingHandoffOffers = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingItemHandoffOffer> _hostPendingHandoffOffers = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingItemHandoffOffer> _localIncomingHandoffOffers = new(StringComparer.Ordinal);
     private readonly List<PlayerHomeEntry> _homes = new();
     private string _favoriteHomeName = string.Empty;
     private bool _survivalRespawnPending;
@@ -387,7 +518,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool IsJoinedClientSession => _lanSession != null && !_lanSession.IsHost;
     private bool IsHostingSession => _lanSession != null && _lanSession.IsHost;
     private bool IsTextInputActive => _commandInputActive || _chatInputActive;
-    private bool IsAnyTextCaptureActive => IsTextInputActive || _homeGuiRenameFocused || _homeGuiCreateNameFocused || _homeGuiIconSearchFocused || _inventoryCatalogSearchFocused;
+    private bool IsAnyTextCaptureActive => IsTextInputActive || _homeGuiRenameFocused || _homeGuiCreateNameFocused || _homeGuiIconSearchFocused || _inventoryCatalogSearchFocused || _handCraftSearchFocused;
     private bool IsOverlayActionInteractionActive => !IsTextInputActive
         && _worldTimeSeconds < _chatOverlayActionUnlockUntil
         && _chatLines.Any(line => (line.HasTeleportAction || line.HasCopyAction || line.HasCustomAction) && line.TimeRemaining > 0f);
@@ -445,14 +576,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private string _pauseInviteStatusText = string.Empty;
     private float _pauseInviteStatusTimer;
     private float _pauseInviteScrollTimer;
-    private DateTime _nextPauseInviteRefreshUtc = DateTime.MinValue;
     private Task? _pauseInviteRefreshTask;
     private readonly OnlineGateClient _onlineGate;
     private readonly OnlineSocialStateService _socialState;
     private readonly InputState _pauseGameplayInput = new();
     private EosClient? _eosClient;
-    private bool _debugFaceOverlay;
     private bool _debugHudVisible;
+    private bool _debugHudExtraVisible;
     private Texture2D? _gamemodeArtificerIcon;
     private Texture2D? _gamemodeVeilwalkerIcon;
     private Texture2D? _gamemodeVeilseerIcon;
@@ -501,21 +631,32 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int InventoryCols = Inventory.GridCols;
     private const int InventoryRows = Inventory.GridRows;
     private const int InventorySlotSize = 56;
+    private const int InventoryExpandedSlotSize = 76;
     private const int InventorySlotGap = 8;
     private const int InventoryPadding = 24;
     private const int InventoryTitleHeight = 48;
     private const int InventoryTitleHeightWithTabs = 98;
     private const int InventoryFooterHeight = 60;
-    private const int InventoryTabHeight = 36;
-    private const int InventoryTabWidth = 156;
+    private const int InventoryTabHeight = 42;
+    private const int InventoryTabWidth = 176;
+    private const int InventoryCharacterPanelWidth = 260;
+    private const int InventoryCharacterPanelGap = 24;
+    private const int InventoryEquipmentSlotSize = 34;
+    private const int MaxPinnedHandCraftRecipes = 8;
+    private const int MaxVisiblePinnedHandCraftRecipes = 6;
+    private const double InventoryDoubleClickSeconds = 0.35;
+    private const double InventoryDoubleClickPlacementLockoutSeconds = 0.18;
     private const float InventoryPanelVisualScale = 1.24f;
+    private const int HandCraftRecipeRowHeight = 58;
+    private const int ArtificerBenchHandCraftRowGap = 4;
     private const int HotbarBackdropPadX = 18;
     private const int HotbarBackdropPadY = 14;
     private const int CatalogSearchMaxLength = 64;
     private const int CatalogHeaderHeight = 52;
     private const int CatalogSearchHeight = 36;
-    private const int CatalogRowHeight = 50;
-    private const int CatalogRowOverscan = 2;
+    private const int CatalogGridSlotSize = 46;
+    private const int CatalogGridSlotGap = 6;
+    private const int CatalogGridOverscanRows = 2;
     private const int CatalogTooltipMaxWidth = 420;
     private const string CatalogLoreAssetPath = "data/lore/base_block_lore_overrides.json";
     private const float CatalogScrollWheelImpulse = 520f;
@@ -547,9 +688,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const float DamageHandKickDurationSeconds = 0.20f;
     private const float DamageCameraKickDurationSeconds = 0.16f;
 
-    private float _fpsTimer;
     private float _fps;
     private int _frameCount;
+    private readonly Stopwatch _fpsStopwatch = Stopwatch.StartNew();
     private float _playerSaveTimer; // Timer for periodic player state saving
     private float _chunkSaveTimer; // Timer for periodic chunk saving
     private int _autoSaveInFlight;
@@ -571,6 +712,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const float InteractCooldownSeconds = 0.15f;
     private const float BlockBreakCooldownSeconds = 0.30f;
     private const float HeldAirSwingCooldownSeconds = 0.26f;
+    private const float BlockBreakProgressBaseSeconds = 0.25f;
+    private const float BlockBreakProgressHardnessScale = 1.45f;
+    private const float BlockBreakProgressMinSeconds = 0.45f;
+    private const float BlockBreakProgressMaxSeconds = 8.5f;
+    private const float BlockBreakProgressAbandonGraceSeconds = 1.8f;
+    private const float BlockBreakProgressDecayPerSecond = 0.45f;
+    private const float BlockBreakProgressResetDistance = 7.0f * Scale.BlockSize;
+    private const float BlockBreakProgressSwingIntervalSeconds = 0.22f;
     private const float LocalActionSwingDurationSeconds = 0.42f;
     private const float LocalActionSwingRestartWindowSeconds = 0.06f;
     private const float PlayerMeleeRange = 3.15f * Scale.BlockSize;
@@ -578,6 +727,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const int PlayerMeleeDamage = 4;
     private const float PlayerMeleeKnockbackHorizontal = 13.75f * Scale.BlockSize;
     private const float PlayerMeleeKnockbackVertical = 5.2f * Scale.BlockSize;
+    private const int MaxPebbleProjectiles = 24;
+    private const float PebbleProjectileLifetimeSeconds = 4.0f;
+    private const float PebbleProjectileSpeed = 15.5f * Scale.BlockSize;
+    private const float PebbleProjectileGravity = 12.0f * Scale.BlockSize;
+    private const float PebbleProjectileRadius = 0.09f * Scale.BlockSize;
+    private const float PebbleProjectileKnockbackHorizontal = 8.0f * Scale.BlockSize;
+    private const float PebbleProjectileKnockbackVertical = 2.4f * Scale.BlockSize;
+    private const float PebbleProjectileBreakChance = 0.32f;
     private const float HurtOutlineDurationSeconds = 0.35f;
     private const int HurtParticleMaxCount = 96;
     private const int HurtParticleSpawnCount = 18;
@@ -592,20 +749,34 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const byte PlayerStatusGrounded = 1 << 4;
     private const byte PlayerStatusVeilseer = 1 << 5;
     private const byte PlayerStatusInventoryOpen = 1 << 6;
+    private const byte PlayerStatusSwimming = 1 << 7;
     private const int MaxPriorityMeshBuildsPerFrame = 4;
     private const int MaxInlinePriorityMeshBuildsPerFrame = 1;
     private const int BlockEditBoostFrames = 14;
+    private const float WaterFlowStepSeconds = 0.10f;
+    private const float WaterFlowScanSeconds = 1.50f;
+    private const int WaterFlowMaxUpdatesPerStep = 6;
+    private const double WaterFlowMaxMillisecondsPerStep = 0.35;
+    private const int WaterFlowScanRadius = 5;
+    private const int WaterFlowVerticalScanRadius = 2;
+    private const int WaterFlowScanBacklogLimit = 64;
+    private const float FlowingWaterAnimationFramesPerSecond = 3f;
     private const float PostSyncRecoverySeconds = 2.5f;
     private const int PostSyncDirtyScanIntervalFrames = 3;
     private const int CatalogRowIconSize = 32;
     private float _interactCooldown;
     private float _localActionSwingTimer;
+    private float _waterFlowAccumulator;
+    private float _waterFlowScanAccumulator;
+    private readonly Queue<(int X, int Y, int Z)> _waterFlowQueue = new();
+    private readonly HashSet<(int X, int Y, int Z)> _waterFlowQueued = new();
     private readonly Queue<ChunkCoord> _priorityMeshQueue = new();
     private readonly HashSet<ChunkCoord> _priorityMeshQueued = new();
     private int _blockEditBoostRemaining;
     private bool _worldSyncInProgress = true;
     private bool _hasLoadedWorld;
     private int _chunksReceived;
+    private float _rejoinStreamingThrottleTimer;
     private float _postSyncRecoveryTimer;
     private int _postSyncDirtyScanGate;
     private readonly Queue<ChunkCoord> _postSyncDirtyHintQueue = new();
@@ -654,13 +825,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private readonly HashSet<int> _pendingRemoteJoinAnnouncements = new();
     private readonly HashSet<int> _announcedRemotePlayers = new();
     private readonly Dictionary<int, DateTime> _remoteJoinAnnouncedUtc = new();
+    private readonly List<PebbleProjectile> _pebbleProjectiles = new(MaxPebbleProjectiles);
+    private const int MaxJavelinProjectiles = 32;
+    private const float JavelinMaxChargeSeconds = 1.0f;
+    private const float JavelinMinChargeSeconds = 0.15f;
+    private const float JavelinThrowSpeedMin = 18.0f * Scale.BlockSize;
+    private const float JavelinThrowSpeedMax = 38.0f * Scale.BlockSize;
+    private const float JavelinGravity = 10.5f * Scale.BlockSize;
+    private const float JavelinJabCooldownSeconds = 0.22f;
+    private const float JavelinPickDistance = 3.2f * Scale.BlockSize;
+    private const float JavelinMaxLifetimeSeconds = 300f;
+    private float _javelinChargeHoldTimer;
+    private bool _isChargingJavelin;
+    private int _stuckJavelinsInLocalPlayer;
+    private readonly List<JavelinProjectile> _javelinProjectiles = new(MaxJavelinProjectiles);
     private static readonly TimeSpan RemoteLeaveAnnouncementGrace = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan RemotePersistenceFlushInterval = TimeSpan.FromSeconds(5);
     private const float PersistenceSendIntervalSeconds = 0.75f;
 
+
     private float _selectedNameTimer;
     private int _lastSelectedIndex = -1;
     private string _displayName = "";
+    private CatalogRarity _displayNameRarity = CatalogRarity.Common;
     private Keys _chatKey = Keys.T;
     private Keys _commandKey = Keys.OemQuestion;
     private Keys _homeGuiKey = Keys.H;
@@ -721,6 +908,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const string InventoryGiveSyncPrefix = "__lv_invgive__:";
     private const string InventoryHandoffRequestPrefix = "__lv_invhandoff_req__:";
     private const string InventoryHandoffSyncPrefix = "__lv_invhandoff_sync__:";
+    private const string InventoryHandoffOfferPrefix = "__lv_invhandoff_offer__:";
+    private const string InventoryHandoffResponsePrefix = "__lv_invhandoff_resp__:";
+    private const string InventoryHandoffResultPrefix = "__lv_invhandoff_result__:";
     private const string PlayerStatSyncPrefix = "__lv_setstat__:";
     private const string SoulLootTakeRequestPrefix = "__lv_soul_take__:";
     private const string SoulLootTakeSyncPrefix = "__lv_soul_take_sync__:";
@@ -741,6 +931,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private const string InventoryClearConfirmActionPrefix = "invclear-confirm:";
     private const string InventoryClearCancelActionPrefix = "invclear-cancel:";
     private const float InviteQuickHoldAcceptSeconds = 0.7f;
+    private const float InventoryHandoffTimeoutSeconds = 12f;
+    private const string InventoryHandoffAcceptActionPrefix = "invhandoff-accept:";
+    private const string InventoryHandoffDeclineActionPrefix = "invhandoff-decline:";
     private bool _inviteQuickHoldActive;
     private bool _inviteQuickHoldAccepted;
     private float _inviteQuickHoldElapsed;
@@ -820,6 +1013,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _weatherCycleEnabled = true;
     private float _timeCycleAccumulator;
     private float _weatherCycleAccumulator;
+    private WorldTime _worldTime = new();
     private int _weatherCycleIndex;
     private static readonly string[] WeatherCycleStates = { "clear", "rain", "storm" };
     private static readonly float[] WeatherCycleDurationsSeconds = { 300f, 180f, 120f };
@@ -827,6 +1021,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _gamemodeWheelWaitForRelease;
     private readonly BlockBreakParticleSystem _blockBreakParticles = new();
     private readonly SoulMarkerParticleSystem _soulMarkerParticles = new();
+    private readonly TorchFlameParticleSystem _torchFlameParticles = new();
+    private readonly Dictionary<ChunkCoord, TorchFlameChunkCache> _torchFlameChunkCache = new();
+    private readonly List<VoxelChunkData> _torchFlameChunkScratch = new();
+    private readonly List<(int X, int Y, int Z)> _torchFlameLocalScratch = new();
+    private readonly List<ChunkCoord> _torchFlameRemovalScratch = new();
+    private readonly List<Vector3> _torchFlameAnchors = new();
+    private float _torchFlameRefreshTimer;
+    private const int MaxTorchFlameChunkScansPerRefresh = 4;
+    private const float TorchFlameRefreshIntervalSeconds = 0.18f;
+    private int _renderFrameCounter = 0;
+    private int _torchRenderFrameCounter = 0;
+    private int _timeUpdateCounter = 0;
+    private bool _sleepInProgress;
+    private float _sleepFadeTimer;
+    private const float SleepFadeDurationSeconds = 2.0f;
     private const string DefaultHomeName = "Home";
     private const int HomeGuiRowHeight = 56;
     private const int HomeGuiIconCellSize = 52;
@@ -889,7 +1098,27 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private bool _spectateCameraInitialized;
     private float _thirdPersonCameraDistance;
 
-    private static readonly Color SkyColor = new(135, 206, 235);
+    // Time-based lighting colors
+    private static readonly Color DawnSkyColor = new(255, 200, 150);
+    private static readonly Color DaySkyColor = new(135, 206, 235);
+    private static readonly Color DuskSkyColor = new(255, 140, 100);
+    private static readonly Color NightSkyColor = new(25, 25, 45);
+    
+    private static readonly Color DawnAmbientColor = new(255, 220, 180);
+    private static readonly Color DayAmbientColor = new(255, 255, 255);
+    private static readonly Color DuskAmbientColor = new(255, 180, 140);
+    private static readonly Color NightAmbientColor = new(70, 70, 100);
+    
+    private Color _currentSkyColor = DaySkyColor;
+    private Color _currentAmbientColor = DayAmbientColor;
+    private static readonly Color SkyColor = new(135, 206, 235); // Legacy fallback
+
+    // Celestial bodies
+    private Texture2D? _sunTexture;
+    private Texture2D? _moonTexture;
+    private VertexBuffer? _celestialVertexBuffer;
+    private IndexBuffer? _celestialIndexBuffer;
+    private BasicEffect? _celestialEffect;
     private static readonly RasterizerState WireframeState = new()
     {
         FillMode = FillMode.WireFrame,
@@ -923,16 +1152,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _world = preloadedWorld; // Use preloaded world if available
         _settings = GameSettings.LoadOrCreate(_log);
         _settingsStamp = GetSettingsStamp();
-        _targetActiveRadiusChunks = Math.Clamp(_settings.RenderDistanceChunks, 4, MaxRuntimeActiveRadius);
+        _targetActiveRadiusChunks = ResolveRuntimeRenderDistance(_settings.RenderDistanceChunks);
         _activeRadiusChunks = GetInitialActiveRadius(_targetActiveRadiusChunks);
         UpdateReticleSettings();
         ApplyRuntimeInputBindingsFromSettings();
         _indicatorsEnabled = _settings.IndicatorsEnabled;
+        _autoAcceptItemHandoffs = _settings.AutoAcceptItemHandoffs;
         _soulMarkerGuidanceEnabled = _settings.SoulDeathMarkerGuidanceEnabled;
         _nametagMode = NormalizeNametagMode(_settings.NametagMode);
         _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         _soulMarkerParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
+        _torchFlameParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         EnsureCommandRegistry();
 
         // Initialize stub services to fix compilation (will be replaced with new world generation)
@@ -965,6 +1196,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _pauseInviteClose = new Button("CLOSE", CloseInviteFriendsPopupFromPause) { BoldText = true };
         _inventoryClose = new Button("CLOSE", CloseInventory);
         _inventoryClear = new Button("CLEAR INVENTORY", ClearArtificerInventoryFromUi);
+        _inventoryDispose = new Button("DISPOSE HELD", DisposeArtificerHeldItemFromUi);
         _soulLootClose = new Button("CLOSE", CloseInventory);
         _soulLootClear = new Button("CLEAR SOUL", ClearSoulLootFromUi);
         _soulLootTakeAll = new Button("TAKE ALL", TakeAllSoulLootFromUi);
@@ -1000,6 +1232,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _healthHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/health.png");
             _hungerHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/hunger.png");
             _sigilHudTexture = TryLoadOptionalTexture("textures/menu/GUIS/sigil_balance_mockup.png");
+            _inventoryDispose.Texture = TryLoadOptionalTexture("textures/menu/icons/trashcan.png");
         }
         catch (Exception ex)
         {
@@ -1008,7 +1241,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         LoadGamemodeWheelIcons();
         _structureFinderPanelTexture = TryLoadOptionalTexture(
-            "textures/menu/GUIS/GUIBOX.png",
             "textures/menu/GUIS/WorldGeneration_GUI.png");
 
         // Note: World load is deferred to the first Update() to allow "Loading..." screen to draw.
@@ -1072,18 +1304,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var rawDt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         // Only clamp catastrophic stalls; do not clamp normal frame deltas to avoid perceived slow-motion.
         var dt = Math.Min(rawDt, 0.1f);
+        if (_rejoinStreamingThrottleTimer > 0f)
+            _rejoinStreamingThrottleTimer = Math.Max(0f, _rejoinStreamingThrottleTimer - rawDt);
+        UpdateGameplayPointerSuppression(input);
         _worldTimeSeconds = (float)gameTime.TotalGameTime.TotalSeconds;
+        UpdateActiveKilnSmelt(dt);
         if (_postSyncRecoveryTimer > 0f)
             _postSyncRecoveryTimer = Math.Max(0f, _postSyncRecoveryTimer - rawDt);
-
-        _fpsTimer += rawDt;
-        _frameCount++;
-        if (_fpsTimer >= 1.0f)
-        {
-            _fps = _frameCount / _fpsTimer;
-            _frameCount = 0;
-            _fpsTimer = 0;
-        }
 
         TickHostedOnlineLobbyHeartbeat();
 
@@ -1130,6 +1357,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         UpdateSigilHudAnimation(rawDt);
         UpdateWorldRuleCycles(rawDt);
+        UpdateVoxelLightParameters();
+        UpdateSleepSequence(rawDt);
 
         if (_veilseerSpectatePopupTimer > 0f)
         {
@@ -1157,11 +1386,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _soulRecoverStatusText = string.Empty;
         }
 
+        UpdatePendingItemHandoffs(rawDt);
         UpdateInviteQuickAction(input, rawDt);
         _overlayMousePos = input.MousePosition;
         if (_attunementWipPopupVisible)
         {
             UpdateAttunementWipPopup(input);
+            SuppressGameplayPointerUntilRelease(input);
             return;
         }
 
@@ -1171,11 +1402,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (input.IsNewKeyPress(Keys.F9))
             ExportAtlas();
         if (input.IsNewKeyPress(Keys.F3))
-            _debugHudVisible = !_debugHudVisible;
-        if (input.IsNewKeyPress(Keys.F4))
-            _debugFaceOverlay = !_debugFaceOverlay;
-        if (input.IsNewKeyPress(Keys.F5))
-            ToggleThirdPersonMode();
+        {
+            var shiftDown = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+            if (shiftDown)
+            {
+                _debugHudVisible = true;
+                _debugHudExtraVisible = !_debugHudExtraVisible;
+            }
+            else
+            {
+                _debugHudVisible = !_debugHudVisible;
+            }
+        }
 
 #if DEBUG
         if (input.IsNewKeyPress(Keys.F6))
@@ -1194,6 +1432,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
         UpdateSoulMarker(rawDt);
         UpdateSoulRecoverAction(input, rawDt);
+        UpdateWaterFlow(rawDt);
+        UpdateHorizonLod();
+        UpdateHorizonLodPreloadGate();
 
         // PERIODIC PLAYER STATE SAVING - Save player position periodically during gameplay
         _playerSaveTimer += rawDt;
@@ -1219,7 +1460,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_isClosing)
             return;
         _blockBreakParticles.Update(rawDt);
+        UpdateTorchFlameAnchors(rawDt);
         UpdateHurtFeedback(rawDt);
+        UpdatePebbleProjectiles(rawDt);
+        UpdateJavelinProjectiles(rawDt);
+        HandleStuckJavelinRemoval(input);
+
 
         if (_worldSyncInProgress)
         {
@@ -1234,16 +1480,25 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_pauseMenuOpen)
             {
                 UpdatePauseButtons(input);
+                SuppressGameplayPointerUntilRelease(input);
             }
             return; // Skip all other game logic if sync is not complete
         }
 
-        // CONTINUOUS MESH PROCESSING - Process mesh results to prevent graphical issues
-        ProcessMeshJobsNonBlocking();
-        var chunkScheduleBudget = _spawnPrewarmComplete
-            ? RuntimeChunkScheduleBudget
-            : Math.Max(RuntimeChunkScheduleBudget, PrewarmChunkBudgetPerFrame);
-        ProcessChunkGenerationJobs(chunkScheduleBudget);
+        // Keep already-finished work moving, but do not start more chunk work while a GUI is open.
+        var heavyGuiOpen = IsHeavyGuiOpenForStreaming();
+        if (!heavyGuiOpen)
+        {
+            ProcessMeshJobsNonBlocking();
+            var chunkScheduleBudget = _spawnPrewarmComplete
+                ? GetRuntimeChunkScheduleBudget()
+                : Math.Max(GetRuntimeChunkScheduleBudget(), PrewarmChunkBudgetPerFrame);
+            ProcessChunkGenerationJobs(chunkScheduleBudget);
+        }
+        else
+        {
+            ApplyCompletedMeshBuilds(1);
+        }
 
         if (!_spawnPrewarmComplete)
         {
@@ -1256,15 +1511,37 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_pauseMenuOpen)
             {
                 UpdatePauseButtons(input);
+                SuppressGameplayPointerUntilRelease(input);
                 WarmBlockIcons();
             }
 
             return; // Block gameplay controls until prewarm gate is visually ready.
         }
 
+        if (!_horizonLodPreloadComplete)
+        {
+            _spinnerFrame = (_spinnerFrame + 1) % 8;
+            ProcessStreamingResults(aggressiveApply: true);
+            ProcessChunkGenerationJobs(PrewarmChunkBudgetPerFrame);
+            ProcessMeshBuildQueue(PrewarmMeshBudgetPerFrame);
+
+            if (input.IsNewKeyPress(Keys.Escape))
+                TogglePauseMenuFromEscape();
+
+            if (_pauseMenuOpen)
+            {
+                UpdatePauseButtons(input);
+                SuppressGameplayPointerUntilRelease(input);
+                WarmBlockIcons();
+            }
+
+            return; // Keep the loading screen up until the first distant horizon is cached or loaded.
+        }
+
         if (_survivalRespawnPending)
         {
             UpdateDeathScreen(input);
+            SuppressGameplayPointerUntilRelease(input);
             ProcessWorldVisualMaintenance();
             WarmBlockIcons();
             return;
@@ -1285,6 +1562,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 UpdateSoulLoot(input);
             else
                 UpdateInventory(input, dt);
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1302,9 +1580,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (TryOpenVeilseerSpectatedInventory())
                 return;
 
-            _inventoryOpen = true;
-            _inventoryCatalogSearchFocused = false;
-            _inventoryCatalogSearchCaret = 0;
+            OpenInventoryUi();
             return;
         }
 
@@ -1322,6 +1598,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen)
         {
             UpdatePauseButtons(input);
+            SuppressGameplayPointerUntilRelease(input);
         }
 
         if (pauseMenuWasOpenThisFrame || _pauseMenuOpen)
@@ -1331,9 +1608,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        if (input.IsNewKeyPress(Keys.F5))
+            ToggleThirdPersonMode();
+
         if (_homeGuiOpen)
         {
             UpdateHomeGui(input, rawDt);
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1342,6 +1623,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_structureFinderOpen)
         {
             UpdateStructureFinderGui(input, rawDt);
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1384,6 +1666,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_chatInputActive)
         {
             UpdateChatInput(input);
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1392,6 +1675,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_commandInputActive)
         {
             UpdateCommandInput(input);
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1399,6 +1683,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         if (HandleGameModeWheelInput(input))
         {
+            SuppressGameplayPointerUntilRelease(input);
             UpdateOverlayWorldSimulation(gameTime, dt);
             WarmBlockIcons();
             return;
@@ -1423,7 +1708,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         ApplyPlayerSeparation(dt);
         UpdateActiveRadiusRamp(dt);
         UpdateActiveChunks(force: false);
-        ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+        ProcessChunkGenerationJobs(GetRuntimeChunkScheduleBudget());
 
         HandleHotbarInput(input);
         UpdateSelectionTimer(dt);
@@ -1431,7 +1716,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         HandleUseItem(input);
         HandleDropAndGive(input);
         UpdateWorldItems();
-        HandleBlockInteraction(gameTime, input);
+        HandleBlockInteraction(gameTime, input, _suppressGameplayPointerUntilRelease || IsPointerOverGameplayHud(input.MousePosition));
         ProcessStreamingResults(); // Apply completed loads/unloads first (main thread only)
         QueueDirtyChunks(); // Then enumerate safely
         ProcessMeshBuildQueue();
@@ -1441,11 +1726,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private void UpdateOverlayWorldSimulation(GameTime gameTime, float dt)
     {
         var pausedInput = _pauseGameplayInput;
+        _player.ClearMoveInput();
+        var guiShouldThrottleWorldStreaming = IsHeavyGuiOpenForStreaming();
+        if (guiShouldThrottleWorldStreaming)
+        {
+            UpdateSelectionTimer(dt);
+            UpdateHandoffTarget(pausedInput);
+            UpdateWorldItems();
+            ApplyCompletedMeshBuilds(1);
+            return;
+        }
+
         UpdatePlayer(gameTime, dt, pausedInput);
         ApplyPlayerSeparation(dt);
         UpdateActiveRadiusRamp(dt);
         UpdateActiveChunks(force: false);
-        ProcessChunkGenerationJobs(Math.Max(1, RuntimeChunkScheduleBudget / 2));
+        ProcessChunkGenerationJobs(GetRuntimeChunkScheduleBudget());
         UpdateSelectionTimer(dt);
         UpdateHandoffTarget(pausedInput);
         UpdateWorldItems();
@@ -1458,8 +1754,26 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         ProcessStreamingResults();
         QueueDirtyChunks();
-        ProcessMeshBuildQueue(Math.Max(1, RuntimeMeshScheduleBudget));
+        ProcessMeshBuildQueue(Math.Max(1, GetRuntimeMeshScheduleBudget()));
     }
+
+    private bool IsHeavyGuiOpenForStreaming()
+        => _inventoryOpen || _homeGuiOpen || _structureFinderOpen || _pauseMenuOpen;
+
+    private bool IsRejoinStreamingThrottled()
+        => _rejoinStreamingThrottleTimer > 0f;
+
+    private int GetRuntimeChunkRequestBudget()
+        => IsRejoinStreamingThrottled() ? StartupChunkRequestBudget : Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget);
+
+    private int GetRuntimeMeshRequestBudget()
+        => IsRejoinStreamingThrottled() ? StartupMeshRequestBudget : Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget);
+
+    private int GetRuntimeChunkScheduleBudget()
+        => IsRejoinStreamingThrottled() ? StartupChunkScheduleBudget : RuntimeChunkScheduleBudget;
+
+    private int GetRuntimeMeshScheduleBudget()
+        => IsRejoinStreamingThrottled() ? StartupMeshScheduleBudget : RuntimeMeshScheduleBudget;
 
     private void UpdateInviteQuickAction(InputState input, float dt)
     {
@@ -1649,6 +1963,53 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _inviteQuickHoldPromptText = string.Empty;
     }
 
+    private void UpdatePendingItemHandoffs(float dt)
+    {
+        if (dt <= 0f)
+            return;
+
+        foreach (var key in _localOutgoingHandoffOffers.Keys.ToArray())
+        {
+            var offer = _localOutgoingHandoffOffers[key];
+            offer.ExpiresIn -= dt;
+            if (offer.ExpiresIn <= 0f)
+                _localOutgoingHandoffOffers.Remove(key);
+            else
+                _localOutgoingHandoffOffers[key] = offer;
+        }
+
+        foreach (var key in _localIncomingHandoffOffers.Keys.ToArray())
+        {
+            var offer = _localIncomingHandoffOffers[key];
+            offer.ExpiresIn -= dt;
+            if (offer.ExpiresIn <= 0f)
+            {
+                _localIncomingHandoffOffers.Remove(key);
+                ClearPendingItemHandoffConfirmation(key);
+            }
+            else
+                _localIncomingHandoffOffers[key] = offer;
+        }
+
+        if (_lanSession == null || !_lanSession.IsHost || _hostPendingHandoffOffers.Count == 0)
+            return;
+
+        foreach (var key in _hostPendingHandoffOffers.Keys.ToArray())
+        {
+            var offer = _hostPendingHandoffOffers[key];
+            offer.ExpiresIn -= dt;
+            if (offer.ExpiresIn > 0f)
+            {
+                _hostPendingHandoffOffers[key] = offer;
+                continue;
+            }
+
+            _hostPendingHandoffOffers.Remove(key);
+            ReturnHostPendingHandoffToSender(offer, $"{ResolvePlayerName(offer.TargetPlayerId)} did not accept {offer.Amount}x {GetItemDisplayName(offer.ItemId)} in time.");
+            SendInventoryHandoffResult(offer.TargetPlayerId, offer.OfferId, "target", "Item handoff timed out.");
+        }
+    }
+
     private bool TryGetPendingQuickConfirmation(out string confirmToken, out string cancelToken, out string promptText)
     {
         confirmToken = string.Empty;
@@ -1677,10 +2038,59 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         confirmToken = _pendingQuickConfirmToken;
         cancelToken = _pendingQuickCancelToken;
-        promptText = string.IsNullOrWhiteSpace(_pendingQuickPromptText)
-            ? "Confirmation pending."
-            : _pendingQuickPromptText;
+        promptText = TryGetPendingItemHandoffPrompt(_pendingQuickConfirmToken, out var handoffPrompt)
+            ? handoffPrompt
+            : string.IsNullOrWhiteSpace(_pendingQuickPromptText)
+                ? "Confirmation pending."
+                : _pendingQuickPromptText;
         return true;
+    }
+
+    private bool TryGetPendingItemHandoffPrompt(string confirmToken, out string promptText)
+    {
+        promptText = string.Empty;
+        if (!confirmToken.StartsWith(InventoryHandoffAcceptActionPrefix, StringComparison.Ordinal))
+            return false;
+
+        var offerId = confirmToken.Substring(InventoryHandoffAcceptActionPrefix.Length).Trim();
+        if (!_localIncomingHandoffOffers.TryGetValue(offerId, out var offer))
+            return false;
+
+        var seconds = Math.Max(0, (int)MathF.Ceiling(offer.ExpiresIn));
+        var senderName = string.IsNullOrWhiteSpace(offer.SenderName)
+            ? ResolvePlayerName(offer.SenderPlayerId)
+            : offer.SenderName.Trim();
+        promptText = $"{senderName} offers {offer.Amount}x {GetItemDisplayName(offer.ItemId)} ({seconds}s).";
+        return true;
+    }
+
+    private bool TryGetPendingItemHandoffIcon(out BlockId itemId, out int amount)
+    {
+        itemId = BlockId.Air;
+        amount = 0;
+        if (!_pendingQuickConfirmActive || !_pendingQuickConfirmToken.StartsWith(InventoryHandoffAcceptActionPrefix, StringComparison.Ordinal))
+            return false;
+
+        var offerId = _pendingQuickConfirmToken.Substring(InventoryHandoffAcceptActionPrefix.Length).Trim();
+        if (!_localIncomingHandoffOffers.TryGetValue(offerId, out var offer) || offer.ItemId == BlockId.Air || offer.Amount <= 0)
+            return false;
+
+        itemId = offer.ItemId;
+        amount = offer.Amount;
+        return true;
+    }
+
+    private void ClearPendingItemHandoffConfirmation(string offerId)
+    {
+        offerId = (offerId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(offerId))
+            return;
+
+        if (_pendingQuickConfirmActive
+            && string.Equals(_pendingQuickConfirmToken, InventoryHandoffAcceptActionPrefix + offerId, StringComparison.Ordinal))
+        {
+            ClearPendingQuickConfirmation();
+        }
     }
 
     private bool TryHandleInventoryViewRequestMessage(LanChatMessage message)
@@ -1883,6 +2293,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (viewport != _viewport)
             OnResize(viewport);
+        TrackRenderFps();
 
         if (_saveAndExitInProgress)
         {
@@ -1930,8 +2341,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     layerDepth: 0f);
             }
             
-            var title = !_hasLoadedWorld ? "WORLD MATERIALIZING..." : 
-                       _worldSyncInProgress ? "DIMENSIONAL SYNC..." : 
+            var title = !_hasLoadedWorld ? "WORLD MATERIALIZING..." :
+                       _worldSyncInProgress ? "DIMENSIONAL SYNC..." :
+                       !_spawnPrewarmComplete ? "REALM STABILIZING..." :
+                       !IsHorizonLodPreloadReady() ? "DISTANT HORIZON CACHING..." :
                        "REALM STABILIZING...";
             var titleSize = _font.MeasureString(title);
             _font.DrawString(sb, title, new Vector2(center.X - titleSize.X / 2f, center.Y - 20), Color.White);
@@ -1951,6 +2364,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 sb.Draw(_pixel, new Rectangle(barX, barY, barW, barH), Color.White * 0.18f);
                 sb.Draw(_pixel, new Rectangle(barX, barY, (int)(barW * pct), barH), Color.White * 0.65f);
             }
+            else if (!_horizonLodPreloadComplete && IsHorizonLodEnabled())
+            {
+                var progress = $"LOD {_horizonLodStatus}";
+                var progressSize = _font.MeasureString(progress);
+                _font.DrawString(sb, progress, new Vector2(center.X - progressSize.X / 2f, center.Y + 10 + _font.LineHeight + 6), Color.White);
+
+                var elapsed = (DateTime.UtcNow - _horizonLodPreloadStartTime).TotalSeconds;
+                var pct = Math.Clamp(elapsed / HorizonLodPreloadTimeoutSeconds, 0f, 1f);
+                var barW = 260;
+                var barH = 10;
+                var barX = (int)center.X - barW / 2;
+                var barY = (int)center.Y + 10 + _font.LineHeight * 2 + 14;
+                sb.Draw(_pixel, new Rectangle(barX, barY, barW, barH), Color.White * 0.18f);
+                sb.Draw(_pixel, new Rectangle(barX, barY, (int)(barW * pct), barH), Color.White * 0.45f);
+            }
             
             // Spinner glyph so it feels alive even before prewarm starts.
             char[] spinner = new[] { '|', '/', '-', '\\', '|', '/', '-', '\\' };
@@ -1962,7 +2390,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         var device = sb.GraphicsDevice;
-        var clearColor = SkyColor;
+        var clearColor = _timeCycleEnabled ? _currentSkyColor : SkyColor;
+        var cameraUnderwater = IsCameraUnderwater();
+        if (cameraUnderwater)
+            clearColor = new Color(28, 78, 110);
 #if DEBUG
         if (!_debugSkyClear)
             clearColor = Color.Black;
@@ -1988,6 +2419,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         EnsureEffect(device);
         EnsureCutoutEffect(device);
+        if (IsHorizonLodEnabled())
+            EnsureHorizonLodEffect(device);
         if (_effect == null || _cutoutEffect == null || _atlas == null)
             return;
 
@@ -1996,39 +2429,69 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var xrayMode = _gameMode == GameMode.Veilseer && _veilseerXrayEnabled;
         var aspect = device.Viewport.AspectRatio;
         var chunkWorld = VoxelChunkData.ChunkSizeX * Scale.BlockSize;
-        var farPlane = MathF.Max(500f, (_activeRadiusChunks + 4) * chunkWorld);
+        var farPlane = IsHorizonLodEnabled()
+            ? MathF.Max(500f, (GetHorizonLodConfig(_settings.QualityPreset, _targetActiveRadiusChunks, _meta?.Performance?.LODLevels ?? 3).RadiusChunks + 4) * chunkWorld)
+            : MathF.Max(500f, (_activeRadiusChunks + 4) * chunkWorld);
         var proj = Matrix.CreatePerspectiveFieldOfView(MathHelper.ToRadians(70f), aspect, 0.1f, farPlane);
         
         _effect.TextureEnabled = true;
         _effect.Texture = _atlas.Texture;
-        _effect.FogEnabled = !xrayMode;
+        _effect.FogEnabled = false;
         _effect.FogColor = clearColor.ToVector3();
-        
+
         // 5) DISTANCE FOG - Tied to render distance to prevent seeing sharp void edges
         var fogStartRadius = Math.Max(4f, (_activeRadiusChunks - 3) * chunkWorld);
         var fogEndRadius = Math.Max(fogStartRadius + chunkWorld * 2f, (_activeRadiusChunks - 0.8f) * chunkWorld);
-        
+        if (cameraUnderwater)
+        {
+            fogStartRadius = Math.Min(fogStartRadius, 42f * Scale.BlockSize);
+            fogEndRadius = Math.Min(fogEndRadius, 128f * Scale.BlockSize);
+        }
+
         _effect.FogStart = fogStartRadius;
         _effect.FogEnd = fogEndRadius;
         _effect.View = view;
         _effect.Projection = proj;
         _effect.World = Matrix.Identity;
+
+        // Use DiffuseColor to modulate environmental brightness (VertexPositionTexture has no normals)
+        _effect.LightingEnabled = false;
+        // Stage 2 / pre-voxel-shader: enable vertex color so the white vertex colors from
+        // VertexPositionColorTexture multiply through transparently (white × texture = texture).
+        // Stage 5 will replace these draw calls with the custom voxel shader.
+        _effect.VertexColorEnabled = false;
         _effect.DiffuseColor = Vector3.One;
         _effect.Alpha = xrayMode ? 0.34f : 1f;
+        if (cameraUnderwater)
+            _effect.FogColor = new Vector3(0.10f, 0.30f, 0.42f);
+
+        // Log lighting effect configuration periodically
+        _renderFrameCounter++;
 
         _cutoutEffect.Texture = _atlas.Texture;
         _cutoutEffect.World = Matrix.Identity;
         _cutoutEffect.View = view;
         _cutoutEffect.Projection = proj;
-        _cutoutEffect.FogEnabled = !xrayMode;
+        _cutoutEffect.FogEnabled = false;
         _cutoutEffect.FogColor = clearColor.ToVector3();
         _cutoutEffect.FogStart = fogStartRadius;
         _cutoutEffect.FogEnd = fogEndRadius;
         _cutoutEffect.Alpha = xrayMode ? 0.34f : 1f;
+        if (cameraUnderwater)
+            _cutoutEffect.FogColor = new Vector3(0.10f, 0.30f, 0.42f);
         _cutoutEffect.AlphaFunction = CompareFunction.Greater;
         _cutoutEffect.ReferenceAlpha = 128;
 
+        // AlphaTestEffect doesn't support lighting, so we use diffuse color to apply ambient tint
+        // Stage 2: use DiffuseColor=Vector3.One and let vertex color (white) multiply through.
+        _cutoutEffect.DiffuseColor = Vector3.One;
+
+        // Load and render celestial bodies
+        EnsureCelestialAssets(device);
+        DrawCelestialBodies(device, view, proj);
+
         var frustum = new BoundingFrustum(view * proj);
+        DrawHorizonLod(device, view, proj, frustum);
 
 #if DEBUG
         _debugWorldAtlasBound = _effect.Texture != null;
@@ -2056,11 +2519,30 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             try
             {
-                // Safe rendering with error handling
-                foreach (var pass in _effect.CurrentTechnique.Passes)
+                // Safe rendering with error handling — use voxel shader when available,
+                // otherwise fall back to the existing BasicEffect path.
+                if (_voxelEffect != null)
                 {
-                    pass.Apply();
-                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                    // Set per-frame lighting parameters for time-of-day control.
+                    // SkyLightParams.r: 0..1 scale (0=night, 1=full daylight) — updated each frame.
+                    // SkyLightParams.g: block light intensity multiplier (1.0 default).
+                    // SkyLightParams.b: ambient occlusion strength (1.0 default).
+                    _voxelEffect.Parameters["SkyLightParams"]?.SetValue(new Vector4(SkyLightFactor, BlockLightIntensity, AOStrength, 0f));
+                    _voxelEffect.Parameters["BlockLightTint"]?.SetValue(BlockLightTint);
+
+                    foreach (var pass in _voxelEffect.CurrentTechnique.Passes)
+                    {
+                        pass.Apply();
+                        device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                    }
+                }
+                else
+                {
+                    foreach (var pass in _effect.CurrentTechnique.Passes)
+                    {
+                        pass.Apply();
+                        device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
+                    }
                 }
             }
             catch (Exception ex)
@@ -2181,6 +2663,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         DrawWaterChunks(device, frustum, view, proj);
 
         DrawWorldItems(device, view, proj);
+        DrawPebbleProjectiles(device, view, proj);
+        DrawJavelinProjectiles(device, view, proj);
+
+        DrawTorchFlames(sb, device, view, proj);
         if (_blockBreakParticles.ActiveCount > 0)
         {
             sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
@@ -2209,6 +2695,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _highlightActive = false;
 
         sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend, transformMatrix: UiLayout.Transform);
+        DrawUnderwaterOverlay(sb);
         DrawReticle(sb);
         if (_gameMode == GameMode.Veilseer && _veilseerSpectateTargetPlayerId >= 0)
         {
@@ -2222,13 +2709,16 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             DrawHotbar(sb);
         }
         DrawSurvivalHud(sb);
+        DrawPinnedHandCraftRecipesHud(sb);
         DrawSoulMarkerHud(sb, device, view, proj);
         DrawContextIndicators(sb);
         DrawSelectedBlockName(sb);
         DrawWorldNametags(sb, device, view, proj);
         DrawCommandOverlay(sb);
         DrawGamemodeToast(sb);
+        DrawStuckJavelinPrompt(sb);
         DrawFlySpeedToast(sb);
+
         DrawVeilseerStatus(sb);
         DrawThirdPersonStatus(sb);
         DrawVeilseerSpectatePopup(sb);
@@ -2240,7 +2730,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_debugHudVisible)
             DrawDevOverlay(sb);
         DrawDamageOverlay(sb);
-        DrawFaceOverlay(sb);
         DrawPlayerList(sb);
         DrawRespawnOverlay(sb);
         sb.End();
@@ -2250,7 +2739,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_pauseMenuOpen)
             DrawPauseMenu(sb);
         if (_inventoryOpen)
+        {
             DrawInventory(sb);
+            DrawSigilHudOverlay(sb);
+        }
             
         // E) FAILSAFE ASSERT - Check visibility on first gameplay frame
         if (_visibilitySafe && !_firstGameplayFrame && !_visibilityAssertLogged)
@@ -2479,6 +2971,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         _meta = _world.Meta;
         _gameMode = _meta.CurrentWorldGameMode;
+        StartIntegratedServerIfLocal();
         _playerCollisionEnabled = _meta.PlayerCollision;
         _sigilPowerEnabled = _meta.Gameplay?.EnableSigilPower ?? true;
         _giveItemsEnabled = _meta.Gameplay?.EnableGiveItems ?? true;
@@ -2490,6 +2983,59 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _weatherCycleEnabled = _meta.Gameplay?.WeatherCycleEnabled ?? _meta.WeatherCycleEnabled;
         _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_meta.Gameplay?.TimeOfDayTicks ?? _meta.TimeOfDayTicks);
         _weatherState = WorldMeta.CanonicalWeatherState(_meta.Gameplay?.WeatherState ?? _meta.WeatherState);
+        
+        // Initialize WorldTime with backward compatibility from legacy ticks
+        var totalElapsedGameSeconds = _meta.Gameplay?.TotalElapsedGameSeconds ?? _meta.TotalElapsedGameSeconds;
+        if (totalElapsedGameSeconds <= 0.0)
+        {
+            // Migrate from legacy ticks if no game seconds exist
+            totalElapsedGameSeconds = WorldTime.LegacyTicksToGameSeconds(_timeOfDayTicks);
+            System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] LoadWorld: Migrated from legacy ticks={_timeOfDayTicks} to game seconds={totalElapsedGameSeconds:F2}");
+        }
+        _worldTime = new WorldTime(totalElapsedGameSeconds);
+        _worldTime.TimeEnabled = _timeCycleEnabled;
+        
+        System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] LoadWorld: WorldTime initialized - TotalSeconds={_worldTime.TotalElapsedGameSeconds:F2}, TimeOfDay={_worldTime.TimeOfDaySeconds:F2}, Phase={_worldTime.Phase}, Day={_worldTime.DayNumber}, LegacyTicks={_timeOfDayTicks}, TimeCycleEnabled={_timeCycleEnabled}");
+        
+        // Initialize visual sky/ambient state from loaded WorldTime immediately
+        var phase = _worldTime.Phase;
+        var timeOfDay = _worldTime.TimeOfDaySeconds;
+        
+        Color initialSkyColor;
+        Color initialAmbientColor;
+        
+        switch (phase)
+        {
+            case TimePhase.Dawn:
+                {
+                    var dawnProgress = (float)((timeOfDay - WorldTime.DawnStart) / (WorldTime.DayStart - WorldTime.DawnStart));
+                    initialSkyColor = Color.Lerp(NightSkyColor, DaySkyColor, dawnProgress);
+                    initialAmbientColor = Color.Lerp(NightAmbientColor, DayAmbientColor, dawnProgress);
+                    break;
+                }
+            case TimePhase.Day:
+                initialSkyColor = DaySkyColor;
+                initialAmbientColor = DayAmbientColor;
+                break;
+            case TimePhase.Dusk:
+                {
+                    var duskProgress = (float)((timeOfDay - WorldTime.DuskStart) / (WorldTime.NightStart - WorldTime.DuskStart));
+                    initialSkyColor = Color.Lerp(DaySkyColor, NightSkyColor, duskProgress);
+                    initialAmbientColor = Color.Lerp(DayAmbientColor, NightAmbientColor, duskProgress);
+                    break;
+                }
+            case TimePhase.Night:
+            default:
+                initialSkyColor = NightSkyColor;
+                initialAmbientColor = NightAmbientColor;
+                break;
+        }
+        
+        _currentSkyColor = initialSkyColor;
+        _currentAmbientColor = initialAmbientColor;
+        
+        System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] LoadWorld: Initial ambient colors set - Sky=({initialSkyColor.R},{initialSkyColor.G},{initialSkyColor.B}), Ambient=({initialAmbientColor.R},{initialAmbientColor.G},{initialAmbientColor.B}), Phase={phase}");
+        
         SyncWeatherCycleIndexFromState(resetAccumulator: true);
         SyncRuntimeRulesToMeta(persist: false);
         _difficultyLevel = Math.Clamp(_meta.DifficultyLevel, 0, 3);
@@ -2550,6 +3096,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (IsJoinedClientSession)
         {
             _spawnPrewarmComplete = true;
+            _horizonLodPreloadComplete = true;
             _prewarmTargetCount = 0;
             _prewarmReadyCount = 0;
             swTotal.Stop();
@@ -2623,6 +3170,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         EnsurePlayerNotInsideSolid(forceLog: false);
         InitializePrewarmTargets();
+        _rejoinStreamingThrottleTimer = RejoinStreamingThrottleSeconds;
         UpdateActiveChunks(force: false);
 
         swTotal.Stop();
@@ -2745,6 +3293,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _firstGameplayFrame = false;
         _visibilityAssertLogged = false;
         _spawnPrewarmStartTime = DateTime.UtcNow;
+        _horizonLodPreloadComplete = !IsHorizonLodEnabled();
+        _horizonLodPreloadTimedOut = false;
+        _horizonLodPreloadStartTime = DateTime.UtcNow;
 
         PrimeTier0FromMeshCache();
         if (IsPrewarmGateReady())
@@ -2783,14 +3334,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_world == null || _isClosing || maxSchedule <= 0)
             return;
+        if (IsHeavyGuiOpenForStreaming())
+            return;
 
         var scheduled = 0;
+        var maxInFlightDuringThrottle = IsRejoinStreamingThrottled() ? StartupChunkScheduleBudget : ChunkWorkerCount;
         while (scheduled < maxSchedule && _chunkGenerationQueue.TryDequeue(out var coord))
         {
             _chunkGenerationQueued.TryRemove(coord, out _);
 
             if (_chunkGenerationInFlight.ContainsKey(coord))
                 continue;
+
+            if (_chunkGenerationInFlight.Count >= maxInFlightDuringThrottle)
+            {
+                QueueChunkGeneration(coord);
+                break;
+            }
 
             if (!_chunkGenerationInFlight.TryAdd(coord, 0))
                 continue;
@@ -2961,6 +3521,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        if (!IsVisualRadiusReady(_centerChunk, _activeRadiusChunks))
+        {
+            _activeRadiusRampTimer = 0f;
+            return;
+        }
+
         _activeRadiusRampTimer += dt;
         if (_activeRadiusRampTimer < ActiveRadiusRampIntervalSeconds)
             return;
@@ -3056,10 +3622,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var radius = Math.Clamp(_activeRadiusChunks, 2, MaxRuntimeActiveRadius);
         var radiusSq = radius * radius;
         var chunkBudgetPerFrame = _spawnPrewarmComplete
-            ? Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget)
+            ? GetRuntimeChunkRequestBudget()
             : Math.Max(Math.Max(MaxNewChunkRequestsPerFrame, RuntimeChunkRequestBudget), PrewarmChunkBudgetPerFrame);
         var meshBudgetPerFrame = _spawnPrewarmComplete
-            ? Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget)
+            ? GetRuntimeMeshRequestBudget()
             : Math.Max(Math.Max(MaxMeshBuildRequestsPerFrame, RuntimeMeshRequestBudget), PrewarmMeshBudgetPerFrame);
         _activeKeepBuffer.Clear();
         _drawOrderBuffer.Clear();
@@ -3163,6 +3729,62 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_chunkMeshes.ContainsKey(coord))
                 _chunkOrder.Add(coord);
         }
+
+        _readyVisualRadiusChunks = ComputeReadyVisualRadius(playerChunk, radius);
+    }
+
+    private int ComputeReadyVisualRadius(ChunkCoord focusChunk, int maxRadius)
+    {
+        if (_world == null)
+            return 0;
+
+        var cappedRadius = Math.Clamp(maxRadius, 0, MaxRuntimeActiveRadius);
+        var maxCy = GetStreamingMaxChunkY(focusChunk.Y);
+        var readyRadius = 0;
+
+        for (var ring = 0; ring <= cappedRadius; ring++)
+        {
+            if (!IsVisualRingReady(focusChunk, ring, maxCy))
+                break;
+
+            readyRadius = ring;
+        }
+
+        return readyRadius;
+    }
+
+    private bool IsVisualRadiusReady(ChunkCoord focusChunk, int radius)
+        => ComputeReadyVisualRadius(focusChunk, radius) >= radius;
+
+    private bool IsVisualRingReady(ChunkCoord focusChunk, int ring, int maxCy)
+    {
+        if (_world == null)
+            return false;
+
+        var radiusSq = ring * ring;
+        for (var dz = -ring; dz <= ring; dz++)
+        {
+            for (var dx = -ring; dx <= ring; dx++)
+            {
+                if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != ring)
+                    continue;
+                if (dx * dx + dz * dz > radiusSq)
+                    continue;
+
+                for (var cy = 0; cy <= maxCy; cy++)
+                {
+                    var coord = new ChunkCoord(focusChunk.X + dx, cy, focusChunk.Z + dz);
+                    if (!IsChunkWithinWorldBounds(coord))
+                        continue;
+                    if (!_world.TryGetChunk(coord, out var chunk) || chunk == null)
+                        return false;
+                    if (!_chunkMeshes.ContainsKey(coord))
+                        return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private void BuildStreamingFocusChunks(List<ChunkCoord> output)
@@ -3216,6 +3838,539 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return false;
     }
 
+    private void UpdateHorizonLod()
+    {
+        if (_world == null)
+            return;
+
+        if (!IsHorizonLodEnabled())
+        {
+            lock (_horizonLodLock)
+            {
+                _horizonLodVertices = null;
+                _horizonLodHasMesh = false;
+                _horizonLodStatus = "OFF";
+            }
+            _horizonLodPreloadComplete = true;
+            DisposeHorizonLodVertexBuffer();
+            return;
+        }
+
+        if (_horizonLodBuildTask is { IsCompleted: true } completed)
+        {
+            try
+            {
+                var result = completed.GetAwaiter().GetResult();
+                lock (_horizonLodLock)
+                {
+                    _horizonLodVertices = result.Vertices;
+                    _horizonLodCenterChunk = result.CenterChunk;
+                    _horizonLodInnerRadiusChunks = result.InnerRadiusChunks;
+                    _horizonLodRadiusChunks = result.RadiusChunks;
+                    _horizonLodQuality = result.Quality;
+                    _horizonLodHasMesh = result.Vertices.Length > 0;
+                _horizonLodStatus = result.Vertices.Length > 0
+                        ? $"READY {result.Vertices.Length / 3} TRI {(result.LoadedFromCache ? "CACHE" : "BUILT")} {result.BuildMilliseconds}MS"
+                        : "EMPTY";
+                }
+                _log.Info($"Horizon LOD ready: {_horizonLodStatus}, center={result.CenterChunk.X},{result.CenterChunk.Z}, inner={result.InnerRadiusChunks}, radius={result.RadiusChunks}, quality={result.Quality}, elapsed={result.BuildMilliseconds}ms.");
+                DisposeHorizonLodVertexBuffer();
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Horizon LOD build failed: {ex.Message}");
+                _horizonLodStatus = "FAILED";
+            }
+            finally
+            {
+                _horizonLodBuildTask = null;
+                _horizonLodBuildQueued = false;
+            }
+        }
+
+        if (_horizonLodBuildTask != null || _horizonLodBuildQueued)
+            return;
+
+        var center = QuantizeChunkCenter(_centerChunk, HorizonLodCenterChunkStep);
+        var config = GetHorizonLodConfig(_settings.QualityPreset, _targetActiveRadiusChunks, _meta?.Performance?.LODLevels ?? 3);
+        var innerRadius = ComputeHorizonLodInnerRadius(center, config.RadiusChunks);
+        var needsBuild = !_horizonLodHasMesh
+            || _horizonLodInnerRadiusChunks != innerRadius
+            || _horizonLodRadiusChunks != config.RadiusChunks
+            || !string.Equals(_horizonLodQuality, config.Quality, StringComparison.Ordinal)
+            || Math.Abs(center.X - _horizonLodCenterChunk.X) >= HorizonLodRebuildChunkStep
+            || Math.Abs(center.Z - _horizonLodCenterChunk.Z) >= HorizonLodRebuildChunkStep;
+
+        if (!needsBuild)
+            return;
+
+        var world = _world;
+        _horizonLodBuildQueued = true;
+        _horizonLodStatus = "BUILDING";
+        _log.Info($"Horizon LOD build queued: center={center.X},{center.Z}, player={_centerChunk.X},{_centerChunk.Z}, inner={innerRadius}, radius={config.RadiusChunks}, quality={config.Quality}.");
+        _horizonLodBuildTask = Task.Run(() => BuildHorizonLodMesh(world, center, innerRadius, config));
+    }
+
+    private int ComputeHorizonLodInnerRadius(ChunkCoord horizonCenter, int lodRadiusChunks)
+    {
+        var visualRadius = Math.Clamp(Math.Max(_activeRadiusChunks, _targetActiveRadiusChunks), 2, MaxRuntimeActiveRadius);
+        var innerRadius = visualRadius + HorizonLodInnerPaddingChunks;
+
+        BuildStreamingFocusChunks(_streamingFocusChunks);
+        if (_streamingFocusChunks.Count == 0)
+            _streamingFocusChunks.Add(_centerChunk);
+
+        for (var i = 0; i < _streamingFocusChunks.Count; i++)
+        {
+            var focus = _streamingFocusChunks[i];
+            var dx = focus.X - horizonCenter.X;
+            var dz = focus.Z - horizonCenter.Z;
+            var focusOffset = Math.Sqrt(dx * dx + dz * dz);
+            innerRadius = Math.Max(innerRadius, (int)Math.Ceiling(focusOffset + visualRadius + HorizonLodInnerPaddingChunks));
+        }
+
+        return Math.Clamp(innerRadius, 3, Math.Max(3, lodRadiusChunks - 4));
+    }
+
+    private bool IsHorizonLodEnabled()
+        => RuntimeHorizonLodEnabled && _meta?.Performance?.EnableLOD == true;
+
+    private bool IsHorizonLodPreloadReady()
+        => !IsHorizonLodEnabled() || _horizonLodHasMesh || _horizonLodPreloadTimedOut;
+
+    private void UpdateHorizonLodPreloadGate()
+    {
+        if (_horizonLodPreloadComplete)
+            return;
+
+        if (!IsHorizonLodEnabled())
+        {
+            _horizonLodPreloadComplete = true;
+            return;
+        }
+
+        if (_horizonLodHasMesh)
+        {
+            _horizonLodPreloadComplete = true;
+            _log.Info($"Horizon LOD preload complete: {_horizonLodStatus}.");
+            return;
+        }
+
+        var elapsed = (DateTime.UtcNow - _horizonLodPreloadStartTime).TotalSeconds;
+        if (elapsed < HorizonLodPreloadTimeoutSeconds)
+            return;
+
+        _horizonLodPreloadTimedOut = true;
+        _horizonLodPreloadComplete = true;
+        _log.Warn($"Horizon LOD preload timeout after {elapsed:0.00}s; entering world while LOD continues in background. Status={_horizonLodStatus}.");
+    }
+
+    private void EnsureHorizonLodEffect(GraphicsDevice device)
+    {
+        if (_horizonLodEffect != null)
+            return;
+
+        _horizonLodEffect = new BasicEffect(device)
+        {
+            VertexColorEnabled = true,
+            TextureEnabled = false,
+            LightingEnabled = false,
+            FogEnabled = false,
+            World = Matrix.Identity
+        };
+    }
+
+    private void DrawHorizonLod(GraphicsDevice device, Matrix view, Matrix proj, BoundingFrustum frustum)
+    {
+        if (!IsHorizonLodEnabled())
+            return;
+
+        if (_horizonLodEffect == null)
+            return;
+
+        VertexPositionColor[]? verts;
+        lock (_horizonLodLock)
+        {
+            verts = _horizonLodVertices;
+        }
+
+        if (verts == null || verts.Length < 3)
+            return;
+
+        if (_horizonLodVertexBuffer == null || _horizonLodVertexBuffer.VertexCount != verts.Length)
+        {
+            DisposeHorizonLodVertexBuffer();
+            _horizonLodVertexBuffer = new VertexBuffer(
+                device,
+                VertexPositionColor.VertexDeclaration,
+                verts.Length,
+                BufferUsage.WriteOnly);
+            _horizonLodVertexBuffer.SetData(verts);
+            _horizonLodPrimitiveCount = verts.Length / 3;
+        }
+
+        _horizonLodEffect.View = view;
+        _horizonLodEffect.Projection = proj;
+        _horizonLodEffect.Alpha = 1f;
+
+        var previousBlend = device.BlendState;
+        var previousDepth = device.DepthStencilState;
+        var previousRaster = device.RasterizerState;
+
+        device.BlendState = BlendState.Opaque;
+        device.DepthStencilState = DepthStencilState.Default;
+        device.RasterizerState = RasterizerState.CullNone;
+        device.SetVertexBuffer(_horizonLodVertexBuffer);
+
+        foreach (var pass in _horizonLodEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            device.DrawPrimitives(PrimitiveType.TriangleList, 0, _horizonLodPrimitiveCount);
+        }
+
+        device.SetVertexBuffer(null);
+        device.BlendState = previousBlend;
+        device.DepthStencilState = previousDepth;
+        device.RasterizerState = previousRaster;
+    }
+
+    private void DisposeHorizonLodVertexBuffer()
+    {
+        _horizonLodVertexBuffer?.Dispose();
+        _horizonLodVertexBuffer = null;
+        _horizonLodPrimitiveCount = 0;
+    }
+
+    private static HorizonLodBuildResult BuildHorizonLodMesh(VoxelWorld world, ChunkCoord centerChunk, int innerRadiusChunks, HorizonLodConfig config)
+    {
+        var timer = Stopwatch.StartNew();
+        if (HorizonLodCacheStore.TryLoad(
+                world.WorldPath,
+                centerChunk.X,
+                centerChunk.Z,
+                innerRadiusChunks,
+                config.RadiusChunks,
+                config.CacheKey,
+                out var cachedVertices))
+        {
+            timer.Stop();
+            return new HorizonLodBuildResult(centerChunk, innerRadiusChunks, config.RadiusChunks, config.Quality, cachedVertices, LoadedFromCache: true, timer.ElapsedMilliseconds);
+        }
+
+        var vertices = new List<VertexPositionColor>(config.VertexCapacityHint);
+        var chunkSize = VoxelChunkData.ChunkSizeX;
+        var centerX = centerChunk.X * chunkSize + chunkSize / 2;
+        var centerZ = centerChunk.Z * chunkSize + chunkSize / 2;
+        var innerBlocks = Math.Max(chunkSize * 2, innerRadiusChunks * chunkSize);
+        var radiusBlocks = Math.Max(innerBlocks + chunkSize * 4, config.RadiusChunks * chunkSize);
+        var nearEnd = Math.Min(radiusBlocks, innerBlocks + config.NearBandChunks * chunkSize);
+        var midEnd = Math.Min(radiusBlocks, nearEnd + config.MidBandChunks * chunkSize);
+
+        AddHorizonLodRing(world, vertices, centerChunk.X, centerChunk.Z, centerX, centerZ, innerRadiusChunks, innerBlocks, nearEnd, config.NearStepBlocks);
+        AddHorizonLodRing(world, vertices, centerChunk.X, centerChunk.Z, centerX, centerZ, innerRadiusChunks, nearEnd - config.NearStepBlocks, midEnd, config.MidStepBlocks);
+        AddHorizonLodRing(world, vertices, centerChunk.X, centerChunk.Z, centerX, centerZ, innerRadiusChunks, midEnd - config.MidStepBlocks, radiusBlocks, config.FarStepBlocks);
+
+        var builtVertices = vertices.ToArray();
+        HorizonLodCacheStore.Save(
+            world.WorldPath,
+            centerChunk.X,
+            centerChunk.Z,
+            innerRadiusChunks,
+            config.RadiusChunks,
+            config.CacheKey,
+            builtVertices);
+
+        timer.Stop();
+        return new HorizonLodBuildResult(centerChunk, innerRadiusChunks, config.RadiusChunks, config.Quality, builtVertices, LoadedFromCache: false, timer.ElapsedMilliseconds);
+    }
+
+    private static void AddHorizonLodRing(
+        VoxelWorld world,
+        List<VertexPositionColor> vertices,
+        int centerChunkX,
+        int centerChunkZ,
+        int centerX,
+        int centerZ,
+        int innerRadiusChunks,
+        int innerBlocks,
+        int outerBlocks,
+        int step)
+    {
+        if (outerBlocks <= innerBlocks)
+            return;
+
+        var minX = FloorToMultiple(centerX - outerBlocks, step);
+        var maxX = FloorToMultiple(centerX + outerBlocks, step);
+        var minZ = FloorToMultiple(centerZ - outerBlocks, step);
+        var maxZ = FloorToMultiple(centerZ + outerBlocks, step);
+
+        for (var x = minX; x < maxX; x += step)
+        {
+            for (var z = minZ; z < maxZ; z += step)
+            {
+                var cellCenterX = x + step / 2;
+                var cellCenterZ = z + step / 2;
+                var cellChunkX = FloorDiv(cellCenterX, VoxelChunkData.ChunkSizeX);
+                var cellChunkZ = FloorDiv(cellCenterZ, VoxelChunkData.ChunkSizeZ);
+                var chunkDx = cellChunkX - centerChunkX;
+                var chunkDz = cellChunkZ - centerChunkZ;
+                if (chunkDx * chunkDx + chunkDz * chunkDz <= innerRadiusChunks * innerRadiusChunks)
+                    continue;
+
+                var dx = cellCenterX - centerX;
+                var dz = cellCenterZ - centerZ;
+                var ringDistance = MathF.Sqrt(dx * dx + dz * dz);
+                if (ringDistance < innerBlocks || ringDistance > outerBlocks)
+                    continue;
+
+                var sample = world.SampleDistantTerrainColumn(cellCenterX, cellCenterZ);
+                var east = world.SampleDistantTerrainColumn(cellCenterX + step, cellCenterZ);
+                var west = world.SampleDistantTerrainColumn(cellCenterX - step, cellCenterZ);
+                var south = world.SampleDistantTerrainColumn(cellCenterX, cellCenterZ + step);
+                var north = world.SampleDistantTerrainColumn(cellCenterX, cellCenterZ - step);
+                var heightStep = step <= 6 ? 1 : step <= 16 ? 2 : step <= 32 ? 4 : 8;
+
+                AddHorizonTerrainCell(
+                    vertices,
+                    centerChunkX,
+                    centerChunkZ,
+                    innerRadiusChunks,
+                    x,
+                    z,
+                    step,
+                    heightStep,
+                    sample,
+                    east,
+                    west,
+                    south,
+                    north);
+                if (sample.HasWater || east.HasWater || west.HasWater || south.HasWater || north.HasWater)
+                    AddHorizonWaterCell(vertices, x, z, step);
+            }
+        }
+    }
+
+    private static void AddHorizonTerrainCell(
+        List<VertexPositionColor> vertices,
+        int centerChunkX,
+        int centerChunkZ,
+        int innerRadiusChunks,
+        int x,
+        int z,
+        int step,
+        int heightStep,
+        VoxelWorld.DistantTerrainSample sample,
+        VoxelWorld.DistantTerrainSample east,
+        VoxelWorld.DistantTerrainSample west,
+        VoxelWorld.DistantTerrainSample south,
+        VoxelWorld.DistantTerrainSample north)
+    {
+        var y = QuantizeHorizonHeight(sample.SurfaceY, heightStep) + 0.03f;
+        var eastY = QuantizeHorizonHeight(east.SurfaceY, heightStep) + 0.03f;
+        var westY = QuantizeHorizonHeight(west.SurfaceY, heightStep) + 0.03f;
+        var southY = QuantizeHorizonHeight(south.SurfaceY, heightStep) + 0.03f;
+        var northY = QuantizeHorizonHeight(north.SurfaceY, heightStep) + 0.03f;
+        var p00 = new Vector3(x, y, z);
+        var p10 = new Vector3(x + step, y, z);
+        var p01 = new Vector3(x, y, z + step);
+        var p11 = new Vector3(x + step, y, z + step);
+
+        var color = ResolveHorizonTerrainColor(sample);
+
+        AddHorizonQuad(vertices, p00, p10, p11, p01, color);
+
+        var sideColor = ResolveHorizonSideColor(sample);
+        if (ShouldDrawHorizonSide(x + step, z + step / 2, centerChunkX, centerChunkZ, innerRadiusChunks) || eastY + 0.5f < y)
+            AddHorizonVerticalFace(vertices, p10, p11, eastY, sideColor);
+        if (ShouldDrawHorizonSide(x, z + step / 2, centerChunkX, centerChunkZ, innerRadiusChunks) || westY + 0.5f < y)
+            AddHorizonVerticalFace(vertices, p01, p00, westY, sideColor);
+        if (ShouldDrawHorizonSide(x + step / 2, z + step, centerChunkX, centerChunkZ, innerRadiusChunks) || southY + 0.5f < y)
+            AddHorizonVerticalFace(vertices, p11, p01, southY, sideColor);
+        if (ShouldDrawHorizonSide(x + step / 2, z, centerChunkX, centerChunkZ, innerRadiusChunks) || northY + 0.5f < y)
+            AddHorizonVerticalFace(vertices, p00, p10, northY, sideColor);
+    }
+
+    private static void AddHorizonVerticalFace(
+        List<VertexPositionColor> vertices,
+        Vector3 topA,
+        Vector3 topB,
+        float bottomY,
+        Color color)
+    {
+        if (bottomY >= topA.Y - 0.5f)
+            return;
+
+        bottomY = MathF.Max(1f, bottomY);
+        var bottomA = new Vector3(topA.X, bottomY, topA.Z);
+        var bottomB = new Vector3(topB.X, bottomY, topB.Z);
+        var bottomColor = ShadeColor(color, 0.72f);
+
+        vertices.Add(new VertexPositionColor(topA, color));
+        vertices.Add(new VertexPositionColor(topB, color));
+        vertices.Add(new VertexPositionColor(bottomB, bottomColor));
+        vertices.Add(new VertexPositionColor(topA, color));
+        vertices.Add(new VertexPositionColor(bottomB, bottomColor));
+        vertices.Add(new VertexPositionColor(bottomA, bottomColor));
+    }
+
+    private static void AddHorizonQuad(List<VertexPositionColor> vertices, Vector3 p00, Vector3 p10, Vector3 p11, Vector3 p01, Color color)
+    {
+        vertices.Add(new VertexPositionColor(p00, color));
+        vertices.Add(new VertexPositionColor(p10, color));
+        vertices.Add(new VertexPositionColor(p11, color));
+        vertices.Add(new VertexPositionColor(p00, color));
+        vertices.Add(new VertexPositionColor(p11, color));
+        vertices.Add(new VertexPositionColor(p01, color));
+    }
+
+    private static void AddHorizonWaterCell(List<VertexPositionColor> vertices, int x, int z, int step)
+    {
+        var waterY = HorizonLodSeaLevel + 0.04f;
+        var color = new Color(64, 171, 221);
+        var p00 = new Vector3(x, waterY, z);
+        var p10 = new Vector3(x + step, waterY, z);
+        var p01 = new Vector3(x, waterY, z + step);
+        var p11 = new Vector3(x + step, waterY, z + step);
+
+        vertices.Add(new VertexPositionColor(p00, color));
+        vertices.Add(new VertexPositionColor(p10, color));
+        vertices.Add(new VertexPositionColor(p11, color));
+        vertices.Add(new VertexPositionColor(p00, color));
+        vertices.Add(new VertexPositionColor(p11, color));
+        vertices.Add(new VertexPositionColor(p01, color));
+    }
+
+    private static Color ResolveHorizonTerrainColor(VoxelWorld.DistantTerrainSample sample)
+    {
+        var color = sample.SurfaceBlock switch
+        {
+            BlockIds.Sand => new Color(196, 181, 119),
+            BlockIds.Dirt => new Color(113, 79, 52),
+            BlockIds.Stone => new Color(126, 126, 120),
+            _ => sample.BiomeId == (byte)BiomeId.Forest
+                ? new Color(47, 129, 42)
+                : sample.BiomeId == (byte)BiomeId.Hills
+                    ? new Color(63, 145, 52)
+                    : new Color(66, 162, 39)
+        };
+
+        var heightShade = Math.Clamp((sample.SurfaceY - HorizonLodSeaLevel) / 80f, -0.18f, 0.20f);
+        return ShadeColor(color, 1f + heightShade);
+    }
+
+    private static Color ResolveHorizonSideColor(VoxelWorld.DistantTerrainSample sample)
+    {
+        if (sample.SurfaceBlock == BlockIds.Sand)
+            return ShadeColor(new Color(181, 166, 107), 0.88f);
+        if (sample.SurfaceBlock == BlockIds.Stone)
+            return ShadeColor(new Color(122, 122, 116), 0.90f);
+        return ShadeColor(new Color(104, 73, 48), 0.92f);
+    }
+
+    private static int QuantizeHorizonHeight(int surfaceY, int heightStep)
+        => FloorToMultiple(surfaceY, Math.Max(1, heightStep));
+
+    private static bool ShouldDrawHorizonSide(int worldX, int worldZ, int centerChunkX, int centerChunkZ, int innerRadiusChunks)
+    {
+        var chunkX = FloorDiv(worldX, VoxelChunkData.ChunkSizeX);
+        var chunkZ = FloorDiv(worldZ, VoxelChunkData.ChunkSizeZ);
+        var dx = chunkX - centerChunkX;
+        var dz = chunkZ - centerChunkZ;
+        return dx * dx + dz * dz <= innerRadiusChunks * innerRadiusChunks;
+    }
+
+    private static Color ShadeColor(Color color, float factor)
+    {
+        factor = Math.Clamp(factor, 0.65f, 1.18f);
+        return new Color(
+            (byte)Math.Clamp((int)(color.R * factor), 0, 255),
+            (byte)Math.Clamp((int)(color.G * factor), 0, 255),
+            (byte)Math.Clamp((int)(color.B * factor), 0, 255),
+            color.A);
+    }
+
+    private static int FloorToMultiple(int value, int step)
+        => (int)MathF.Floor(value / (float)step) * step;
+
+    private static int FloorDiv(int value, int divisor)
+        => (int)MathF.Floor(value / (float)divisor);
+
+    private static ChunkCoord QuantizeChunkCenter(ChunkCoord center, int step)
+    {
+        step = Math.Max(1, step);
+        return new ChunkCoord(FloorToMultiple(center.X, step), center.Y, FloorToMultiple(center.Z, step));
+    }
+
+    private static HorizonLodConfig GetHorizonLodConfig(string? qualityPreset, int renderDistanceChunks, int lodLevels)
+    {
+        var quality = string.IsNullOrWhiteSpace(qualityPreset)
+            ? "MEDIUM"
+            : qualityPreset.Trim().ToUpperInvariant();
+        var renderBoost = Math.Clamp(renderDistanceChunks - GameSettings.RenderDistanceMin, 0, 6);
+        lodLevels = Math.Clamp(lodLevels, 1, 4);
+
+        var config = quality switch
+        {
+            "LOW" => new HorizonLodConfig("LOW", 56 + renderBoost * 2, 24, 48, 96, 8, 14, 35_000),
+            "HIGH" => new HorizonLodConfig("HIGH", 72 + renderBoost * 2, 12, 24, 48, 10, 18, 85_000),
+            "ULTRA" => new HorizonLodConfig("ULTRA", 80 + renderBoost * 2, 8, 16, 32, 12, 22, 160_000),
+            _ => new HorizonLodConfig("MEDIUM", 64 + renderBoost * 2, 16, 32, 64, 9, 16, 55_000)
+        };
+
+        if (lodLevels >= 4)
+            return config with
+            {
+                RadiusChunks = config.RadiusChunks + 12,
+                NearStepBlocks = Math.Max(8, config.NearStepBlocks),
+                MidStepBlocks = Math.Max(16, config.MidStepBlocks),
+                FarStepBlocks = Math.Max(32, config.FarStepBlocks),
+                NearBandChunks = config.NearBandChunks + 2,
+                MidBandChunks = config.MidBandChunks + 4,
+                VertexCapacityHint = config.VertexCapacityHint + 60_000
+            };
+        if (lodLevels <= 1)
+            return config with
+            {
+                RadiusChunks = Math.Max(32, config.RadiusChunks - 20),
+                NearStepBlocks = Math.Max(config.NearStepBlocks, 8),
+                MidStepBlocks = Math.Max(config.MidStepBlocks, 16),
+                FarStepBlocks = Math.Max(config.FarStepBlocks, 24),
+                VertexCapacityHint = Math.Max(40_000, config.VertexCapacityHint / 2)
+            };
+        if (lodLevels == 2)
+            return config with
+            {
+                RadiusChunks = Math.Max(48, config.RadiusChunks - 12),
+                NearStepBlocks = Math.Max(config.NearStepBlocks, 4),
+                MidStepBlocks = Math.Max(config.MidStepBlocks, 8),
+                FarStepBlocks = Math.Max(config.FarStepBlocks, 16)
+            };
+
+        return config;
+    }
+
+    private readonly record struct HorizonLodConfig(
+        string Quality,
+        int RadiusChunks,
+        int NearStepBlocks,
+        int MidStepBlocks,
+        int FarStepBlocks,
+        int NearBandChunks,
+        int MidBandChunks,
+        int VertexCapacityHint)
+    {
+        public string CacheKey => $"blocky-v9-{Quality}-r{RadiusChunks}-n{NearStepBlocks}-m{MidStepBlocks}-f{FarStepBlocks}-nb{NearBandChunks}-mb{MidBandChunks}";
+    }
+
+    private readonly record struct HorizonLodBuildResult(
+        ChunkCoord CenterChunk,
+        int InnerRadiusChunks,
+        int RadiusChunks,
+        string Quality,
+        VertexPositionColor[] Vertices,
+        bool LoadedFromCache,
+        long BuildMilliseconds);
+
     private void ScheduleNeighborMeshes(ChunkCoord center, int priority)
     {
         if (_world == null)
@@ -3244,6 +4399,36 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private int ResolveRuntimeRenderDistance(int settingsRadius)
+    {
+        var requestedRadius = settingsRadius;
+
+        // Launcher render distance is a startup cap. The in-game setting can still lower the real radius.
+        var args = Environment.GetCommandLineArgs();
+        foreach (var arg in args)
+        {
+            if (!arg.StartsWith("--render-distance=", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!int.TryParse(arg.AsSpan()["--render-distance=".Length..], out var cliRadius))
+                continue;
+
+            var cappedRadius = Math.Min(requestedRadius, cliRadius);
+            if (cappedRadius != requestedRadius)
+                _log.Info($"Launcher render distance cap applied: {requestedRadius} -> {cappedRadius} chunks.");
+            requestedRadius = cappedRadius;
+            break;
+        }
+
+        var resolvedRadius = Math.Clamp(requestedRadius, GameSettings.RenderDistanceMin, MaxRuntimeActiveRadius);
+        if (requestedRadius > MaxRuntimeActiveRadius)
+            _log.Info($"Render distance capped at {MaxRuntimeActiveRadius} (requested {requestedRadius}) to reduce in-world lag.");
+        else if (requestedRadius < GameSettings.RenderDistanceMin)
+            _log.Info($"Render distance raised to minimum {GameSettings.RenderDistanceMin} (requested {requestedRadius}).");
+
+        return resolvedRadius;
+    }
+
     private void RefreshSettingsIfChanged()
     {
         var stamp = GetSettingsStamp();
@@ -3253,37 +4438,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var oldQuality = _settings.QualityPreset;
         _settingsStamp = stamp;
         _settings = GameSettings.LoadOrCreate(_log);
-        
-        // C) RENDER DISTANCE GUARDRAILS - check command line first
-        var requestedRadius = _settings.RenderDistanceChunks;
-        
-        // Check for command line override from launcher
-        var args = Environment.GetCommandLineArgs();
-        foreach (var arg in args)
-        {
-            if (arg.StartsWith("--render-distance="))
-            {
-                if (int.TryParse(arg.AsSpan()["--render-distance=".Length..], out var cliRadius))
-                {
-                    requestedRadius = cliRadius;
-                    _log.Info($"Using render distance from command line: {cliRadius}");
-                }
-            }
-        }
-        
-        var newRadius = Math.Clamp(requestedRadius, 4, MaxRuntimeActiveRadius);
-        if (requestedRadius > MaxRuntimeActiveRadius)
-        {
-            _log.Info($"Render distance capped at {MaxRuntimeActiveRadius} (requested {requestedRadius}) to reduce in-world lag.");
-        }
+
+        var newRadius = ResolveRuntimeRenderDistance(_settings.RenderDistanceChunks);
         var newQuality = _settings.QualityPreset;
         ApplyRuntimeInputBindingsFromSettings();
         _indicatorsEnabled = _settings.IndicatorsEnabled;
+        _autoAcceptItemHandoffs = _settings.AutoAcceptItemHandoffs;
         _soulMarkerGuidanceEnabled = _settings.SoulDeathMarkerGuidanceEnabled;
         _nametagMode = NormalizeNametagMode(_settings.NametagMode);
         _nametagFadeSeconds = Math.Clamp(_settings.NametagFadeSeconds, 0.5f, 12f);
         _blockBreakParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         _soulMarkerParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
+        _torchFlameParticles.ApplyPreset(_settings.ParticlePreset, _settings.QualityPreset);
         UpdateReticleSettings();
 
         if (newQuality != oldQuality)
@@ -3294,54 +4460,145 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         var oldTargetRadius = _targetActiveRadiusChunks;
-        _targetActiveRadiusChunks = newRadius;
+        ApplyRuntimeRenderDistanceChange(oldTargetRadius, newRadius);
+    }
 
-        if (newRadius < _activeRadiusChunks)
+    private void ApplyRuntimeRenderDistanceChange(int oldTargetRadius, int newRadius)
+    {
+        if (oldTargetRadius == newRadius && _activeRadiusChunks <= newRadius)
+            return;
+
+        var oldActiveRadius = _activeRadiusChunks;
+        _targetActiveRadiusChunks = newRadius;
+        _activeRadiusRampTimer = 0f;
+
+        if (newRadius < oldActiveRadius)
         {
-            var oldRadius = _activeRadiusChunks;
             _activeRadiusChunks = newRadius;
-            _activeRadiusRampTimer = 0f;
-            
-            // 4) RENDER DISTANCE CHANGES - Aggressive unloading and job cancellation
-            _log.Info($"Render distance lowered: {oldRadius} -> {newRadius}, aggressively unloading");
-            
-            // Cancel pending jobs outside new radius
-            CancelJobsOutsideRadius(newRadius);
-            
-            // Force immediate trim of far chunks
-            TrimFarChunks(newRadius + KeepRadiusBuffer);
-            
-            // Clear meshes for unloaded chunks
-            BuildStreamingFocusChunks(_streamingFocusChunks);
-            if (_streamingFocusChunks.Count == 0)
-                _streamingFocusChunks.Add(_centerChunk);
-            var chunksToRemove = _chunkMeshes.Keys.Where(coord => {
-                return !IsWithinFocusRadius(coord, _streamingFocusChunks, newRadius + KeepRadiusBuffer);
-            }).ToList();
-            
-            foreach (var coord in chunksToRemove)
-            {
-                _chunkMeshes.TryRemove(coord, out _);
-                _chunkOrder.Remove(coord);
-            }
-            
-            _log.Info($"Unloaded {chunksToRemove.Count} chunk meshes due to reduced render distance");
-            
+            _log.Info($"Render distance lowered: {oldActiveRadius} -> {newRadius}, aggressively unloading.");
+            PruneStreamingWorkOutsideRadius(newRadius + KeepRadiusBuffer);
+            TrimRuntimeChunksOutsideRadius(newRadius + KeepRadiusBuffer);
             UpdateActiveChunks(force: false);
-            _log.Info($"Render distance changed: {_activeRadiusChunks} chunks");
+            _log.Info($"Render distance changed immediately: active={_activeRadiusChunks}, target={_targetActiveRadiusChunks}.");
+            return;
         }
-        else if (newRadius > _activeRadiusChunks || oldTargetRadius != newRadius)
+
+        if (newRadius < oldTargetRadius)
         {
-            _activeRadiusRampTimer = 0f;
-            _log.Info($"Render distance target set to {newRadius}; streaming will ramp up from {_activeRadiusChunks}.");
+            _log.Info($"Render distance target lowered: {oldTargetRadius} -> {newRadius}; active radius remains {_activeRadiusChunks}.");
+            PruneStreamingWorkOutsideRadius(newRadius + KeepRadiusBuffer);
+            TrimRuntimeChunksOutsideRadius(newRadius + KeepRadiusBuffer);
+            UpdateActiveChunks(force: false);
+            return;
         }
+
+        if (newRadius > oldTargetRadius || newRadius > oldActiveRadius)
+        {
+            _log.Info($"Render distance target raised: {oldTargetRadius} -> {newRadius}; streaming will ramp up from {_activeRadiusChunks}.");
+            UpdateActiveChunks(force: false);
+        }
+    }
+
+    private void TrimRuntimeChunksOutsideRadius(int keepRadius)
+    {
+        TrimFarChunks(keepRadius);
+
+        BuildStreamingFocusChunks(_streamingFocusChunks);
+        if (_streamingFocusChunks.Count == 0)
+            _streamingFocusChunks.Add(_centerChunk);
+
+        var chunksToRemove = _chunkMeshes.Keys
+            .Where(coord => !IsWithinFocusRadius(coord, _streamingFocusChunks, keepRadius))
+            .ToList();
+
+        foreach (var coord in chunksToRemove)
+        {
+            _chunkMeshes.TryRemove(coord, out _);
+            _chunkOrder.Remove(coord);
+        }
+
+        if (chunksToRemove.Count > 0)
+            _log.Info($"Unloaded {chunksToRemove.Count} chunk meshes outside render distance {keepRadius}.");
+    }
+
+    private void PruneStreamingWorkOutsideRadius(int keepRadius)
+    {
+        BuildStreamingFocusChunks(_streamingFocusChunks);
+        if (_streamingFocusChunks.Count == 0)
+            _streamingFocusChunks.Add(_centerChunk);
+
+        var prunedChunkJobs = PruneChunkGenerationQueue(keepRadius);
+        var prunedMeshJobs = PruneMeshQueues(keepRadius);
+        if (prunedChunkJobs > 0 || prunedMeshJobs > 0)
+            _log.Info($"Pruned streaming work outside render distance {keepRadius}: chunks={prunedChunkJobs}, meshes={prunedMeshJobs}.");
+    }
+
+    private int PruneChunkGenerationQueue(int keepRadius)
+    {
+        var kept = new List<ChunkCoord>();
+        var pruned = 0;
+        while (_chunkGenerationQueue.TryDequeue(out var coord))
+        {
+            if (IsWithinFocusRadius(coord, _streamingFocusChunks, keepRadius))
+            {
+                kept.Add(coord);
+            }
+            else
+            {
+                _chunkGenerationQueued.TryRemove(coord, out _);
+                pruned++;
+            }
+        }
+
+        for (var i = 0; i < kept.Count; i++)
+            _chunkGenerationQueue.Enqueue(kept[i]);
+
+        return pruned;
+    }
+
+    private int PruneMeshQueues(int keepRadius)
+    {
+        var pruned = 0;
+        var keptMesh = new List<ChunkCoord>();
+        while (_meshQueue.TryDequeue(out var coord))
+        {
+            if (IsWithinFocusRadius(coord, _streamingFocusChunks, keepRadius))
+            {
+                keptMesh.Add(coord);
+            }
+            else
+            {
+                _meshQueued.Remove(coord);
+                pruned++;
+            }
+        }
+
+        for (var i = 0; i < keptMesh.Count; i++)
+            _meshQueue.Enqueue(keptMesh[i]);
+
+        var keptPriority = new List<ChunkCoord>();
+        while (_priorityMeshQueue.TryDequeue(out var coord))
+        {
+            if (IsWithinFocusRadius(coord, _streamingFocusChunks, keepRadius))
+            {
+                keptPriority.Add(coord);
+            }
+            else
+            {
+                _priorityMeshQueued.Remove(coord);
+                pruned++;
+            }
+        }
+
+        for (var i = 0; i < keptPriority.Count; i++)
+            _priorityMeshQueue.Enqueue(keptPriority[i]);
+
+        return pruned;
     }
 
     private void CancelJobsOutsideRadius(int radius)
     {
-        // This would require extending ChunkStreamingService to support job cancellation
-        // For now, we'll just log that jobs outside radius should be cancelled
-        _log.Debug($"Would cancel jobs outside radius {radius} (job cancellation not yet implemented)");
+        PruneStreamingWorkOutsideRadius(radius);
     }
 
     private void UpdateReticleSettings()
@@ -3731,6 +4988,215 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void QueueWaterRemeshForBlockEdit(int wx, int wy, int wz)
+    {
+        _blockEditBoostRemaining = Math.Max(_blockEditBoostRemaining, Math.Min(BlockEditBoostFrames, 4));
+        var coord = VoxelWorld.WorldToChunk(wx, wy, wz, out var lx, out var ly, out var lz);
+        InvalidateWaterEditMesh(coord);
+
+        if (lx == 0)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X - 1, coord.Y, coord.Z));
+        if (lx == VoxelChunkData.ChunkSizeX - 1)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X + 1, coord.Y, coord.Z));
+        if (ly == 0)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X, coord.Y - 1, coord.Z));
+        if (ly == VoxelChunkData.ChunkSizeY - 1)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X, coord.Y + 1, coord.Z));
+        if (lz == 0)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X, coord.Y, coord.Z - 1));
+        if (lz == VoxelChunkData.ChunkSizeZ - 1)
+            InvalidateWaterEditMesh(new ChunkCoord(coord.X, coord.Y, coord.Z + 1));
+    }
+
+    private void InvalidateWaterEditMesh(ChunkCoord coord)
+    {
+        if (_activeChunks.Count > 0 && !_activeChunks.Contains(coord))
+            return;
+
+        if (_world?.TryGetChunk(coord, out var chunk) == true && chunk != null)
+            chunk.IsDirty = true;
+
+        QueuePriorityMeshBuild(coord);
+    }
+
+    private void QueueWaterFlowAt(int x, int y, int z)
+    {
+        var pos = (x, y, z);
+        if (_waterFlowQueued.Add(pos))
+            _waterFlowQueue.Enqueue(pos);
+    }
+
+    private void QueueWaterFlowAround(int x, int y, int z)
+    {
+        QueueWaterFlowAt(x, y, z);
+        QueueWaterFlowAt(x, y - 1, z);
+        QueueWaterFlowAt(x, y + 1, z);
+        QueueWaterFlowAt(x + 1, y, z);
+        QueueWaterFlowAt(x - 1, y, z);
+        QueueWaterFlowAt(x, y, z + 1);
+        QueueWaterFlowAt(x, y, z - 1);
+    }
+
+    private void UpdateWaterFlow(float dt)
+    {
+        if (_world == null || IsJoinedClientSession)
+            return;
+
+        _waterFlowAccumulator += dt;
+        _waterFlowScanAccumulator += dt;
+        if (_waterFlowScanAccumulator >= WaterFlowScanSeconds)
+        {
+            _waterFlowScanAccumulator = 0f;
+            if (_waterFlowQueue.Count < WaterFlowScanBacklogLimit)
+                QueueNearbyWaterForFlow();
+        }
+
+        if (_waterFlowAccumulator < WaterFlowStepSeconds)
+            return;
+
+        _waterFlowAccumulator = 0f;
+        var updates = 0;
+        var started = Stopwatch.GetTimestamp();
+        while (updates < WaterFlowMaxUpdatesPerStep && _waterFlowQueue.Count > 0)
+        {
+            if (updates > 0 && Stopwatch.GetElapsedTime(started).TotalMilliseconds >= WaterFlowMaxMillisecondsPerStep)
+                break;
+
+            var pos = _waterFlowQueue.Dequeue();
+            _waterFlowQueued.Remove(pos);
+            if (TryFlowWaterFrom(pos.X, pos.Y, pos.Z))
+                updates++;
+        }
+    }
+
+    private void QueueNearbyWaterForFlow()
+    {
+        if (_world == null)
+            return;
+
+        var centerX = (int)MathF.Floor(_player.Position.X);
+        var centerY = (int)MathF.Floor(_player.Position.Y);
+        var centerZ = (int)MathF.Floor(_player.Position.Z);
+        for (var y = centerY - WaterFlowVerticalScanRadius; y <= centerY + WaterFlowVerticalScanRadius; y++)
+        for (var x = centerX - WaterFlowScanRadius; x <= centerX + WaterFlowScanRadius; x++)
+        for (var z = centerZ - WaterFlowScanRadius; z <= centerZ + WaterFlowScanRadius; z++)
+        {
+            if (BlockIds.IsWater(_world.GetBlock(x, y, z)) && HasWaterFlowTarget(x, y, z))
+                QueueWaterFlowAt(x, y, z);
+        }
+    }
+
+    private bool TryFlowWaterFrom(int x, int y, int z)
+    {
+        if (_world == null)
+            return false;
+
+        var id = _world.GetBlock(x, y, z);
+        if (!BlockIds.IsWater(id))
+            return false;
+
+        var source = BlockIds.IsWaterSource(id);
+        var level = source ? 0 : BlockIds.GetFlowingWaterLevel(id);
+        if (!source)
+        {
+            var supportedLevel = GetSupportedFlowingWaterLevel(x, y, z);
+            if (supportedLevel == 0)
+                return SetFlowingWaterBlock(x, y, z, BlockIds.Air);
+
+            if (supportedLevel != level)
+            {
+                SetFlowingWaterBlock(x, y, z, BlockIds.FlowingWaterForLevel(supportedLevel));
+                level = supportedLevel;
+            }
+        }
+
+        if (TryPlaceFlowedWater(x, y - 1, z, Math.Max(1, level)))
+            return true;
+
+        var nextLevel = level + 1;
+        if (nextLevel > 7)
+            return false;
+
+        var flowed = false;
+        flowed |= TryPlaceFlowedWater(x + 1, y, z, nextLevel);
+        flowed |= TryPlaceFlowedWater(x - 1, y, z, nextLevel);
+        flowed |= TryPlaceFlowedWater(x, y, z + 1, nextLevel);
+        flowed |= TryPlaceFlowedWater(x, y, z - 1, nextLevel);
+        return flowed;
+    }
+
+    private bool HasWaterFlowTarget(int x, int y, int z)
+    {
+        if (_world == null)
+            return false;
+
+        return _world.GetBlock(x, y - 1, z) == BlockIds.Air
+            || _world.GetBlock(x + 1, y, z) == BlockIds.Air
+            || _world.GetBlock(x - 1, y, z) == BlockIds.Air
+            || _world.GetBlock(x, y, z + 1) == BlockIds.Air
+            || _world.GetBlock(x, y, z - 1) == BlockIds.Air;
+    }
+
+    private int GetSupportedFlowingWaterLevel(int x, int y, int z)
+    {
+        if (_world == null)
+            return 0;
+
+        var best = 8;
+        AddSupport(_world.GetBlock(x, y + 1, z), vertical: true);
+        AddSupport(_world.GetBlock(x + 1, y, z), vertical: false);
+        AddSupport(_world.GetBlock(x - 1, y, z), vertical: false);
+        AddSupport(_world.GetBlock(x, y, z + 1), vertical: false);
+        AddSupport(_world.GetBlock(x, y, z - 1), vertical: false);
+        return best <= 7 ? best : 0;
+
+        void AddSupport(byte supportId, bool vertical)
+        {
+            if (BlockIds.IsWaterSource(supportId))
+            {
+                best = Math.Min(best, 1);
+                return;
+            }
+
+            if (!BlockIds.IsFlowingWater(supportId))
+                return;
+
+            var supportLevel = BlockIds.GetFlowingWaterLevel(supportId);
+            var nextLevel = vertical ? supportLevel : supportLevel + 1;
+            if (nextLevel <= 7)
+                best = Math.Min(best, nextLevel);
+        }
+    }
+
+    private bool TryPlaceFlowedWater(int x, int y, int z, int level)
+    {
+        if (_world == null)
+            return false;
+
+        var current = _world.GetBlock(x, y, z);
+        if (BlockIds.IsWaterSource(current))
+            return false;
+
+        if (current != BlockIds.Air && !BlockIds.IsFlowingWater(current))
+            return false;
+
+        if (BlockIds.IsFlowingWater(current) && BlockIds.GetFlowingWaterLevel(current) <= level)
+            return false;
+
+        return SetFlowingWaterBlock(x, y, z, BlockIds.FlowingWaterForLevel(level));
+    }
+
+    private bool SetFlowingWaterBlock(int x, int y, int z, byte id)
+    {
+        if (_world == null || !_world.SetBlock(x, y, z, id))
+            return false;
+
+        _lanSession?.SendBlockSet(x, y, z, id);
+        QueueWaterRemeshForBlockEdit(x, y, z);
+        QueueWaterFlowAround(x, y, z);
+        return true;
+    }
+
     private void InvalidateBlockEditMesh(ChunkCoord coord)
     {
         if (_activeChunks.Count > 0 && !_activeChunks.Contains(coord))
@@ -3831,8 +5297,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _completedLoadsAppliedThisFrame = 0;
         _completedMeshesAppliedThisFrame = 0;
         
-        // 4) AGGRESSIVE APPLY - Higher budget during preparing (up to 16 meshes/frame)
-        int maxMeshesPerFrame = aggressiveApply ? 16 : 4;
+        // 4) Higher apply budget prevents visible holes after render-distance changes.
+        int maxMeshesPerFrame = aggressiveApply ? 24 : Math.Max(4, MaxApplyCompletedMeshesPerFrame);
 
         // Process load results - add loaded chunks to world
         _streamingService.ProcessLoadResults(result => {
@@ -3872,10 +5338,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             {
                 _log.Error($"Failed to load chunk {result.Coord}: {result.Error}");
             }
-        }, maxResults: MaxApplyCompletedChunkLoadsPerFrame);
+        }, maxResults: aggressiveApply ? MaxApplyCompletedChunkLoadsPerFrame * 2 : MaxApplyCompletedChunkLoadsPerFrame);
 
         // Process mesh results - add built meshes to rendering
         _streamingService.ProcessMeshResults(result => {
+            if (!_activeChunks.Contains(result.Coord))
+            {
+                _chunkMeshes.TryRemove(result.Coord, out _);
+                _chunkOrder.Remove(result.Coord);
+                return;
+            }
+
             if (result.Success && result.Mesh != null)
             {
                 _chunkMeshes[result.Coord] = result.Mesh;
@@ -3932,13 +5405,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         public ChunkMesh? Mesh { get; }
         public string? Error { get; }
         public int Version { get; }
+        /// <summary>
+        /// Neighbor chunk coords whose lightmaps were dirtied by cross-chunk light
+        /// propagation during this build. Null when no propagation occurred or when
+        /// no neighbors were affected. Processed by ApplyCompletedMeshBuilds.
+        /// </summary>
+        public HashSet<ChunkCoord>? AffectedNeighbors { get; }
 
-        public MeshBuildResult(ChunkCoord coord, ChunkMesh? mesh, string? error, int version)
+        public MeshBuildResult(ChunkCoord coord, ChunkMesh? mesh, string? error, int version,
+            HashSet<ChunkCoord>? affectedNeighbors = null)
         {
             Coord = coord;
             Mesh = mesh;
             Error = error;
             Version = version;
+            AffectedNeighbors = affectedNeighbors;
         }
     }
 
@@ -3976,7 +5457,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         var scheduleBudget = budgetOverride > 0
             ? budgetOverride
-            : Math.Max(MaxMeshBuildsPerFrame, RuntimeMeshScheduleBudget);
+            : Math.Max(MaxMeshBuildsPerFrame, GetRuntimeMeshScheduleBudget());
+        if (IsHeavyGuiOpenForStreaming())
+            scheduleBudget = 0;
         if (boostBuilds)
             scheduleBudget = Math.Max(scheduleBudget, Math.Min(MeshWorkerCount + 1, 6));
 
@@ -4177,6 +5660,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
 
             chunk.IsDirty = false;
+
+            // Stage 4: process light-affected neighbors.
+            // When light crossed a chunk boundary during propagation, those neighbors
+            // need their lightmaps re-propagated before their next mesh build.
+            if (result.AffectedNeighbors != null && _world != null)
+            {
+                foreach (var neighborCoord in result.AffectedNeighbors)
+                {
+                    if (_world.TryGetChunk(neighborCoord, out var neighborChunk) && neighborChunk != null)
+                    {
+                        neighborChunk.InvalidateLightmap();
+                        neighborChunk.IsDirty = true;
+                        QueueMeshBuild(neighborCoord);
+                    }
+                }
+            }
         }
     }
 
@@ -4201,12 +5700,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             || mesh.WaterVertices.Length % 3 != 0)
             return false;
 
+        // Lit arrays (sky/block/AO per vertex)
         return VerticesFinite(mesh.OpaqueVertices)
             && VerticesFinite(mesh.CutoutVertices)
             && VerticesFinite(mesh.TransparentVertices)
+            // Unlit water array
             && VerticesFinite(mesh.WaterVertices);
     }
 
+    // Overload for lit vertex arrays (opaque/cutout/transparent).
+    private static bool VerticesFinite(VertexPositionColorTexture[] verts)
+    {
+        for (int i = 0; i < verts.Length; i++)
+        {
+            var p = verts[i].Position;
+            if (float.IsNaN(p.X) || float.IsNaN(p.Y) || float.IsNaN(p.Z))
+                return false;
+            if (float.IsInfinity(p.X) || float.IsInfinity(p.Y) || float.IsInfinity(p.Z))
+                return false;
+        }
+        return true;
+    }
+
+    // Overload for unlit vertex arrays (water only).
     private static bool VerticesFinite(VertexPositionTexture[] verts)
     {
         for (int i = 0; i < verts.Length; i++)
@@ -4521,8 +6037,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         else
         {
             var spawnPoint = GetWorldSpawnPoint();
-            var safeHeight = FindSafeSpawnHeight(spawnPoint.X, spawnPoint.Y);
-            respawnPosition = new Vector3(spawnPoint.X, Math.Max(safeHeight + 2f, 6f), spawnPoint.Y);
+            respawnPosition = ResolveGrassSurfaceSpawnPosition(spawnPoint);
         }
 
         _player.Position = respawnPosition;
@@ -4962,7 +6477,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _player.Position = candidate;
     }
 
-    private void HandleBlockInteraction(GameTime gameTime, InputState input)
+    private void HandleBlockInteraction(GameTime gameTime, InputState input, bool suppressPointerActions)
     {
         if (_world == null)
             return;
@@ -4970,32 +6485,81 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
+        UpdateBlockBreakProgressDecay(dt);
         if (_interactCooldown > 0f)
             _interactCooldown = Math.Max(0f, _interactCooldown - dt);
 
         if (_interactCooldown > 0f)
             return;
 
+        if (suppressPointerActions)
+        {
+            _hasActiveBreakProgress = false;
+            return;
+        }
+
         var leftDown = input.IsLeftDown();
         var newLeftClick = input.IsNewLeftClick();
         var origin = _player.Position + _player.HeadOffset;
         var dir = _player.Forward;
+
+        var selectedItem = _inventory.SelectedId;
+        var isHeldJavelin = ItemRegistry.IsJavelin((ItemId)(byte)selectedItem);
+
+        if (isHeldJavelin && _inventory.SelectedCount > 0)
+        {
+            if (input.IsRightDown())
+            {
+                _isChargingJavelin = true;
+                _javelinChargeHoldTimer = Math.Min(JavelinMaxChargeSeconds, _javelinChargeHoldTimer + dt);
+            }
+            else if (_isChargingJavelin)
+            {
+                if (_javelinChargeHoldTimer >= JavelinMinChargeSeconds)
+                {
+                    TryThrowHeldJavelin(origin, dir, _javelinChargeHoldTimer / JavelinMaxChargeSeconds);
+                }
+                _isChargingJavelin = false;
+                _javelinChargeHoldTimer = 0f;
+            }
+        }
+        else
+        {
+            _isChargingJavelin = false;
+            _javelinChargeHoldTimer = 0f;
+        }
+
+        if (input.IsNewRightClick() && TryPickStuckJavelin(origin, dir))
+        {
+            _interactCooldown = 0.18f;
+            return;
+        }
+
+        if (input.IsNewRightClick() && TryThrowHeldPebble(origin, dir))
+            return;
+
         if (input.IsNewRightClick() && TryHandleSoulRightClick(origin, dir))
         {
             _interactCooldown = InteractCooldownSeconds;
             return;
         }
 
-        var hasBlockHit = VoxelRaycast.Raycast(origin, dir, InteractRange, _world.GetBlock, out var hit);
+        var hasBlockHit = TryRaycastInteractBlock(origin, dir, out var hit);
         var blockHitDistance = hasBlockHit
             ? Vector3.Distance(origin, new Vector3(hit.X + 0.5f, hit.Y + 0.5f, hit.Z + 0.5f))
             : float.MaxValue;
 
         if (newLeftClick && TryHandlePlayerMeleeClick(origin, dir, blockHitDistance))
+        {
+            if (isHeldJavelin)
+                _interactCooldown = JavelinJabCooldownSeconds;
             return;
+        }
+
 
         if (!hasBlockHit)
         {
+            _hasActiveBreakProgress = false;
             if (leftDown)
             {
                 TriggerLocalActionSwing(dir);
@@ -5009,33 +6573,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
             if (id != BlockIds.Air)
             {
-                if (id == BlockIds.Nullblock && _gameMode == GameMode.Veilwalker)
+                if (BlockIds.IsWater(id))
                 {
+                    _hasActiveBreakProgress = false;
                     _interactCooldown = InteractCooldownSeconds;
                     return;
                 }
 
-                _world.SetBlock(hit.X, hit.Y, hit.Z, BlockIds.Air);
-                _lanSession?.SendBlockSet(hit.X, hit.Y, hit.Z, BlockIds.Air);
-                QueuePriorityRemeshForBlockEdit(hit.X, hit.Y, hit.Z);
-                _blockBreakParticles.SpawnBlockBreak(hit.X, hit.Y, hit.Z, id);
-                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.X, hit.Y, hit.Z));
-                
-                if (_gameMode == GameMode.Veilwalker)
-                    SpawnBlockDrop(hit.X, hit.Y, hit.Z, (BlockId)id);
-                else
+                if (id == BlockIds.Nullblock && _gameMode == GameMode.Veilwalker)
                 {
-                    if (!AlreadyOwnsItem((BlockId)id))
-                    {
-                        _inventory.Add((BlockId)id, 1);
-                        MarkPlayerStateDirty(); // Mark dirty after inventory change
-                    }
+                    _hasActiveBreakProgress = false;
+                    _interactCooldown = InteractCooldownSeconds;
+                    return;
                 }
-                _interactCooldown = GetBlockBreakCooldownSeconds(id);
+
+                if (_gameMode == GameMode.Artificer)
+                {
+                    _blockBreakProgress.Remove(new BlockBreakKey(hit.X, hit.Y, hit.Z));
+                    CompleteBlockBreak(hit.X, hit.Y, hit.Z, id);
+                    TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.X, hit.Y, hit.Z));
+                    return;
+                }
+
+                if (TryAdvanceBlockBreakProgress(hit.X, hit.Y, hit.Z, id, dt, origin, out var shouldBreak))
+                {
+                    TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.X, hit.Y, hit.Z));
+                }
+
+                if (shouldBreak)
+                    CompleteBlockBreak(hit.X, hit.Y, hit.Z, id);
             }
         }
         else if (input.IsNewMiddleClick())
         {
+            _hasActiveBreakProgress = false;
             var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
             if (id != BlockIds.Air)
             {
@@ -5045,36 +6616,69 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
         else if (input.IsNewRightClick())
         {
+            _hasActiveBreakProgress = false;
+            var hitId = _world.GetBlock(hit.X, hit.Y, hit.Z);
             var id = _world.GetBlock(hit.PrevX, hit.PrevY, hit.PrevZ);
             var selected = _inventory.SelectedId;
             var sandbox = _gameMode == GameMode.Artificer;
-            if (id == BlockIds.Air && selected == BlockId.WaterBucket && (sandbox || _inventory.SelectedCount > 0))
-            {
-                if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
-                {
-                    _interactCooldown = InteractCooldownSeconds;
-                    return;
-                }
 
-                _world.SetBlock(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
-                _lanSession?.SendBlockSet(hit.PrevX, hit.PrevY, hit.PrevZ, BlockIds.Water);
-                QueuePriorityRemeshForBlockEdit(hit.PrevX, hit.PrevY, hit.PrevZ);
-                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.PrevX, hit.PrevY, hit.PrevZ));
+            if (hitId == (byte)BlockId.ArtificerBench && _gameMode != GameMode.Artificer)
+            {
+                OpenArtificerBenchGui(hit.X, hit.Y, hit.Z);
                 _interactCooldown = InteractCooldownSeconds;
                 return;
             }
 
-            if (id == BlockIds.Air && selected != BlockId.Air && (sandbox || _inventory.SelectedCount > 0))
+            if (IsKilnBlock((BlockId)hitId) && _gameMode != GameMode.Artificer)
             {
-                if (WouldBlockIntersectAnyPlayer(hit.PrevX, hit.PrevY, hit.PrevZ))
+                OpenKilnGui(hit.X, hit.Y, hit.Z, (BlockId)hitId);
+                _interactCooldown = InteractCooldownSeconds;
+                return;
+            }
+
+            if (hitId == (byte)BlockId.SleepingBag && _gameMode != GameMode.Artificer)
+            {
+                TryUseSleepingBag(hit.X, hit.Y, hit.Z);
+                _interactCooldown = InteractCooldownSeconds;
+                return;
+            }
+
+            if (selected == BlockId.EmptyBucket
+                && (sandbox || _inventory.SelectedCount > 0)
+                && TryCollectSourceWaterWithBucket(hit.X, hit.Y, hit.Z, origin, sandbox))
+            {
+                return;
+            }
+
+            var waterPlaceX = BlockIds.IsFlowingWater(hitId) ? hit.X : hit.PrevX;
+            var waterPlaceY = BlockIds.IsFlowingWater(hitId) ? hit.Y : hit.PrevY;
+            var waterPlaceZ = BlockIds.IsFlowingWater(hitId) ? hit.Z : hit.PrevZ;
+            if (selected == BlockId.WaterBucket
+                && (sandbox || _inventory.SelectedCount > 0)
+                && TryPlaceWaterFromBucket(waterPlaceX, waterPlaceY, waterPlaceZ, origin, sandbox))
+            {
+                return;
+            }
+
+            var placeX = BlockIds.IsWater(hitId) ? hit.X : hit.PrevX;
+            var placeY = BlockIds.IsWater(hitId) ? hit.Y : hit.PrevY;
+            var placeZ = BlockIds.IsWater(hitId) ? hit.Z : hit.PrevZ;
+            var placeTargetId = BlockIds.IsWater(hitId) ? hitId : id;
+            if ((placeTargetId == BlockIds.Air || BlockIds.IsWater(placeTargetId))
+                && selected != BlockId.Air
+                && (sandbox || _inventory.SelectedCount > 0)
+                && ItemRegistry.TryGetPlaceBlock((ItemId)(byte)selected, out var placeBlock))
+            {
+                if (WouldBlockIntersectAnyPlayer(placeX, placeY, placeZ))
                 {
                     _interactCooldown = InteractCooldownSeconds;
                     return;
                 }
-                _world.SetBlock(hit.PrevX, hit.PrevY, hit.PrevZ, (byte)selected);
-                _lanSession?.SendBlockSet(hit.PrevX, hit.PrevY, hit.PrevZ, (byte)selected);
-                QueuePriorityRemeshForBlockEdit(hit.PrevX, hit.PrevY, hit.PrevZ);
-                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, hit.PrevX, hit.PrevY, hit.PrevZ));
+                _world.SetBlock(placeX, placeY, placeZ, (byte)placeBlock);
+                _lanSession?.SendBlockSet(placeX, placeY, placeZ, (byte)placeBlock);
+                QueuePriorityRemeshForBlockEdit(placeX, placeY, placeZ);
+                QueueWaterFlowAround(placeX, placeY, placeZ);
+                TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, placeX, placeY, placeZ));
                 
                 if (!sandbox && _inventory.TryConsumeSelected(1))
                     _interactCooldown = InteractCooldownSeconds;
@@ -5082,11 +6686,247 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     _interactCooldown = InteractCooldownSeconds;
             }
         }
+        else
+        {
+            var key = new BlockBreakKey(hit.X, hit.Y, hit.Z);
+            if (_blockBreakProgress.TryGetValue(key, out var progress) && progress.BlockId == _world.GetBlock(hit.X, hit.Y, hit.Z))
+                SetActiveBlockBreakProgress(key, progress);
+            else
+                _hasActiveBreakProgress = false;
+        }
+    }
+
+    private bool TryCollectSourceWaterWithBucket(int x, int y, int z, Vector3 origin, bool sandbox)
+    {
+        if (_world == null)
+            return false;
+
+        if (_world.GetBlock(x, y, z) != BlockIds.Water)
+            return false;
+
+        _world.SetBlock(x, y, z, BlockIds.Air);
+        _lanSession?.SendBlockSet(x, y, z, BlockIds.Air);
+        QueueWaterRemeshForBlockEdit(x, y, z);
+        QueueWaterFlowAround(x, y, z);
+        TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, x, y, z));
+
+        if (!sandbox)
+            ReplaceSelectedItem(BlockId.WaterBucket);
+
+        _interactCooldown = InteractCooldownSeconds;
+        return true;
+    }
+
+    private bool TryPlaceWaterFromBucket(int x, int y, int z, Vector3 origin, bool sandbox)
+    {
+        if (_world == null)
+            return false;
+
+        var targetId = _world.GetBlock(x, y, z);
+        if (targetId == BlockIds.Water)
+            return false;
+        if (targetId != BlockIds.Air && !BlockIds.IsFlowingWater(targetId))
+            return false;
+
+        if (WouldBlockIntersectAnyPlayer(x, y, z))
+        {
+            _interactCooldown = InteractCooldownSeconds;
+            return true;
+        }
+
+        _world.SetBlock(x, y, z, BlockIds.Water);
+        _lanSession?.SendBlockSet(x, y, z, BlockIds.Water);
+        QueueWaterRemeshForBlockEdit(x, y, z);
+        QueueWaterFlowAround(x, y, z);
+        TriggerLocalActionSwing(GetDirectionToBlockCenter(origin, x, y, z));
+
+        if (!sandbox)
+            ReplaceSelectedItem(BlockId.EmptyBucket);
+
+        _interactCooldown = InteractCooldownSeconds;
+        return true;
+    }
+
+    private void ReplaceSelectedItem(BlockId id)
+    {
+        ref var slot = ref _inventory.Hotbar[_inventory.SelectedIndex];
+        slot.Id = id;
+        slot.Count = id == BlockId.Air ? 0 : 1;
+        MarkPlayerStateDirty();
+
+        if (id != BlockId.Air)
+            SetDisplayNameForItem(id);
     }
 
     private float GetBlockBreakCooldownSeconds(byte id)
     {
         return BlockBreakCooldownSeconds;
+    }
+
+    private bool TryAdvanceBlockBreakProgress(int x, int y, int z, byte id, float dt, Vector3 origin, out bool shouldBreak)
+    {
+        shouldBreak = false;
+        if (_world == null || id == BlockIds.Air)
+        {
+            _hasActiveBreakProgress = false;
+            return false;
+        }
+
+        var def = BlockRegistry.Get(id);
+        if (def.Hardness < 0f)
+        {
+            _hasActiveBreakProgress = false;
+            return false;
+        }
+
+        var key = new BlockBreakKey(x, y, z);
+        if (!_blockBreakProgress.TryGetValue(key, out var progress) || progress.BlockId != id)
+            progress = new BlockBreakProgress(id);
+
+        var breakSeconds = GetBlockBreakDurationSeconds(id);
+        progress.ProgressSeconds = Math.Min(breakSeconds, progress.ProgressSeconds + Math.Max(0f, dt));
+        progress.InactiveSeconds = 0f;
+        progress.SwingTimer -= Math.Max(0f, dt);
+
+        var shouldSwing = progress.SwingTimer <= 0f;
+        if (shouldSwing)
+            progress.SwingTimer = BlockBreakProgressSwingIntervalSeconds;
+
+        _blockBreakProgress[key] = progress;
+        SetActiveBlockBreakProgress(key, progress);
+
+        shouldBreak = progress.ProgressSeconds >= breakSeconds;
+        if (shouldBreak)
+            _blockBreakProgress.Remove(key);
+
+        return shouldSwing;
+    }
+
+    private void CompleteBlockBreak(int x, int y, int z, byte id)
+    {
+        if (_world == null || id == BlockIds.Air)
+            return;
+
+        if (id == BlockIds.Grass)
+        {
+            _world.SetBlock(x, y, z, BlockIds.Dirt);
+            _lanSession?.SendBlockSet(x, y, z, BlockIds.Dirt);
+            QueuePriorityRemeshForBlockEdit(x, y, z);
+            QueueWaterFlowAround(x, y, z);
+            _blockBreakParticles.SpawnBlockBreak(x, y, z, id);
+            _hasActiveBreakProgress = false;
+            _interactCooldown = 0f;
+            return;
+        }
+
+        if (id == BlockIds.ArtificerBench)
+            DropStoredArtificerBenchItems(x, y, z);
+        if (IsKilnBlock((BlockId)id))
+            DropStoredKilnItems(x, y, z);
+
+        _world.SetBlock(x, y, z, BlockIds.Air);
+        _lanSession?.SendBlockSet(x, y, z, BlockIds.Air);
+        QueuePriorityRemeshForBlockEdit(x, y, z);
+        QueueWaterFlowAround(x, y, z);
+        _blockBreakParticles.SpawnBlockBreak(x, y, z, id);
+
+        if (_gameMode == GameMode.Veilwalker)
+            SpawnBlockDrops(x, y, z, (BlockId)id);
+        else
+        {
+            var pickedId = IsKilnBlock((BlockId)id) ? GetKilnBaseBlock((BlockId)id) : (BlockId)id;
+            if (!AlreadyOwnsItem(pickedId))
+            {
+                _inventory.Add(pickedId, 1);
+                MarkPlayerStateDirty();
+            }
+        }
+
+        _hasActiveBreakProgress = false;
+        _interactCooldown = GetBlockBreakCooldownSeconds(id);
+    }
+
+    private void UpdateBlockBreakProgressDecay(float dt)
+    {
+        if (_world == null)
+        {
+            _blockBreakProgress.Clear();
+            _hasActiveBreakProgress = false;
+            return;
+        }
+
+        var remove = new List<BlockBreakKey>();
+        var playerCenter = _player.Position + _player.HeadOffset;
+        var resetDistanceSq = BlockBreakProgressResetDistance * BlockBreakProgressResetDistance;
+        foreach (var pair in _blockBreakProgress.ToArray())
+        {
+            var key = pair.Key;
+            var progress = pair.Value;
+            var currentId = _world.GetBlock(key.X, key.Y, key.Z);
+            if (currentId != progress.BlockId || currentId == BlockIds.Air)
+            {
+                remove.Add(key);
+                continue;
+            }
+
+            var blockCenter = new Vector3(key.X + 0.5f, key.Y + 0.5f, key.Z + 0.5f);
+            if (Vector3.DistanceSquared(playerCenter, blockCenter) > resetDistanceSq)
+            {
+                remove.Add(key);
+                continue;
+            }
+
+            progress.InactiveSeconds += Math.Max(0f, dt);
+            if (progress.InactiveSeconds > BlockBreakProgressAbandonGraceSeconds)
+            {
+                progress.ProgressSeconds -= BlockBreakProgressDecayPerSecond * Math.Max(0f, dt);
+                if (progress.ProgressSeconds <= 0f)
+                {
+                    remove.Add(key);
+                    continue;
+                }
+            }
+
+            _blockBreakProgress[key] = progress;
+        }
+
+        foreach (var key in remove)
+            _blockBreakProgress.Remove(key);
+
+        if (_hasActiveBreakProgress && !_blockBreakProgress.ContainsKey(_activeBreakKey))
+            _hasActiveBreakProgress = false;
+    }
+
+    private void SetActiveBlockBreakProgress(BlockBreakKey key, BlockBreakProgress progress)
+    {
+        _activeBreakKey = key;
+        _hasActiveBreakProgress = true;
+        _activeBreakProgressFraction = Math.Clamp(progress.ProgressSeconds / GetBlockBreakDurationSeconds(progress.BlockId), 0f, 1f);
+        _activeBreakBlockName = BlockRegistry.Get(progress.BlockId).Name;
+    }
+
+    private float GetBlockBreakDurationSeconds(byte id)
+    {
+        var def = BlockRegistry.Get(id);
+        if (def.Hardness < 0f)
+            return float.PositiveInfinity;
+
+        if (id == BlockIds.Grass)
+            return Math.Min(0.18f, BlockBreakProgressMinSeconds);
+
+        var duration = Math.Clamp(
+            BlockBreakProgressBaseSeconds + Math.Max(0f, def.Hardness) * BlockBreakProgressHardnessScale,
+            BlockBreakProgressMinSeconds,
+            BlockBreakProgressMaxSeconds);
+
+        var heldItemId = ItemRegistry.FromLegacyBlockId(_inventory.SelectedId);
+        var multiplier = ItemRegistry.GetToolSpeedMultiplier(heldItemId, (BlockId)id);
+        if (multiplier > 1.0f)
+        {
+            duration = Math.Max(BlockBreakProgressMinSeconds, duration / multiplier);
+        }
+
+        return duration;
     }
 
     private bool TryHandlePlayerMeleeClick(Vector3 origin, Vector3 dir, float blockHitDistance)
@@ -5501,9 +7341,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         RequestInventoryView(_veilseerSpectateTargetPlayerId, openUi: true);
-        _inventoryOpen = true;
-        _inventoryCatalogSearchFocused = false;
-        _inventoryCatalogSearchCaret = 0;
+        OpenInventoryUi();
         return true;
     }
 
@@ -5593,6 +7431,457 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
 
         return _inventory.TryConsumeSelected(amount);
+    }
+
+    private bool TryThrowHeldJavelin(Vector3 origin, Vector3 forward, float charge)
+    {
+        var selectedId = _inventory.SelectedId;
+        if (!ItemRegistry.IsJavelin((ItemId)(byte)selectedId) || _inventory.SelectedCount <= 0)
+            return false;
+
+        if (!TryConsumeSelectedForWorldDrop(1, out _))
+            return false;
+
+        if (_javelinProjectiles.Count >= MaxJavelinProjectiles)
+            _javelinProjectiles.RemoveAt(0);
+
+        var dir = forward;
+        if (dir.LengthSquared() <= 0.0001f)
+            dir = Vector3.Forward;
+        else
+            dir.Normalize();
+
+        charge = Math.Clamp(charge, 0f, 1f);
+        var speed = MathHelper.Lerp(JavelinThrowSpeedMin, JavelinThrowSpeedMax, charge);
+        var lobY = MathHelper.Lerp(1.2f, 3.2f, charge) * Scale.BlockSize;
+        var spawnPosition = origin + dir * (0.50f * Scale.BlockSize) - new Vector3(0f, 0.05f * Scale.BlockSize, 0f);
+
+        _javelinProjectiles.Add(new JavelinProjectile
+        {
+            ItemId = selectedId,
+            Position = spawnPosition,
+            PreviousPosition = spawnPosition,
+            Velocity = dir * speed + new Vector3(0f, lobY, 0f),
+            Age = 0f,
+            SpawnTime = _worldTimeSeconds,
+            Charge = charge,
+            FlightDistance = 0f,
+            IsStuck = false,
+            StuckDirection = dir,
+            StuckTargetPlayerId = -1,
+            StuckLocalOffset = Vector3.Zero
+        });
+
+        TriggerLocalActionSwing(dir);
+        _interactCooldown = 0.25f;
+        MarkPlayerStateDirty();
+        return true;
+    }
+
+    private void UpdateJavelinProjectiles(float dt)
+    {
+        if (_world == null || _javelinProjectiles.Count == 0)
+            return;
+
+        dt = Math.Clamp(dt, 0f, 0.05f);
+        for (var i = _javelinProjectiles.Count - 1; i >= 0; i--)
+        {
+            var projectile = _javelinProjectiles[i];
+            projectile.Age += dt;
+
+            if (projectile.IsStuck)
+            {
+                if (projectile.StuckTargetPlayerId >= 0)
+                {
+                    if (projectile.StuckTargetPlayerId == (_lanSession?.LocalPlayerId ?? -1))
+                    {
+                        projectile.Position = _player.Position + projectile.StuckLocalOffset;
+                    }
+                    else if (_remotePlayers.TryGetValue(projectile.StuckTargetPlayerId, out var targetModel))
+                    {
+                        projectile.Position = targetModel.Position + projectile.StuckLocalOffset;
+                    }
+                    else
+                    {
+                        projectile.StuckTargetPlayerId = -1;
+                        projectile.StuckLocalOffset = Vector3.Zero;
+                    }
+                }
+
+                if (projectile.Age >= JavelinMaxLifetimeSeconds)
+                {
+                    _javelinProjectiles.RemoveAt(i);
+                    continue;
+                }
+
+                _javelinProjectiles[i] = projectile;
+                continue;
+            }
+
+            projectile.PreviousPosition = projectile.Position;
+            projectile.Velocity += new Vector3(0f, -JavelinGravity * dt, 0f);
+            var step = projectile.Velocity * dt;
+            projectile.Position += step;
+            projectile.FlightDistance += step.Length();
+
+            if (projectile.Age >= 10.0f)
+            {
+                projectile.IsStuck = true;
+                projectile.StuckDirection = projectile.Velocity.LengthSquared() > 0.001f ? Vector3.Normalize(projectile.Velocity) : Vector3.Down;
+                projectile.Velocity = Vector3.Zero;
+                _javelinProjectiles[i] = projectile;
+                continue;
+            }
+
+            if (TryHandleJavelinPlayerHit(ref projectile))
+            {
+                _javelinProjectiles[i] = projectile;
+                continue;
+            }
+
+            if (IsSolidAt(projectile.Position))
+            {
+                projectile.IsStuck = true;
+                projectile.StuckDirection = projectile.Velocity.LengthSquared() > 0.001f ? Vector3.Normalize(projectile.Velocity) : Vector3.Down;
+                projectile.Velocity = Vector3.Zero;
+                _blockBreakParticles.SpawnPebbleImpact(projectile.Position);
+                _javelinProjectiles[i] = projectile;
+                continue;
+            }
+
+            _javelinProjectiles[i] = projectile;
+        }
+    }
+
+    private bool TryHandleJavelinPlayerHit(ref JavelinProjectile projectile)
+    {
+        var tier = ItemRegistry.GetHarvestToolTier((ItemId)(byte)projectile.ItemId);
+        var baseDamage = tier switch
+        {
+            LootRegistry.HarvestToolTier.Wood => 5,
+            LootRegistry.HarvestToolTier.Stone => 7,
+            LootRegistry.HarvestToolTier.Iron => 10,
+            LootRegistry.HarvestToolTier.Diamond => 14,
+            _ => 5
+        };
+
+        var distanceModifier = Math.Clamp(1.0f + (projectile.FlightDistance / Scale.BlockSize) * 0.05f, 1.0f, 2.5f);
+        var chargeModifier = 0.8f + projectile.Charge * 0.7f;
+        var totalDamage = (int)Math.Round(baseDamage * chargeModifier * distanceModifier);
+
+        var localMin = new Vector3(_player.Position.X - PlayerController.ColliderHalfWidth, _player.Position.Y, _player.Position.Z - PlayerController.ColliderHalfWidth);
+        var localMax = new Vector3(_player.Position.X + PlayerController.ColliderHalfWidth, _player.Position.Y + _player.ColliderHeight, _player.Position.Z + PlayerController.ColliderHalfWidth);
+        if (_lanSession != null && !_lanSession.IsHost && SegmentIntersectsAabb(projectile.PreviousPosition, projectile.Position, localMin, localMax))
+        {
+            _stuckJavelinsInLocalPlayer++;
+            projectile.IsStuck = true;
+            projectile.StuckTargetPlayerId = _lanSession.LocalPlayerId;
+            projectile.StuckLocalOffset = projectile.Position - _player.Position;
+            projectile.Velocity = Vector3.Zero;
+            ApplyDamageToLocalPlayer(totalDamage, BuildPebbleKnockback(projectile.Velocity));
+            return true;
+        }
+
+        foreach (var pair in _remotePlayers)
+        {
+            if (ShouldHideRemotePlayerFromLocal(pair.Key))
+                continue;
+
+            var model = pair.Value;
+            var min = new Vector3(model.Position.X - PlayerController.ColliderHalfWidth, model.Position.Y, model.Position.Z - PlayerController.ColliderHalfWidth);
+            var max = new Vector3(model.Position.X + PlayerController.ColliderHalfWidth, model.Position.Y + model.ColliderHeight, model.Position.Z + PlayerController.ColliderHalfWidth);
+
+            if (!SegmentIntersectsAabb(projectile.PreviousPosition, projectile.Position, min, max))
+                continue;
+
+            var knockback = BuildPebbleKnockback(projectile.Velocity);
+            if (_lanSession != null && _lanSession.IsConnected)
+            {
+                _lanSession.SendPlayerCombat(new LanPlayerCombat
+                {
+                    Kind = LanPlayerCombatKind.Result,
+                    AttackerPlayerId = _lanSession.LocalPlayerId,
+                    TargetPlayerId = pair.Key,
+                    Damage = totalDamage,
+                    TargetHealth = Math.Max(0, GetPlayerCombatHealth(pair.Key) - totalDamage),
+                    TargetDied = GetPlayerCombatHealth(pair.Key) - totalDamage <= 0,
+                    KnockbackX = knockback.X,
+                    KnockbackY = knockback.Y,
+                    KnockbackZ = knockback.Z
+                });
+            }
+
+            _remoteHurtOutlineTimers[pair.Key] = Math.Max(_remoteHurtOutlineTimers.GetValueOrDefault(pair.Key), 0.25f);
+            SpawnHurtParticles(projectile.Position);
+
+            projectile.IsStuck = true;
+            projectile.StuckTargetPlayerId = pair.Key;
+            projectile.StuckLocalOffset = projectile.Position - model.Position;
+            projectile.Velocity = Vector3.Zero;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryPickStuckJavelin(Vector3 origin, Vector3 dir)
+    {
+        for (var i = _javelinProjectiles.Count - 1; i >= 0; i--)
+        {
+            var p = _javelinProjectiles[i];
+            if (!p.IsStuck || p.StuckTargetPlayerId >= 0)
+                continue;
+
+            var dist = Vector3.Distance(origin, p.Position);
+            if (dist > JavelinPickDistance)
+                continue;
+
+            var toJavelin = Vector3.Normalize(p.Position - origin);
+            if (Vector3.Dot(dir, toJavelin) > 0.65f || dist < 1.2f * Scale.BlockSize)
+            {
+                var blockId = p.ItemId;
+                _inventory.Add(blockId, 1);
+                _javelinProjectiles.RemoveAt(i);
+                SetCommandStatus($"Picked up {ItemRegistry.Get((byte)blockId).Name}", 1.5f, echoToChat: false);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void HandleStuckJavelinRemoval(InputState input)
+    {
+        if (_stuckJavelinsInLocalPlayer <= 0)
+            return;
+
+        if (input.IsNewKeyPress(Keys.E))
+        {
+            _stuckJavelinsInLocalPlayer--;
+            _inventory.Add(BlockId.WoodJavelin, 1);
+            SpawnHurtParticles(_player.Position + new Vector3(0f, _player.ColliderHeight * 0.5f, 0f));
+            SetCommandStatus("Removed javelin from body", 1.5f, echoToChat: false);
+        }
+    }
+
+    private void DrawJavelinProjectiles(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_javelinProjectiles.Count == 0)
+            return;
+
+        EnsureItemEffect(device);
+        if (_itemEffect == null)
+            return;
+
+        Matrix.Invert(ref view, out var cameraWorld);
+        var cameraRight = cameraWorld.Right;
+        var cameraUp = cameraWorld.Up;
+
+        device.RasterizerState = RasterizerState.CullNone;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+        device.DepthStencilState = DepthStencilState.DepthRead;
+        device.BlendState = BlendState.NonPremultiplied;
+
+        for (var i = 0; i < _javelinProjectiles.Count; i++)
+        {
+            var projectile = _javelinProjectiles[i];
+            var sprite = GetItemSprite(projectile.ItemId);
+            if (sprite == null)
+                continue;
+
+            var verts = BuildWorldItemSpriteVerts(
+                projectile.Position,
+                cameraRight,
+                cameraUp,
+                (int)Math.Round(sprite.Width * 1.5f),
+                (int)Math.Round(sprite.Height * 1.5f));
+
+
+            _itemEffect.View = view;
+            _itemEffect.Projection = proj;
+            _itemEffect.Texture = sprite;
+            _itemEffect.World = Matrix.Identity;
+
+            foreach (var pass in _itemEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, 2);
+            }
+        }
+    }
+
+    private bool TryThrowHeldPebble(Vector3 origin, Vector3 forward)
+    {
+        if (_inventory.SelectedId != BlockId.Pebbles || _inventory.SelectedCount <= 0)
+            return false;
+
+
+        if (!TryConsumeSelectedForWorldDrop(1, out _))
+            return false;
+
+        if (_pebbleProjectiles.Count >= MaxPebbleProjectiles)
+            _pebbleProjectiles.RemoveAt(0);
+
+        var dir = forward;
+        if (dir.LengthSquared() <= 0.0001f)
+            dir = Vector3.Forward;
+        else
+            dir.Normalize();
+
+        var spawnPosition = origin + dir * (0.42f * Scale.BlockSize) - new Vector3(0f, 0.08f * Scale.BlockSize, 0f);
+        _pebbleProjectiles.Add(new PebbleProjectile
+        {
+            Position = spawnPosition,
+            PreviousPosition = spawnPosition,
+            Velocity = dir * PebbleProjectileSpeed + new Vector3(0f, 1.15f * Scale.BlockSize, 0f),
+            Age = 0f,
+            SpawnTime = _worldTimeSeconds
+        });
+
+        TriggerLocalActionSwing(dir);
+        _interactCooldown = HeldAirSwingCooldownSeconds;
+        MarkPlayerStateDirty();
+        return true;
+    }
+
+    private void UpdatePebbleProjectiles(float dt)
+    {
+        if (_world == null || _pebbleProjectiles.Count == 0)
+            return;
+
+        dt = Math.Clamp(dt, 0f, 0.05f);
+        for (var i = _pebbleProjectiles.Count - 1; i >= 0; i--)
+        {
+            var projectile = _pebbleProjectiles[i];
+            projectile.Age += dt;
+            projectile.PreviousPosition = projectile.Position;
+            projectile.Velocity += new Vector3(0f, -PebbleProjectileGravity * dt, 0f);
+            projectile.Position += projectile.Velocity * dt;
+
+            if (projectile.Age >= PebbleProjectileLifetimeSeconds)
+            {
+                FinishPebbleProjectile(i, projectile, spawnDrop: true);
+                continue;
+            }
+
+            if (TryHandlePebblePlayerHit(projectile))
+            {
+                FinishPebbleProjectile(i, projectile, spawnDrop: false);
+                continue;
+            }
+
+            if (IsSolidAt(projectile.Position))
+            {
+                FinishPebbleProjectile(i, projectile, spawnDrop: _lootRandom.NextDouble() >= PebbleProjectileBreakChance);
+                continue;
+            }
+
+            _pebbleProjectiles[i] = projectile;
+        }
+    }
+
+    private bool TryHandlePebblePlayerHit(PebbleProjectile projectile)
+    {
+        foreach (var pair in _remotePlayers)
+        {
+            if (ShouldHideRemotePlayerFromLocal(pair.Key))
+                continue;
+
+            var model = pair.Value;
+            var min = new Vector3(
+                model.Position.X - PlayerController.ColliderHalfWidth,
+                model.Position.Y,
+                model.Position.Z - PlayerController.ColliderHalfWidth);
+            var max = new Vector3(
+                model.Position.X + PlayerController.ColliderHalfWidth,
+                model.Position.Y + model.ColliderHeight,
+                model.Position.Z + PlayerController.ColliderHalfWidth);
+
+            if (!SegmentIntersectsAabb(projectile.PreviousPosition, projectile.Position, min, max))
+                continue;
+
+            var knockback = BuildPebbleKnockback(projectile.Velocity);
+            if (_lanSession != null && _lanSession.IsConnected)
+            {
+                _lanSession.SendPlayerCombat(new LanPlayerCombat
+                {
+                    Kind = LanPlayerCombatKind.Result,
+                    AttackerPlayerId = _lanSession.LocalPlayerId,
+                    TargetPlayerId = pair.Key,
+                    Damage = 0,
+                    TargetHealth = GetPlayerCombatHealth(pair.Key),
+                    TargetDied = false,
+                    KnockbackX = knockback.X,
+                    KnockbackY = knockback.Y,
+                    KnockbackZ = knockback.Z
+                });
+            }
+
+            _remoteHurtOutlineTimers[pair.Key] = Math.Max(_remoteHurtOutlineTimers.GetValueOrDefault(pair.Key), 0.12f);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void FinishPebbleProjectile(int index, PebbleProjectile projectile, bool spawnDrop)
+    {
+        _pebbleProjectiles.RemoveAt(index);
+        _blockBreakParticles.SpawnPebbleImpact(projectile.Position);
+
+        if (spawnDrop)
+            SpawnRestingPebble(projectile.Position);
+    }
+
+    private void SpawnRestingPebble(Vector3 position)
+    {
+        if (_world == null)
+            return;
+
+        var spawn = new LanItemSpawn
+        {
+            ItemId = NextItemId(),
+            BlockId = (byte)BlockId.Pebbles,
+            Count = 1,
+            X = position.X,
+            Y = position.Y,
+            Z = position.Z,
+            VelX = 0f,
+            VelY = 0f,
+            VelZ = 0f,
+            PickupDelay = ItemGroundPickupDelaySeconds,
+            PickupLockPlayerId = _lanSession?.LocalPlayerId ?? -1
+        };
+        SpawnWorldItem(spawn);
+        SendItemSpawn(spawn);
+    }
+
+    private static Vector3 BuildPebbleKnockback(Vector3 velocity)
+    {
+        var horizontal = new Vector2(velocity.X, velocity.Z);
+        if (horizontal.LengthSquared() < 0.0001f)
+            horizontal = Vector2.UnitX;
+        else
+            horizontal.Normalize();
+
+        return new Vector3(
+            horizontal.X * PebbleProjectileKnockbackHorizontal,
+            PebbleProjectileKnockbackVertical,
+            horizontal.Y * PebbleProjectileKnockbackHorizontal);
+    }
+
+    private static bool SegmentIntersectsAabb(Vector3 start, Vector3 end, Vector3 min, Vector3 max)
+    {
+        var dir = end - start;
+        var length = dir.Length();
+        if (length <= 0.0001f)
+            return start.X >= min.X && start.X <= max.X
+                && start.Y >= min.Y && start.Y <= max.Y
+                && start.Z >= min.Z && start.Z <= max.Z;
+
+        dir /= length;
+        return TryRayIntersectsAabbDistance(start, dir, min, max, out var distance)
+            && distance <= length + PebbleProjectileRadius;
     }
 
     private static bool IsCombatEnabledForMode(GameMode mode)
@@ -5789,6 +8078,46 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private bool IsPointerOverGameplayHud(Point p)
+    {
+        if (_hotbarRect.Width > 0 && _hotbarRect.Height > 0)
+        {
+            var hotbarUiRect = new Rectangle(
+                _hotbarRect.X - HotbarBackdropPadX,
+                _hotbarRect.Y - HotbarBackdropPadY,
+                _hotbarRect.Width + HotbarBackdropPadX * 2,
+                _hotbarRect.Height + HotbarBackdropPadY * 2);
+            if (hotbarUiRect.Contains(p))
+                return true;
+        }
+
+        if (TryGetSigilHudRect(out var sigilRect) && sigilRect.Contains(p))
+            return true;
+
+        return false;
+    }
+
+    private void UpdateGameplayPointerSuppression(InputState input)
+    {
+        if (!IsAnyGameplayPointerDown(input))
+            _suppressGameplayPointerUntilRelease = false;
+    }
+
+    private void SuppressGameplayPointerUntilRelease(InputState input)
+    {
+        if (IsAnyGameplayPointerDown(input))
+            _suppressGameplayPointerUntilRelease = true;
+    }
+
+    private static bool IsAnyGameplayPointerDown(InputState input)
+    {
+        return input.IsLeftDown()
+            || input.IsRightDown()
+            || input.IsMiddleDown()
+            || input.IsXButton1Down()
+            || input.IsXButton2Down();
+    }
+
     private void ShowFlySpeedToast()
     {
         _flySpeedToastText = $"FLY SPEED {(_player.FlySpeedMultiplier * 100f):0}%";
@@ -5977,7 +8306,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
     }
-
     private bool WouldBlockIntersectAnyPlayer(int x, int y, int z)
     {
         var blockMin = new Vector3(x, y, z);
@@ -6105,7 +8433,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (effectParts.Count == 0)
             effectParts.Add("no effect");
 
-        var itemName = BlockRegistry.Get(selected).Name;
+        var itemId = ItemRegistry.FromLegacyBlockId(selected);
+        var itemDef = ItemRegistry.Get(itemId);
+        var itemName = itemDef.Id != ItemId.None ? itemDef.Name : BlockRegistry.Get(selected).Name;
         SetCommandStatus($"{itemName}: {string.Join(", ", effectParts)}.", 2.2f, echoToChat: false);
         return true;
     }
@@ -6113,20 +8443,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     private static bool TryGetConsumableEffects(BlockId item, out int hungerRestore, out int healthRestore, out bool returnsPhial)
     {
         returnsPhial = false;
+        var itemId = ItemRegistry.FromLegacyBlockId(item);
+        if (ItemRegistry.TryGetConsumable(itemId, out hungerRestore, out healthRestore))
+        {
+            return true;
+        }
+
         switch (item)
         {
-            case BlockId.Swiftleaf:
-                hungerRestore = 3;
-                healthRestore = 0;
-                return true;
-            case BlockId.Driftcap:
-                hungerRestore = 4;
-                healthRestore = 0;
-                return true;
-            case BlockId.EchoBloom:
-                hungerRestore = 2;
-                healthRestore = 1;
-                return true;
             case BlockId.FleetstepDraught:
                 hungerRestore = 3;
                 healthRestore = 1;
@@ -6211,13 +8535,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return (owner << 24) | (seq & 0x00FFFFFF);
     }
 
-    private void SpawnBlockDrop(int x, int y, int z, BlockId id)
+    private void SpawnBlockDrops(int x, int y, int z, BlockId sourceId)
     {
+        var harvestTier = GetHeldHarvestToolTier();
+        foreach (var drop in LootRegistry.RollBlockDrops(sourceId, _lootRandom, harvestTier))
+            SpawnBlockDrop(x, y, z, ItemRegistry.ToLegacyBlockId(drop.Id), drop.Count);
+    }
+
+    private LootRegistry.HarvestToolTier GetHeldHarvestToolTier()
+    {
+        var heldItemId = ItemRegistry.FromLegacyBlockId(_inventory.SelectedId);
+        return ItemRegistry.GetHarvestToolTier(heldItemId);
+    }
+
+    private void SpawnBlockDrop(int x, int y, int z, BlockId id, int count)
+    {
+        if (id == BlockId.Air || count <= 0)
+            return;
+
         var spawn = new LanItemSpawn
         {
             ItemId = NextItemId(),
             BlockId = (byte)id,
-            Count = 1,
+            Count = count,
             X = x + 0.5f,
             Y = y + 0.5f,
             Z = z + 0.5f,
@@ -6471,21 +8811,49 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void UpdateInventoryLayout()
     {
-        var tabsVisible = _gameMode == GameMode.Artificer;
+        var tabsVisible = !HasActiveRemoteInventoryView() && !_artificerBenchGuiOpen && !_kilnGuiOpen && !_trashGuiOpen;
         var headerHeight = tabsVisible ? InventoryTitleHeightWithTabs : InventoryTitleHeight;
         var maxW = _viewport.Width - 40;
         var maxH = _viewport.Height - 40;
-        var slotSize = InventorySlotSize;
+        var isSurvivalLayout = _gameMode != GameMode.Artificer && !HasActiveRemoteInventoryView();
+        var isCraftingLayout = isSurvivalLayout && _survivalInventoryView == SurvivalInventoryView.Crafting;
+        var isArtificerBenchLayout = isCraftingLayout && _artificerBenchGuiOpen;
+        var isKilnLayout = isCraftingLayout && _kilnGuiOpen;
+        var isSurvivalInventoryLayout = isSurvivalLayout && !isCraftingLayout;
+        var isArtificerCatalogLayout = _gameMode == GameMode.Artificer
+            && !HasActiveRemoteInventoryView()
+            && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var isArtificerInventoryLayout = _gameMode == GameMode.Artificer
+            && !HasActiveRemoteInventoryView()
+            && _artificerInventoryView == ArtificerInventoryView.Inventory;
+        var isTrashLayout = IsTrashInventoryView();
+        var isBlockGuiLayout = isArtificerBenchLayout || isKilnLayout;
+        var isPlayerInventoryLayout = isSurvivalInventoryLayout || isArtificerInventoryLayout || isTrashLayout;
+        var slotSize = isSurvivalLayout ? Math.Min(40, InventorySlotSize) : InventorySlotSize;
         var gridW = InventoryCols * slotSize + (InventoryCols - 1) * InventorySlotGap;
         var gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
-        var windowW = InventoryPadding * 2 + gridW;
-        var windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
+        var contentH = isBlockGuiLayout ? 360 : 430;
+        var craftColumnGap = isSurvivalLayout ? 18 : 0;
+        var craftPanelW = isSurvivalLayout ? (isBlockGuiLayout ? 430 : 300) : 0;
+        var windowW = InventoryPadding * 2 + gridW + craftColumnGap + craftPanelW;
+        var standardPlayerWindowW = InventoryPadding * 2 + (InventoryCols * InventorySlotSize + (InventoryCols - 1) * InventorySlotGap) + 18 + 300;
+        var standardBlockWindowW = InventoryPadding * 2 + gridW + craftColumnGap + 430;
+        windowW = isBlockGuiLayout
+            ? standardBlockWindowW
+            : Math.Max(windowW, standardPlayerWindowW);
+        var windowH = InventoryPadding * 2 + headerHeight + contentH + InventoryFooterHeight;
 
         if (windowW > maxW)
         {
-            slotSize = Math.Clamp((maxW - InventoryPadding * 2 - InventorySlotGap * (InventoryCols - 1)) / InventoryCols, 36, InventorySlotSize);
+            var reservedCraftWidth = craftColumnGap + craftPanelW;
+            slotSize = Math.Clamp((maxW - InventoryPadding * 2 - reservedCraftWidth - InventorySlotGap * (InventoryCols - 1)) / InventoryCols, 30, InventorySlotSize);
             gridW = InventoryCols * slotSize + (InventoryCols - 1) * InventorySlotGap;
-            windowW = InventoryPadding * 2 + gridW;
+            gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
+            contentH = isBlockGuiLayout ? 360 : 430;
+            if (isSurvivalLayout && slotSize <= 34)
+                craftPanelW = Math.Max(isBlockGuiLayout ? 330 : 240, maxW - InventoryPadding * 2 - gridW - craftColumnGap);
+            windowW = InventoryPadding * 2 + gridW + craftColumnGap + craftPanelW;
+            windowW = isBlockGuiLayout ? windowW : Math.Max(windowW, Math.Min(maxW, standardPlayerWindowW));
         }
 
         if (windowH > maxH)
@@ -6493,19 +8861,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var maxSlot = (maxH - InventoryPadding * 2 - headerHeight - InventoryFooterHeight - InventorySlotGap * (InventoryRows - 1)) / InventoryRows;
             slotSize = Math.Clamp(Math.Min(slotSize, maxSlot), 32, InventorySlotSize);
             gridH = InventoryRows * slotSize + (InventoryRows - 1) * InventorySlotGap;
-            windowH = InventoryPadding * 2 + headerHeight + gridH + InventoryFooterHeight;
+            contentH = Math.Min(isBlockGuiLayout ? 360 : 430, maxH - InventoryPadding * 2 - headerHeight - InventoryFooterHeight);
+            windowH = InventoryPadding * 2 + headerHeight + contentH + InventoryFooterHeight;
         }
 
         var visualWidth = Math.Min(maxW, (int)MathF.Round(windowW * InventoryPanelVisualScale));
         var visualHeight = Math.Min(maxH, (int)MathF.Round(windowH * InventoryPanelVisualScale));
         var inventoryY = _viewport.Y + (_viewport.Height - windowH) / 2;
-        if (TryGetSigilHudRect(out var inventorySigilRect))
-        {
-            var maxBottom = inventorySigilRect.Y - 20;
-            var visualTopInset = (visualHeight - windowH) / 2;
-            var visualBottomInset = visualHeight - windowH - visualTopInset;
-            inventoryY = Math.Min(inventoryY, maxBottom - windowH - visualBottomInset);
-        }
 
         inventoryY = Math.Clamp(inventoryY, _viewport.Y + 12, Math.Max(_viewport.Y + 12, _viewport.Bottom - windowH - 12));
         _inventoryRect = new Rectangle(
@@ -6525,41 +8887,115 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var tabY = _inventoryRect.Y + InventoryPadding;
             _inventoryCatalogTabRect = new Rectangle(_inventoryRect.X + InventoryPadding, tabY, InventoryTabWidth, InventoryTabHeight);
             _inventoryStorageTabRect = new Rectangle(_inventoryCatalogTabRect.Right + 10, tabY, InventoryTabWidth, InventoryTabHeight);
+            _inventoryTrashTabRect = _gameMode == GameMode.Artificer
+                ? new Rectangle(_inventoryStorageTabRect.Right + 10, tabY, InventoryTabWidth, InventoryTabHeight)
+                : Rectangle.Empty;
         }
         else
         {
             _inventoryCatalogTabRect = Rectangle.Empty;
             _inventoryStorageTabRect = Rectangle.Empty;
+            _inventoryTrashTabRect = Rectangle.Empty;
         }
 
         var startX = _inventoryRect.X + InventoryPadding;
         var startY = _inventoryRect.Y + InventoryPadding + headerHeight;
+        var layoutSlotSize = slotSize;
+        var layoutGridW = gridW;
+        var layoutGridH = gridH;
+        if (isPlayerInventoryLayout)
+        {
+            var availableW = windowW - InventoryPadding * 2;
+            var availableH = contentH;
+            var characterPanelW = Math.Min(InventoryCharacterPanelWidth, Math.Max(160, availableW / 4));
+            var gridAvailableW = Math.Max(InventoryCols * slotSize + InventorySlotGap * (InventoryCols - 1), availableW - characterPanelW - InventoryCharacterPanelGap);
+            layoutSlotSize = Math.Clamp(
+                Math.Min(
+                    InventoryExpandedSlotSize,
+                    Math.Min(
+                        (gridAvailableW - InventorySlotGap * (InventoryCols - 1)) / InventoryCols,
+                        (availableH - InventorySlotGap * (InventoryRows - 1)) / InventoryRows)),
+                slotSize,
+                InventoryExpandedSlotSize);
+            layoutGridW = InventoryCols * layoutSlotSize + (InventoryCols - 1) * InventorySlotGap;
+            layoutGridH = InventoryRows * layoutSlotSize + (InventoryRows - 1) * InventorySlotGap;
+            _inventoryCharacterPanelRect = new Rectangle(
+                _inventoryRect.X + InventoryPadding,
+                _inventoryRect.Y + InventoryPadding + headerHeight,
+                characterPanelW,
+                contentH);
+            _inventoryPlayerPreviewRect = new Rectangle(
+                _inventoryCharacterPanelRect.X + 58,
+                _inventoryCharacterPanelRect.Y + 42,
+                Math.Max(136, _inventoryCharacterPanelRect.Width - 72),
+                Math.Max(210, _inventoryCharacterPanelRect.Height - 54));
+            startX = _inventoryCharacterPanelRect.Right + InventoryCharacterPanelGap + Math.Max(0, (gridAvailableW - layoutGridW) / 2);
+            startY = _inventoryRect.Y + InventoryPadding + headerHeight + Math.Max(0, (contentH - layoutGridH) / 2);
+        }
+        else
+        {
+            _inventoryCharacterPanelRect = Rectangle.Empty;
+            _inventoryPlayerPreviewRect = Rectangle.Empty;
+            _inventoryPlayerPreviewDragging = false;
+        }
 
         for (int row = 0; row < InventoryRows; row++)
         {
             for (int col = 0; col < InventoryCols; col++)
             {
                 var idx = row * InventoryCols + col;
-                var x = startX + col * (slotSize + InventorySlotGap);
-                var y = startY + row * (slotSize + InventorySlotGap);
-                _inventoryGridSlots[idx] = new Rectangle(x, y, slotSize, slotSize);
+                var x = startX + col * (layoutSlotSize + InventorySlotGap);
+                var y = startY + row * (layoutSlotSize + InventorySlotGap);
+                _inventoryGridSlots[idx] = new Rectangle(x, y, layoutSlotSize, layoutSlotSize);
             }
         }
 
-        // Initialize inventory hotbar slots (above the grid)
-        var hotbarStartY = startY - slotSize - InventorySlotGap - 10;
-        for (int i = 0; i < Inventory.HotbarSize; i++)
-        {
-            var x = startX + i * (slotSize + InventorySlotGap);
-            _inventoryHotbarSlots[i] = new Rectangle(x, hotbarStartY, slotSize, slotSize);
-        }
+        Array.Fill(_inventoryHotbarSlots, Rectangle.Empty);
+        UpdateTrashInventoryLayout(isTrashLayout, startX, startY, layoutSlotSize);
 
         _inventoryClose.Bounds = new Rectangle(_inventoryRect.Right - 40, _inventoryRect.Y + 9, 32, 32);
-        _inventoryClear.Bounds = new Rectangle(_inventoryRect.X + 16, _inventoryRect.Bottom - 50, 220, 38);
+        _inventoryClear.Bounds = new Rectangle(_inventoryRect.X + 58, _inventoryRect.Bottom - 68, 220, 34);
+        _inventoryDispose.Bounds = new Rectangle(_inventoryClear.Bounds.Right + 14, _inventoryRect.Bottom - 70, 42, 38);
+        var craftArea = GetInventoryGridBounds();
+        _handCraftInventoryRect = craftArea;
+        _handCraftPanelRect = isSurvivalLayout && !isArtificerBenchLayout && craftArea.Width > 0
+            ? new Rectangle(craftArea.Right + craftColumnGap, craftArea.Y, craftPanelW, contentH)
+            : Rectangle.Empty;
+        _handCraftSearchRect = _handCraftPanelRect.Width > 0
+            ? new Rectangle(_handCraftPanelRect.X, _handCraftPanelRect.Y, _handCraftPanelRect.Width, CatalogSearchHeight)
+            : Rectangle.Empty;
+        _handCraftSearchClearRect = _handCraftSearchRect.Width > 0
+            ? new Rectangle(_handCraftSearchRect.Right - 30, _handCraftSearchRect.Y + 2, 26, _handCraftSearchRect.Height - 4)
+            : Rectangle.Empty;
+        _handCraftRecipeListRect = _handCraftPanelRect.Width > 0
+            ? new Rectangle(_handCraftPanelRect.X, _handCraftSearchRect.Bottom + 8, _handCraftPanelRect.Width, _handCraftPanelRect.Bottom - _handCraftSearchRect.Bottom - 8)
+            : Rectangle.Empty;
+        _handCraftDetailsRect = isArtificerBenchLayout && craftArea.Width > 0
+            ? new Rectangle(craftArea.Right + craftColumnGap, craftArea.Y, craftPanelW, contentH)
+            : isKilnLayout && craftArea.Width > 0
+            ? Rectangle.Empty
+            : isSurvivalLayout && craftArea.Width > 0
+            ? new Rectangle(craftArea.X, craftArea.Bottom + 14, craftArea.Width, Math.Max(82, _inventoryRect.Bottom - InventoryPadding - craftArea.Bottom - 14))
+            : Rectangle.Empty;
+        _kilnPanelRect = isKilnLayout && craftArea.Width > 0
+            ? new Rectangle(craftArea.Right + craftColumnGap, craftArea.Y, craftPanelW, contentH)
+            : Rectangle.Empty;
+        UpdateKilnLayout();
+        _artificerBenchHandCraftBarRect = isArtificerBenchLayout && craftArea.Width > 0
+            ? new Rectangle(craftArea.X, craftArea.Bottom + 14, craftArea.Width, Math.Max(96, _inventoryRect.Bottom - InventoryPadding - craftArea.Bottom - 14))
+            : Rectangle.Empty;
+        _handCraftButtonRect = _handCraftDetailsRect.Width > 0 && !isArtificerBenchLayout
+            ? new Rectangle(_handCraftDetailsRect.Right - 96, _handCraftDetailsRect.Bottom - 36, 86, 28)
+            : Rectangle.Empty;
+        UpdateArtificerBenchGridLayout();
+        ClampArtificerBenchHandCraftScroll();
 
         var gridBounds = GetInventoryGridBounds();
-        _inventoryCatalogHeaderRect = gridBounds.Width > 0
-            ? new Rectangle(gridBounds.X, gridBounds.Y, gridBounds.Width, CatalogHeaderHeight)
+        var catalogBounds = isArtificerCatalogLayout
+            ? new Rectangle(_inventoryRect.X + InventoryPadding, startY, windowW - InventoryPadding * 2, contentH)
+            : gridBounds;
+        _inventoryCatalogHeaderRect = catalogBounds.Width > 0
+            ? new Rectangle(catalogBounds.X, catalogBounds.Y, catalogBounds.Width, CatalogHeaderHeight)
             : Rectangle.Empty;
 
         if (_inventoryCatalogHeaderRect.Width > 0)
@@ -6582,10 +9018,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 favoritesWidth - 12,
                 CatalogSearchHeight);
             _inventoryCatalogListRect = new Rectangle(
-                gridBounds.X,
+                catalogBounds.X,
                 _inventoryCatalogHeaderRect.Bottom + 4,
-                gridBounds.Width,
-                Math.Max(0, gridBounds.Height - _inventoryCatalogHeaderRect.Height - 4));
+                catalogBounds.Width,
+                Math.Max(0, catalogBounds.Height - _inventoryCatalogHeaderRect.Height - 4));
         }
         else
         {
@@ -6698,6 +9134,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!_inventoryOpen)
             return;
 
+        UpdateArtificerBenchStorageFlush(dt);
+
         if (_viewport != UiLayout.Viewport)
         {
             _viewport = UiLayout.Viewport;
@@ -6705,12 +9143,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             UpdateInventoryLayout();
         }
 
+        var previousInventoryMousePos = _hasLastInventoryMousePos ? _lastInventoryMousePos : input.MousePosition;
         _inventoryMousePos = input.MousePosition;
+        _inventoryPointerActive = input.IsLeftDown() || input.IsRightDown();
+        _lastInventoryMousePos = _inventoryMousePos;
+        _hasLastInventoryMousePos = _inventoryPointerActive;
+        ClearInventoryHoverTooltip();
         var p = _inventoryMousePos;
+        UpdatePendingLeftInventoryPlacement(input);
+        SweepInventoryLeftDrag(previousInventoryMousePos, p, input);
+        if (!_inventoryPointerActive)
+        {
+            _lastInventoryDragGroup = InventorySlotGroup.None;
+            _lastInventoryDragIndex = -1;
+            _lastInventoryDragWasRight = false;
+            _hasLastInventoryMousePos = false;
+            _leftInventoryDragSlots.Clear();
+            ResetRightInventoryDragDistribution();
+            if (_inventoryHasHeld && _inventoryHeld.Count <= 0)
+            {
+                _inventoryHeld = default;
+                _inventoryHasHeld = false;
+                _heldFrom = InventorySlotGroup.None;
+                _heldIndex = -1;
+            }
+        }
+
         var isLiveView = HasActiveRemoteInventoryView();
         var showArtificerTabs = _gameMode == GameMode.Artificer && !isLiveView;
+        var showSurvivalTabs = _gameMode != GameMode.Artificer && !isLiveView;
         var isCatalogView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var isTrashView = IsTrashInventoryView();
+        var isHandCraftingView = showSurvivalTabs && _survivalInventoryView == SurvivalInventoryView.Crafting;
         var searchFocusLocked = isCatalogView && _inventoryCatalogSearchFocused;
+        var craftSearchFocusLocked = isHandCraftingView && _handCraftSearchFocused;
 
         if (_inventoryClearConfirmPending)
         {
@@ -6718,13 +9184,38 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_inventoryClearConfirmTimer <= 0f)
                 _inventoryClearConfirmPending = false;
         }
+        if (_trashClearConfirmPending)
+        {
+            _trashClearConfirmTimer = Math.Max(0f, _trashClearConfirmTimer - Math.Max(0f, dt));
+            if (_trashClearConfirmTimer <= 0f)
+                _trashClearConfirmPending = false;
+        }
 
         _inventoryClear.Visible = _gameMode == GameMode.Artificer && !isLiveView;
         _inventoryClear.Enabled = _gameMode == GameMode.Artificer && !isLiveView;
         _inventoryClear.Label = _inventoryClearConfirmPending ? "CONFIRM CLEAR" : "CLEAR INVENTORY";
+        _inventoryDispose.Visible = _gameMode == GameMode.Artificer && !isLiveView;
+        _inventoryDispose.Enabled = _gameMode == GameMode.Artificer && !isLiveView;
+        _inventoryDispose.Label = string.Empty;
 
         if (searchFocusLocked)
         {
+            if (_inventoryCatalogListRect.Contains(p) && input.ScrollDelta != 0)
+            {
+                var wheelSteps = input.ScrollDelta / 120f;
+                if (Math.Abs(wheelSteps) < 0.01f)
+                    wheelSteps = Math.Sign(input.ScrollDelta);
+                _inventoryCatalogScrollVelocityPxPerSec -= wheelSteps * CatalogScrollWheelImpulse;
+            }
+
+            var focusedScrollDecay = MathF.Exp(-CatalogScrollDamping * Math.Max(0f, dt));
+            _inventoryCatalogScrollVelocityPxPerSec *= focusedScrollDecay;
+            if (MathF.Abs(_inventoryCatalogScrollVelocityPxPerSec) < 1f)
+                _inventoryCatalogScrollVelocityPxPerSec = 0f;
+
+            _inventoryCatalogScrollOffsetPx += _inventoryCatalogScrollVelocityPxPerSec * Math.Max(0f, dt);
+            ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
+
             if (input.IsNewKeyPress(Keys.Escape))
             {
                 _inventoryCatalogSearchFocused = false;
@@ -6766,6 +9257,69 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             CloseInventory();
             return;
         }
+        else if (craftSearchFocusLocked)
+        {
+            if (input.IsNewKeyPress(Keys.Escape))
+            {
+                _handCraftSearchFocused = false;
+                return;
+            }
+
+            if (input.IsNewLeftClick())
+            {
+                var clickInsideSearchUi = _handCraftSearchRect.Contains(p)
+                    || _handCraftSearchClearRect.Contains(p);
+                if (!clickInsideSearchUi)
+                {
+                    _handCraftSearchFocused = false;
+                }
+                else if (_handCraftSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_handCraftSearchQuery))
+                {
+                    _handCraftSearchQuery = string.Empty;
+                    _handCraftSearchCaret = 0;
+                    _handCraftRecipeScrollOffsetPx = 0f;
+                    _handCraftRecipeScrollVelocityPxPerSec = 0f;
+                    ClampHandCraftRecipeScroll(resetVelocityWhenClamped: true);
+                    return;
+                }
+            }
+
+            UpdateHandCraftSearchInput(input);
+            if (_handCraftSearchFocused)
+                return;
+        }
+
+        var isPlayerInventoryView = (showSurvivalTabs && _survivalInventoryView == SurvivalInventoryView.Inventory)
+            || (showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Inventory)
+            || isTrashView;
+        if (isPlayerInventoryView && _inventoryPlayerPreviewRect.Width > 0)
+        {
+            if (input.IsNewLeftClick() && _inventoryPlayerPreviewRect.Contains(p))
+            {
+                _inventoryPlayerPreviewDragging = true;
+                _inventoryPlayerPreviewLastMouseX = p.X;
+                return;
+            }
+
+            if (_inventoryPlayerPreviewDragging)
+            {
+                if (!input.IsLeftDown())
+                {
+                    _inventoryPlayerPreviewDragging = false;
+                }
+                else
+                {
+                    var dx = p.X - _inventoryPlayerPreviewLastMouseX;
+                    _inventoryPlayerPreviewLastMouseX = p.X;
+                    _inventoryPlayerPreviewYaw = MathHelper.WrapAngle(_inventoryPlayerPreviewYaw - dx * 0.018f);
+                    return;
+                }
+            }
+        }
+        else
+        {
+            _inventoryPlayerPreviewDragging = false;
+        }
 
         if (isCatalogView)
         {
@@ -6787,20 +9341,85 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             UpdateInventoryCatalogSearchInput(input);
         }
+        else if (isHandCraftingView)
+        {
+            if (_handCraftRecipeListRect.Contains(p) && input.ScrollDelta != 0)
+            {
+                var wheelSteps = input.ScrollDelta / 120f;
+                if (Math.Abs(wheelSteps) < 0.01f)
+                    wheelSteps = Math.Sign(input.ScrollDelta);
+                _handCraftRecipeScrollVelocityPxPerSec -= wheelSteps * CatalogScrollWheelImpulse;
+            }
+
+            var scrollDecay = MathF.Exp(-CatalogScrollDamping * Math.Max(0f, dt));
+            _handCraftRecipeScrollVelocityPxPerSec *= scrollDecay;
+            if (MathF.Abs(_handCraftRecipeScrollVelocityPxPerSec) < 1f)
+                _handCraftRecipeScrollVelocityPxPerSec = 0f;
+
+            _handCraftRecipeScrollOffsetPx += _handCraftRecipeScrollVelocityPxPerSec * Math.Max(0f, dt);
+            ClampHandCraftRecipeScroll(resetVelocityWhenClamped: true);
+
+            UpdateHandCraftSearchInput(input);
+        }
         else
         {
             _inventoryCatalogSearchFocused = false;
+            _handCraftSearchFocused = false;
             _inventoryCatalogScrollVelocityPxPerSec = 0f;
             ClampInventoryCatalogScroll(resetVelocityWhenClamped: false);
+            _handCraftRecipeScrollVelocityPxPerSec = 0f;
+            ClampHandCraftRecipeScroll(resetVelocityWhenClamped: false);
         }
 
         _inventoryClose.Update(input);
         _inventoryClear.Update(input);
+        _inventoryDispose.Update(input);
         if (!_inventoryOpen)
             return;
 
         // Hover detection
         var hoveredAny = false;
+        var trashViewOpen = IsTrashInventoryView();
+        if (!isTrashView && _inventoryDispose.Visible && _inventoryDispose.Bounds.Contains(p))
+        {
+            SetInventoryCustomHoverTooltip("CLEAR CURRENTLY HELD ITEM(S)");
+            hoveredAny = true;
+        }
+        if (trashViewOpen && _trashClearButtonRect.Contains(p))
+        {
+            SetInventoryCustomHoverTooltip(_trashClearConfirmPending ? "CLICK AGAIN TO CLEAR TRASH" : "CLEAR ITEMS IN THE TRASH");
+            hoveredAny = true;
+        }
+        if (trashViewOpen && !hoveredAny)
+        {
+            for (var i = 0; i < _trashInventorySlots.Length; i++)
+            {
+                if (_trashInventorySlots[i].Contains(p))
+                {
+                    var slot = _trashInventory[i];
+                    if (slot.Id != BlockId.Air && slot.Count > 0)
+                    {
+                        SetInventoryHoverTooltip(slot.Id);
+                        hoveredAny = true;
+                    }
+                    break;
+                }
+            }
+
+            for (var i = 0; !hoveredAny && i < _trashPlayerSlots.Length; i++)
+            {
+                if (_trashPlayerSlots[i].Contains(p))
+                {
+                    var slot = _inventory.Grid[i];
+                    if (slot.Id != BlockId.Air && slot.Count > 0)
+                    {
+                        SetInventoryHoverTooltip(slot.Id);
+                        hoveredAny = true;
+                    }
+                    break;
+                }
+            }
+        }
         if (isLiveView)
         {
             if (TryGetActiveRemoteInventoryView(out var liveView))
@@ -6813,7 +9432,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                         var count = i < liveView.HotbarCounts.Length ? liveView.HotbarCounts[i] : 0;
                         if (blockId != BlockId.Air && count > 0)
                         {
-                            SetDisplayName(BlockRegistry.Get(blockId).Name);
+                            SetInventoryHoverTooltip(blockId);
                             hoveredAny = true;
                         }
                         break;
@@ -6830,7 +9449,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                             var count = i < liveView.GridCounts.Length ? liveView.GridCounts[i] : 0;
                             if (blockId != BlockId.Air && count > 0)
                             {
-                                SetDisplayName(BlockRegistry.Get(blockId).Name);
+                                SetInventoryHoverTooltip(blockId);
                                 hoveredAny = true;
                             }
                             break;
@@ -6851,7 +9470,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 var slot = _inventory.GetSandboxCatalogFilteredEntryAt(hoveredIndex);
                 if (slot.Id != BlockId.Air && slot.Count > 0)
                 {
-                    SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                    SetInventoryHoverTooltip(slot.Id);
                     hoveredAny = true;
                 }
             }
@@ -6865,7 +9484,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     var slot = _inventory.Grid[i];
                     if (slot.Id != BlockId.Air && slot.Count > 0)
                     {
-                        SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                        SetInventoryHoverTooltip(slot.Id);
                         hoveredAny = true;
                     }
                     break;
@@ -6882,10 +9501,49 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                     var slot = _inventory.Hotbar[i];
                     if (slot.Id != BlockId.Air && slot.Count > 0)
                     {
-                        SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                        SetInventoryHoverTooltip(slot.Id);
                         hoveredAny = true;
                     }
                     break;
+                }
+            }
+        }
+
+        if (isTrashView)
+        {
+            if (input.IsNewLeftClick() && _trashClearButtonRect.Contains(p))
+            {
+                ClearTrashInventoryFromUi();
+                return;
+            }
+
+            for (var i = 0; i < _trashInventorySlots.Length; i++)
+            {
+                if (_trashInventorySlots[i].Contains(p))
+                {
+                    ref var slot = ref _trashInventory[i];
+                    if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.Trash, i, input, sandboxCatalogMode: false))
+                        return;
+                    if (input.IsNewLeftClick())
+                        HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.Trash, i, sandboxCatalogMode: false);
+                    else if (input.IsNewRightClick())
+                        HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Trash, i, sandboxCatalogMode: false);
+                    return;
+                }
+            }
+
+            for (var i = 0; i < _trashPlayerSlots.Length; i++)
+            {
+                if (_trashPlayerSlots[i].Contains(p))
+                {
+                    ref var slot = ref _inventory.Grid[i];
+                    if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.Grid, i, input, sandboxCatalogMode: false))
+                        return;
+                    if (input.IsNewLeftClick())
+                        HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                    else if (input.IsNewRightClick())
+                        HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                    return;
                 }
             }
         }
@@ -6897,6 +9555,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _artificerInventoryView = ArtificerInventoryView.Catalog;
                 _lastArtificerInventoryView = _artificerInventoryView;
                 _inventoryCatalogSearchFocused = false;
+                _trashClearConfirmPending = false;
+                _trashClearConfirmTimer = 0f;
+                UpdateInventoryLayout();
                 return;
             }
 
@@ -6905,6 +9566,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 _artificerInventoryView = ArtificerInventoryView.Inventory;
                 _lastArtificerInventoryView = _artificerInventoryView;
                 _inventoryCatalogSearchFocused = false;
+                _trashClearConfirmPending = false;
+                _trashClearConfirmTimer = 0f;
+                UpdateInventoryLayout();
+                return;
+            }
+
+            if (_inventoryTrashTabRect.Width > 0 && input.IsNewLeftClick() && _inventoryTrashTabRect.Contains(p))
+            {
+                _artificerInventoryView = ArtificerInventoryView.Trash;
+                _lastArtificerInventoryView = _artificerInventoryView;
+                _inventoryCatalogSearchFocused = false;
+                UpdateInventoryLayout();
+                return;
+            }
+        }
+        else if (showSurvivalTabs)
+        {
+            if (input.IsNewLeftClick() && _inventoryCatalogTabRect.Contains(p))
+            {
+                if (_artificerBenchGuiOpen)
+                    ReturnArtificerBenchGridItemsToInventory();
+                _survivalInventoryView = SurvivalInventoryView.Inventory;
+                _artificerBenchGuiOpen = false;
+                UpdateInventoryLayout();
+                return;
+            }
+
+            if (input.IsNewLeftClick() && _inventoryStorageTabRect.Contains(p))
+            {
+                if (_artificerBenchGuiOpen)
+                    ReturnArtificerBenchGridItemsToInventory();
+                _survivalInventoryView = SurvivalInventoryView.Crafting;
+                _artificerBenchGuiOpen = false;
+                UpdateInventoryLayout();
                 return;
             }
         }
@@ -6971,13 +9666,157 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         else
         {
             _inventoryCatalogSearchFocused = false;
+            if (isHandCraftingView)
+            {
+                if (_artificerBenchGuiOpen)
+                {
+                    if (_artificerBenchHandCraftBarRect.Contains(p) && input.ScrollDelta != 0)
+                    {
+                        var wheelSteps = input.ScrollDelta / 120f;
+                        if (Math.Abs(wheelSteps) < 0.01f)
+                            wheelSteps = Math.Sign(input.ScrollDelta);
+                        _artificerBenchHandCraftScrollOffsetPx -= wheelSteps * (HandCraftRecipeRowHeight + ArtificerBenchHandCraftRowGap);
+                        ClampArtificerBenchHandCraftScroll();
+                        return;
+                    }
+
+                    if (input.IsNewLeftClick()
+                        && TryGetArtificerBenchHandCraftCardAtPoint(p, out var benchRecipeIndex, out var benchCardRect))
+                    {
+                        var recipe = HandCraftingRecipes.All[benchRecipeIndex];
+                        var pinRect = GetArtificerBenchHandCraftPinRect(benchCardRect);
+                        if (pinRect.Contains(p))
+                            TogglePinnedHandCraftRecipe(recipe);
+                        else
+                            _selectedHandCraftRecipeIndex = _selectedHandCraftRecipeIndex == benchRecipeIndex ? -1 : benchRecipeIndex;
+                        return;
+                    }
+
+                    if (input.IsNewLeftClick()
+                        && _artificerBenchRecipeStageButtonRect.Contains(p)
+                        && TryGetSelectedHandCraftRecipe(out var selectedBenchRecipe))
+                    {
+                        TryStageArtificerBenchRecipe(selectedBenchRecipe);
+                        SaveActiveArtificerBenchStorage();
+                        return;
+                    }
+
+                    if (_artificerBenchOutputSlot.Contains(p) && (input.IsNewLeftClick() || input.IsNewRightClick()))
+                    {
+                        TryTakeArtificerBenchGridOutput(shiftToInventory: input.IsNewLeftClick() && IsStackModifierDown(input));
+                        SaveActiveArtificerBenchStorage();
+                        return;
+                    }
+
+                    for (var i = 0; i < _artificerBenchCraftSlots.Length; i++)
+                    {
+                        if (!_artificerBenchCraftSlots[i].Contains(p))
+                            continue;
+
+                        ref var slot = ref _artificerBenchCraftGrid[i];
+                        if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.ArtificerBenchCraft, i, input, sandboxCatalogMode: false))
+                        {
+                            SaveActiveArtificerBenchStorage();
+                            return;
+                        }
+                        if (input.IsNewLeftClick() && IsStackModifierDown(input) && !_inventoryHasHeld)
+                            ShiftTransferArtificerBenchSlotToPlayer(i);
+                        else if (input.IsNewLeftClick())
+                            HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.ArtificerBenchCraft, i, sandboxCatalogMode: false);
+                        else if (input.IsNewRightClick())
+                            HandleInventorySlotRightClick(ref slot, InventorySlotGroup.ArtificerBenchCraft, i, sandboxCatalogMode: false);
+                        SaveActiveArtificerBenchStorage();
+                        return;
+                    }
+                }
+
+                if (input.IsNewLeftClick() && _handCraftSearchClearRect.Contains(p) && !string.IsNullOrEmpty(_handCraftSearchQuery))
+                {
+                    _handCraftSearchQuery = string.Empty;
+                    _handCraftSearchCaret = 0;
+                    _handCraftRecipeScrollOffsetPx = 0f;
+                    _handCraftRecipeScrollVelocityPxPerSec = 0f;
+                    ClampHandCraftRecipeScroll(resetVelocityWhenClamped: true);
+                    return;
+                }
+
+                if (input.IsNewLeftClick() && _handCraftSearchRect.Contains(p))
+                {
+                    _handCraftSearchSelectAll = _handCraftSearchFocused && !string.IsNullOrEmpty(_handCraftSearchQuery);
+                    _handCraftSearchFocused = true;
+                    _handCraftSearchCaret = _handCraftSearchQuery.Length;
+                    return;
+                }
+
+                if (input.IsNewLeftClick() && TryGetHandCraftRecipeRowAtPoint(p, out var pinRecipeIndex, out var pinRowRect)
+                    && GetHandCraftPinRect(pinRowRect).Contains(p))
+                {
+                    TogglePinnedHandCraftRecipe(HandCraftingRecipes.All[pinRecipeIndex]);
+                    return;
+                }
+
+                if (input.IsNewLeftClick() && TryGetHandCraftRecipeRowAtPoint(p, out var recipeIndex, out _))
+                {
+                    _selectedHandCraftRecipeIndex = _selectedHandCraftRecipeIndex == recipeIndex ? -1 : recipeIndex;
+                    return;
+                }
+
+                if (!_artificerBenchGuiOpen
+                    && input.IsNewLeftClick()
+                    && _handCraftButtonRect.Contains(p)
+                    && TryGetSelectedHandCraftRecipe(out var selectedRecipe))
+                {
+                    TryCraftHandRecipe(selectedRecipe);
+                    return;
+                }
+
+                if (_kilnGuiOpen)
+                {
+                    if (input.IsNewLeftClick() && _kilnSmeltButtonRect.Contains(p))
+                    {
+                        TrySmeltActiveKiln();
+                        return;
+                    }
+
+                    for (var i = 0; i < _kilnSlots.Length; i++)
+                    {
+                        if (!_kilnSlots[i].Contains(p))
+                            continue;
+
+                        ref var slot = ref _kilnInventory[i];
+                        if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.Kiln, i, input, sandboxCatalogMode: false))
+                        {
+                            SaveActiveKilnInventory();
+                            return;
+                        }
+                        if (input.IsNewLeftClick())
+                            HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.Kiln, i, sandboxCatalogMode: false);
+                        else if (input.IsNewRightClick())
+                            HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Kiln, i, sandboxCatalogMode: false);
+                        SaveActiveKilnInventory();
+                        return;
+                    }
+                }
+            }
+
             for (int i = 0; i < _inventoryGridSlots.Length; i++)
             {
                 if (_inventoryGridSlots[i].Contains(p))
                 {
                     ref var slot = ref _inventory.Grid[i];
-                    if (input.IsNewLeftClick())
-                        HandleInventorySlotClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
+                    if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.Grid, i, input, sandboxCatalogMode: false))
+                    {
+                        if (_artificerBenchGuiOpen)
+                            SaveActiveArtificerBenchStorage();
+                        return;
+                    }
+                    if (_artificerBenchGuiOpen && input.IsNewLeftClick() && IsStackModifierDown(input) && !_inventoryHasHeld)
+                    {
+                        ShiftTransferPlayerSlotToArtificerBench(ref slot);
+                        SaveActiveArtificerBenchStorage();
+                    }
+                    else if (input.IsNewLeftClick())
+                        HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
                     else if (input.IsNewRightClick())
                         HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Grid, i, sandboxCatalogMode: false);
                     return;
@@ -6990,10 +9829,18 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (_hotbarSlots[i].Contains(p))
             {
                 ref var slot = ref _inventory.Hotbar[i];
-                if (input.IsNewLeftClick())
-                    HandleInventorySlotClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: isCatalogView);
+                if (TryHandleInventorySlotDrag(ref slot, InventorySlotGroup.Hotbar, i, input, sandboxCatalogMode: false))
+                {
+                    if (_artificerBenchGuiOpen)
+                        SaveActiveArtificerBenchStorage();
+                    return;
+                }
+                if (input.IsNewLeftClick() && IsStackModifierDown(input) && !_inventoryHasHeld)
+                    ShiftTransferHotbarSlotToInventoryGrid(ref slot);
+                else if (input.IsNewLeftClick())
+                    HandleInventorySlotLeftClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: false);
                 else if (input.IsNewRightClick())
-                    HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: isCatalogView);
+                    HandleInventorySlotRightClick(ref slot, InventorySlotGroup.Hotbar, i, sandboxCatalogMode: false);
                 return;
             }
         }
@@ -7027,6 +9874,98 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return new Rectangle(left, top, right - left, bottom - top);
     }
 
+    private void UpdateArtificerBenchGridLayout()
+    {
+        if (_handCraftDetailsRect.Width <= 0 || _handCraftDetailsRect.Height <= 0)
+        {
+            _artificerBenchGridPanelRect = Rectangle.Empty;
+            _artificerBenchOutputSlot = Rectangle.Empty;
+            _artificerBenchRecipeStageButtonRect = Rectangle.Empty;
+            Array.Fill(_artificerBenchCraftSlots, Rectangle.Empty);
+            return;
+        }
+
+        _artificerBenchGridPanelRect = _handCraftDetailsRect;
+        var availableH = Math.Max(120, _artificerBenchGridPanelRect.Height - 98);
+        var availableW = Math.Max(180, _artificerBenchGridPanelRect.Width - 96);
+        var slotSize = Math.Clamp(
+            Math.Min(
+                (availableH - InventorySlotGap * 2) / 3,
+                (availableW - InventorySlotGap * 2 - 96) / 4),
+            30,
+            58);
+        var gridW = slotSize * 3 + InventorySlotGap * 2;
+        var outputW = slotSize + 54;
+        var totalW = gridW + outputW;
+        var startX = _artificerBenchGridPanelRect.X + Math.Max(18, (_artificerBenchGridPanelRect.Width - totalW) / 2);
+        var startY = _artificerBenchGridPanelRect.Y + Math.Max(56, (_artificerBenchGridPanelRect.Height - (slotSize * 3 + InventorySlotGap * 2)) / 2);
+        var requirementBottom = TryGetSelectedHandCraftRecipe(out _)
+            ? _artificerBenchGridPanelRect.Y + 112
+            : _artificerBenchGridPanelRect.Y + 72;
+        startY = Math.Max(startY, Math.Max(_artificerBenchGridPanelRect.Y + 112, requirementBottom));
+
+        for (var row = 0; row < 3; row++)
+        {
+            for (var col = 0; col < 3; col++)
+            {
+                var index = row * 3 + col;
+                _artificerBenchCraftSlots[index] = new Rectangle(
+                    startX + col * (slotSize + InventorySlotGap),
+                    startY + row * (slotSize + InventorySlotGap),
+                    slotSize,
+                    slotSize);
+            }
+        }
+
+        _artificerBenchOutputSlot = new Rectangle(
+            startX + gridW + 54,
+            startY + slotSize + InventorySlotGap,
+            slotSize,
+            slotSize);
+        _artificerBenchRecipeStageButtonRect = new Rectangle(
+            _artificerBenchGridPanelRect.X + 18,
+            (_artificerBenchHandCraftBarRect.Height > 0 ? _artificerBenchHandCraftBarRect.Bottom : _artificerBenchGridPanelRect.Bottom) - 38,
+            112,
+            30);
+    }
+
+    private void UpdateKilnLayout()
+    {
+        if (_kilnPanelRect.Width <= 0 || _kilnPanelRect.Height <= 0)
+        {
+            Array.Clear(_kilnSlots, 0, _kilnSlots.Length);
+            _kilnSmeltButtonRect = Rectangle.Empty;
+            _kilnProgressArrowRect = Rectangle.Empty;
+            return;
+        }
+
+        var slot = Math.Clamp(Math.Min(_kilnPanelRect.Width / 5, _kilnPanelRect.Height / 5), 48, 64);
+        var top = _kilnPanelRect.Y + 84;
+        var centerX = _kilnPanelRect.Center.X;
+        _kilnSlots[0] = new Rectangle(centerX - slot - 42, top, slot, slot);
+        _kilnSlots[1] = new Rectangle(centerX - slot - 42, top + slot + 30, slot, slot);
+        _kilnSlots[2] = new Rectangle(centerX + 42, top + slot / 2 + 15, slot, slot);
+        _kilnProgressArrowRect = new Rectangle(_kilnSlots[0].Right + 16, _kilnSlots[2].Center.Y - 10, 52, 20);
+        _kilnSmeltButtonRect = new Rectangle(centerX - 62, _kilnPanelRect.Bottom - 62, 124, 32);
+    }
+
+    private void UpdateTrashInventoryLayout(bool isTrashLayout, int startX, int startY, int slotSize)
+    {
+        if (!isTrashLayout)
+        {
+            _trashPanelRect = Rectangle.Empty;
+            _trashClearButtonRect = Rectangle.Empty;
+            Array.Fill(_trashInventorySlots, Rectangle.Empty);
+            Array.Fill(_trashPlayerSlots, Rectangle.Empty);
+            return;
+        }
+
+        Array.Copy(_inventoryGridSlots, _trashInventorySlots, Math.Min(_inventoryGridSlots.Length, _trashInventorySlots.Length));
+        Array.Fill(_trashPlayerSlots, Rectangle.Empty);
+        _trashPanelRect = GetInventoryGridBounds();
+        _trashClearButtonRect = new Rectangle(_inventoryRect.X + InventoryPadding + 18, _inventoryRect.Bottom - 70, 46, 42);
+    }
+
     private void ClampInventoryCatalogScroll(bool resetVelocityWhenClamped)
     {
         if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
@@ -7037,14 +9976,958 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
-        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
-        var maxScroll = Math.Max(0f, totalRows * CatalogRowHeight - _inventoryCatalogListRect.Height);
+        var totalItems = _inventory.GetSandboxCatalogFilteredCount();
+        var columns = GetInventoryCatalogGridColumnCount();
+        var totalRows = columns <= 0 ? 0 : (int)MathF.Ceiling(totalItems / (float)columns);
+        var rowStride = CatalogGridSlotSize + CatalogGridSlotGap;
+        var maxScroll = Math.Max(0f, totalRows * rowStride - CatalogGridSlotGap - _inventoryCatalogListRect.Height);
         var clamped = Math.Clamp(_inventoryCatalogScrollOffsetPx, 0f, maxScroll);
         if (Math.Abs(clamped - _inventoryCatalogScrollOffsetPx) > 0.001f && resetVelocityWhenClamped)
             _inventoryCatalogScrollVelocityPxPerSec = 0f;
 
         _inventoryCatalogScrollOffsetPx = clamped;
     }
+
+    private int GetInventoryCatalogGridColumnCount()
+    {
+        if (_inventoryCatalogListRect.Width <= 0)
+            return 1;
+
+        return Math.Max(1, (_inventoryCatalogListRect.Width - CatalogGridSlotGap) / (CatalogGridSlotSize + CatalogGridSlotGap));
+    }
+
+    private void ClampHandCraftRecipeScroll(bool resetVelocityWhenClamped)
+    {
+        if (_handCraftRecipeListRect.Width <= 0 || _handCraftRecipeListRect.Height <= 0)
+        {
+            _handCraftRecipeScrollOffsetPx = 0f;
+            if (resetVelocityWhenClamped)
+                _handCraftRecipeScrollVelocityPxPerSec = 0f;
+            return;
+        }
+
+        var totalRows = GetFilteredHandCraftRecipeIndices().Count;
+        var maxScroll = Math.Max(0f, totalRows * HandCraftRecipeRowHeight - _handCraftRecipeListRect.Height);
+        var clamped = Math.Clamp(_handCraftRecipeScrollOffsetPx, 0f, maxScroll);
+        if (Math.Abs(clamped - _handCraftRecipeScrollOffsetPx) > 0.001f && resetVelocityWhenClamped)
+            _handCraftRecipeScrollVelocityPxPerSec = 0f;
+
+        _handCraftRecipeScrollOffsetPx = clamped;
+    }
+
+    private bool TryGetHandCraftRecipeRowAtPoint(Point point, out int recipeIndex, out Rectangle rowRect)
+    {
+        recipeIndex = -1;
+        rowRect = Rectangle.Empty;
+
+        if (_handCraftRecipeListRect.Width <= 0 || _handCraftRecipeListRect.Height <= 0)
+            return false;
+        if (!_handCraftRecipeListRect.Contains(point))
+            return false;
+
+        var filtered = GetFilteredHandCraftRecipeIndices();
+        var totalRows = filtered.Count;
+        if (totalRows <= 0)
+            return false;
+
+        var contentY = (point.Y - _handCraftRecipeListRect.Y) + _handCraftRecipeScrollOffsetPx;
+        var filteredRow = (int)MathF.Floor(contentY / HandCraftRecipeRowHeight);
+        if (filteredRow < 0 || filteredRow >= totalRows)
+            return false;
+
+        recipeIndex = filtered[filteredRow];
+        var rowTop = _handCraftRecipeListRect.Y + (int)MathF.Floor(filteredRow * HandCraftRecipeRowHeight - _handCraftRecipeScrollOffsetPx);
+        rowRect = new Rectangle(_handCraftRecipeListRect.X + 6, rowTop + 4, _handCraftRecipeListRect.Width - 12, HandCraftRecipeRowHeight - 8);
+        return rowRect.Contains(point);
+    }
+
+    private List<int> GetFilteredHandCraftRecipeIndices()
+    {
+        var recipes = HandCraftingRecipes.All;
+        var query = (_handCraftSearchQuery ?? string.Empty).Trim();
+        var filtered = new List<int>(recipes.Count);
+
+        for (var i = 0; i < recipes.Count; i++)
+        {
+            var recipe = recipes[i];
+            if (!string.IsNullOrWhiteSpace(query)
+                && !recipe.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
+                && !recipe.Id.Contains(query, StringComparison.OrdinalIgnoreCase)
+                && !recipe.Ingredients.Any(ingredient => ingredient.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase))
+                && !ItemRegistry.Get((byte)recipe.OutputId).Name.Contains(query, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            filtered.Add(i);
+        }
+
+        filtered.Sort((left, right) =>
+        {
+            var leftPinned = _pinnedHandCraftRecipes.Contains(recipes[left].Id);
+            var rightPinned = _pinnedHandCraftRecipes.Contains(recipes[right].Id);
+            if (leftPinned != rightPinned)
+                return leftPinned ? -1 : 1;
+            return left.CompareTo(right);
+        });
+
+        return filtered;
+    }
+
+    private Rectangle GetHandCraftPinRect(Rectangle rowRect) =>
+        new(rowRect.X + 8, rowRect.Y + 10, 26, 26);
+
+    private void TogglePinnedHandCraftRecipe(HandCraftingRecipe recipe)
+    {
+        if (!_pinnedHandCraftRecipes.Add(recipe.Id))
+        {
+            _pinnedHandCraftRecipes.Remove(recipe.Id);
+            SavePlayerState();
+            return;
+        }
+
+        if (_pinnedHandCraftRecipes.Count > MaxPinnedHandCraftRecipes)
+        {
+            _pinnedHandCraftRecipes.Remove(recipe.Id);
+            SetCommandStatus($"Recipe pins are limited to {MaxPinnedHandCraftRecipes}.", 1.8f, echoToChat: false);
+            return;
+        }
+
+        SavePlayerState();
+    }
+
+    private void RestorePinnedHandCraftRecipes(IEnumerable<string>? recipeIds)
+    {
+        _pinnedHandCraftRecipes.Clear();
+        if (recipeIds == null)
+            return;
+
+        var knownRecipeIds = HandCraftingRecipes.All
+            .Select(recipe => recipe.Id)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var recipeId in recipeIds)
+        {
+            if (_pinnedHandCraftRecipes.Count >= MaxPinnedHandCraftRecipes)
+                break;
+            if (string.IsNullOrWhiteSpace(recipeId))
+                continue;
+
+            var normalized = recipeId.Trim();
+            if (knownRecipeIds.Contains(normalized))
+                _pinnedHandCraftRecipes.Add(normalized);
+        }
+    }
+
+    private string[] GetPinnedHandCraftRecipeIdsForSave()
+    {
+        return HandCraftingRecipes.All
+            .Where(recipe => _pinnedHandCraftRecipes.Contains(recipe.Id))
+            .Take(MaxPinnedHandCraftRecipes)
+            .Select(recipe => recipe.Id)
+            .ToArray();
+    }
+
+    private bool TryGetSelectedHandCraftRecipe(out HandCraftingRecipe recipe)
+    {
+        var recipes = HandCraftingRecipes.All;
+        if (_selectedHandCraftRecipeIndex >= 0 && _selectedHandCraftRecipeIndex < recipes.Count)
+        {
+            recipe = recipes[_selectedHandCraftRecipeIndex];
+            return true;
+        }
+
+        recipe = HandCraftingRecipes.OakPlanksFromOakLog;
+        return false;
+    }
+
+    private int CountHandCraftIngredient(HandCraftingIngredient ingredient) =>
+        ingredient.Kind == HandCraftingIngredientKind.Item
+            ? _inventory.Count(ingredient.ItemId)
+            : _inventory.CountMatching(ingredient.Matches);
+
+    private bool HasAnyHandCraftIngredient(HandCraftingRecipe recipe)
+    {
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            if (CountHandCraftIngredient(recipe.Ingredients[i]) > 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool CanCraftHandRecipe(HandCraftingRecipe recipe)
+    {
+        if (_inventoryHasHeld || !_inventory.CanAdd(recipe.OutputId, recipe.OutputCount))
+            return false;
+
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            if (CountHandCraftIngredient(ingredient) < ingredient.Count)
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool IsArtificerBenchCraftingUnlocked(HandCraftingRecipe recipe)
+    {
+        if (_meta?.Gameplay?.UnlockCrafting ?? true)
+            return true;
+
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            if (CountHandCraftIngredient(ingredient) < 2)
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool CanUseArtificerBenchRecipe(HandCraftingRecipe recipe)
+        => IsArtificerBenchCraftingUnlocked(recipe)
+            && !_inventoryHasHeld
+            && TryGetArtificerBenchRecipeLayout(recipe, out _)
+            && CanStageArtificerBenchRecipe(recipe, showStatus: false);
+
+    private bool TryGetArtificerBenchRecipeLayout(HandCraftingRecipe recipe, out BenchRecipeRequirement[] requirements)
+    {
+        if (ReferenceEquals(recipe, HandCraftingRecipes.OakPlanksFromOakLog) || recipe.Id == HandCraftingRecipes.OakPlanksFromOakLog.Id)
+        {
+            requirements = new[] { new BenchRecipeRequirement(4, recipe.Ingredients[0]) };
+            return true;
+        }
+
+        if (ReferenceEquals(recipe, HandCraftingRecipes.SticksFromOakPlanks) || recipe.Id == HandCraftingRecipes.SticksFromOakPlanks.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[0])
+            };
+            return true;
+        }
+
+        if (ReferenceEquals(recipe, HandCraftingRecipes.ArtificerBenchFromWoodPlanks) || recipe.Id == HandCraftingRecipes.ArtificerBenchFromWoodPlanks.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(0, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(3, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[0])
+            };
+            return true;
+        }
+
+        if (ReferenceEquals(recipe, HandCraftingRecipes.TorchesFromCoalChunkAndStick) || recipe.Id == HandCraftingRecipes.TorchesFromCoalChunkAndStick.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[1])
+            };
+            return true;
+        }
+
+        if (ReferenceEquals(recipe, HandCraftingRecipes.FiberWrappedTorchesFromFiberCoalChunkAndStick) || recipe.Id == HandCraftingRecipes.FiberWrappedTorchesFromFiberCoalChunkAndStick.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(0, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(1, recipe.Ingredients[1]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[2])
+            };
+            return true;
+        }
+
+        // Tool Recipes (Pickaxes, Axes, Shovels)
+        if (recipe.Id == HandCraftingRecipes.WoodPickaxeFromPlanksAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.StonePickaxeFromStoneAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.IronPickaxeFromBilletsAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.DiamondPickaxeFromGemsAndSticks.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(0, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(2, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[1]),
+                new BenchRecipeRequirement(7, recipe.Ingredients[1])
+            };
+            return true;
+        }
+
+        if (recipe.Id == HandCraftingRecipes.WoodAxeFromPlanksAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.StoneAxeFromStoneAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.IronAxeFromBilletsAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.DiamondAxeFromGemsAndSticks.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(0, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(3, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[1]),
+                new BenchRecipeRequirement(7, recipe.Ingredients[1])
+            };
+            return true;
+        }
+
+        if (recipe.Id == HandCraftingRecipes.WoodShovelFromPlanksAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.StoneShovelFromStoneAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.IronShovelFromBilletsAndSticks.Id
+            || recipe.Id == HandCraftingRecipes.DiamondShovelFromGemsAndSticks.Id)
+        {
+            requirements = new[]
+            {
+                new BenchRecipeRequirement(1, recipe.Ingredients[0]),
+                new BenchRecipeRequirement(4, recipe.Ingredients[1]),
+                new BenchRecipeRequirement(7, recipe.Ingredients[1])
+            };
+            return true;
+        }
+
+        requirements = Array.Empty<BenchRecipeRequirement>();
+        return false;
+    }
+
+    private bool CanStageArtificerBenchRecipe(HandCraftingRecipe recipe, bool showStatus)
+    {
+        if (_inventoryHasHeld)
+        {
+            if (showStatus)
+                SetCommandStatus("Place held item first.", 1.8f, echoToChat: false);
+            return false;
+        }
+
+        if (!IsArtificerBenchCraftingUnlocked(recipe))
+        {
+            if (showStatus)
+                SetCommandStatus("Gather at least 2 of each needed item to unlock this bench recipe.", 2.2f, echoToChat: false);
+            return false;
+        }
+
+        if (!TryGetArtificerBenchRecipeLayout(recipe, out var requirements))
+        {
+            if (showStatus)
+                SetCommandStatus("That recipe cannot be staged on the Artificer Bench yet.", 1.8f, echoToChat: false);
+            return false;
+        }
+
+        return TryResolveBenchRecipeItems(requirements, out _, showStatus);
+    }
+
+    private bool TryStageArtificerBenchRecipe(HandCraftingRecipe recipe)
+    {
+        if (!TryGetArtificerBenchRecipeLayout(recipe, out var requirements))
+        {
+            SetCommandStatus("That recipe cannot be staged on the Artificer Bench yet.", 1.8f, echoToChat: false);
+            return false;
+        }
+
+        if (!CanStageArtificerBenchRecipe(recipe, showStatus: true))
+            return false;
+
+        if (!TryResolveBenchRecipeItems(requirements, out var resolvedIds, showStatus: true))
+            return false;
+
+        for (var i = 0; i < requirements.Length; i++)
+        {
+            var slotIndex = requirements[i].SlotIndex;
+            var id = resolvedIds[i];
+            if (!_inventory.TryConsume(id, 1))
+                return false;
+
+            ref var slot = ref _artificerBenchCraftGrid[slotIndex];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                slot = new HotbarSlot { Id = id, Count = 1 };
+            else
+                slot.Count++;
+        }
+
+        MarkPlayerStateDirty();
+        SetCommandStatus($"Loaded {recipe.Name} into the Artificer Bench.", 1.8f, echoToChat: false);
+        return true;
+    }
+
+    private bool TryResolveBenchRecipeItems(BenchRecipeRequirement[] requirements, out BlockId[] resolvedIds, bool showStatus)
+    {
+        resolvedIds = new BlockId[requirements.Length];
+        var reserved = new Dictionary<BlockId, int>();
+
+        for (var i = 0; i < requirements.Length; i++)
+        {
+            var requirement = requirements[i];
+            if (!TryResolveBenchRequirementItem(requirement.Ingredient, reserved, out var id))
+            {
+                if (showStatus)
+                    SetCommandStatus($"Missing {requirement.Ingredient.DisplayName}.", 1.8f, echoToChat: false);
+                return false;
+            }
+
+            var slot = _artificerBenchCraftGrid[requirement.SlotIndex];
+            var max = _inventory.GetMaxStackSize(id);
+            if (slot.Id != BlockId.Air && slot.Count > 0 && slot.Id != id)
+            {
+                if (showStatus)
+                    SetCommandStatus("Clear the target bench slots first.", 1.8f, echoToChat: false);
+                return false;
+            }
+
+            if (slot.Count >= max)
+            {
+                if (showStatus)
+                    SetCommandStatus("Target bench slot is full.", 1.8f, echoToChat: false);
+                return false;
+            }
+
+            resolvedIds[i] = id;
+            reserved.TryGetValue(id, out var count);
+            reserved[id] = count + 1;
+        }
+
+        return true;
+    }
+
+    private bool TryResolveBenchRequirementItem(HandCraftingIngredient ingredient, Dictionary<BlockId, int> reserved, out BlockId id)
+    {
+        id = BlockId.Air;
+        if (ingredient.Kind == HandCraftingIngredientKind.Item)
+        {
+            reserved.TryGetValue(ingredient.ItemId, out var used);
+            if (_inventory.Count(ingredient.ItemId) > used)
+            {
+                id = ingredient.ItemId;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (TryResolveBenchRequirementFromSlots(_inventory.Grid, ingredient, reserved, out id))
+            return true;
+        return TryResolveBenchRequirementFromSlots(_inventory.Hotbar, ingredient, reserved, out id);
+    }
+
+    private bool TryResolveBenchRequirementFromSlots(HotbarSlot[] slots, HandCraftingIngredient ingredient, Dictionary<BlockId, int> reserved, out BlockId id)
+    {
+        id = BlockId.Air;
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0 || !ingredient.Matches(slot.Id))
+                continue;
+
+            reserved.TryGetValue(slot.Id, out var used);
+            if (_inventory.Count(slot.Id) <= used)
+                continue;
+
+            id = slot.Id;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryGetArtificerBenchGridOutput(out HandCraftingRecipe recipe, out int[] inputIndices)
+    {
+        if (TryMatchSingleInput(BlockId.OakLog, out var singleIndex))
+        {
+            recipe = HandCraftingRecipes.OakPlanksFromOakLog;
+            if (!IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = Array.Empty<int>();
+                return false;
+            }
+            inputIndices = new[] { singleIndex };
+            return true;
+        }
+
+        if (TryMatchVerticalPair(
+            id => IsWoodPlankItem(id),
+            id => IsWoodPlankItem(id),
+            out var stickTop,
+            out var stickBottom))
+        {
+            recipe = HandCraftingRecipes.SticksFromOakPlanks;
+            if (!IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = Array.Empty<int>();
+                return false;
+            }
+            inputIndices = new[] { stickTop, stickBottom };
+            return true;
+        }
+
+        if (TryMatchTwoByTwoWoodPlanks(out var benchIndices))
+        {
+            recipe = HandCraftingRecipes.ArtificerBenchFromWoodPlanks;
+            if (!IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = Array.Empty<int>();
+                return false;
+            }
+            inputIndices = benchIndices;
+            return true;
+        }
+
+        if (TryMatchShapelessPair(
+            id => id == BlockId.CoalChunk,
+            id => id == BlockId.Stick,
+            out var torchFirst,
+            out var torchSecond))
+        {
+            recipe = HandCraftingRecipes.TorchesFromCoalChunkAndStick;
+            if (!IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = Array.Empty<int>();
+                return false;
+            }
+            inputIndices = new[] { torchFirst, torchSecond };
+            return true;
+        }
+
+        // --- Pickaxes (Top Row 3x Head + Center Column 2x Sticks) ---
+        if (TryMatchTopRowAndSticks(IsWoodPlankItem, out var woodPickIndices))
+        {
+            recipe = HandCraftingRecipes.WoodPickaxeFromPlanksAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = woodPickIndices;
+                return true;
+            }
+        }
+        if (TryMatchTopRowAndSticks(id => id == BlockId.Stone, out var stonePickIndices))
+        {
+            recipe = HandCraftingRecipes.StonePickaxeFromStoneAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = stonePickIndices;
+                return true;
+            }
+        }
+        if (TryMatchTopRowAndSticks(id => id == BlockId.IronBillet, out var ironPickIndices))
+        {
+            recipe = HandCraftingRecipes.IronPickaxeFromBilletsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = ironPickIndices;
+                return true;
+            }
+        }
+        if (TryMatchTopRowAndSticks(id => id == BlockId.DiamondGem, out var diamondPickIndices))
+        {
+            recipe = HandCraftingRecipes.DiamondPickaxeFromGemsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = diamondPickIndices;
+                return true;
+            }
+        }
+
+        // --- Axes (3x Head in P/Inverted-P shape + Center Column 2x Sticks) ---
+        if (TryMatchAxeShape(IsWoodPlankItem, out var woodAxeIndices))
+        {
+            recipe = HandCraftingRecipes.WoodAxeFromPlanksAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = woodAxeIndices;
+                return true;
+            }
+        }
+        if (TryMatchAxeShape(id => id == BlockId.Stone, out var stoneAxeIndices))
+        {
+            recipe = HandCraftingRecipes.StoneAxeFromStoneAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = stoneAxeIndices;
+                return true;
+            }
+        }
+        if (TryMatchAxeShape(id => id == BlockId.IronBillet, out var ironAxeIndices))
+        {
+            recipe = HandCraftingRecipes.IronAxeFromBilletsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = ironAxeIndices;
+                return true;
+            }
+        }
+        if (TryMatchAxeShape(id => id == BlockId.DiamondGem, out var diamondAxeIndices))
+        {
+            recipe = HandCraftingRecipes.DiamondAxeFromGemsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = diamondAxeIndices;
+                return true;
+            }
+        }
+
+        // --- Shovels (1x Head on Top Center + Center Column 2x Sticks) ---
+        if (TryMatchShovelShape(IsWoodPlankItem, out var woodShovelIndices))
+        {
+            recipe = HandCraftingRecipes.WoodShovelFromPlanksAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = woodShovelIndices;
+                return true;
+            }
+        }
+        if (TryMatchShovelShape(id => id == BlockId.Stone, out var stoneShovelIndices))
+        {
+            recipe = HandCraftingRecipes.StoneShovelFromStoneAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = stoneShovelIndices;
+                return true;
+            }
+        }
+        if (TryMatchShovelShape(id => id == BlockId.IronBillet, out var ironShovelIndices))
+        {
+            recipe = HandCraftingRecipes.IronShovelFromBilletsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = ironShovelIndices;
+                return true;
+            }
+        }
+        if (TryMatchShovelShape(id => id == BlockId.DiamondGem, out var diamondShovelIndices))
+        {
+            recipe = HandCraftingRecipes.DiamondShovelFromGemsAndSticks;
+            if (IsArtificerBenchCraftingUnlocked(recipe))
+            {
+                inputIndices = diamondShovelIndices;
+                return true;
+            }
+        }
+
+        recipe = HandCraftingRecipes.OakPlanksFromOakLog;
+        inputIndices = Array.Empty<int>();
+        return false;
+    }
+
+    private bool TryTakeArtificerBenchGridOutput(bool shiftToInventory)
+    {
+        if (!TryGetArtificerBenchGridOutput(out var recipe, out var inputIndices))
+            return false;
+
+        if (shiftToInventory)
+        {
+            var crafted = 0;
+            while (TryGetArtificerBenchGridOutput(out recipe, out inputIndices)
+                && _inventory.CanAdd(recipe.OutputId, recipe.OutputCount))
+            {
+                ConsumeArtificerBenchGridInputs(inputIndices);
+                var leftover = _inventory.Add(recipe.OutputId, recipe.OutputCount);
+                if (leftover > 0)
+                    break;
+                crafted += recipe.OutputCount;
+            }
+
+            if (crafted <= 0)
+            {
+                SetCommandStatus("No inventory space for crafting.", 1.8f, echoToChat: false);
+                return false;
+            }
+
+            MarkPlayerStateDirty();
+            SetCommandStatus($"Crafted {crafted}x {recipe.Name}.", 1.8f, echoToChat: false);
+            return true;
+        }
+
+        var max = _inventory.GetMaxStackSize(recipe.OutputId);
+        if (_inventoryHasHeld)
+        {
+            if (_inventoryHeld.Id != recipe.OutputId || _inventoryHeld.Count + recipe.OutputCount > max)
+            {
+                SetCommandStatus("Place held item first.", 1.8f, echoToChat: false);
+                return false;
+            }
+
+            _inventoryHeld.Count += recipe.OutputCount;
+        }
+        else
+        {
+            _inventoryHeld = new HotbarSlot { Id = recipe.OutputId, Count = recipe.OutputCount };
+            _inventoryHasHeld = true;
+            _heldFrom = InventorySlotGroup.ArtificerBenchCraft;
+            _heldIndex = -1;
+        }
+
+        ConsumeArtificerBenchGridInputs(inputIndices);
+        MarkPlayerStateDirty();
+        SetCommandStatus($"Crafted {recipe.OutputCount}x {recipe.Name}.", 1.8f, echoToChat: false);
+        return true;
+    }
+
+    private void ConsumeArtificerBenchGridInputs(int[] inputIndices)
+    {
+        for (var i = 0; i < inputIndices.Length; i++)
+        {
+            var slotIndex = inputIndices[i];
+            if (slotIndex < 0 || slotIndex >= _artificerBenchCraftGrid.Length)
+                continue;
+
+            ref var slot = ref _artificerBenchCraftGrid[slotIndex];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            slot.Count--;
+            if (slot.Count <= 0)
+                slot = default;
+        }
+    }
+
+    private bool TryMatchSingleInput(BlockId id, out int inputIndex)
+    {
+        inputIndex = -1;
+        for (var i = 0; i < _artificerBenchCraftGrid.Length; i++)
+        {
+            var slot = _artificerBenchCraftGrid[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            if (slot.Id != id || inputIndex >= 0)
+            {
+                inputIndex = -1;
+                return false;
+            }
+
+            inputIndex = i;
+        }
+
+        return inputIndex >= 0;
+    }
+
+    private bool TryMatchVerticalPair(Func<BlockId, bool> topMatches, Func<BlockId, bool> bottomMatches, out int topIndex, out int bottomIndex)
+    {
+        topIndex = -1;
+        bottomIndex = -1;
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 2)
+            return false;
+
+        var first = occupied[0];
+        var second = occupied[1];
+        var firstCol = first % 3;
+        var firstRow = first / 3;
+        var secondCol = second % 3;
+        var secondRow = second / 3;
+        if (firstCol != secondCol || Math.Abs(firstRow - secondRow) != 1)
+            return false;
+
+        topIndex = firstRow < secondRow ? first : second;
+        bottomIndex = firstRow < secondRow ? second : first;
+        return topMatches(_artificerBenchCraftGrid[topIndex].Id)
+            && bottomMatches(_artificerBenchCraftGrid[bottomIndex].Id);
+    }
+
+    private bool TryMatchShapelessPair(Func<BlockId, bool> firstMatches, Func<BlockId, bool> secondMatches, out int firstIndex, out int secondIndex)
+    {
+        firstIndex = -1;
+        secondIndex = -1;
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 2)
+            return false;
+
+        var a = occupied[0];
+        var b = occupied[1];
+        var aId = _artificerBenchCraftGrid[a].Id;
+        var bId = _artificerBenchCraftGrid[b].Id;
+        if (firstMatches(aId) && secondMatches(bId))
+        {
+            firstIndex = a;
+            secondIndex = b;
+            return true;
+        }
+
+        if (firstMatches(bId) && secondMatches(aId))
+        {
+            firstIndex = b;
+            secondIndex = a;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryMatchShapelessTriple(
+        Func<BlockId, bool> firstMatches,
+        Func<BlockId, bool> secondMatches,
+        Func<BlockId, bool> thirdMatches,
+        out int firstIndex,
+        out int secondIndex,
+        out int thirdIndex)
+    {
+        firstIndex = -1;
+        secondIndex = -1;
+        thirdIndex = -1;
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 3)
+            return false;
+
+        for (var first = 0; first < occupied.Count; first++)
+        {
+            var candidateFirst = occupied[first];
+            if (!firstMatches(_artificerBenchCraftGrid[candidateFirst].Id))
+                continue;
+
+            for (var second = 0; second < occupied.Count; second++)
+            {
+                if (second == first)
+                    continue;
+
+                var candidateSecond = occupied[second];
+                if (!secondMatches(_artificerBenchCraftGrid[candidateSecond].Id))
+                    continue;
+
+                for (var third = 0; third < occupied.Count; third++)
+                {
+                    if (third == first || third == second)
+                        continue;
+
+                    var candidateThird = occupied[third];
+                    if (!thirdMatches(_artificerBenchCraftGrid[candidateThird].Id))
+                        continue;
+
+                    firstIndex = candidateFirst;
+                    secondIndex = candidateSecond;
+                    thirdIndex = candidateThird;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryMatchTwoByTwoWoodPlanks(out int[] inputIndices)
+    {
+        inputIndices = Array.Empty<int>();
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 4)
+            return false;
+
+        for (var row = 0; row <= 1; row++)
+        {
+            for (var col = 0; col <= 1; col++)
+            {
+                var indices = new[]
+                {
+                    row * 3 + col,
+                    row * 3 + col + 1,
+                    (row + 1) * 3 + col,
+                    (row + 1) * 3 + col + 1
+                };
+
+                if (indices.All(index => occupied.Contains(index) && IsWoodPlankItem(_artificerBenchCraftGrid[index].Id)))
+                {
+                    inputIndices = indices;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryMatchTopRowAndSticks(Func<BlockId, bool> headMatches, out int[] inputIndices)
+    {
+        inputIndices = Array.Empty<int>();
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 5)
+            return false;
+
+        var required = new[] { 0, 1, 2, 4, 7 };
+        if (!required.All(occupied.Contains))
+            return false;
+
+        if (headMatches(_artificerBenchCraftGrid[0].Id)
+            && headMatches(_artificerBenchCraftGrid[1].Id)
+            && headMatches(_artificerBenchCraftGrid[2].Id)
+            && _artificerBenchCraftGrid[4].Id == BlockId.Stick
+            && _artificerBenchCraftGrid[7].Id == BlockId.Stick)
+        {
+            inputIndices = required;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryMatchAxeShape(Func<BlockId, bool> headMatches, out int[] inputIndices)
+    {
+        inputIndices = Array.Empty<int>();
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 5)
+            return false;
+
+        var leftShape = new[] { 0, 1, 3, 4, 7 };
+        if (leftShape.All(occupied.Contains)
+            && headMatches(_artificerBenchCraftGrid[0].Id)
+            && headMatches(_artificerBenchCraftGrid[1].Id)
+            && headMatches(_artificerBenchCraftGrid[3].Id)
+            && _artificerBenchCraftGrid[4].Id == BlockId.Stick
+            && _artificerBenchCraftGrid[7].Id == BlockId.Stick)
+        {
+            inputIndices = leftShape;
+            return true;
+        }
+
+        var rightShape = new[] { 1, 2, 5, 4, 7 };
+        if (rightShape.All(occupied.Contains)
+            && headMatches(_artificerBenchCraftGrid[1].Id)
+            && headMatches(_artificerBenchCraftGrid[2].Id)
+            && headMatches(_artificerBenchCraftGrid[5].Id)
+            && _artificerBenchCraftGrid[4].Id == BlockId.Stick
+            && _artificerBenchCraftGrid[7].Id == BlockId.Stick)
+        {
+            inputIndices = rightShape;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryMatchShovelShape(Func<BlockId, bool> headMatches, out int[] inputIndices)
+    {
+        inputIndices = Array.Empty<int>();
+        var occupied = GetOccupiedArtificerBenchGridSlots();
+        if (occupied.Count != 3)
+            return false;
+
+        var shape = new[] { 1, 4, 7 };
+        if (shape.All(occupied.Contains)
+            && headMatches(_artificerBenchCraftGrid[1].Id)
+            && _artificerBenchCraftGrid[4].Id == BlockId.Stick
+            && _artificerBenchCraftGrid[7].Id == BlockId.Stick)
+        {
+            inputIndices = shape;
+            return true;
+        }
+
+        return false;
+    }
+
+    private List<int> GetOccupiedArtificerBenchGridSlots()
+    {
+        var occupied = new List<int>(9);
+        for (var i = 0; i < _artificerBenchCraftGrid.Length; i++)
+        {
+            var slot = _artificerBenchCraftGrid[i];
+            if (slot.Id != BlockId.Air && slot.Count > 0)
+                occupied.Add(i);
+        }
+
+        return occupied;
+    }
+
+    private static bool IsWoodPlankItem(BlockId id) =>
+        id != BlockId.Air && ItemRegistry.HasTag((ItemId)(byte)id, ItemTag.WoodPlank);
 
     private bool TryGetInventoryCatalogRowAtPoint(Point point, out int filteredIndex, out Rectangle rowRect, out Rectangle favoriteRect)
     {
@@ -7057,21 +10940,30 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!_inventoryCatalogListRect.Contains(point))
             return false;
 
-        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
-        if (totalRows <= 0)
+        var totalItems = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalItems <= 0)
             return false;
 
+        var columns = GetInventoryCatalogGridColumnCount();
+        var rowStride = CatalogGridSlotSize + CatalogGridSlotGap;
+        var colStride = CatalogGridSlotSize + CatalogGridSlotGap;
         var contentY = (point.Y - _inventoryCatalogListRect.Y) + _inventoryCatalogScrollOffsetPx;
-        filteredIndex = (int)MathF.Floor(contentY / CatalogRowHeight);
-        if (filteredIndex < 0 || filteredIndex >= totalRows)
+        var row = (int)MathF.Floor(contentY / rowStride);
+        var col = (point.X - _inventoryCatalogListRect.X - CatalogGridSlotGap) / colStride;
+        if (row < 0 || col < 0 || col >= columns)
             return false;
 
-        var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(filteredIndex * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
-        rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
+        filteredIndex = row * columns + col;
+        if (filteredIndex < 0 || filteredIndex >= totalItems)
+            return false;
+
+        var left = _inventoryCatalogListRect.X + CatalogGridSlotGap + col * colStride;
+        var top = _inventoryCatalogListRect.Y + (int)MathF.Floor(row * rowStride - _inventoryCatalogScrollOffsetPx);
+        rowRect = new Rectangle(left, top, CatalogGridSlotSize, CatalogGridSlotSize);
         if (!rowRect.Contains(point))
             return false;
 
-        favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+        favoriteRect = new Rectangle(rowRect.Right - 15, rowRect.Y + 3, 12, 12);
         return true;
     }
 
@@ -7184,6 +11076,104 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         ClampInventoryCatalogScroll(resetVelocityWhenClamped: true);
     }
 
+    private void UpdateHandCraftSearchInput(InputState input)
+    {
+        if (!_handCraftSearchFocused)
+            return;
+
+        var query = _handCraftSearchQuery ?? string.Empty;
+        if (!string.IsNullOrEmpty(query) && _handCraftSearchRect.Contains(input.MousePosition) && input.IsLeftDragActive())
+            _handCraftSearchSelectAll = true;
+        _handCraftSearchCaret = Math.Clamp(_handCraftSearchCaret, 0, query.Length);
+
+        if (input.IsNewKeyPress(Keys.Left))
+            _handCraftSearchCaret = Math.Max(0, _handCraftSearchCaret - 1);
+        if (input.IsNewKeyPress(Keys.Right))
+            _handCraftSearchCaret = Math.Min(query.Length, _handCraftSearchCaret + 1);
+        if (input.IsNewKeyPress(Keys.Home))
+            _handCraftSearchCaret = 0;
+        if (input.IsNewKeyPress(Keys.End))
+            _handCraftSearchCaret = query.Length;
+
+        var changed = false;
+        if (TryHandleWholeFieldClipboard(input, ref query, CatalogSearchMaxLength, ref _handCraftSearchSelectAll))
+        {
+            _handCraftSearchCaret = query.Length;
+            changed = true;
+        }
+
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+        foreach (var key in input.GetTextInputKeys())
+        {
+            if (key is Keys.Tab or Keys.Enter or Keys.Left or Keys.Right or Keys.Home or Keys.End)
+                continue;
+
+            if (key == Keys.Back)
+            {
+                if (_handCraftSearchSelectAll)
+                {
+                    query = string.Empty;
+                    _handCraftSearchCaret = 0;
+                    _handCraftSearchSelectAll = false;
+                    changed = true;
+                }
+                else if (_handCraftSearchCaret > 0)
+                {
+                    query = query.Remove(_handCraftSearchCaret - 1, 1);
+                    _handCraftSearchCaret--;
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (key == Keys.Delete)
+            {
+                if (_handCraftSearchSelectAll)
+                {
+                    query = string.Empty;
+                    _handCraftSearchCaret = 0;
+                    _handCraftSearchSelectAll = false;
+                    changed = true;
+                }
+                else if (_handCraftSearchCaret < query.Length)
+                {
+                    query = query.Remove(_handCraftSearchCaret, 1);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (!TryMapCommandInputKey(key, shift, out var c) || query.Length >= CatalogSearchMaxLength)
+                continue;
+
+            if (_handCraftSearchSelectAll)
+            {
+                query = c.ToString();
+                _handCraftSearchCaret = 1;
+                _handCraftSearchSelectAll = false;
+            }
+            else
+            {
+                query = query.Insert(_handCraftSearchCaret, c.ToString());
+                _handCraftSearchCaret++;
+            }
+
+            changed = true;
+        }
+
+        if (!changed)
+            return;
+
+        if (query.Length > CatalogSearchMaxLength)
+            query = query.Substring(0, CatalogSearchMaxLength);
+
+        _handCraftSearchQuery = query;
+        _handCraftSearchCaret = Math.Clamp(_handCraftSearchCaret, 0, _handCraftSearchQuery.Length);
+        _handCraftRecipeScrollOffsetPx = 0f;
+        _handCraftRecipeScrollVelocityPxPerSec = 0f;
+        ClampHandCraftRecipeScroll(resetVelocityWhenClamped: true);
+    }
+
     private void DrawInventoryCatalogPanel(SpriteBatch sb)
     {
         if (_inventoryCatalogHeaderRect.Width <= 0 || _inventoryCatalogListRect.Width <= 0)
@@ -7197,7 +11187,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         sb.Draw(_pixel, _inventoryCatalogSearchRect, new Color(10, 10, 14, 235));
         DrawBorder(sb, _inventoryCatalogSearchRect, _inventoryCatalogSearchFocused ? new Color(230, 230, 140) : new Color(170, 170, 170));
         var query = _inventory.SandboxCatalogSearchQuery;
-        var queryDisplay = string.IsNullOrEmpty(query) ? "Search blocks..." : query;
+        var queryDisplay = string.IsNullOrEmpty(query) ? "Search items..." : query;
         var queryColor = string.IsNullOrEmpty(query) ? new Color(150, 150, 150) : Color.White;
         var queryPos = new Vector2(_inventoryCatalogSearchRect.X + 8, _inventoryCatalogSearchRect.Y + 8);
         TextFieldVisuals.DrawWholeFieldSelection(sb, _pixel, _font, query, queryPos, _inventoryCatalogSearchRect, _inventoryCatalogSearchSelectAll, new Color(88, 148, 218, 170));
@@ -7238,18 +11228,20 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         sb.Draw(_pixel, _inventoryCatalogListRect, new Color(9, 10, 12, 220));
         DrawBorder(sb, _inventoryCatalogListRect, new Color(170, 170, 170));
 
-        var totalRows = _inventory.GetSandboxCatalogFilteredCount();
-        if (totalRows <= 0)
+        var totalItems = _inventory.GetSandboxCatalogFilteredCount();
+        if (totalItems <= 0)
         {
-            _font.DrawString(sb, "No blocks match search.", new Vector2(_inventoryCatalogListRect.X + 12, _inventoryCatalogListRect.Y + 12), new Color(220, 220, 220));
+            _font.DrawString(sb, "No items match search.", new Vector2(_inventoryCatalogListRect.X + 12, _inventoryCatalogListRect.Y + 12), new Color(220, 220, 220));
             return;
         }
 
-        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
-        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
-        var last = Math.Min(totalRows - 1, first + visible - 1);
-        var hoveredBlockId = BlockId.Air;
-        var hoveredRowRect = Rectangle.Empty;
+        var columns = GetInventoryCatalogGridColumnCount();
+        var rowStride = CatalogGridSlotSize + CatalogGridSlotGap;
+        var colStride = CatalogGridSlotSize + CatalogGridSlotGap;
+        var firstRow = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / rowStride) - CatalogGridOverscanRows);
+        var visibleRows = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)rowStride) + CatalogGridOverscanRows * 2);
+        var first = firstRow * columns;
+        var last = Math.Min(totalItems - 1, (firstRow + visibleRows) * columns - 1);
 
         var device = _graphics.GraphicsDevice;
         var priorScissor = device.ScissorRectangle;
@@ -7263,51 +11255,37 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         for (var index = first; index <= last; index++)
         {
-            var rowTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(index * CatalogRowHeight - _inventoryCatalogScrollOffsetPx);
-            var rowRect = new Rectangle(_inventoryCatalogListRect.X + 2, rowTop, _inventoryCatalogListRect.Width - 4, CatalogRowHeight - 2);
-            if (rowRect.Bottom <= _inventoryCatalogListRect.Top || rowRect.Top >= _inventoryCatalogListRect.Bottom)
+            var row = index / columns;
+            var col = index % columns;
+            var cellLeft = _inventoryCatalogListRect.X + CatalogGridSlotGap + col * colStride;
+            var cellTop = _inventoryCatalogListRect.Y + (int)MathF.Floor(row * rowStride - _inventoryCatalogScrollOffsetPx);
+            var cellRect = new Rectangle(cellLeft, cellTop, CatalogGridSlotSize, CatalogGridSlotSize);
+            if (cellRect.Bottom <= _inventoryCatalogListRect.Top || cellRect.Top >= _inventoryCatalogListRect.Bottom)
                 continue;
 
-            var hovered = rowRect.Contains(_inventoryMousePos);
-            sb.Draw(_pixel, rowRect, hovered ? new Color(34, 44, 58, 220) : new Color(20, 24, 30, 210));
-            DrawBorder(sb, rowRect, hovered ? new Color(188, 214, 252) : new Color(88, 96, 110));
+            var hovered = cellRect.Contains(_inventoryMousePos);
+            sb.Draw(_pixel, cellRect, hovered ? new Color(34, 44, 58, 220) : new Color(20, 24, 30, 210));
+            DrawBorder(sb, cellRect, hovered ? new Color(188, 214, 252) : new Color(88, 96, 110));
 
             var slot = _inventory.GetSandboxCatalogFilteredEntryAt(index);
-            var iconRect = new Rectangle(rowRect.X + 8, rowRect.Y + 4, CatalogRowIconSize, CatalogRowIconSize);
-            var icon = GetBlockIconIfReady(slot.Id, iconRect.Width);
-            if (icon != null)
-                sb.Draw(icon, iconRect, Color.White);
-            else if (_atlas != null)
-                sb.Draw(_atlas.Texture, iconRect, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+            var iconSize = Math.Min(CatalogRowIconSize, CatalogGridSlotSize - 10);
+            var iconRect = new Rectangle(
+                cellRect.Center.X - iconSize / 2,
+                cellRect.Center.Y - iconSize / 2,
+                iconSize,
+                iconSize);
+            DrawItemIcon(sb, slot.Id, iconRect);
 
-            var def = BlockRegistry.Get(slot.Id);
-            var name = def.Name.ToUpperInvariant();
-            var rarity = ResolveCatalogRarity(slot.Id, def);
-            var nameColor = GetCatalogRarityColor(rarity);
-            var nameY = rowRect.Y + (rowRect.Height - _font.LineHeight) / 2f;
-
-            var favoriteRect = new Rectangle(rowRect.Right - 32, rowRect.Y + 8, 22, 22);
+            var favoriteRect = new Rectangle(cellRect.Right - 15, cellRect.Y + 3, 12, 12);
             var favorite = _inventory.IsSandboxCatalogFavorite((int)slot.Id);
             sb.Draw(_pixel, favoriteRect, favorite ? new Color(64, 112, 84, 245) : new Color(34, 34, 34, 245));
             DrawBorder(sb, favoriteRect, favorite ? new Color(210, 245, 220) : new Color(150, 150, 150));
-            _font.DrawString(sb, favorite ? "*" : "+", new Vector2(favoriteRect.X + 7, favoriteRect.Y + 3), Color.White);
-            var nameMaxWidth = Math.Max(40, favoriteRect.Left - (iconRect.Right + 8) - 10);
-            var displayName = TruncateCatalogLabel(name, nameMaxWidth);
-            _font.DrawString(sb, displayName, new Vector2(iconRect.Right + 8, nameY), nameColor);
 
-            if (hovered)
-            {
-                hoveredBlockId = slot.Id;
-                hoveredRowRect = rowRect;
-            }
         }
 
         sb.End();
         device.ScissorRectangle = priorScissor;
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
-
-        if (hoveredRowRect != Rectangle.Empty)
-            DrawCatalogHoverTooltip(sb, hoveredBlockId, hoveredRowRect);
     }
 
     private void EnsureCatalogLoreLoaded()
@@ -7447,12 +11425,41 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return "Reliable structural block for building, landscaping, and terrain shaping.";
     }
 
+    private static string BuildDefaultCatalogDescription(ItemDef item, BlockDef? placedBlock)
+    {
+        if (item.CanPlaceBlock && placedBlock != null)
+            return BuildDefaultCatalogDescription(placedBlock);
+
+        var token = item.Id.ToString().ToLowerInvariant();
+        if (token.Contains("fiber", StringComparison.Ordinal))
+            return "Light gathered material used as an early crafting ingredient.";
+        if (token.Contains("bucket", StringComparison.Ordinal))
+            return "Utility item used to carry and place liquid resources.";
+        if (item.MaxStack == 1)
+            return "Single-slot utility item used for specialized actions.";
+        return "Stackable material used for crafting, survival, and utility recipes.";
+    }
+
     private CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def)
     {
         if (_catalogLoreByBlock.TryGetValue(blockId, out var lore))
             return lore.Rarity;
 
         return ResolveCatalogRarity(blockId, def, Array.Empty<string>());
+    }
+
+    private CatalogRarity ResolveCatalogRarity(BlockId legacyItemId, ItemDef item, BlockDef? placedBlock)
+    {
+        if (item.PlacesBlock.HasValue && _catalogLoreByBlock.TryGetValue(item.PlacesBlock.Value, out var lore))
+            return lore.Rarity;
+
+        if (placedBlock != null && item.CanPlaceBlock)
+            return ResolveCatalogRarity(item.PlacesBlock!.Value, placedBlock, Array.Empty<string>());
+
+        var token = item.Id.ToString().ToLowerInvariant();
+        if (token.Contains("bucket", StringComparison.Ordinal) || item.MaxStack == 1)
+            return CatalogRarity.Uncommon;
+        return CatalogRarity.Common;
     }
 
     private static CatalogRarity ResolveCatalogRarity(BlockId blockId, BlockDef def, IReadOnlyList<string> tags)
@@ -7506,15 +11513,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         };
     }
 
-    private void DrawCatalogHoverTooltip(SpriteBatch sb, BlockId blockId, Rectangle hoveredRowRect)
+    private static string GetCatalogRarityLabel(CatalogRarity rarity)
     {
-        var def = BlockRegistry.Get(blockId);
-        var lore = _catalogLoreByBlock.TryGetValue(blockId, out var entry)
-            ? entry
-            : new CatalogLoreEntry(def.Name, BuildDefaultCatalogDescription(def), Array.Empty<string>(), ResolveCatalogRarity(blockId, def));
-        var rarity = lore.Rarity;
-        var rarityColor = GetCatalogRarityColor(rarity);
-        var rarityLabel = rarity switch
+        return rarity switch
         {
             CatalogRarity.Common => "COMMON",
             CatalogRarity.Uncommon => "UNCOMMON",
@@ -7522,18 +11523,68 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             CatalogRarity.Legendary => "LEGENDARY",
             _ => "COMMON"
         };
+    }
+
+    private void ClearInventoryHoverTooltip()
+    {
+        _inventoryHoverTooltipVisible = false;
+        _inventoryHoverTooltipId = BlockId.Air;
+        _inventoryCustomHoverTooltip = string.Empty;
+    }
+
+    private void SetInventoryHoverTooltip(BlockId id)
+    {
+        _inventoryHoverTooltipVisible = id != BlockId.Air;
+        _inventoryHoverTooltipId = id;
+        var budget = 1;
+        WarmItemIcon(id, 26, ref budget);
+    }
+
+    private void SetInventoryCustomHoverTooltip(string text)
+    {
+        _inventoryCustomHoverTooltip = text ?? string.Empty;
+        _inventoryHoverTooltipVisible = false;
+        _inventoryHoverTooltipId = BlockId.Air;
+    }
+
+    private void DrawInventoryHoverTooltip(SpriteBatch sb)
+    {
+        if (!_inventoryHoverTooltipVisible || _inventoryHoverTooltipId == BlockId.Air || _inventoryHasHeld)
+            return;
+
+        var blockId = _inventoryHoverTooltipId;
+        var item = ItemRegistry.Get((byte)blockId);
+        var placeBlockId = item.PlacesBlock ?? blockId;
+        var def = BlockRegistry.Get(placeBlockId);
+        CatalogLoreEntry lore;
+        if (item.PlacesBlock.HasValue && _catalogLoreByBlock.TryGetValue(item.PlacesBlock.Value, out var entry))
+        {
+            lore = entry;
+        }
+        else
+        {
+            lore = new CatalogLoreEntry(
+                item.Id == ItemId.None ? def.Name : item.Name,
+                item.Id == ItemId.None ? BuildDefaultCatalogDescription(def) : BuildDefaultCatalogDescription(item, item.CanPlaceBlock ? def : null),
+                Array.Empty<string>(),
+                item.Id == ItemId.None ? ResolveCatalogRarity(blockId, def) : ResolveCatalogRarity(blockId, item, item.CanPlaceBlock ? def : null));
+        }
+        var rarity = lore.Rarity;
+        var rarityColor = GetCatalogRarityColor(rarity);
+        var rarityLabel = GetCatalogRarityLabel(rarity);
 
         var title = lore.DisplayName.ToUpperInvariant();
         var description = string.IsNullOrWhiteSpace(lore.Description)
-            ? BuildDefaultCatalogDescription(def)
+            ? (item.Id == ItemId.None ? BuildDefaultCatalogDescription(def) : BuildDefaultCatalogDescription(item, item.CanPlaceBlock ? def : null))
             : lore.Description;
-        var wrapped = WrapOverlayText(description, CatalogTooltipMaxWidth - 30);
-        var maxTextWidth = _font.MeasureString(title).X + 14 + _font.MeasureString(rarityLabel).X;
+        var wrapped = WrapOverlayText(description, 250).Take(2).ToList();
+        var iconSize = 34;
+        var maxTextWidth = iconSize + 12 + _font.MeasureString(title).X + 12 + _font.MeasureString(rarityLabel).X;
         for (var i = 0; i < wrapped.Count; i++)
-            maxTextWidth = Math.Max(maxTextWidth, _font.MeasureString(wrapped[i]).X);
+            maxTextWidth = Math.Max(maxTextWidth, iconSize + 12 + _font.MeasureString(wrapped[i]).X);
 
-        var panelWidth = (int)Math.Ceiling(Math.Clamp(maxTextWidth + 20f, 240f, CatalogTooltipMaxWidth));
-        var panelHeight = 12 + _font.LineHeight + 8 + (wrapped.Count * (_font.LineHeight + 2)) + 10;
+        var panelWidth = (int)Math.Ceiling(Math.Clamp(maxTextWidth + 24f, 250f, CatalogTooltipMaxWidth));
+        var panelHeight = Math.Max(58, 16 + _font.LineHeight + 5 + (wrapped.Count * (_font.LineHeight + 2)) + 8);
 
         var x = _inventoryMousePos.X + 18;
         var y = _inventoryMousePos.Y + 18;
@@ -7551,17 +11602,23 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         else
             y = Math.Clamp(y, minY, maxY);
 
-        if (y + panelHeight > _inventoryCatalogListRect.Bottom && hoveredRowRect.Top - panelHeight - 8 >= _viewport.Y + 8)
-            y = hoveredRowRect.Top - panelHeight - 8;
-
         var panel = new Rectangle(x, y, panelWidth, panelHeight);
-        sb.Draw(_pixel, panel, new Color(8, 10, 14, 244));
-        DrawBorder(sb, panel, new Color(208, 218, 234, 220));
+        sb.Draw(_pixel, panel, new Color(6, 8, 12, 246));
+        sb.Draw(_pixel, new Rectangle(panel.X + 3, panel.Y + 3, panel.Width - 6, panel.Height - 6), new Color(18, 22, 30, 190));
+        DrawBorder(sb, panel, rarityColor * 0.9f);
+        sb.Draw(_pixel, new Rectangle(panel.X + 2, panel.Y + 2, panel.Width - 4, 2), rarityColor * 0.55f);
+        sb.Draw(_pixel, new Rectangle(panel.X + 6, panel.Y + 8, 3, panel.Height - 16), rarityColor * 0.75f);
 
-        var divider = new Rectangle(panel.X + 10, panel.Y + 12 + _font.LineHeight + 2, panel.Width - 20, 1);
-        sb.Draw(_pixel, divider, new Color(76, 90, 112, 210));
+        var iconRect = new Rectangle(panel.X + 15, panel.Y + 13, iconSize, iconSize);
+        sb.Draw(_pixel, iconRect, new Color(10, 12, 16, 230));
+        DrawBorder(sb, iconRect, rarityColor * 0.45f);
+        DrawItemIcon(sb, blockId, new Rectangle(iconRect.X + 4, iconRect.Y + 4, iconRect.Width - 8, iconRect.Height - 8));
 
-        var titlePos = new Vector2(panel.X + 10, panel.Y + 10);
+        var textLeft = iconRect.Right + 10;
+        var divider = new Rectangle(textLeft, panel.Y + 12 + _font.LineHeight + 2, panel.Right - textLeft - 10, 1);
+        sb.Draw(_pixel, divider, rarityColor * 0.4f);
+
+        var titlePos = new Vector2(textLeft, panel.Y + 10);
         var titleShadow = titlePos + new Vector2(1f, 1f);
         _font.DrawString(sb, title, titleShadow, new Color(0, 0, 0, 210));
         _font.DrawString(sb, title, titlePos, rarityColor);
@@ -7574,7 +11631,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var textY = divider.Bottom + 6;
         for (var i = 0; i < wrapped.Count; i++)
         {
-            var linePos = new Vector2(panel.X + 10, textY + i * (_font.LineHeight + 2));
+            var linePos = new Vector2(textLeft, textY + i * (_font.LineHeight + 2));
             _font.DrawString(sb, wrapped[i], linePos + new Vector2(1f, 1f), new Color(0, 0, 0, 200));
             _font.DrawString(sb, wrapped[i], linePos, new Color(236, 242, 255));
         }
@@ -7606,23 +11663,48 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         if (_blockIconCache == null)
             return;
+        if (_inventoryOpen && _inventoryPointerActive)
+            return;
 
         const int pad = 6;
         var hotbarSize = _hotbarSlots.Length > 0 && _hotbarSlots[0].Width > 0
             ? _hotbarSlots[0].Width - pad * 2
             : InventorySlotSize - pad * 2;
 
-        WarmIconSlots(_inventory.Hotbar, hotbarSize);
+        var warmBudget = _inventoryOpen ? (_artificerBenchGuiOpen ? 12 : 3) : 1;
+        if (_inventoryOpen && _artificerBenchGuiOpen)
+        {
+            WarmIconSlots(_artificerBenchCraftGrid, GetArtificerBenchCraftIconSize(), ref warmBudget);
+            if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
+                WarmItemIcon(_inventoryHeld.Id, GetArtificerBenchCraftIconSize(), ref warmBudget);
+            WarmVisibleArtificerBenchHandCraftIcons(ref warmBudget);
+            if (warmBudget <= 0)
+                return;
+        }
+
+        WarmIconSlots(_inventory.Hotbar, hotbarSize, ref warmBudget);
+        if (warmBudget <= 0)
+            return;
 
         if (_inventoryOpen)
         {
             var gridSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
                 ? _inventoryGridSlots[0].Width - pad * 2
                 : InventorySlotSize - pad * 2;
-            if (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
-                WarmVisibleCatalogIcons(CatalogRowIconSize);
+            if (_artificerBenchGuiOpen)
+            {
+                WarmIconSlots(_artificerBenchCraftGrid, GetArtificerBenchCraftIconSize(), ref warmBudget);
+                WarmVisibleArtificerBenchHandCraftIcons(ref warmBudget);
+            }
+            else if (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
+            {
+                WarmVisibleCatalogIcons(CatalogRowIconSize, ref warmBudget);
+            }
             else
-                WarmIconSlots(_inventory.Grid, gridSize);
+            {
+                WarmIconSlots(_inventory.Grid, gridSize, ref warmBudget);
+                WarmVisibleHandCraftIcons(ref warmBudget);
+            }
         }
 
         if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air)
@@ -7630,42 +11712,200 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var heldSize = _inventoryGridSlots.Length > 0 && _inventoryGridSlots[0].Width > 0
                 ? _inventoryGridSlots[0].Width - pad * 2
                 : InventorySlotSize - pad * 2;
-            _blockIconCache.Warm(_inventoryHeld.Id, heldSize, BlockModelContext.Gui);
+            WarmItemIcon(_inventoryHeld.Id, heldSize, ref warmBudget);
         }
     }
 
-    private void WarmIconSlots(HotbarSlot[] slots, int size)
+    private int GetArtificerBenchCraftIconSize()
+    {
+        for (var i = 0; i < _artificerBenchCraftSlots.Length; i++)
+        {
+            var slot = _artificerBenchCraftSlots[i];
+            if (slot.Width > 2 && slot.Height > 2)
+                return Math.Max(8, Math.Max(slot.Width - 2, slot.Height - 2));
+        }
+
+        return Math.Max(8, InventorySlotSize - 2);
+    }
+
+    private void WarmIconSlots(HotbarSlot[] slots, int size, ref int budget)
     {
         for (var i = 0; i < slots.Length; i++)
         {
+            if (budget <= 0)
+                return;
+
             var slot = slots[i];
             if (slot.Count <= 0 || slot.Id == BlockId.Air)
                 continue;
 
-            _blockIconCache?.Warm(slot.Id, size, BlockModelContext.Gui);
+            WarmItemIcon(slot.Id, size, ref budget);
         }
     }
 
-    private void WarmVisibleCatalogIcons(int size)
+    private void WarmItemIcon(BlockId legacyItemId, int size, ref int budget)
     {
-        if (_inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
+        if (budget <= 0 || legacyItemId == BlockId.Air || !ShouldUseBlockIcon(legacyItemId))
+            return;
+
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        var blockId = item.Id != ItemId.None && item.PlacesBlock.HasValue
+            ? item.PlacesBlock.Value
+            : legacyItemId;
+        if (GetBlockIconIfReady(blockId, size) != null)
+            return;
+
+        _blockIconCache?.Warm(blockId, size, BlockModelContext.Gui);
+        budget--;
+    }
+
+    private void WarmVisibleCatalogIcons(int size, ref int budget)
+    {
+        if (budget <= 0 || _inventoryCatalogListRect.Width <= 0 || _inventoryCatalogListRect.Height <= 0)
             return;
 
         var total = _inventory.GetSandboxCatalogFilteredCount();
         if (total <= 0)
             return;
 
-        var first = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / CatalogRowHeight) - CatalogRowOverscan);
-        var visible = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)CatalogRowHeight) + CatalogRowOverscan * 2);
-        var last = Math.Min(total - 1, first + visible - 1);
+        var columns = GetInventoryCatalogGridColumnCount();
+        var rowStride = CatalogGridSlotSize + CatalogGridSlotGap;
+        var firstRow = Math.Max(0, (int)MathF.Floor(_inventoryCatalogScrollOffsetPx / rowStride) - CatalogGridOverscanRows);
+        var visibleRows = Math.Max(1, (int)MathF.Ceiling(_inventoryCatalogListRect.Height / (float)rowStride) + CatalogGridOverscanRows * 2);
+        var first = firstRow * columns;
+        var last = Math.Min(total - 1, (firstRow + visibleRows) * columns - 1);
         for (var i = first; i <= last; i++)
         {
+            if (budget <= 0)
+                return;
+
             var slot = _inventory.GetSandboxCatalogFilteredEntryAt(i);
             if (slot.Id == BlockId.Air || slot.Count <= 0)
                 continue;
 
-            _blockIconCache?.Warm(slot.Id, size, BlockModelContext.Gui);
+            WarmItemIcon(slot.Id, size, ref budget);
         }
+    }
+
+    private void WarmVisibleHandCraftIcons(ref int budget)
+    {
+        if (budget <= 0 || _survivalInventoryView != SurvivalInventoryView.Crafting || _handCraftRecipeListRect.Width <= 0 || _handCraftRecipeListRect.Height <= 0)
+            return;
+
+        var filtered = GetFilteredHandCraftRecipeIndices();
+        if (filtered.Count <= 0)
+            return;
+
+        var first = Math.Max(0, (int)MathF.Floor(_handCraftRecipeScrollOffsetPx / HandCraftRecipeRowHeight) - 1);
+        var visible = Math.Max(1, (int)MathF.Ceiling(_handCraftRecipeListRect.Height / (float)HandCraftRecipeRowHeight) + 2);
+        var last = Math.Min(filtered.Count - 1, first + visible - 1);
+        for (var filteredRow = first; filteredRow <= last && budget > 0; filteredRow++)
+        {
+            var recipe = HandCraftingRecipes.All[filtered[filteredRow]];
+            WarmItemIcon(recipe.OutputId, 34, ref budget);
+        }
+
+        if (TryGetSelectedHandCraftRecipe(out var selectedRecipe))
+        {
+            for (var i = 0; i < selectedRecipe.Ingredients.Count && budget > 0; i++)
+            {
+                var inputIconId = GetHandCraftIngredientIconId(selectedRecipe.Ingredients[i]);
+                WarmItemIcon(inputIconId, 28, ref budget);
+            }
+
+            WarmItemIcon(selectedRecipe.OutputId, 28, ref budget);
+        }
+    }
+
+    private void WarmVisibleArtificerBenchHandCraftIcons(ref int budget)
+    {
+        if (budget <= 0 || !_artificerBenchGuiOpen)
+            return;
+
+        var indices = GetArtificerBenchHandCraftRecipeIndices();
+        var listRect = GetArtificerBenchHandCraftListRect();
+        if (indices.Count <= 0 || listRect.Width <= 0 || listRect.Height <= 0)
+            return;
+
+        var pitch = HandCraftRecipeRowHeight + ArtificerBenchHandCraftRowGap;
+        var first = Math.Max(0, (int)MathF.Floor(_artificerBenchHandCraftScrollOffsetPx / pitch) - 1);
+        var visible = Math.Max(1, (int)MathF.Ceiling(listRect.Height / (float)pitch) + 2);
+        var last = Math.Min(indices.Count - 1, first + visible - 1);
+        for (var displayIndex = first; displayIndex <= last && budget > 0; displayIndex++)
+        {
+            var recipe = HandCraftingRecipes.All[indices[displayIndex]];
+            WarmItemIcon(recipe.OutputId, 36, ref budget);
+        }
+    }
+
+    private void DrawItemIcon(SpriteBatch sb, BlockId legacyItemId, Rectangle dst)
+    {
+        if (legacyItemId == BlockId.Air || dst.Width <= 0 || dst.Height <= 0)
+            return;
+
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        if (item.Id != ItemId.None && item.InventoryModel == ItemInventoryModelKind.FlatSprite)
+        {
+            var sprite = GetItemSprite(legacyItemId);
+            if (sprite != null)
+            {
+                sb.Draw(sprite, FitRect(sprite.Width, sprite.Height, dst), Color.White);
+                return;
+            }
+        }
+
+        if (_atlas == null)
+            return;
+
+        var blockId = item.Id != ItemId.None && item.PlacesBlock.HasValue
+            ? item.PlacesBlock.Value
+            : legacyItemId;
+        var icon = GetBlockIconIfReady(blockId, dst.Width);
+        if (icon != null)
+            sb.Draw(icon, dst, Color.White);
+        else
+            sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)blockId, FaceDirection.PosY), Color.White);
+    }
+
+    private Texture2D? GetItemSprite(BlockId legacyItemId)
+    {
+        if (_itemSpriteCache.TryGetValue(legacyItemId, out var cached))
+            return cached;
+
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        if (item.Id == ItemId.None || string.IsNullOrWhiteSpace(item.TextureName))
+        {
+            _itemSpriteCache[legacyItemId] = null;
+            return null;
+        }
+
+        var fileName = item.TextureName!.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+            ? item.TextureName
+            : $"{item.TextureName}.png";
+        var texture = _assets.LoadTexture($"textures/items/{fileName}");
+        _itemSpriteCache[legacyItemId] = texture;
+        return texture;
+    }
+
+    private static bool ShouldUseBlockIcon(BlockId legacyItemId)
+    {
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        return item.Id == ItemId.None || item.InventoryModel == ItemInventoryModelKind.BlockIcon || item.InventoryModel == ItemInventoryModelKind.CustomModel;
+    }
+
+    private static Rectangle FitRect(int sourceWidth, int sourceHeight, Rectangle bounds)
+    {
+        if (sourceWidth <= 0 || sourceHeight <= 0 || bounds.Width <= 0 || bounds.Height <= 0)
+            return bounds;
+
+        var scale = Math.Min(bounds.Width / (float)sourceWidth, bounds.Height / (float)sourceHeight);
+        var width = Math.Max(1, (int)MathF.Round(sourceWidth * scale));
+        var height = Math.Max(1, (int)MathF.Round(sourceHeight * scale));
+        return new Rectangle(
+            bounds.X + (bounds.Width - width) / 2,
+            bounds.Y + (bounds.Height - height) / 2,
+            width,
+            height);
     }
 
     private Texture2D? GetBlockIcon(BlockId id, int size)
@@ -7691,6 +11931,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _soulLootTitleText = string.Empty;
             _soulLootStatusText = string.Empty;
             _inventoryOpen = false;
+            _inventoryPointerActive = false;
             if (shouldDismissClearedSoul)
                 ClearSoulMarker(saveImmediately: true);
             return;
@@ -7718,9 +11959,1075 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        if (_artificerBenchGuiOpen)
+        {
+            SaveActiveArtificerBenchStorage();
+            SaveArtificerBenchStorageFile();
+        }
+        if (_kilnGuiOpen)
+            SaveActiveKilnInventory();
+
         _inventoryCatalogSearchFocused = false;
         _inventoryCatalogSearchCaret = 0;
+        _handCraftSearchFocused = false;
+        _handCraftSearchCaret = 0;
+        _trashClearConfirmPending = false;
+        _trashClearConfirmTimer = 0f;
+        _artificerBenchGuiOpen = false;
+        _hasActiveArtificerBenchKey = false;
+        _kilnGuiOpen = false;
+        _hasActiveKilnKey = false;
+        _trashGuiOpen = false;
         _inventoryOpen = false;
+        _inventoryPointerActive = false;
+    }
+
+    private void OpenInventoryUi()
+    {
+        if (_artificerBenchGuiOpen)
+            SaveActiveArtificerBenchStorage();
+        _inventoryOpen = true;
+        _artificerBenchGuiOpen = false;
+        _hasActiveArtificerBenchKey = false;
+        _kilnGuiOpen = false;
+        _hasActiveKilnKey = false;
+        _trashGuiOpen = false;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        _handCraftSearchFocused = false;
+        _handCraftSearchCaret = 0;
+        _inventoryPlayerPreviewDragging = false;
+        _inventoryPlayerPreviewYaw = MathHelper.PiOver2;
+        UpdateInventoryLayout();
+    }
+
+    private void ReturnArtificerBenchGridItemsToInventory()
+    {
+        var changed = false;
+        for (var i = 0; i < _artificerBenchCraftGrid.Length; i++)
+        {
+            var slot = _artificerBenchCraftGrid[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+            {
+                _artificerBenchCraftGrid[i] = default;
+                continue;
+            }
+
+            var leftover = _inventory.Add(slot.Id, slot.Count);
+            if (leftover > 0)
+                SpawnDroppedItem(slot.Id, leftover);
+
+            _artificerBenchCraftGrid[i] = default;
+            changed = true;
+        }
+
+        if (changed)
+        {
+            MarkPlayerStateDirty();
+            SaveActiveArtificerBenchStorage();
+            SaveArtificerBenchStorageFile();
+        }
+    }
+
+    private string GetArtificerBenchStoragePath() =>
+        Path.Combine(_worldPath, "storage", "artificer_benches.lvc");
+
+    private void EnsureArtificerBenchStorageLoaded()
+    {
+        if (_artificerBenchStorageLoaded)
+            return;
+
+        _artificerBenchStorageLoaded = true;
+        _artificerBenchStoredGrids.Clear();
+
+        var path = GetArtificerBenchStoragePath();
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            var data = LvcSerializer.Read(path);
+            if (!data.TryGetValue("benchCount", out var countText)
+                || !int.TryParse(countText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count))
+            {
+                return;
+            }
+
+            for (var benchIndex = 0; benchIndex < count; benchIndex++)
+            {
+                if (!TryReadStorageInt(data, $"bench.{benchIndex}.x", out var x)
+                    || !TryReadStorageInt(data, $"bench.{benchIndex}.y", out var y)
+                    || !TryReadStorageInt(data, $"bench.{benchIndex}.z", out var z))
+                {
+                    continue;
+                }
+
+                var slots = new HotbarSlot[_artificerBenchCraftGrid.Length];
+                var hasAny = false;
+                for (var slotIndex = 0; slotIndex < slots.Length; slotIndex++)
+                {
+                    if (!TryReadStorageInt(data, $"bench.{benchIndex}.slot.{slotIndex}.id", out var idValue)
+                        || !TryReadStorageInt(data, $"bench.{benchIndex}.slot.{slotIndex}.count", out var slotCount))
+                    {
+                        continue;
+                    }
+
+                    var id = (BlockId)Math.Clamp(idValue, 0, byte.MaxValue);
+                    if (id == BlockId.Air || slotCount <= 0)
+                        continue;
+
+                    slots[slotIndex] = new HotbarSlot { Id = id, Count = slotCount };
+                    hasAny = true;
+                }
+
+                if (hasAny)
+                    _artificerBenchStoredGrids[new BlockBreakKey(x, y, z)] = slots;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load Artificer Bench storage: {ex.Message}");
+        }
+    }
+
+    private static bool TryReadStorageInt(Dictionary<string, string> data, string key, out int value)
+    {
+        value = 0;
+        return data.TryGetValue(key, out var text)
+            && int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+    }
+
+    private void LoadActiveArtificerBenchGrid()
+    {
+        Array.Clear(_artificerBenchCraftGrid, 0, _artificerBenchCraftGrid.Length);
+        if (!_hasActiveArtificerBenchKey)
+            return;
+
+        if (!_artificerBenchStoredGrids.TryGetValue(_activeArtificerBenchKey, out var stored))
+            return;
+
+        for (var i = 0; i < _artificerBenchCraftGrid.Length && i < stored.Length; i++)
+            _artificerBenchCraftGrid[i] = stored[i];
+    }
+
+    private void SaveActiveArtificerBenchStorage()
+    {
+        if (!_hasActiveArtificerBenchKey)
+            return;
+
+        EnsureArtificerBenchStorageLoaded();
+        var slots = new HotbarSlot[_artificerBenchCraftGrid.Length];
+        var hasAny = false;
+        for (var i = 0; i < _artificerBenchCraftGrid.Length; i++)
+        {
+            var slot = _artificerBenchCraftGrid[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+            {
+                _artificerBenchCraftGrid[i] = default;
+                continue;
+            }
+
+            slots[i] = slot;
+            hasAny = true;
+        }
+
+        if (hasAny)
+            _artificerBenchStoredGrids[_activeArtificerBenchKey] = slots;
+        else
+            _artificerBenchStoredGrids.Remove(_activeArtificerBenchKey);
+
+        _artificerBenchStorageDirty = true;
+        _artificerBenchStorageFlushTimer = 0.75f;
+    }
+
+    private void UpdateArtificerBenchStorageFlush(float dt)
+    {
+        if (!_artificerBenchStorageDirty)
+            return;
+
+        _artificerBenchStorageFlushTimer = Math.Max(0f, _artificerBenchStorageFlushTimer - Math.Max(0f, dt));
+        if (_artificerBenchStorageFlushTimer > 0f || _inventoryPointerActive)
+            return;
+
+        SaveArtificerBenchStorageFile();
+    }
+
+    private void SaveArtificerBenchStorageFile()
+    {
+        try
+        {
+            var path = GetArtificerBenchStoragePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? _worldPath);
+
+            var benches = _artificerBenchStoredGrids
+                .Where(pair => pair.Value.Any(slot => slot.Id != BlockId.Air && slot.Count > 0))
+                .OrderBy(pair => pair.Key.X)
+                .ThenBy(pair => pair.Key.Y)
+                .ThenBy(pair => pair.Key.Z)
+                .ToList();
+
+            var data = new Dictionary<string, string>
+            {
+                ["version"] = "1",
+                ["benchCount"] = benches.Count.ToString(CultureInfo.InvariantCulture)
+            };
+
+            for (var benchIndex = 0; benchIndex < benches.Count; benchIndex++)
+            {
+                var pair = benches[benchIndex];
+                data[$"bench.{benchIndex}.x"] = pair.Key.X.ToString(CultureInfo.InvariantCulture);
+                data[$"bench.{benchIndex}.y"] = pair.Key.Y.ToString(CultureInfo.InvariantCulture);
+                data[$"bench.{benchIndex}.z"] = pair.Key.Z.ToString(CultureInfo.InvariantCulture);
+
+                for (var slotIndex = 0; slotIndex < pair.Value.Length; slotIndex++)
+                {
+                    var slot = pair.Value[slotIndex];
+                    if (slot.Id == BlockId.Air || slot.Count <= 0)
+                        continue;
+
+                    data[$"bench.{benchIndex}.slot.{slotIndex}.id"] = ((int)slot.Id).ToString(CultureInfo.InvariantCulture);
+                    data[$"bench.{benchIndex}.slot.{slotIndex}.count"] = slot.Count.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+
+            LvcSerializer.Write(path, data);
+            _artificerBenchStorageDirty = false;
+            _artificerBenchStorageFlushTimer = 0f;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save Artificer Bench storage: {ex.Message}");
+        }
+    }
+
+    private void DropStoredArtificerBenchItems(int x, int y, int z)
+    {
+        EnsureArtificerBenchStorageLoaded();
+        var key = new BlockBreakKey(x, y, z);
+        if (!_artificerBenchStoredGrids.TryGetValue(key, out var slots))
+            return;
+
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Id != BlockId.Air && slot.Count > 0)
+                SpawnDroppedItem(slot.Id, slot.Count);
+        }
+
+        _artificerBenchStoredGrids.Remove(key);
+        if (_hasActiveArtificerBenchKey && _activeArtificerBenchKey.Equals(key))
+        {
+            Array.Clear(_artificerBenchCraftGrid, 0, _artificerBenchCraftGrid.Length);
+            _hasActiveArtificerBenchKey = false;
+        }
+
+        SaveArtificerBenchStorageFile();
+    }
+
+    private void DropStoredKilnItems(int x, int y, int z)
+    {
+        var key = new BlockBreakKey(x, y, z);
+        if (!_kilnStoredInventories.TryGetValue(key, out var slots))
+            return;
+
+        for (var i = 0; i < slots.Length; i++)
+        {
+            var slot = slots[i];
+            if (slot.Id != BlockId.Air && slot.Count > 0)
+                SpawnDroppedItem(slot.Id, slot.Count);
+        }
+
+        _kilnStoredInventories.Remove(key);
+        if (_hasActiveKilnKey && _activeKilnKey.Equals(key))
+        {
+            Array.Clear(_kilnInventory, 0, _kilnInventory.Length);
+            _hasActiveKilnKey = false;
+        }
+    }
+
+    private void ShiftTransferArtificerBenchSlotToPlayer(int index)
+    {
+        if (index < 0 || index >= _artificerBenchCraftGrid.Length)
+            return;
+
+        ref var slot = ref _artificerBenchCraftGrid[index];
+        if (slot.Id == BlockId.Air || slot.Count <= 0)
+            return;
+
+        var originalId = slot.Id;
+        var originalCount = slot.Count;
+        var leftover = _inventory.Add(originalId, originalCount);
+        var moved = originalCount - leftover;
+        if (moved <= 0)
+        {
+            SetCommandStatus("No inventory space for that stack.", 1.5f, echoToChat: false);
+            return;
+        }
+
+        slot.Count = leftover;
+        slot.Id = leftover > 0 ? originalId : BlockId.Air;
+        MarkPlayerStateDirty();
+    }
+
+    private void ShiftTransferPlayerSlotToArtificerBench(ref HotbarSlot slot)
+    {
+        if (slot.Id == BlockId.Air || slot.Count <= 0)
+            return;
+
+        var originalId = slot.Id;
+        var originalCount = slot.Count;
+        var leftover = AddStackToArtificerBenchGrid(originalId, originalCount);
+        var moved = originalCount - leftover;
+        if (moved <= 0)
+        {
+            SetCommandStatus("No room in the Artificer Bench grid.", 1.5f, echoToChat: false);
+            return;
+        }
+
+        slot.Count = leftover;
+        slot.Id = leftover > 0 ? originalId : BlockId.Air;
+        MarkPlayerStateDirty();
+    }
+
+    private void ShiftTransferHotbarSlotToInventoryGrid(ref HotbarSlot slot)
+    {
+        if (slot.Id == BlockId.Air || slot.Count <= 0)
+            return;
+
+        var originalId = slot.Id;
+        var originalCount = slot.Count;
+        var leftover = AddStackToInventoryGridOnly(originalId, originalCount);
+        var moved = originalCount - leftover;
+        if (moved <= 0)
+        {
+            SetCommandStatus("No inventory space for that stack.", 1.5f, echoToChat: false);
+            return;
+        }
+
+        slot.Count = leftover;
+        slot.Id = leftover > 0 ? originalId : BlockId.Air;
+        MarkPlayerStateDirty();
+    }
+
+    private int AddStackToInventoryGridOnly(BlockId id, int count)
+    {
+        if (id == BlockId.Air || count <= 0)
+            return count;
+
+        var max = _inventory.GetMaxStackSize(id);
+        for (var i = 0; i < _inventory.Grid.Length && count > 0; i++)
+        {
+            if (_inventory.Grid[i].Id != id || _inventory.Grid[i].Count <= 0)
+                continue;
+
+            var add = Math.Min(max - _inventory.Grid[i].Count, count);
+            if (add <= 0)
+                continue;
+
+            _inventory.Grid[i].Count += add;
+            count -= add;
+        }
+
+        for (var i = 0; i < _inventory.Grid.Length && count > 0; i++)
+        {
+            if (_inventory.Grid[i].Count > 0 && _inventory.Grid[i].Id != BlockId.Air)
+                continue;
+
+            var add = Math.Min(max, count);
+            _inventory.Grid[i] = new HotbarSlot { Id = id, Count = add };
+            count -= add;
+        }
+
+        return count;
+    }
+
+    private int AddStackToArtificerBenchGrid(BlockId id, int count)
+    {
+        if (id == BlockId.Air || count <= 0)
+            return count;
+
+        var max = _inventory.GetMaxStackSize(id);
+        for (var i = 0; i < _artificerBenchCraftGrid.Length && count > 0; i++)
+        {
+            if (_artificerBenchCraftGrid[i].Id != id || _artificerBenchCraftGrid[i].Count <= 0)
+                continue;
+
+            var add = Math.Min(max - _artificerBenchCraftGrid[i].Count, count);
+            if (add <= 0)
+                continue;
+
+            _artificerBenchCraftGrid[i].Count += add;
+            count -= add;
+        }
+
+        for (var i = 0; i < _artificerBenchCraftGrid.Length && count > 0; i++)
+        {
+            if (_artificerBenchCraftGrid[i].Count > 0 && _artificerBenchCraftGrid[i].Id != BlockId.Air)
+                continue;
+
+            var add = Math.Min(max, count);
+            _artificerBenchCraftGrid[i] = new HotbarSlot { Id = id, Count = add };
+            count -= add;
+        }
+
+        return count;
+    }
+
+    private void OpenArtificerBenchGui(int x, int y, int z)
+    {
+        EnsureArtificerBenchStorageLoaded();
+        _activeArtificerBenchKey = new BlockBreakKey(x, y, z);
+        _hasActiveArtificerBenchKey = true;
+        LoadActiveArtificerBenchGrid();
+        _inventoryOpen = true;
+        _artificerBenchGuiOpen = true;
+        _survivalInventoryView = SurvivalInventoryView.Crafting;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        _handCraftSearchFocused = false;
+        _handCraftSearchCaret = 0;
+        _inventoryPlayerPreviewDragging = false;
+        UpdateInventoryLayout();
+    }
+
+    private void OpenTrashInventoryUi()
+    {
+        if (_artificerBenchGuiOpen)
+            SaveActiveArtificerBenchStorage();
+        _inventoryOpen = true;
+        _trashGuiOpen = _gameMode != GameMode.Artificer;
+        if (_gameMode == GameMode.Artificer)
+        {
+            _artificerInventoryView = ArtificerInventoryView.Trash;
+            _lastArtificerInventoryView = ArtificerInventoryView.Trash;
+        }
+        _artificerBenchGuiOpen = false;
+        _hasActiveArtificerBenchKey = false;
+        _kilnGuiOpen = false;
+        _hasActiveKilnKey = false;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        _handCraftSearchFocused = false;
+        _handCraftSearchCaret = 0;
+        _trashClearConfirmPending = false;
+        _trashClearConfirmTimer = 0f;
+        _inventoryPlayerPreviewDragging = false;
+        UpdateInventoryLayout();
+    }
+
+    private void OpenKilnGui(int x, int y, int z, BlockId kilnBlockId)
+    {
+        _activeKilnKey = new BlockBreakKey(x, y, z);
+        _hasActiveKilnKey = true;
+        _activeKilnBlockId = IsKilnBlock(kilnBlockId) ? GetKilnBaseBlock(kilnBlockId) : BlockId.BasicKiln;
+        LoadActiveKilnInventory();
+        _inventoryOpen = true;
+        _kilnGuiOpen = true;
+        _artificerBenchGuiOpen = false;
+        _hasActiveArtificerBenchKey = false;
+        _survivalInventoryView = SurvivalInventoryView.Crafting;
+        _inventoryCatalogSearchFocused = false;
+        _inventoryCatalogSearchCaret = 0;
+        _handCraftSearchFocused = false;
+        _handCraftSearchCaret = 0;
+        _trashClearConfirmPending = false;
+        _trashClearConfirmTimer = 0f;
+        _inventoryPlayerPreviewDragging = false;
+        UpdateInventoryLayout();
+    }
+
+    private static bool IsKilnBlock(BlockId blockId) =>
+        blockId is BlockId.BasicKiln or BlockId.AdvancedKiln or BlockId.FieldOven
+            or BlockId.BasicKilnLit or BlockId.AdvancedKilnLit or BlockId.FieldOvenLit;
+
+    private static BlockId GetKilnBaseBlock(BlockId blockId) => blockId switch
+    {
+        BlockId.BasicKilnLit => BlockId.BasicKiln,
+        BlockId.AdvancedKilnLit => BlockId.AdvancedKiln,
+        BlockId.FieldOvenLit => BlockId.FieldOven,
+        _ => blockId
+    };
+
+    private static BlockId GetKilnLitBlock(BlockId blockId) => GetKilnBaseBlock(blockId) switch
+    {
+        BlockId.AdvancedKiln => BlockId.AdvancedKilnLit,
+        BlockId.FieldOven => BlockId.FieldOvenLit,
+        _ => BlockId.BasicKilnLit
+    };
+
+    private void TryUseSleepingBag(int x, int y, int z)
+    {
+        if (_sleepInProgress)
+            return;
+
+        if (!_worldTime.IsSleepWindow)
+        {
+            SetCommandStatus("You can only sleep at night (19:00-05:00)", 3.0f);
+            return;
+        }
+
+        // Start sleep sequence
+        _sleepInProgress = true;
+        _sleepFadeTimer = 0f;
+        SetCommandStatus("Sleeping until dawn...", 2.0f);
+    }
+
+    private void UpdateSleepSequence(float dt)
+    {
+        if (!_sleepInProgress)
+            return;
+
+        _sleepFadeTimer += dt;
+
+        // At end of fade, perform time skip
+        if (_sleepFadeTimer >= SleepFadeDurationSeconds)
+        {
+            _worldTime.SleepToNextDawn();
+            _sleepInProgress = false;
+            _sleepFadeTimer = 0f;
+            SetCommandStatus("You wake with the dawn.", 2.0f);
+
+            // Sync runtime rules to meta to save the new time
+            SyncRuntimeRulesToMeta(persist: true);
+            MarkPlayerStateDirty();
+        }
+    }
+
+    private void LoadActiveKilnInventory()
+    {
+        Array.Clear(_kilnInventory, 0, _kilnInventory.Length);
+        if (!_hasActiveKilnKey)
+            return;
+
+        if (_kilnStoredInventories.TryGetValue(_activeKilnKey, out var stored))
+        {
+            for (var i = 0; i < Math.Min(stored.Length, _kilnInventory.Length); i++)
+                _kilnInventory[i] = stored[i];
+        }
+    }
+
+    private void SaveActiveKilnInventory()
+    {
+        if (!_hasActiveKilnKey)
+            return;
+
+        var any = false;
+        var slots = new HotbarSlot[_kilnInventory.Length];
+        for (var i = 0; i < _kilnInventory.Length; i++)
+        {
+            slots[i] = _kilnInventory[i];
+            any |= slots[i].Id != BlockId.Air && slots[i].Count > 0;
+        }
+
+        if (any)
+            _kilnStoredInventories[_activeKilnKey] = slots;
+        else
+            _kilnStoredInventories.Remove(_activeKilnKey);
+    }
+
+    private bool TrySmeltActiveKiln()
+    {
+        if (!_kilnGuiOpen)
+            return false;
+        if (_activeKilnSmelting)
+            return false;
+
+        ref var input = ref _kilnInventory[0];
+        ref var fuel = ref _kilnInventory[1];
+        ref var output = ref _kilnInventory[2];
+        if (_activeKilnBlockId == BlockId.FieldOven)
+        {
+            SetCommandStatus("Field Oven cooking recipes are not added yet.", 2f, echoToChat: false);
+            return false;
+        }
+
+        if (!TryGetKilnOutput(input.Id, out var outputId))
+        {
+            SetCommandStatus("That material does not smelt in this kiln.", 2f, echoToChat: false);
+            return false;
+        }
+
+        if (input.Count <= 0 || fuel.Id != BlockId.CoalChunk || fuel.Count <= 0)
+        {
+            SetCommandStatus("Kiln needs ore cluster and coal chunk.", 2f, echoToChat: false);
+            return false;
+        }
+
+        var max = _inventory.GetMaxStackSize(outputId);
+        if (output.Id != BlockId.Air && output.Id != outputId)
+        {
+            SetCommandStatus("Clear the output slot first.", 2f, echoToChat: false);
+            return false;
+        }
+
+        if (output.Count >= max)
+        {
+            SetCommandStatus("Output slot is full.", 2f, echoToChat: false);
+            return false;
+        }
+
+        input.Count--;
+        fuel.Count--;
+        if (input.Count <= 0)
+            input = default;
+        if (fuel.Count <= 0)
+            fuel = default;
+        _activeKilnOutputId = outputId;
+        _activeKilnProgressSeconds = 0f;
+        _activeKilnDurationSeconds = _activeKilnBlockId == BlockId.AdvancedKiln ? 1.25f : 2.75f;
+        _activeKilnSmelting = true;
+        SetActiveKilnWorldBlock(GetKilnLitBlock(_activeKilnBlockId));
+        SaveActiveKilnInventory();
+        SetCommandStatus($"{GetActiveKilnTitle()} is firing.", 1.2f, echoToChat: false);
+        return true;
+    }
+
+    private void UpdateActiveKilnSmelt(float dt)
+    {
+        if (!_activeKilnSmelting)
+            return;
+
+        _activeKilnProgressSeconds += Math.Max(0f, dt);
+        if (_activeKilnProgressSeconds < Math.Max(0.1f, _activeKilnDurationSeconds))
+            return;
+
+        ref var output = ref _kilnInventory[2];
+        if (output.Id == BlockId.Air || output.Count <= 0)
+            output = new HotbarSlot { Id = _activeKilnOutputId, Count = 0 };
+        if (output.Id == _activeKilnOutputId && output.Count < _inventory.GetMaxStackSize(_activeKilnOutputId))
+            output.Count++;
+
+        _activeKilnSmelting = false;
+        _activeKilnProgressSeconds = 0f;
+        _activeKilnDurationSeconds = 0f;
+        _activeKilnOutputId = BlockId.Air;
+        SetActiveKilnWorldBlock(_activeKilnBlockId);
+        SaveActiveKilnInventory();
+        SetCommandStatus("Kiln output cooled.", 1.2f, echoToChat: false);
+    }
+
+    private void SetActiveKilnWorldBlock(BlockId blockId)
+    {
+        if (!_hasActiveKilnKey || _world == null)
+            return;
+
+        var current = (BlockId)_world.GetBlock(_activeKilnKey.X, _activeKilnKey.Y, _activeKilnKey.Z);
+        if (!IsKilnBlock(current) || current == blockId)
+            return;
+
+        _world.SetBlock(_activeKilnKey.X, _activeKilnKey.Y, _activeKilnKey.Z, (byte)blockId);
+        _lanSession?.SendBlockSet(_activeKilnKey.X, _activeKilnKey.Y, _activeKilnKey.Z, (byte)blockId);
+        QueuePriorityRemeshForBlockEdit(_activeKilnKey.X, _activeKilnKey.Y, _activeKilnKey.Z);
+    }
+
+    private float GetActiveKilnProgressFraction()
+    {
+        if (!_activeKilnSmelting || _activeKilnDurationSeconds <= 0f)
+            return 0f;
+        return Math.Clamp(_activeKilnProgressSeconds / _activeKilnDurationSeconds, 0f, 1f);
+    }
+
+    private string GetActiveKilnTitle() => _activeKilnBlockId switch
+    {
+        BlockId.AdvancedKiln => "ADVANCED KILN",
+        BlockId.FieldOven => "FIELD OVEN",
+        _ => "BASIC KILN"
+    };
+
+    private static bool TryGetKilnOutput(BlockId inputId, out BlockId outputId)
+    {
+        outputId = inputId switch
+        {
+            BlockId.IronCluster => BlockId.IronBillet,
+            BlockId.GoldCluster => BlockId.GoldBillet,
+            BlockId.CopperCluster => BlockId.CopperBillet,
+            _ => BlockId.Air
+        };
+        return outputId != BlockId.Air;
+    }
+
+    private void HandleInventorySlotLeftClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
+    {
+        if (sandboxCatalogMode && _inventoryHasHeld)
+            sandboxCatalogMode = false;
+
+        if (TryHandleInventorySlotDoubleClick(ref slot, group, index, sandboxCatalogMode))
+            return;
+
+        TrackInventoryLeftClick(group, index);
+
+        if (!sandboxCatalogMode && IsInventoryPlacementBlocked() && CanPlaceHeldItemIntoSlot(slot))
+            return;
+
+        if (!sandboxCatalogMode && CanPlaceHeldItemIntoSlot(slot))
+        {
+            BeginPendingLeftInventoryPlacement(group, index, _inventoryMousePos);
+            return;
+        }
+
+        HandleInventorySlotClick(ref slot, group, index, sandboxCatalogMode);
+    }
+
+    private bool TryHandleInventorySlotDoubleClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
+    {
+        if (sandboxCatalogMode)
+            return false;
+
+        var isDoubleClick = _lastInventoryLeftClickGroup == group
+            && _lastInventoryLeftClickIndex == index
+            && _worldTimeSeconds - _lastInventoryLeftClickTime <= InventoryDoubleClickSeconds;
+        if (!isDoubleClick)
+            return false;
+
+        TrackInventoryLeftClick(InventorySlotGroup.None, -1);
+
+        var targetId = _inventoryHasHeld && _inventoryHeld.Id != BlockId.Air && _inventoryHeld.Count > 0
+            ? _inventoryHeld.Id
+            : slot.Id;
+        if (targetId == BlockId.Air)
+            return true;
+
+        var max = _inventory.GetMaxStackSize(targetId);
+        if (max <= 0)
+            return true;
+
+        if (!_inventoryHasHeld || _inventoryHeld.Id != targetId)
+        {
+            _inventoryHeld = default;
+            _inventoryHasHeld = true;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        _inventoryHeld.Id = targetId;
+        _inventoryHeld.Count = Math.Clamp(_inventoryHeld.Count, 0, max);
+        CollectMatchingInventoryItemsToHeld(targetId, group, max);
+        if (_inventoryHeld.Count <= 0)
+        {
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+        else
+        {
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+
+        _pendingLeftInventoryPlacement = false;
+        _leftInventoryDragSlots.Clear();
+        _inventoryPlacementBlockedUntil = _worldTimeSeconds + InventoryDoubleClickPlacementLockoutSeconds;
+        ResetRightInventoryDragDistribution();
+        return true;
+    }
+
+    private bool IsInventoryPlacementBlocked()
+        => _inventoryHasHeld
+            && _inventoryHeld.Id != BlockId.Air
+            && _inventoryHeld.Count > 0
+            && _worldTimeSeconds < _inventoryPlacementBlockedUntil;
+
+    private void TrackInventoryLeftClick(InventorySlotGroup group, int index)
+    {
+        _lastInventoryLeftClickGroup = group;
+        _lastInventoryLeftClickIndex = index;
+        _lastInventoryLeftClickTime = _worldTimeSeconds;
+    }
+
+    private void CollectMatchingInventoryItemsToHeld(BlockId targetId, InventorySlotGroup clickedGroup, int max)
+    {
+        if (clickedGroup == InventorySlotGroup.ArtificerBenchCraft)
+        {
+            CollectMatchingItemsFromSlotsToHeld(_artificerBenchCraftGrid, targetId, max);
+            return;
+        }
+
+        CollectMatchingItemsFromSlotsToHeld(_inventory.Grid, targetId, max);
+        if (_inventoryHeld.Count < max)
+            CollectMatchingItemsFromSlotsToHeld(_inventory.Hotbar, targetId, max);
+    }
+
+    private void CollectMatchingItemsFromSlotsToHeld(HotbarSlot[] slots, BlockId targetId, int max)
+    {
+        if (!_inventoryHasHeld || _inventoryHeld.Id != targetId || _inventoryHeld.Count >= max)
+            return;
+
+        for (var i = 0; i < slots.Length && _inventoryHeld.Count < max; i++)
+        {
+            if (slots[i].Id != targetId || slots[i].Count <= 0)
+                continue;
+
+            var move = Math.Min(max - _inventoryHeld.Count, slots[i].Count);
+            _inventoryHeld.Count += move;
+            slots[i].Count -= move;
+            if (slots[i].Count <= 0)
+                slots[i] = default;
+        }
+    }
+
+    private bool CanPlaceHeldItemIntoSlot(HotbarSlot slot)
+    {
+        if (!_inventoryHasHeld || _inventoryHeld.Id == BlockId.Air || _inventoryHeld.Count <= 0)
+            return false;
+
+        if (slot.Id != BlockId.Air && slot.Id != _inventoryHeld.Id)
+            return false;
+
+        var max = _inventory.GetMaxStackSize(_inventoryHeld.Id);
+        return max > 0 && slot.Count < max;
+    }
+
+    private void BeginPendingLeftInventoryPlacement(InventorySlotGroup group, int index, Point point)
+    {
+        _pendingLeftInventoryPlacement = true;
+        _pendingLeftInventoryPlacementGroup = group;
+        _pendingLeftInventoryPlacementIndex = index;
+        _pendingLeftInventoryPlacementPoint = point;
+    }
+
+    private void UpdatePendingLeftInventoryPlacement(InputState input)
+    {
+        if (!_pendingLeftInventoryPlacement)
+            return;
+
+        if (IsInventoryPlacementBlocked())
+        {
+            ClearPendingLeftInventoryPlacement();
+            return;
+        }
+
+        if (!_inventoryHasHeld || _inventoryHeld.Id == BlockId.Air || _inventoryHeld.Count <= 0)
+        {
+            ClearPendingLeftInventoryPlacement();
+            return;
+        }
+
+        if (!input.IsLeftDown())
+        {
+            ApplyFullPendingLeftInventoryPlacement();
+            ClearPendingLeftInventoryPlacement();
+            return;
+        }
+
+        var p = input.MousePosition;
+        var dx = p.X - _pendingLeftInventoryPlacementPoint.X;
+        var dy = p.Y - _pendingLeftInventoryPlacementPoint.Y;
+        if ((dx * dx) + (dy * dy) < 9)
+            return;
+
+        ApplyOnePendingLeftInventoryPlacement();
+        MarkLeftInventoryDragSlot(_pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex);
+        _lastInventoryDragGroup = _pendingLeftInventoryPlacementGroup;
+        _lastInventoryDragIndex = _pendingLeftInventoryPlacementIndex;
+        _lastInventoryDragWasRight = false;
+        ClearPendingLeftInventoryPlacement();
+    }
+
+    private void ApplyFullPendingLeftInventoryPlacement()
+    {
+        if (!TryGetInventorySlotValue(_pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex, out var slot))
+            return;
+
+        HandleInventorySlotClick(ref slot, _pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex, sandboxCatalogMode: false);
+        SetInventoryDragSlotValue(_pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex, slot);
+        if (_artificerBenchGuiOpen && _pendingLeftInventoryPlacementGroup == InventorySlotGroup.ArtificerBenchCraft)
+            SaveActiveArtificerBenchStorage();
+    }
+
+    private void ApplyOnePendingLeftInventoryPlacement()
+    {
+        if (!TryGetInventorySlotValue(_pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex, out var slot))
+            return;
+
+        PlaceOneHeldItemIntoSlot(ref slot);
+        SetInventoryDragSlotValue(_pendingLeftInventoryPlacementGroup, _pendingLeftInventoryPlacementIndex, slot);
+        if (_artificerBenchGuiOpen && _pendingLeftInventoryPlacementGroup == InventorySlotGroup.ArtificerBenchCraft)
+            SaveActiveArtificerBenchStorage();
+    }
+
+    private void ClearPendingLeftInventoryPlacement()
+    {
+        _pendingLeftInventoryPlacement = false;
+        _pendingLeftInventoryPlacementGroup = InventorySlotGroup.None;
+        _pendingLeftInventoryPlacementIndex = -1;
+        _pendingLeftInventoryPlacementPoint = Point.Zero;
+    }
+
+    private void PlaceOneHeldItemIntoSlot(ref HotbarSlot slot)
+    {
+        if (!CanPlaceHeldItemIntoSlot(slot))
+            return;
+
+        var max = _inventory.GetMaxStackSize(_inventoryHeld.Id);
+        if (slot.Id == BlockId.Air || slot.Count <= 0)
+            slot = new HotbarSlot { Id = _inventoryHeld.Id, Count = 0 };
+
+        var move = Math.Min(1, Math.Min(max - slot.Count, _inventoryHeld.Count));
+        if (move <= 0)
+            return;
+
+        slot.Count += move;
+        _inventoryHeld.Count -= move;
+        if (_inventoryHeld.Count <= 0)
+        {
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+        }
+    }
+
+    private bool LeftInventoryDragContains(InventorySlotGroup group, int index)
+    {
+        for (var i = 0; i < _leftInventoryDragSlots.Count; i++)
+        {
+            var slot = _leftInventoryDragSlots[i];
+            if (slot.Group == group && slot.Index == index)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void MarkLeftInventoryDragSlot(InventorySlotGroup group, int index)
+    {
+        if (!LeftInventoryDragContains(group, index))
+            _leftInventoryDragSlots.Add(new InventoryDragSlotKey(group, index));
+    }
+
+    private void SweepInventoryLeftDrag(Point from, Point to, InputState input)
+    {
+        if (!input.IsLeftDown()
+            || input.IsNewLeftClick()
+            || _pendingLeftInventoryPlacement
+            || IsInventoryPlacementBlocked()
+            || !_inventoryHasHeld
+            || _inventoryHeld.Id == BlockId.Air
+            || _inventoryHeld.Count <= 0)
+        {
+            return;
+        }
+
+        if (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Catalog)
+            return;
+
+        ResetRightInventoryDragDistribution();
+
+        var dx = to.X - from.X;
+        var dy = to.Y - from.Y;
+        var distance = MathF.Sqrt((dx * dx) + (dy * dy));
+        var steps = Math.Max(1, (int)MathF.Ceiling(distance / 6f));
+
+        for (var step = 0; step <= steps; step++)
+        {
+            if (!_inventoryHasHeld || _inventoryHeld.Count <= 0)
+                break;
+
+            var t = steps == 0 ? 1f : step / (float)steps;
+            var point = new Point(
+                (int)MathF.Round(from.X + dx * t),
+                (int)MathF.Round(from.Y + dy * t));
+
+            if (!TryGetInventorySlotAtPoint(point, out var group, out var index))
+                continue;
+
+            if (group == _heldFrom && index == _heldIndex)
+                continue;
+            if (LeftInventoryDragContains(group, index))
+                continue;
+            if (!TryGetInventorySlotValue(group, index, out var slot))
+                continue;
+
+            PlaceOneHeldItemIntoSlot(ref slot);
+            SetInventoryDragSlotValue(group, index, slot);
+            MarkLeftInventoryDragSlot(group, index);
+            _lastInventoryDragGroup = group;
+            _lastInventoryDragIndex = index;
+            _lastInventoryDragWasRight = false;
+
+            if (_artificerBenchGuiOpen && group == InventorySlotGroup.ArtificerBenchCraft)
+                SaveActiveArtificerBenchStorage();
+            if (_kilnGuiOpen && group == InventorySlotGroup.Kiln)
+                SaveActiveKilnInventory();
+        }
+    }
+
+    private bool TryGetInventorySlotAtPoint(Point point, out InventorySlotGroup group, out int index)
+    {
+        group = InventorySlotGroup.None;
+        index = -1;
+
+        if (_artificerBenchGuiOpen)
+        {
+            for (var i = 0; i < _artificerBenchCraftSlots.Length; i++)
+            {
+                if (_artificerBenchCraftSlots[i].Contains(point))
+                {
+                    group = InventorySlotGroup.ArtificerBenchCraft;
+                    index = i;
+                    return true;
+                }
+            }
+        }
+
+        if (_kilnGuiOpen)
+        {
+            for (var i = 0; i < _kilnSlots.Length; i++)
+            {
+                if (_kilnSlots[i].Contains(point))
+                {
+                    group = InventorySlotGroup.Kiln;
+                    index = i;
+                    return true;
+                }
+            }
+        }
+
+        if (IsTrashInventoryView())
+        {
+            for (var i = 0; i < _trashInventorySlots.Length; i++)
+            {
+                if (_trashInventorySlots[i].Contains(point))
+                {
+                    group = InventorySlotGroup.Trash;
+                    index = i;
+                    return true;
+                }
+            }
+
+            for (var i = 0; i < _trashPlayerSlots.Length; i++)
+            {
+                if (_trashPlayerSlots[i].Contains(point))
+                {
+                    group = InventorySlotGroup.Grid;
+                    index = i;
+                    return true;
+                }
+            }
+        }
+
+        for (var i = 0; i < _inventoryGridSlots.Length; i++)
+        {
+            if (_inventoryGridSlots[i].Contains(point))
+            {
+                group = InventorySlotGroup.Grid;
+                index = i;
+                return true;
+            }
+        }
+
+        for (var i = 0; i < _hotbarSlots.Length; i++)
+        {
+            if (_hotbarSlots[i].Contains(point))
+            {
+                group = InventorySlotGroup.Hotbar;
+                index = i;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void HandleInventorySlotClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
@@ -7743,6 +13050,27 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        if (slot.Id == _inventoryHeld.Id && slot.Count > 0)
+        {
+            var max = _inventory.GetMaxStackSize(slot.Id);
+            var space = Math.Max(0, max - slot.Count);
+            if (space > 0)
+            {
+                var move = Math.Min(space, _inventoryHeld.Count);
+                slot.Count += move;
+                _inventoryHeld.Count -= move;
+                if (_inventoryHeld.Count <= 0)
+                {
+                    _inventoryHeld = default;
+                    _inventoryHasHeld = false;
+                    _heldFrom = InventorySlotGroup.None;
+                    _heldIndex = -1;
+                }
+            }
+
+            return;
+        }
+
         var temp = slot;
         slot = _inventoryHeld;
         _inventoryHeld = temp;
@@ -7761,8 +13089,268 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         // Non-artificer mode keeps standard move/swap behavior.
     }
 
+    private bool TryHandleInventorySlotDrag(ref HotbarSlot slot, InventorySlotGroup group, int index, InputState input, bool sandboxCatalogMode)
+    {
+        var rightDrag = input.IsRightDown() && !input.IsNewRightClick();
+        var leftDrag = input.IsLeftDown() && !input.IsNewLeftClick();
+        if (!rightDrag && !leftDrag)
+            return false;
+
+        if (leftDrag && IsInventoryPlacementBlocked())
+            return true;
+
+        if (leftDrag && _pendingLeftInventoryPlacement)
+            return true;
+
+        var activeRightDistribution = rightDrag
+            && !sandboxCatalogMode
+            && _rightInventoryDragItemId != BlockId.Air
+            && _rightInventoryDragTotal > 0;
+        if ((!_inventoryHasHeld || _inventoryHeld.Id == BlockId.Air || _inventoryHeld.Count <= 0) && !activeRightDistribution)
+            return false;
+
+        if (leftDrag)
+            ResetRightInventoryDragDistribution();
+
+        if (group == _heldFrom && index == _heldIndex)
+            return true;
+
+        if (_lastInventoryDragGroup == group
+            && _lastInventoryDragIndex == index
+            && _lastInventoryDragWasRight == rightDrag)
+        {
+            return true;
+        }
+
+        _lastInventoryDragGroup = group;
+        _lastInventoryDragIndex = index;
+        _lastInventoryDragWasRight = rightDrag;
+
+        if (rightDrag && !sandboxCatalogMode)
+            return TryHandleRightInventorySlotDragDistribution(ref slot, group, index);
+
+        if (leftDrag && LeftInventoryDragContains(group, index))
+            return true;
+
+        PlaceOneHeldItemIntoSlot(ref slot);
+        if (leftDrag)
+            MarkLeftInventoryDragSlot(group, index);
+        if (!_inventoryHasHeld)
+        {
+            _lastInventoryDragGroup = InventorySlotGroup.None;
+            _lastInventoryDragIndex = -1;
+            ResetRightInventoryDragDistribution();
+        }
+
+        return true;
+    }
+
+    private bool TryHandleRightInventorySlotDragDistribution(ref HotbarSlot slot, InventorySlotGroup group, int index)
+    {
+        if (_rightInventoryDragItemId != _inventoryHeld.Id || _rightInventoryDragTotal <= 0)
+            BeginRightInventoryDragDistribution(group, index, GetSlotBaseCountForDistribution(slot), _inventoryHeld.Count);
+
+        if (slot.Id != BlockId.Air && slot.Id != _inventoryHeld.Id)
+            return true;
+
+        var max = _inventory.GetMaxStackSize(_inventoryHeld.Id);
+        var baseCount = GetSlotBaseCountForDistribution(slot);
+        if (baseCount >= max)
+            return true;
+
+        if (!RightInventoryDragContains(group, index))
+            _rightInventoryDragSlots.Add(new InventoryDragDistributionSlot(group, index, baseCount));
+
+        if (_rightInventoryDragSlots.Count < 2)
+            return true;
+
+        ApplyRightInventoryDragDistribution();
+        return true;
+    }
+
+    private int GetSlotBaseCountForDistribution(HotbarSlot slot)
+    {
+        if (slot.Id == _inventoryHeld.Id && slot.Count > 0)
+            return slot.Count;
+
+        return 0;
+    }
+
+    private void BeginRightInventoryDragDistribution(InventorySlotGroup group, int index, int baseCount, int totalAvailable)
+    {
+        _rightInventoryDragSlots.Clear();
+        _rightInventoryDragItemId = _inventoryHeld.Id;
+        _rightInventoryDragTotal = Math.Max(0, totalAvailable);
+
+        if (_rightInventoryDragItemId != BlockId.Air && _rightInventoryDragTotal > 0)
+            _rightInventoryDragSlots.Add(new InventoryDragDistributionSlot(group, index, baseCount));
+    }
+
+    private bool RightInventoryDragContains(InventorySlotGroup group, int index)
+    {
+        for (var i = 0; i < _rightInventoryDragSlots.Count; i++)
+        {
+            var slot = _rightInventoryDragSlots[i];
+            if (slot.Group == group && slot.Index == index)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void ApplyRightInventoryDragDistribution()
+    {
+        if (_rightInventoryDragItemId == BlockId.Air || _rightInventoryDragTotal <= 0 || _rightInventoryDragSlots.Count == 0)
+            return;
+
+        var max = _inventory.GetMaxStackSize(_rightInventoryDragItemId);
+        var assigned = new int[_rightInventoryDragSlots.Count];
+        var remaining = _rightInventoryDragTotal;
+
+        while (remaining > 0)
+        {
+            var activeCount = 0;
+            for (var i = 0; i < _rightInventoryDragSlots.Count; i++)
+            {
+                var capacity = Math.Max(0, max - _rightInventoryDragSlots[i].BaseCount);
+                if (assigned[i] < capacity)
+                    activeCount++;
+            }
+
+            if (activeCount <= 0)
+                break;
+
+            var share = remaining / activeCount;
+            var extra = remaining % activeCount;
+            var movedThisPass = 0;
+
+            for (var i = 0; i < _rightInventoryDragSlots.Count && remaining > 0; i++)
+            {
+                var capacity = Math.Max(0, max - _rightInventoryDragSlots[i].BaseCount);
+                if (assigned[i] >= capacity)
+                    continue;
+
+                var target = share;
+                if (extra > 0)
+                {
+                    target++;
+                    extra--;
+                }
+
+                if (target <= 0)
+                    target = 1;
+
+                var move = Math.Min(target, capacity - assigned[i]);
+                assigned[i] += move;
+                remaining -= move;
+                movedThisPass += move;
+            }
+
+            if (movedThisPass <= 0)
+                break;
+        }
+
+        var placed = 0;
+        for (var i = 0; i < _rightInventoryDragSlots.Count; i++)
+        {
+            var dragSlot = _rightInventoryDragSlots[i];
+            var count = dragSlot.BaseCount + assigned[i];
+            var value = count > 0
+                ? new HotbarSlot { Id = _rightInventoryDragItemId, Count = count }
+                : default;
+            SetInventoryDragSlotValue(dragSlot.Group, dragSlot.Index, value);
+            placed += assigned[i];
+        }
+
+        _inventoryHeld.Count = Math.Max(0, _rightInventoryDragTotal - placed);
+        _inventoryHeld.Id = _rightInventoryDragItemId;
+        _inventoryHasHeld = true;
+    }
+
+    private void SetInventoryDragSlotValue(InventorySlotGroup group, int index, HotbarSlot value)
+    {
+        switch (group)
+        {
+            case InventorySlotGroup.Grid:
+                if (index >= 0 && index < _inventory.Grid.Length)
+                    _inventory.Grid[index] = value;
+                break;
+            case InventorySlotGroup.Hotbar:
+                if (index >= 0 && index < _inventory.Hotbar.Length)
+                    _inventory.Hotbar[index] = value;
+                break;
+            case InventorySlotGroup.Trash:
+                if (index >= 0 && index < _trashInventory.Length)
+                    _trashInventory[index] = value;
+                break;
+            case InventorySlotGroup.ArtificerBenchCraft:
+                if (index >= 0 && index < _artificerBenchCraftGrid.Length)
+                    _artificerBenchCraftGrid[index] = value;
+                break;
+            case InventorySlotGroup.Kiln:
+                if (index >= 0 && index < _kilnInventory.Length)
+                    _kilnInventory[index] = value;
+                break;
+        }
+    }
+
+    private bool TryGetInventorySlotValue(InventorySlotGroup group, int index, out HotbarSlot value)
+    {
+        value = default;
+        switch (group)
+        {
+            case InventorySlotGroup.Grid:
+                if (index >= 0 && index < _inventory.Grid.Length)
+                {
+                    value = _inventory.Grid[index];
+                    return true;
+                }
+                break;
+            case InventorySlotGroup.Hotbar:
+                if (index >= 0 && index < _inventory.Hotbar.Length)
+                {
+                    value = _inventory.Hotbar[index];
+                    return true;
+                }
+                break;
+            case InventorySlotGroup.Trash:
+                if (index >= 0 && index < _trashInventory.Length)
+                {
+                    value = _trashInventory[index];
+                    return true;
+                }
+                break;
+            case InventorySlotGroup.ArtificerBenchCraft:
+                if (index >= 0 && index < _artificerBenchCraftGrid.Length)
+                {
+                    value = _artificerBenchCraftGrid[index];
+                    return true;
+                }
+                break;
+            case InventorySlotGroup.Kiln:
+                if (index >= 0 && index < _kilnInventory.Length)
+                {
+                    value = _kilnInventory[index];
+                    return true;
+                }
+                break;
+        }
+
+        return false;
+    }
+
+    private void ResetRightInventoryDragDistribution()
+    {
+        _rightInventoryDragSlots.Clear();
+        _rightInventoryDragItemId = BlockId.Air;
+        _rightInventoryDragTotal = 0;
+    }
+
     private void HandleInventorySlotRightClick(ref HotbarSlot slot, InventorySlotGroup group, int index, bool sandboxCatalogMode)
     {
+        if (sandboxCatalogMode && _inventoryHasHeld)
+            sandboxCatalogMode = false;
+
         if (sandboxCatalogMode)
         {
             HandleSandboxInventoryRightClick(ref slot, group, index);
@@ -7781,8 +13369,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (slot.Id == BlockId.Air || slot.Count <= 0)
                 slot = new HotbarSlot { Id = _inventoryHeld.Id, Count = 0 };
 
+            BeginRightInventoryDragDistribution(group, index, slot.Count, _inventoryHeld.Count);
             slot.Count++;
             _inventoryHeld.Count--;
+            _lastInventoryDragGroup = group;
+            _lastInventoryDragIndex = index;
+            _lastInventoryDragWasRight = true;
             if (_inventoryHeld.Count <= 0)
             {
                 _inventoryHeld = default;
@@ -7801,6 +13393,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _inventoryHasHeld = true;
         _heldFrom = group;
         _heldIndex = index;
+        ResetRightInventoryDragDistribution();
         slot.Count -= take;
         if (slot.Count <= 0)
             slot = default;
@@ -7857,6 +13450,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
     private void HandleSandboxInventoryRightClick(ref HotbarSlot slot, InventorySlotGroup group, int index)
     {
+        if (group != InventorySlotGroup.Grid)
+        {
+            HandleInventorySlotRightClick(ref slot, group, index, sandboxCatalogMode: false);
+            return;
+        }
+
         if (group == InventorySlotGroup.Grid)
         {
             if (slot.Count <= 0 || slot.Id == BlockId.Air)
@@ -7879,6 +13478,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 return;
 
             slot.Count++;
+            _lastInventoryDragGroup = group;
+            _lastInventoryDragIndex = index;
+            _lastInventoryDragWasRight = true;
             ClampSandboxSlot(ref slot);
             return;
         }
@@ -7932,23 +13534,75 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         return _inventoryHasHeld && _inventoryHeld.Id == id && _inventoryHeld.Count > 0;
     }
 
+    private bool IsTrashInventoryView() =>
+        _trashGuiOpen || (_gameMode == GameMode.Artificer && _artificerInventoryView == ArtificerInventoryView.Trash);
+
     private enum InventorySlotGroup
     {
         None,
         Grid,
         Hotbar,
+        Trash,
         SoulHotbar,
-        SoulGrid
+        SoulGrid,
+        ArtificerBenchCraft,
+        Kiln
+    }
+
+    private readonly struct InventoryDragDistributionSlot
+    {
+        public InventoryDragDistributionSlot(InventorySlotGroup group, int index, int baseCount)
+        {
+            Group = group;
+            Index = index;
+            BaseCount = baseCount;
+        }
+
+        public InventorySlotGroup Group { get; }
+        public int Index { get; }
+        public int BaseCount { get; }
+    }
+
+    private readonly struct InventoryDragSlotKey
+    {
+        public InventoryDragSlotKey(InventorySlotGroup group, int index)
+        {
+            Group = group;
+            Index = index;
+        }
+
+        public InventorySlotGroup Group { get; }
+        public int Index { get; }
+    }
+
+    private readonly struct BenchRecipeRequirement
+    {
+        public BenchRecipeRequirement(int slotIndex, HandCraftingIngredient ingredient)
+        {
+            SlotIndex = slotIndex;
+            Ingredient = ingredient;
+        }
+
+        public int SlotIndex { get; }
+        public HandCraftingIngredient Ingredient { get; }
     }
 
     private enum ArtificerInventoryView
     {
         Catalog,
-        Inventory
+        Inventory,
+        Trash
+    }
+
+    private enum SurvivalInventoryView
+    {
+        Inventory,
+        Crafting
     }
 
     private ArtificerInventoryView _artificerInventoryView = ArtificerInventoryView.Catalog;
     private ArtificerInventoryView _lastArtificerInventoryView = ArtificerInventoryView.Catalog;
+    private SurvivalInventoryView _survivalInventoryView = SurvivalInventoryView.Inventory;
 
     private void DrawHotbar(SpriteBatch sb)
     {
@@ -7995,16 +13649,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var slotId = i < (hotbarIds?.Length ?? 0) ? (BlockId)hotbarIds![i] : BlockId.Air;
             var slotCount = i < (hotbarCounts?.Length ?? 0) ? hotbarCounts![i] : 0;
-            if (slotCount > 0 && slotId != BlockId.Air && _atlas != null)
+            if (slotCount > 0 && slotId != BlockId.Air)
             {
-                var src = _atlas.GetFaceSourceRect((byte)slotId, FaceDirection.PosY);
                 var pad = 6;
                 var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
-                var icon = GetBlockIcon(slotId, dst.Width);
-                if (icon != null)
-                    sb.Draw(icon, dst, Color.White);
-                else
-                    sb.Draw(_atlas.Texture, dst, src, Color.White);
+                DrawItemIcon(sb, slotId, dst);
             }
 
             if (slotCount > 1)
@@ -8154,6 +13803,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
 
         var p = _inventoryMousePos;
+        ClearInventoryHoverTooltip();
         var viewedSoulInventory = GetViewedSoulInventory();
         for (var i = 0; i < _soulLootSoulHotbarSlots.Length; i++)
         {
@@ -8162,7 +13812,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var slot = i < viewedSoulInventory.Length ? viewedSoulInventory[i] : default;
             if (slot.Id != BlockId.Air && slot.Count > 0)
-                SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                SetInventoryHoverTooltip(slot.Id);
             break;
         }
 
@@ -8173,7 +13823,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var slot = Inventory.HotbarSize + i < viewedSoulInventory.Length ? viewedSoulInventory[Inventory.HotbarSize + i] : default;
             if (slot.Id != BlockId.Air && slot.Count > 0)
-                SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                SetInventoryHoverTooltip(slot.Id);
             break;
         }
 
@@ -8184,7 +13834,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var slot = _inventory.Grid[i];
             if (slot.Id != BlockId.Air && slot.Count > 0)
-                SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                SetInventoryHoverTooltip(slot.Id);
             break;
         }
 
@@ -8195,7 +13845,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
             var slot = _inventory.Hotbar[i];
             if (slot.Id != BlockId.Air && slot.Count > 0)
-                SetDisplayName(BlockRegistry.Get(slot.Id).Name);
+                SetInventoryHoverTooltip(slot.Id);
             break;
         }
 
@@ -8371,6 +14021,59 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             fillFromRight: false);
         var hungerRect = new Rectangle(rightStartX, top, hungerClusterWidth, hungerSegmentHeight);
         DrawSurvivalHoverLabel(sb, hungerRect, "HUNGER", hunger, SurvivalVitals.MaxHunger);
+    }
+
+    private void DrawSigilHudOverlay(SpriteBatch sb)
+    {
+        if (!TryGetObservedVitals(out _, out _, out var sigilAtonement, out var sigilCurse)
+            || !TryGetSigilHudRect(out var sigilRect))
+            return;
+
+        sb.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend, transformMatrix: UiLayout.Transform);
+        DrawSigilMeter(sb, sigilRect, sigilAtonement, sigilCurse);
+        DrawSigilHoverLabel(sb, sigilRect, sigilAtonement, sigilCurse);
+        sb.End();
+    }
+
+    private void DrawPinnedHandCraftRecipesHud(SpriteBatch sb)
+    {
+        if (_pinnedHandCraftRecipes.Count == 0 || _inventoryOpen || _pauseMenuOpen || _survivalRespawnPending)
+            return;
+
+        var recipes = HandCraftingRecipes.All
+            .Where(recipe => _pinnedHandCraftRecipes.Contains(recipe.Id))
+            .Take(MaxVisiblePinnedHandCraftRecipes)
+            .ToList();
+        if (recipes.Count == 0)
+            return;
+
+        var width = 300;
+        var rowH = 46;
+        var pad = 10;
+        var panel = new Rectangle(_viewport.X + 18, _viewport.Y + 18, width, pad * 2 + recipes.Count * rowH);
+        sb.Draw(_pixel, panel, new Color(8, 10, 16, 175));
+        DrawBorder(sb, panel, new Color(190, 198, 210, 150));
+
+        for (var i = 0; i < recipes.Count; i++)
+        {
+            var recipe = recipes[i];
+            var row = new Rectangle(panel.X + pad, panel.Y + pad + i * rowH, panel.Width - pad * 2, rowH - 4);
+            var ingredient = recipe.Ingredients.Count > 0 ? recipe.Ingredients[0] : null;
+            var have = ingredient == null ? 0 : CountHandCraftIngredient(ingredient);
+            var complete = ingredient != null && have >= ingredient.Count;
+            var iconRect = new Rectangle(row.X, row.Y + 4, 32, 32);
+            DrawItemIcon(sb, recipe.OutputId, iconRect);
+            _font.DrawString(
+                sb,
+                TrimTextToWidth(recipe.Name.ToUpperInvariant(), row.Width - 44),
+                new Vector2(iconRect.Right + 8, row.Y + 2),
+                Color.White);
+            _font.DrawString(
+                sb,
+                TrimTextToWidth($"{ingredient?.DisplayName ?? "Item"} {Math.Min(have, ingredient?.Count ?? 0)}/{ingredient?.Count ?? 0}", row.Width - 44),
+                new Vector2(iconRect.Right + 8, row.Y + 22),
+                complete ? new Color(180, 238, 178) : new Color(255, 170, 150));
+        }
     }
 
     private Color GetHungerEmptyColor(int hunger)
@@ -9098,6 +14801,67 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
     }
 
+    private void DrawUnderwaterOverlay(SpriteBatch sb)
+    {
+        if (!IsCameraUnderwater())
+            return;
+
+        var rect = new Rectangle(_viewport.X, _viewport.Y, _viewport.Width, _viewport.Height);
+        var pulse = (MathF.Sin(_worldTimeSeconds * 1.35f) + 1f) * 0.5f;
+        sb.Draw(_pixel, rect, new Color(9, 46, 68, 18));
+        sb.Draw(_pixel, rect, new Color(0, 20, 34, (int)MathF.Round(4 + pulse * 3)));
+
+        var bandAlpha = (int)MathF.Round(5 + pulse * 3);
+        var bandHeight = Math.Max(8, _viewport.Height / 44);
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, rect.Width, Math.Min(bandHeight, rect.Height)), new Color(132, 210, 235, bandAlpha));
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Bottom - Math.Min(bandHeight, rect.Height), rect.Width, Math.Min(bandHeight, rect.Height)), new Color(7, 28, 44, bandAlpha));
+
+        var sideWidth = Math.Max(10, _viewport.Width / 80);
+        sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, sideWidth, rect.Height), new Color(5, 28, 46, 8));
+        sb.Draw(_pixel, new Rectangle(rect.Right - sideWidth, rect.Y, sideWidth, rect.Height), new Color(5, 28, 46, 8));
+    }
+
+    private bool IsCameraUnderwater()
+    {
+        if (_world == null)
+            return false;
+
+        var p = _cameraPosition;
+        return BlockIds.IsWater(_world.GetBlock((int)MathF.Floor(p.X), (int)MathF.Floor(p.Y), (int)MathF.Floor(p.Z)))
+            || _player.IsHeadInWater(_world.GetBlock);
+    }
+
+    private bool IsLocalPlayerFullyUnderwater()
+    {
+        return _world != null && _player.IsFullyUnderwater(_world.GetBlock);
+    }
+
+    private bool IsPositionInWater(Vector3 position)
+    {
+        if (_world == null)
+            return false;
+
+        var x = (int)MathF.Floor(position.X);
+        var z = (int)MathF.Floor(position.Z);
+        var feetY = (int)MathF.Floor(position.Y + 0.15f);
+        var bodyY = (int)MathF.Floor(position.Y + 0.85f);
+        return BlockIds.IsWater(_world.GetBlock(x, feetY, z))
+            || BlockIds.IsWater(_world.GetBlock(x, bodyY, z));
+    }
+
+    private bool IsPositionFullyUnderwater(Vector3 position)
+    {
+        if (_world == null)
+            return false;
+
+        var x = (int)MathF.Floor(position.X);
+        var z = (int)MathF.Floor(position.Z);
+        var lowerY = (int)MathF.Floor(position.Y + 0.20f);
+        var upperY = (int)MathF.Floor(position.Y + Scale.PlayerHeight - 0.16f);
+        return BlockIds.IsWater(_world.GetBlock(x, lowerY, z))
+            && BlockIds.IsWater(_world.GetBlock(x, upperY, z));
+    }
+
     private float GetDamageCameraKickAmount()
     {
         if (_damageCameraKickTimer <= 0f || _damageCameraKickStrength <= 0f)
@@ -9236,7 +15000,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             // Skip Veilseer players (hidden from nametags)
             if (ShouldHideRemotePlayerFromLocal(pair.Key))
                 continue;
-                
+
             var name = ResolvePlayerName(pair.Key);
             if (string.IsNullOrWhiteSpace(name))
                 continue;
@@ -9525,29 +15289,55 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        var isLiveView = HasActiveRemoteInventoryView();
+        var showSurvivalTabs = _gameMode != GameMode.Artificer && !isLiveView;
+        var showArtificerTabs = _gameMode == GameMode.Artificer && !isLiveView;
+        var isArtificerInventoryView = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Inventory;
+        var isTrashView = IsTrashInventoryView();
+        var isHandCraftingView = showSurvivalTabs && _survivalInventoryView == SurvivalInventoryView.Crafting;
+        var shouldRenderCharacterPreview = ((showSurvivalTabs && _survivalInventoryView == SurvivalInventoryView.Inventory) || isArtificerInventoryView || isTrashView)
+            && _inventoryCharacterPanelRect.Width > 0
+            && _inventoryCharacterPanelRect.Height > 0
+            && _inventoryPlayerPreviewRect.Width > 0
+            && _inventoryPlayerPreviewRect.Height > 0;
+
         sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
         if (_pausePanel != null)
             sb.Draw(_pausePanel, _inventoryPanelVisualRect, Color.White);
         else
             sb.Draw(_pixel, _inventoryPanelVisualRect, new Color(8, 12, 22, 220));
 
-        var isLiveView = HasActiveRemoteInventoryView();
-
-        var tabsVisible = _gameMode == GameMode.Artificer && !isLiveView;
-        var isArtificerCatalog = tabsVisible && _artificerInventoryView == ArtificerInventoryView.Catalog;
+        var tabsVisible = (showArtificerTabs || showSurvivalTabs) && !_artificerBenchGuiOpen && !_kilnGuiOpen && !_trashGuiOpen;
+        var isArtificerCatalog = showArtificerTabs && _artificerInventoryView == ArtificerInventoryView.Catalog;
 
         if (tabsVisible)
         {
-            sb.Draw(_pixel, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
-            sb.Draw(_pixel, _inventoryStorageTabRect, isArtificerCatalog ? new Color(20, 20, 20, 180) : new Color(42, 66, 98, 235));
-            DrawBorder(sb, _inventoryCatalogTabRect, isArtificerCatalog ? new Color(200, 225, 255) : new Color(120, 120, 120));
-            DrawBorder(sb, _inventoryStorageTabRect, isArtificerCatalog ? new Color(120, 120, 120) : new Color(200, 225, 255));
-            _font.DrawString(sb, "CATALOG", new Vector2(_inventoryCatalogTabRect.X + 16, _inventoryCatalogTabRect.Y + 6), Color.White);
-            _font.DrawString(sb, "INVENTORY", new Vector2(_inventoryStorageTabRect.X + 8, _inventoryStorageTabRect.Y + 6), Color.White);
+            var firstTabActive = showArtificerTabs
+                ? isArtificerCatalog
+                : _survivalInventoryView == SurvivalInventoryView.Inventory;
+            var secondTabActive = showArtificerTabs
+                ? _artificerInventoryView == ArtificerInventoryView.Inventory
+                : _survivalInventoryView == SurvivalInventoryView.Crafting;
+            var firstLabel = showArtificerTabs ? "CATALOG" : "INVENTORY";
+            var secondLabel = showArtificerTabs ? "INVENTORY" : "CRAFTING";
+
+            sb.Draw(_pixel, _inventoryCatalogTabRect, firstTabActive ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
+            sb.Draw(_pixel, _inventoryStorageTabRect, secondTabActive ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
+            DrawBorder(sb, _inventoryCatalogTabRect, firstTabActive ? new Color(200, 225, 255) : new Color(120, 120, 120));
+            DrawBorder(sb, _inventoryStorageTabRect, secondTabActive ? new Color(200, 225, 255) : new Color(120, 120, 120));
+            _font.DrawString(sb, firstLabel, new Vector2(_inventoryCatalogTabRect.X + 12, _inventoryCatalogTabRect.Y + 6), Color.White);
+            _font.DrawString(sb, secondLabel, new Vector2(_inventoryStorageTabRect.X + 12, _inventoryStorageTabRect.Y + 6), Color.White);
+            if (showArtificerTabs && _inventoryTrashTabRect.Width > 0)
+            {
+                var trashActive = _artificerInventoryView == ArtificerInventoryView.Trash;
+                sb.Draw(_pixel, _inventoryTrashTabRect, trashActive ? new Color(42, 66, 98, 235) : new Color(20, 20, 20, 180));
+                DrawBorder(sb, _inventoryTrashTabRect, trashActive ? new Color(200, 225, 255) : new Color(120, 120, 120));
+                _font.DrawString(sb, "TRASH", new Vector2(_inventoryTrashTabRect.X + 12, _inventoryTrashTabRect.Y + 6), Color.White);
+            }
         }
 
         var titleY = _inventoryRect.Y + InventoryPadding + (tabsVisible ? InventoryTabHeight + 8 : 6);
-        var title = isArtificerCatalog ? "ARTIFICER CATALOG" : "INVENTORY";
+        var title = isTrashView ? "TRASH" : isArtificerCatalog ? "ARTIFICER CATALOG" : isHandCraftingView ? (_artificerBenchGuiOpen ? "ARTIFICER BENCH" : _kilnGuiOpen ? GetActiveKilnTitle() : "HAND CRAFTING") : "INVENTORY";
         if (isLiveView)
         {
             var targetName = ResolvePlayerName(_currentLiveInventoryTarget);
@@ -9556,14 +15346,50 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             tabsVisible = false;
             isArtificerCatalog = false;
         }
-        
-        _font.DrawString(sb, title, new Vector2(_inventoryRect.X + InventoryPadding + 2, titleY), Color.White);
-        if (isArtificerCatalog)
+
+        if (_artificerBenchGuiOpen)
+        {
+            const int benchTitleScale = 4;
+            var titleSize = _font.MeasureString(title, benchTitleScale);
+            var titlePos = new Vector2(_inventoryRect.Center.X - titleSize.X * 0.5f, titleY - 3);
+            _font.DrawString(sb, title, titlePos + new Vector2(2, 2), new Color(0, 0, 0, 150), benchTitleScale);
+            _font.DrawString(sb, title, titlePos + new Vector2(1, 0), Color.White, benchTitleScale);
+            _font.DrawString(sb, title, titlePos, Color.White, benchTitleScale);
+        }
+        else
+        {
+            _font.DrawString(sb, title, new Vector2(_inventoryRect.X + InventoryPadding + 2, titleY), Color.White);
+        }
+        if (isTrashView)
+        {
+            DrawTrashInventoryPanel(sb);
+        }
+        else if (isArtificerCatalog)
         {
             var shownText = $"Showing {_inventory.GetSandboxCatalogFilteredCount()} of {_inventory.GetSandboxCatalogTotalCount()}";
             var shownSize = _font.MeasureString(shownText);
             _font.DrawString(sb, shownText, new Vector2(_inventoryRect.Right - shownSize.X - 20, titleY), new Color(205, 220, 255));
             DrawInventoryCatalogPanel(sb);
+        }
+        else if (isHandCraftingView)
+        {
+            _font.DrawString(
+                sb,
+                "YOUR INVENTORY",
+                new Vector2(_handCraftInventoryRect.X, _handCraftInventoryRect.Y - _font.LineHeight - 6),
+                new Color(205, 215, 226));
+            DrawInventorySlots(sb, _inventory.Grid, _inventoryGridSlots);
+            if (_artificerBenchGuiOpen)
+            {
+                DrawArtificerBenchCraftingGrid(sb, _handCraftDetailsRect);
+                DrawArtificerBenchHandCraftBar(sb);
+            }
+            else if (_kilnGuiOpen)
+            {
+                DrawKilnPanel(sb);
+            }
+            else
+                DrawHandCraftingPanel(sb);
         }
         else
         {
@@ -9574,31 +15400,846 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
             else
             {
+                if ((showSurvivalTabs && _survivalInventoryView == SurvivalInventoryView.Inventory) || isArtificerInventoryView)
+                {
+                    DrawInventoryCharacterPanel(sb);
+                }
                 DrawInventorySlots(sb, _inventory.Grid, _inventoryGridSlots);
             }
         }
 
         // Only show clear button when not viewing live inventory
-        if (!isLiveView && _inventoryClear.Visible)
+        if (!isLiveView && !isTrashView && _inventoryClear.Visible)
             _inventoryClear.Draw(sb, _pixel, _font);
+        if (!isLiveView && !isTrashView && _inventoryDispose.Visible)
+            _inventoryDispose.Draw(sb, _pixel, _font);
         _inventoryClose.Draw(sb, _pixel, _font);
+        sb.End();
 
-        if (_inventoryHasHeld && _atlas != null)
+        if (shouldRenderCharacterPreview)
+            RenderInventoryPlayerPreview(sb.GraphicsDevice);
+
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+        if (_inventoryHasHeld)
         {
             var size = _inventoryGridSlots.Length > 0 ? _inventoryGridSlots[0].Width : 40;
             var scale = 1.15f;
             var scaled = (int)MathF.Round(size * scale);
             var dst = new Rectangle(_inventoryMousePos.X - scaled / 2, _inventoryMousePos.Y - scaled / 2, scaled, scaled);
-            var icon = GetBlockIcon(_inventoryHeld.Id, dst.Width);
-            if (icon != null)
-                sb.Draw(icon, dst, Color.White);
-            else
-                sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)_inventoryHeld.Id, FaceDirection.PosY), Color.White);
+            DrawItemIcon(sb, _inventoryHeld.Id, dst);
 
             DrawHeldItemCount(sb, dst, _inventoryHeld.Count);
         }
 
+        DrawInventoryHoverTooltip(sb);
+        if (!string.IsNullOrWhiteSpace(_inventoryCustomHoverTooltip))
+            DrawCompactTooltip(sb, _inventoryCustomHoverTooltip);
         sb.End();
+    }
+
+    private void DrawInventoryCharacterPanel(SpriteBatch sb)
+    {
+        if (_inventoryCharacterPanelRect.Width <= 0 || _inventoryCharacterPanelRect.Height <= 0)
+            return;
+
+        var panel = _inventoryCharacterPanelRect;
+        sb.Draw(_pixel, panel, new Color(8, 10, 15, 155));
+        DrawBorder(sb, panel, new Color(105, 112, 124, 170));
+
+        var name = string.IsNullOrWhiteSpace(_profile.GetDisplayUsername())
+            ? "PLAYER"
+            : _profile.GetDisplayUsername().Trim().ToUpperInvariant();
+        var fittedName = TrimTextToWidth(name, Math.Max(1, panel.Width - 20));
+        _font.DrawString(sb, fittedName, new Vector2(panel.X + 10, panel.Y + 10), new Color(225, 232, 242));
+
+        DrawArmorOutlineSlots(sb);
+    }
+
+    private void DrawTrashInventoryPanel(SpriteBatch sb)
+    {
+        if (_trashPanelRect.Width <= 0)
+            return;
+
+        DrawInventoryCharacterPanel(sb);
+        _font.DrawString(sb, "TRASH", new Vector2(_trashInventorySlots[0].X, _trashInventorySlots[0].Y - _font.LineHeight - 6), new Color(220, 226, 238));
+        DrawInventorySlots(sb, _trashInventory, _trashInventorySlots);
+
+        sb.Draw(_pixel, _trashClearButtonRect, _trashClearConfirmPending ? new Color(96, 44, 44, 235) : new Color(30, 30, 30, 230));
+        DrawBorder(sb, _trashClearButtonRect, _trashClearButtonRect.Contains(_inventoryMousePos) ? new Color(240, 248, 255) : Color.White);
+        if (_inventoryDispose.Texture is { IsDisposed: false } trashIcon)
+        {
+            var iconRect = new Rectangle(_trashClearButtonRect.X + 5, _trashClearButtonRect.Y + 4, _trashClearButtonRect.Width - 10, _trashClearButtonRect.Height - 8);
+            sb.Draw(trashIcon, iconRect, Color.White);
+        }
+    }
+
+    private void DrawArmorOutlineSlots(SpriteBatch sb)
+    {
+        if (_inventoryCharacterPanelRect.Width <= 0)
+            return;
+
+        var slot = InventoryEquipmentSlotSize;
+        var gap = 8;
+        var totalH = slot * 4 + gap * 3;
+        var x = _inventoryCharacterPanelRect.X + 16;
+        var y = _inventoryPlayerPreviewRect.Center.Y - totalH / 2;
+
+        DrawArmorOutlineSlot(sb, new Rectangle(x, y, slot, slot), ArmorOutlineKind.Helmet);
+        DrawArmorOutlineSlot(sb, new Rectangle(x, y + (slot + gap), slot, slot), ArmorOutlineKind.Chest);
+        DrawArmorOutlineSlot(sb, new Rectangle(x, y + (slot + gap) * 2, slot, slot), ArmorOutlineKind.Legs);
+        DrawArmorOutlineSlot(sb, new Rectangle(x, y + (slot + gap) * 3, slot, slot), ArmorOutlineKind.Boots);
+    }
+
+    private void RenderInventoryPlayerPreview(GraphicsDevice device)
+    {
+        var screenRect = UiLayout.ToScreenRect(_inventoryPlayerPreviewRect);
+        if (screenRect.Width <= 2 || screenRect.Height <= 2)
+            return;
+
+        screenRect.Inflate(-2, -2);
+        if (screenRect.Width <= 0 || screenRect.Height <= 0)
+            return;
+
+        _inventoryPreviewPlayerModel ??= new PlayerModel(device, _assets, _log);
+        if (_worldTimeSeconds >= _nextInventoryPreviewSkinRefreshTime)
+        {
+            _inventoryPreviewPlayerModel.RefreshWatchedSkin();
+            _nextInventoryPreviewSkinRefreshTime = _worldTimeSeconds + 1.0f;
+        }
+        _inventoryPreviewPlayerModel.Position = Vector3.Zero;
+        _inventoryPreviewPlayerModel.Yaw = _inventoryPlayerPreviewYaw;
+        _inventoryPreviewPlayerModel.Pitch = 0f;
+        _inventoryPreviewPlayerModel.HeadYawOffset = 0f;
+        _inventoryPreviewPlayerModel.IsFlying = false;
+        _inventoryPreviewPlayerModel.IsSneaking = false;
+        _inventoryPreviewPlayerModel.IsGrounded = true;
+        _inventoryPreviewPlayerModel.IsInWater = false;
+        _inventoryPreviewPlayerModel.IsSprinting = false;
+        _inventoryPreviewPlayerModel.IsSwimming = false;
+        _inventoryPreviewPlayerModel.VerticalVelocity = 0f;
+        _inventoryPreviewPlayerModel.HeldItemId = _inventory.SelectedId;
+        _inventoryPreviewPlayerModel.HeldBlockId = GetHandBlockRenderId(_inventory.SelectedId);
+        _inventoryPreviewPlayerModel.SetAtlas(_atlas);
+
+        var previousViewport = device.Viewport;
+        var previousRasterizer = device.RasterizerState;
+        var previousDepth = device.DepthStencilState;
+        var previousBlend = device.BlendState;
+        var previousSampler = device.SamplerStates[0];
+
+        device.Viewport = new Viewport(screenRect);
+        device.Clear(ClearOptions.DepthBuffer, Color.Transparent, 1f, 0);
+        device.RasterizerState = RasterizerState.CullNone;
+        device.DepthStencilState = DepthStencilState.Default;
+        device.BlendState = BlendState.AlphaBlend;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+
+        var view = Matrix.CreateLookAt(
+            new Vector3(0f, 1.0f, 5.65f),
+            new Vector3(0f, 0.9f, 0f),
+            Vector3.Up);
+        var projection = Matrix.CreatePerspectiveFieldOfView(
+            MathHelper.ToRadians(31f),
+            screenRect.Width / (float)Math.Max(1, screenRect.Height),
+            0.05f,
+            12f);
+        _inventoryPreviewPlayerModel.Render(view, projection, _worldTimeSeconds, Color.White, 1f, drawHeldBlock: true);
+
+        device.Viewport = previousViewport;
+        device.RasterizerState = previousRasterizer;
+        device.DepthStencilState = previousDepth;
+        device.BlendState = previousBlend;
+        device.SamplerStates[0] = previousSampler;
+    }
+
+    private void DrawArmorOutlineSlot(SpriteBatch sb, Rectangle rect, ArmorOutlineKind kind)
+    {
+        var color = new Color(255, 255, 255, 112);
+        DrawBorder(sb, rect, color);
+        var inner = new Rectangle(rect.X + 5, rect.Y + 5, rect.Width - 10, rect.Height - 10);
+        switch (kind)
+        {
+            case ArmorOutlineKind.Helmet:
+                DrawBorder(sb, new Rectangle(inner.X + 3, inner.Y + 2, inner.Width - 6, inner.Height - 5), color);
+                sb.Draw(_pixel, new Rectangle(inner.X + 6, inner.Bottom - 7, inner.Width - 12, 2), color);
+                break;
+            case ArmorOutlineKind.Chest:
+                DrawBorder(sb, new Rectangle(inner.X + 3, inner.Y + 4, inner.Width - 6, inner.Height - 8), color);
+                sb.Draw(_pixel, new Rectangle(inner.X, inner.Y + 7, 5, 2), color);
+                sb.Draw(_pixel, new Rectangle(inner.Right - 5, inner.Y + 7, 5, 2), color);
+                break;
+            case ArmorOutlineKind.Legs:
+                DrawBorder(sb, new Rectangle(inner.X + 4, inner.Y + 2, inner.Width - 8, 8), color);
+                DrawBorder(sb, new Rectangle(inner.X + 5, inner.Y + 10, 6, inner.Height - 12), color);
+                DrawBorder(sb, new Rectangle(inner.Right - 11, inner.Y + 10, 6, inner.Height - 12), color);
+                break;
+            case ArmorOutlineKind.Boots:
+                DrawBorder(sb, new Rectangle(inner.X + 3, inner.Bottom - 10, 9, 7), color);
+                DrawBorder(sb, new Rectangle(inner.Right - 12, inner.Bottom - 10, 9, 7), color);
+                break;
+        }
+    }
+
+    private enum ArmorOutlineKind
+    {
+        Helmet,
+        Chest,
+        Legs,
+        Boots
+    }
+
+    private void DrawHandCraftingPanel(SpriteBatch sb)
+    {
+        if (_handCraftPanelRect.Width <= 0)
+            return;
+
+        _font.DrawString(
+            sb,
+            "RECIPES",
+            new Vector2(_handCraftPanelRect.X, _handCraftPanelRect.Y - _font.LineHeight - 6),
+            new Color(205, 215, 226));
+
+        DrawHandCraftSearchBox(sb);
+
+        sb.Draw(_pixel, _handCraftRecipeListRect, new Color(9, 12, 18, 205));
+        DrawBorder(sb, _handCraftRecipeListRect, new Color(115, 125, 140));
+
+        var recipes = HandCraftingRecipes.All;
+        var filtered = GetFilteredHandCraftRecipeIndices();
+        if (filtered.Count == 0)
+        {
+            _font.DrawString(
+                sb,
+                "NO RECIPES FOUND",
+                new Vector2(_handCraftRecipeListRect.X + 10, _handCraftRecipeListRect.Y + 12),
+                new Color(190, 198, 210));
+        }
+
+        for (var filteredRow = 0; filteredRow < filtered.Count; filteredRow++)
+        {
+            var i = filtered[filteredRow];
+            var recipe = recipes[i];
+            var hasAnyIngredient = HasAnyHandCraftIngredient(recipe);
+            var craftable = CanCraftHandRecipe(recipe);
+            var selected = i == _selectedHandCraftRecipeIndex;
+            var pinned = _pinnedHandCraftRecipes.Contains(recipe.Id);
+            var recipeStateColor = craftable
+                ? new Color(70, 128, 82, 235)
+                : hasAnyIngredient ? new Color(76, 76, 82, 235) : new Color(106, 48, 48, 235);
+            var borderColor = selected
+                ? new Color(230, 236, 248)
+                : craftable ? new Color(115, 210, 132) : new Color(150, 140, 132);
+
+            var rowTop = _handCraftRecipeListRect.Y + 4 + (int)MathF.Floor(filteredRow * HandCraftRecipeRowHeight - _handCraftRecipeScrollOffsetPx);
+            var rowRect = new Rectangle(_handCraftRecipeListRect.X + 6, rowTop, _handCraftRecipeListRect.Width - 12, HandCraftRecipeRowHeight - 8);
+            if (rowRect.Bottom <= _handCraftRecipeListRect.Y || rowRect.Y >= _handCraftRecipeListRect.Bottom)
+                continue;
+
+            sb.Draw(_pixel, rowRect, recipeStateColor);
+            DrawBorder(sb, rowRect, borderColor);
+
+            var pinRect = GetHandCraftPinRect(rowRect);
+            DrawHandCraftPin(sb, pinRect, pinned);
+
+            var outputIcon = new Rectangle(pinRect.Right + 8, rowRect.Y + 7, 34, 34);
+            DrawItemIcon(sb, recipe.OutputId, outputIcon);
+            var textX = outputIcon.Right + 10;
+            var maxTextW = Math.Max(40, rowRect.Right - textX - 8);
+            var name = TrimTextToWidth(recipe.Name.ToUpperInvariant(), maxTextW);
+            _font.DrawString(
+                sb,
+                name,
+                new Vector2(textX, rowRect.Y + 7),
+                Color.White);
+            _font.DrawString(
+                sb,
+                TrimTextToWidth($"{recipe.OutputCount}x output", maxTextW),
+                new Vector2(textX, rowRect.Y + 29),
+                new Color(205, 215, 226));
+        }
+
+        DrawHandCraftRecipeScrollbar(sb);
+
+        var detailsRect = _handCraftDetailsRect;
+        sb.Draw(_pixel, detailsRect, new Color(12, 14, 20, 225));
+        DrawBorder(sb, detailsRect, new Color(120, 125, 135));
+
+        if (_artificerBenchGuiOpen)
+        {
+            DrawArtificerBenchCraftingGrid(sb, detailsRect);
+            return;
+        }
+
+        if (!TryGetSelectedHandCraftRecipe(out var selectedRecipe))
+        {
+            _font.DrawString(sb, "SELECT A RECIPE", new Vector2(detailsRect.X + 10, detailsRect.Y + 10), new Color(220, 226, 238));
+            var promptLines = WrapOverlayText("Select a recipe on the right to view required items here.", detailsRect.Width - 20);
+            for (var i = 0; i < promptLines.Count && i < 3; i++)
+            {
+                _font.DrawString(
+                    sb,
+                    promptLines[i],
+                    new Vector2(detailsRect.X + 10, detailsRect.Y + 36 + i * (_font.LineHeight + 2)),
+                    new Color(175, 185, 198));
+            }
+
+            return;
+        }
+
+        var selectedCraftable = CanCraftHandRecipe(selectedRecipe);
+        string? hoveredRequirementText = null;
+
+        _font.DrawString(sb, "SELECTED", new Vector2(detailsRect.X + 10, detailsRect.Y + 8), new Color(220, 226, 238));
+        _font.DrawString(sb, TrimTextToWidth(selectedRecipe.Name.ToUpperInvariant(), detailsRect.Width - 20), new Vector2(detailsRect.X + 10, detailsRect.Y + 30), Color.White);
+
+        _font.DrawString(sb, "REQUIRES", new Vector2(detailsRect.X + 10, detailsRect.Y + 62), new Color(220, 226, 238));
+
+        var iconSize = 28;
+        var requirementStrip = new Rectangle(detailsRect.X + 10, detailsRect.Y + 88, detailsRect.Width - 20, iconSize);
+        hoveredRequirementText = DrawHandCraftRequirementStrip(sb, selectedRecipe, requirementStrip, applyArtificerUnlockGate: false, iconSize: iconSize);
+
+        _font.DrawString(sb, "OUTPUT", new Vector2(detailsRect.X + 10, requirementStrip.Bottom + 12), new Color(220, 226, 238));
+        var resultIcon = new Rectangle(detailsRect.X + 10, requirementStrip.Bottom + 36, iconSize, iconSize);
+        DrawItemIcon(sb, selectedRecipe.OutputId, resultIcon);
+        _font.DrawString(
+            sb,
+            TrimTextToWidth($"{selectedRecipe.OutputCount}x {selectedRecipe.Name}", Math.Max(40, _handCraftButtonRect.X - resultIcon.Right - 14)),
+            new Vector2(resultIcon.Right + 8, resultIcon.Y + 8),
+            Color.White);
+
+        sb.Draw(_pixel, _handCraftButtonRect, selectedCraftable ? new Color(38, 86, 54, 235) : new Color(60, 60, 66, 210));
+        DrawBorder(sb, _handCraftButtonRect, selectedCraftable ? new Color(170, 240, 180) : new Color(120, 120, 126));
+        var label = "CRAFT";
+        var labelSize = _font.MeasureString(label);
+        _font.DrawString(
+            sb,
+            label,
+            new Vector2(_handCraftButtonRect.Center.X - labelSize.X * 0.5f, _handCraftButtonRect.Center.Y - labelSize.Y * 0.5f),
+            selectedCraftable ? Color.White : new Color(170, 170, 174));
+
+        if (!string.IsNullOrWhiteSpace(hoveredRequirementText))
+            DrawCompactTooltip(sb, hoveredRequirementText);
+    }
+
+    private void DrawArtificerBenchCraftingGrid(SpriteBatch sb, Rectangle detailsRect)
+    {
+        if (detailsRect.Width <= 0 || detailsRect.Height <= 0)
+            return;
+
+        sb.Draw(_pixel, detailsRect, new Color(12, 14, 20, 225));
+        DrawBorder(sb, detailsRect, new Color(120, 125, 135));
+
+        _font.DrawString(sb, "CRAFTING GRID", new Vector2(detailsRect.X + 18, detailsRect.Y + 18), new Color(220, 226, 238));
+        var selectedBenchRecipe = TryGetSelectedHandCraftRecipe(out var benchRecipe) ? benchRecipe : null;
+        string? hoveredRequirementText = null;
+        if (selectedBenchRecipe != null)
+        {
+            var y = detailsRect.Y + 42;
+            _font.DrawString(
+                sb,
+                TrimTextToWidth(selectedBenchRecipe.Name.ToUpperInvariant(), Math.Max(40, detailsRect.Width - 166)),
+                new Vector2(detailsRect.X + 18, y),
+                Color.White);
+            hoveredRequirementText = DrawHandCraftRequirementStrip(sb, selectedBenchRecipe, new Rectangle(detailsRect.X + 18, y + 24, Math.Max(40, detailsRect.Width - 36), 30), applyArtificerUnlockGate: true);
+        }
+
+        for (var i = 0; i < _artificerBenchCraftSlots.Length; i++)
+        {
+            var slotRect = _artificerBenchCraftSlots[i];
+            if (slotRect.Width <= 0 || slotRect.Height <= 0)
+                continue;
+
+            sb.Draw(_pixel, slotRect, new Color(18, 22, 30, 235));
+            DrawBorder(sb, slotRect, new Color(138, 148, 160));
+            var slot = _artificerBenchCraftGrid[i];
+            if (slot.Id != BlockId.Air && slot.Count > 0)
+            {
+                DrawArtificerBenchSlotIcon(sb, slot.Id, slotRect);
+                DrawSlotItemCount(sb, slotRect, slot.Count);
+            }
+        }
+
+        if (_artificerBenchOutputSlot.Width > 0 && _artificerBenchOutputSlot.Height > 0)
+        {
+            _font.DrawString(
+                sb,
+                "OUTPUT",
+                new Vector2(_artificerBenchOutputSlot.X, _artificerBenchOutputSlot.Y - _font.LineHeight - 8),
+                new Color(220, 226, 238));
+            var arrowX = _artificerBenchOutputSlot.X - 34;
+            var arrowY = _artificerBenchOutputSlot.Center.Y;
+            sb.Draw(_pixel, new Rectangle(arrowX, arrowY - 2, 22, 4), new Color(190, 198, 210));
+            sb.Draw(_pixel, new Rectangle(arrowX + 18, arrowY - 7, 4, 14), new Color(190, 198, 210));
+            sb.Draw(_pixel, _artificerBenchOutputSlot, new Color(20, 34, 28, 235));
+            DrawBorder(sb, _artificerBenchOutputSlot, new Color(150, 210, 170));
+            if (TryGetArtificerBenchGridOutput(out var recipe, out _))
+            {
+                DrawItemIcon(sb, recipe.OutputId, _artificerBenchOutputSlot);
+                DrawSlotItemCount(sb, _artificerBenchOutputSlot, recipe.OutputCount);
+            }
+        }
+
+        if (_artificerBenchRecipeStageButtonRect.Width > 0 && selectedBenchRecipe != null)
+        {
+            var canStage = CanUseArtificerBenchRecipe(selectedBenchRecipe);
+            sb.Draw(_pixel, _artificerBenchRecipeStageButtonRect, canStage ? new Color(38, 86, 54, 235) : new Color(60, 60, 66, 210));
+            DrawBorder(sb, _artificerBenchRecipeStageButtonRect, canStage ? new Color(170, 240, 180) : new Color(120, 120, 126));
+            const string label = "AUTOFILL";
+            var labelSize = _font.MeasureString(label);
+            _font.DrawString(
+                sb,
+                label,
+                new Vector2(_artificerBenchRecipeStageButtonRect.Center.X - labelSize.X * 0.5f, _artificerBenchRecipeStageButtonRect.Center.Y - labelSize.Y * 0.5f),
+                canStage ? Color.White : new Color(170, 170, 174));
+        }
+
+        if (!string.IsNullOrWhiteSpace(hoveredRequirementText))
+            DrawCompactTooltip(sb, hoveredRequirementText);
+    }
+
+    private void DrawKilnPanel(SpriteBatch sb)
+    {
+        if (_kilnPanelRect.Width <= 0 || _kilnPanelRect.Height <= 0)
+            return;
+
+        sb.Draw(_pixel, _kilnPanelRect, new Color(12, 14, 20, 225));
+        DrawBorder(sb, _kilnPanelRect, new Color(120, 125, 135));
+        _font.DrawString(sb, GetActiveKilnTitle(), new Vector2(_kilnPanelRect.X + 18, _kilnPanelRect.Y + 18), new Color(220, 226, 238));
+
+        if (_kilnSlots[0].Width > 0)
+        {
+            var inputLabel = _activeKilnBlockId == BlockId.FieldOven ? "FOOD" : "ORE CLUSTER";
+            var fuelLabel = _activeKilnBlockId == BlockId.FieldOven ? "FUEL" : "COAL";
+            _font.DrawString(sb, inputLabel, new Vector2(_kilnSlots[0].X, _kilnSlots[0].Y - _font.LineHeight - 6), new Color(205, 215, 226));
+            _font.DrawString(sb, fuelLabel, new Vector2(_kilnSlots[1].X, _kilnSlots[1].Y - _font.LineHeight - 6), new Color(205, 215, 226));
+            _font.DrawString(sb, "OUTPUT", new Vector2(_kilnSlots[2].X, _kilnSlots[2].Y - _font.LineHeight - 6), new Color(205, 215, 226));
+        }
+
+        DrawInventorySlots(sb, _kilnInventory, _kilnSlots);
+        if (_kilnProgressArrowRect.Width > 0)
+            DrawKilnProgressArrow(sb);
+
+        var canSmelt = _kilnInventory[0].Count > 0
+            && _kilnInventory[1].Id == BlockId.CoalChunk
+            && _kilnInventory[1].Count > 0
+            && TryGetKilnOutput(_kilnInventory[0].Id, out var outId)
+            && (_kilnInventory[2].Id == BlockId.Air || _kilnInventory[2].Id == outId)
+            && _activeKilnBlockId != BlockId.FieldOven
+            && !_activeKilnSmelting;
+        sb.Draw(_pixel, _kilnSmeltButtonRect, canSmelt ? new Color(38, 86, 54, 235) : new Color(60, 60, 66, 210));
+        DrawBorder(sb, _kilnSmeltButtonRect, canSmelt ? new Color(170, 240, 180) : new Color(120, 120, 126));
+        var label = _activeKilnBlockId == BlockId.FieldOven ? "COOK" : "SMELT";
+        var labelSize = _font.MeasureString(label);
+        _font.DrawString(
+            sb,
+            label,
+            new Vector2(_kilnSmeltButtonRect.Center.X - labelSize.X * 0.5f, _kilnSmeltButtonRect.Center.Y - labelSize.Y * 0.5f),
+            canSmelt ? Color.White : new Color(170, 170, 174));
+    }
+
+    private void DrawKilnProgressArrow(SpriteBatch sb)
+    {
+        var rect = _kilnProgressArrowRect;
+        var fill = GetActiveKilnProgressFraction();
+        var track = new Rectangle(rect.X, rect.Y + rect.Height / 2 - 3, rect.Width - 12, 6);
+        var head = new Rectangle(track.Right - 2, rect.Y + 3, 12, rect.Height - 6);
+        sb.Draw(_pixel, track, new Color(38, 42, 50, 220));
+        sb.Draw(_pixel, head, new Color(38, 42, 50, 220));
+        DrawBorder(sb, rect, new Color(112, 120, 132));
+
+        if (fill <= 0f)
+            return;
+
+        var fillW = Math.Clamp((int)MathF.Round((rect.Width - 4) * fill), 1, rect.Width - 4);
+        var fillRect = new Rectangle(rect.X + 2, rect.Y + 2, fillW, rect.Height - 4);
+        sb.Draw(_pixel, fillRect, new Color(246, 126, 38, 190));
+    }
+
+    private string? DrawHandCraftRequirementStrip(SpriteBatch sb, HandCraftingRecipe recipe, Rectangle stripRect, bool applyArtificerUnlockGate, int iconSize = 24)
+    {
+        string? hoveredText = null;
+        var maxItems = Math.Min(4, recipe.Ingredients.Count);
+        var x = stripRect.X;
+        var y = stripRect.Y;
+        const int groupGap = 12;
+
+        for (var i = 0; i < maxItems; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            var have = CountHandCraftIngredient(ingredient);
+            var enough = have >= ingredient.Count;
+            var unlockOk = !applyArtificerUnlockGate || (_meta?.Gameplay?.UnlockCrafting ?? true) || have >= 2;
+            var iconId = GetHandCraftIngredientIconId(ingredient);
+            var iconRect = new Rectangle(x, y, iconSize, iconSize);
+
+            sb.Draw(_pixel, new Rectangle(iconRect.X - 2, iconRect.Y - 2, iconRect.Width + 4, iconRect.Height + 4), new Color(18, 22, 30, 235));
+            DrawBorder(sb, new Rectangle(iconRect.X - 2, iconRect.Y - 2, iconRect.Width + 4, iconRect.Height + 4), enough && unlockOk ? new Color(120, 220, 136) : new Color(230, 126, 112));
+            DrawItemIcon(sb, iconId, iconRect);
+
+            var countText = $"{Math.Min(have, ingredient.Count)}/{ingredient.Count}";
+            var countColor = enough && unlockOk ? new Color(180, 238, 178) : new Color(255, 170, 150);
+            var countPos = new Vector2(iconRect.Right + 6, iconRect.Y + 4);
+            _font.DrawString(sb, countText, countPos, countColor);
+
+            var countW = (int)MathF.Ceiling(_font.MeasureString(countText).X);
+            var hitRect = new Rectangle(iconRect.X - 4, iconRect.Y - 4, iconSize + countW + 14, iconSize + 8);
+            if (hitRect.Contains(_inventoryMousePos))
+            {
+                hoveredText = $"{ingredient.DisplayName} {Math.Min(have, ingredient.Count)}/{ingredient.Count}";
+                if (!unlockOk)
+                    hoveredText += " - need 2 to unlock";
+            }
+
+            x = hitRect.Right + groupGap;
+            if (x + iconSize > stripRect.Right)
+                break;
+        }
+
+        return hoveredText;
+    }
+
+    private static BlockId GetHandCraftIngredientIconId(HandCraftingIngredient ingredient)
+        => ingredient.Kind == HandCraftingIngredientKind.Item
+            ? ingredient.ItemId
+            : BlockId.OakPlanks;
+
+    private void DrawCompactTooltip(SpriteBatch sb, string text)
+    {
+        var display = TrimTextToWidth(text, 320);
+        var size = _font.MeasureString(display);
+        var panel = new Rectangle(
+            Math.Min(_inventoryMousePos.X + 14, _viewport.Right - (int)MathF.Ceiling(size.X) - 24),
+            Math.Max(_viewport.Y + 8, _inventoryMousePos.Y - (int)MathF.Ceiling(size.Y) - 18),
+            (int)MathF.Ceiling(size.X) + 16,
+            (int)MathF.Ceiling(size.Y) + 10);
+        sb.Draw(_pixel, panel, new Color(8, 10, 16, 235));
+        DrawBorder(sb, panel, new Color(190, 198, 210, 210));
+        _font.DrawString(sb, display, new Vector2(panel.X + 8, panel.Y + 5), Color.White);
+    }
+
+    private void DrawArtificerBenchHandCraftBar(SpriteBatch sb)
+    {
+        var barRect = _artificerBenchHandCraftBarRect;
+        if (barRect.Width <= 0 || barRect.Height <= 0)
+            return;
+
+        sb.Draw(_pixel, barRect, new Color(12, 14, 20, 225));
+        DrawBorder(sb, barRect, new Color(120, 125, 135));
+        _font.DrawString(sb, "HAND CRAFTING", new Vector2(barRect.X + 10, barRect.Y + 8), new Color(220, 226, 238));
+
+        var indices = GetArtificerBenchHandCraftRecipeIndices();
+        var listRect = GetArtificerBenchHandCraftListRect();
+        if (listRect.Width <= 0 || listRect.Height <= 0)
+            return;
+
+        if (indices.Count <= 0)
+        {
+            _font.DrawString(sb, "No hand recipes yet.", new Vector2(listRect.X + 8, listRect.Y + 8), new Color(205, 215, 226));
+            return;
+        }
+
+        var pitch = HandCraftRecipeRowHeight + ArtificerBenchHandCraftRowGap;
+        var first = Math.Max(0, (int)MathF.Floor(_artificerBenchHandCraftScrollOffsetPx / pitch) - 1);
+        var visible = Math.Max(1, (int)MathF.Ceiling(listRect.Height / (float)pitch) + 2);
+        var last = Math.Min(indices.Count - 1, first + visible - 1);
+
+        var device = _graphics.GraphicsDevice;
+        var priorScissor = device.ScissorRectangle;
+        var clipRect = UiLayout.ToScreenRect(listRect);
+        if (clipRect.Width <= 0 || clipRect.Height <= 0)
+            return;
+
+        sb.End();
+        device.ScissorRectangle = clipRect;
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform, rasterizerState: ScissorState);
+
+        for (var displayIndex = first; displayIndex <= last; displayIndex++)
+        {
+            var recipeIndex = indices[displayIndex];
+            var recipe = HandCraftingRecipes.All[recipeIndex];
+            var rowTop = listRect.Y + (int)MathF.Floor(displayIndex * pitch - _artificerBenchHandCraftScrollOffsetPx);
+            var rowRect = new Rectangle(listRect.X, rowTop, listRect.Width - 10, HandCraftRecipeRowHeight);
+            if (rowRect.Bottom <= listRect.Top || rowRect.Top >= listRect.Bottom)
+                continue;
+
+            var craftable = CanUseArtificerBenchRecipe(recipe);
+            var pinned = _pinnedHandCraftRecipes.Contains(recipe.Id);
+            var selected = _selectedHandCraftRecipeIndex == recipeIndex;
+            sb.Draw(_pixel, rowRect, selected ? new Color(55, 76, 104, 235) : craftable ? new Color(56, 112, 70, 235) : new Color(76, 76, 82, 235));
+            DrawBorder(sb, rowRect, selected ? new Color(155, 190, 245) : craftable ? new Color(120, 220, 136) : new Color(150, 140, 132));
+
+            var pinRect = GetArtificerBenchHandCraftPinRect(rowRect);
+            DrawHandCraftPin(sb, pinRect, pinned);
+
+            var iconRect = new Rectangle(pinRect.Right + 8, rowRect.Y + 8, 36, 36);
+            DrawItemIcon(sb, recipe.OutputId, iconRect);
+            var textX = iconRect.Right + 8;
+            var textW = Math.Max(30, rowRect.Right - textX - 8);
+            _font.DrawString(sb, TrimTextToWidth(recipe.Name.ToUpperInvariant(), textW), new Vector2(textX, rowRect.Y + 8), Color.White);
+            _font.DrawString(sb, TrimTextToWidth(BuildRecipeRequirementSummary(recipe), textW), new Vector2(textX, rowRect.Y + 30), new Color(205, 215, 226));
+        }
+
+        sb.End();
+        device.ScissorRectangle = priorScissor;
+        sb.Begin(samplerState: SamplerState.PointClamp, transformMatrix: UiLayout.Transform);
+
+        DrawArtificerBenchHandCraftScrollbar(sb, indices.Count);
+    }
+
+    private static string BuildRecipeRequirementSummary(HandCraftingRecipe recipe)
+    {
+        if (recipe.Ingredients.Count == 0)
+            return $"{recipe.OutputCount}x OUTPUT";
+
+        var parts = new List<string>(recipe.Ingredients.Count);
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            parts.Add($"{ingredient.Count}x {ingredient.DisplayName}");
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    private List<int> GetArtificerBenchHandCraftRecipeIndices()
+    {
+        var recipes = HandCraftingRecipes.All;
+        var indices = new List<int>(recipes.Count);
+        for (var i = 0; i < recipes.Count; i++)
+            indices.Add(i);
+
+        indices.Sort((left, right) =>
+        {
+            var leftPinned = _pinnedHandCraftRecipes.Contains(recipes[left].Id);
+            var rightPinned = _pinnedHandCraftRecipes.Contains(recipes[right].Id);
+            if (leftPinned != rightPinned)
+                return leftPinned ? -1 : 1;
+            return left.CompareTo(right);
+        });
+
+        return indices;
+    }
+
+    private bool TryGetArtificerBenchHandCraftCardAtPoint(Point point, out int recipeIndex, out Rectangle cardRect)
+    {
+        recipeIndex = -1;
+        cardRect = Rectangle.Empty;
+
+        var barRect = _artificerBenchHandCraftBarRect;
+        if (barRect.Width <= 0 || barRect.Height <= 0 || !barRect.Contains(point))
+            return false;
+
+        var indices = GetArtificerBenchHandCraftRecipeIndices();
+        var listRect = GetArtificerBenchHandCraftListRect();
+        if (!listRect.Contains(point))
+            return false;
+
+        var pitch = HandCraftRecipeRowHeight + ArtificerBenchHandCraftRowGap;
+        var contentY = point.Y - listRect.Y + _artificerBenchHandCraftScrollOffsetPx;
+        var displayIndex = (int)MathF.Floor(contentY / pitch);
+        if (displayIndex < 0 || displayIndex >= indices.Count)
+            return false;
+
+        cardRect = new Rectangle(
+            listRect.X,
+            listRect.Y + (int)MathF.Floor(displayIndex * pitch - _artificerBenchHandCraftScrollOffsetPx),
+            listRect.Width - 10,
+            HandCraftRecipeRowHeight);
+        if (!cardRect.Contains(point))
+            return false;
+
+        recipeIndex = indices[displayIndex];
+        return true;
+    }
+
+    private Rectangle GetArtificerBenchHandCraftListRect()
+    {
+        var barRect = _artificerBenchHandCraftBarRect;
+        return barRect.Width > 0 && barRect.Height > 0
+            ? new Rectangle(barRect.X + 8, barRect.Y + 30, Math.Max(0, barRect.Width - 16), Math.Max(0, barRect.Height - 38))
+            : Rectangle.Empty;
+    }
+
+    private Rectangle GetArtificerBenchHandCraftPinRect(Rectangle cardRect) =>
+        new(cardRect.X + 8, cardRect.Y + 12, 24, 24);
+
+    private void ClampArtificerBenchHandCraftScroll()
+    {
+        var listRect = GetArtificerBenchHandCraftListRect();
+        if (listRect.Height <= 0)
+        {
+            _artificerBenchHandCraftScrollOffsetPx = 0f;
+            return;
+        }
+
+        var count = HandCraftingRecipes.All.Count;
+        var contentH = Math.Max(0, count * HandCraftRecipeRowHeight + Math.Max(0, count - 1) * ArtificerBenchHandCraftRowGap);
+        var maxScroll = Math.Max(0f, contentH - listRect.Height);
+        _artificerBenchHandCraftScrollOffsetPx = Math.Clamp(_artificerBenchHandCraftScrollOffsetPx, 0f, maxScroll);
+    }
+
+    private void DrawArtificerBenchHandCraftScrollbar(SpriteBatch sb, int recipeCount)
+    {
+        var listRect = GetArtificerBenchHandCraftListRect();
+        var contentH = Math.Max(0, recipeCount * HandCraftRecipeRowHeight + Math.Max(0, recipeCount - 1) * ArtificerBenchHandCraftRowGap);
+        if (listRect.Height <= 0 || contentH <= listRect.Height)
+            return;
+
+        var track = new Rectangle(listRect.Right - 4, listRect.Y, 3, listRect.Height);
+        sb.Draw(_pixel, track, new Color(38, 42, 50, 220));
+        var thumbH = Math.Max(20, (int)MathF.Round(track.Height * (listRect.Height / (float)contentH)));
+        var maxScroll = Math.Max(1f, contentH - listRect.Height);
+        var thumbY = track.Y + (int)MathF.Round((track.Height - thumbH) * (_artificerBenchHandCraftScrollOffsetPx / maxScroll));
+        sb.Draw(_pixel, new Rectangle(track.X, thumbY, track.Width, thumbH), new Color(185, 196, 210, 230));
+    }
+
+    private void DrawArtificerBenchSlotIcon(SpriteBatch sb, BlockId legacyItemId, Rectangle slotRect)
+    {
+        if (legacyItemId == BlockId.Air || slotRect.Width <= 0 || slotRect.Height <= 0)
+            return;
+
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        if (item.Id != ItemId.None && item.InventoryModel == ItemInventoryModelKind.FlatSprite)
+        {
+            var flatRect = new Rectangle(slotRect.X + 4, slotRect.Y + 4, slotRect.Width - 8, slotRect.Height - 8);
+            DrawItemIcon(sb, legacyItemId, flatRect);
+            return;
+        }
+
+        if (_atlas == null)
+            return;
+
+        var blockId = item.Id != ItemId.None && item.PlacesBlock.HasValue
+            ? item.PlacesBlock.Value
+            : legacyItemId;
+        var dst = new Rectangle(slotRect.X + 1, slotRect.Y + 1, slotRect.Width - 2, slotRect.Height - 2);
+        var iconSize = Math.Max(dst.Width, dst.Height);
+        var icon = GetBlockIconIfReady(blockId, iconSize);
+        if (icon == null && !_inventoryPointerActive)
+            icon = GetBlockIcon(blockId, iconSize);
+        if (icon != null)
+            sb.Draw(icon, dst, Color.White);
+        else
+            sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)blockId, FaceDirection.PosY), Color.White);
+    }
+
+    private void DrawHandCraftRecipeScrollbar(SpriteBatch sb)
+    {
+        var totalRows = GetFilteredHandCraftRecipeIndices().Count;
+        var contentHeight = totalRows * HandCraftRecipeRowHeight;
+        if (_handCraftRecipeListRect.Height <= 0 || contentHeight <= _handCraftRecipeListRect.Height)
+            return;
+
+        var track = new Rectangle(_handCraftRecipeListRect.Right - 7, _handCraftRecipeListRect.Y + 4, 3, _handCraftRecipeListRect.Height - 8);
+        sb.Draw(_pixel, track, new Color(38, 42, 50, 220));
+        var thumbHeight = Math.Max(18, (int)MathF.Round(track.Height * (_handCraftRecipeListRect.Height / (float)contentHeight)));
+        var maxScroll = Math.Max(1f, contentHeight - _handCraftRecipeListRect.Height);
+        var thumbY = track.Y + (int)MathF.Round((track.Height - thumbHeight) * (_handCraftRecipeScrollOffsetPx / maxScroll));
+        sb.Draw(_pixel, new Rectangle(track.X, thumbY, track.Width, thumbHeight), new Color(185, 196, 210, 230));
+    }
+
+    private void DrawHandCraftSearchBox(SpriteBatch sb)
+    {
+        if (_handCraftSearchRect.Width <= 0)
+            return;
+
+        sb.Draw(_pixel, _handCraftSearchRect, new Color(10, 10, 14, 235));
+        DrawBorder(sb, _handCraftSearchRect, _handCraftSearchFocused ? new Color(230, 230, 140) : new Color(170, 170, 170));
+
+        var query = _handCraftSearchQuery ?? string.Empty;
+        var display = string.IsNullOrEmpty(query) && !_handCraftSearchFocused ? "Search recipes" : query;
+        var queryColor = string.IsNullOrEmpty(query) && !_handCraftSearchFocused ? new Color(145, 152, 164) : Color.White;
+        var queryPos = new Vector2(_handCraftSearchRect.X + 8, _handCraftSearchRect.Y + 8);
+        TextFieldVisuals.DrawWholeFieldSelection(sb, _pixel, _font, query, queryPos, _handCraftSearchRect, _handCraftSearchSelectAll, new Color(88, 148, 218, 170));
+        _font.DrawString(sb, TrimTextToWidth(display, _handCraftSearchRect.Width - 42), queryPos, queryColor);
+
+        if (!string.IsNullOrEmpty(query))
+        {
+            sb.Draw(_pixel, _handCraftSearchClearRect, new Color(26, 30, 36, 240));
+            DrawBorder(sb, _handCraftSearchClearRect, new Color(205, 205, 205));
+            var clearText = "X";
+            var clearSize = _font.MeasureString(clearText);
+            _font.DrawString(
+                sb,
+                clearText,
+                new Vector2(_handCraftSearchClearRect.Center.X - clearSize.X / 2f, _handCraftSearchClearRect.Center.Y - clearSize.Y / 2f),
+                Color.White);
+        }
+
+        if (_handCraftSearchFocused && !_handCraftSearchSelectAll && ((int)(_worldTimeSeconds * 2f) % 2 == 0))
+        {
+            var caret = Math.Clamp(_handCraftSearchCaret, 0, query.Length);
+            var caretPrefix = caret <= 0 ? string.Empty : query[..caret];
+            var caretOffsetX = _font.MeasureString(caretPrefix).X;
+            var caretX = _handCraftSearchRect.X + 8 + (int)MathF.Round(caretOffsetX);
+            var caretRect = new Rectangle(caretX, _handCraftSearchRect.Y + 6, 2, _handCraftSearchRect.Height - 12);
+            if (caretRect.X < _handCraftSearchClearRect.X - 3)
+                sb.Draw(_pixel, caretRect, Color.White);
+        }
+    }
+
+    private void DrawHandCraftPin(SpriteBatch sb, Rectangle rect, bool pinned)
+    {
+        var head = pinned ? new Color(238, 52, 46) : new Color(150, 158, 170, 170);
+        var highlight = pinned ? new Color(255, 132, 108) : new Color(205, 212, 222, 150);
+        var shadow = pinned ? new Color(126, 28, 32) : new Color(72, 78, 88, 155);
+        var needle = pinned ? new Color(220, 224, 226) : new Color(150, 156, 164, 150);
+        DrawBorder(sb, rect, new Color(head.R, head.G, head.B, pinned ? 235 : 150));
+        var cx = rect.Center.X;
+        var top = rect.Y + 3;
+        sb.Draw(_pixel, new Rectangle(cx - 5, top, 10, 2), shadow);
+        sb.Draw(_pixel, new Rectangle(cx - 7, top + 2, 14, 5), head);
+        sb.Draw(_pixel, new Rectangle(cx - 4, top + 3, 6, 2), highlight);
+        sb.Draw(_pixel, new Rectangle(cx - 3, top + 7, 6, 7), head);
+        sb.Draw(_pixel, new Rectangle(cx + 2, top + 8, 2, 5), shadow);
+        sb.Draw(_pixel, new Rectangle(cx - 7, top + 13, 14, 4), shadow);
+        sb.Draw(_pixel, new Rectangle(cx - 5, top + 12, 10, 4), head);
+        sb.Draw(_pixel, new Rectangle(cx - 3, top + 13, 4, 2), highlight);
+        sb.Draw(_pixel, new Rectangle(cx - 1, top + 17, 2, 5), needle);
+        sb.Draw(_pixel, new Rectangle(cx, top + 22, 1, 2), needle);
+    }
+
+    private bool TryCraftHandRecipe(HandCraftingRecipe recipe)
+    {
+        if (_inventoryHasHeld)
+        {
+            SetCommandStatus("Place held item first.", 1.8f, echoToChat: false);
+            return false;
+        }
+
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            if (CountHandCraftIngredient(ingredient) < ingredient.Count)
+            {
+                SetCommandStatus($"Need {ingredient.Count}x {ingredient.DisplayName}.", 1.8f, echoToChat: false);
+                return false;
+            }
+        }
+
+        if (!_inventory.CanAdd(recipe.OutputId, recipe.OutputCount))
+        {
+            SetCommandStatus("No inventory space for crafting.", 1.8f, echoToChat: false);
+            return false;
+        }
+
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            var ingredient = recipe.Ingredients[i];
+            var consumed = ingredient.Kind == HandCraftingIngredientKind.Item
+                ? _inventory.TryConsume(ingredient.ItemId, ingredient.Count)
+                : _inventory.TryConsumeMatching(ingredient.Matches, ingredient.Count);
+            if (!consumed)
+                return false;
+        }
+
+        var leftover = _inventory.Add(recipe.OutputId, recipe.OutputCount);
+        if (leftover > 0)
+            return false;
+
+        MarkPlayerStateDirty();
+        SetCommandStatus($"Crafted {recipe.OutputCount}x {recipe.Name}.", 1.8f, echoToChat: false);
+        return true;
     }
 
     private void DrawSoulLoot(SpriteBatch sb)
@@ -9655,20 +16296,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _soulLootTakeAll.Draw(sb, _pixel, _font);
         _soulLootClose.Draw(sb, _pixel, _font);
 
-        if (_inventoryHasHeld && _atlas != null)
+        if (_inventoryHasHeld)
         {
             var size = _soulLootPlayerGridSlots.Length > 0 ? _soulLootPlayerGridSlots[0].Width : 40;
             var scaled = (int)MathF.Round(size * 1.15f);
             var dst = new Rectangle(_inventoryMousePos.X - scaled / 2, _inventoryMousePos.Y - scaled / 2, scaled, scaled);
-            var icon = GetBlockIcon(_inventoryHeld.Id, dst.Width);
-            if (icon != null)
-                sb.Draw(icon, dst, Color.White);
-            else
-                sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)_inventoryHeld.Id, FaceDirection.PosY), Color.White);
+            DrawItemIcon(sb, _inventoryHeld.Id, dst);
 
             DrawHeldItemCount(sb, dst, _inventoryHeld.Count);
         }
 
+        DrawInventoryHoverTooltip(sb);
         sb.End();
     }
 
@@ -9687,25 +16325,39 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 continue;
 
             var slot = slots[slotIndex];
-            if (slot.Count > 0 && slot.Id != BlockId.Air && _atlas != null)
+            if (slot.Count > 0 && slot.Id != BlockId.Air)
             {
                 var pad = 6;
                 var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
-                var icon = GetBlockIcon(slot.Id, dst.Width);
-                if (icon != null)
-                    sb.Draw(icon, dst, Color.White);
-                else
-                    sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)slot.Id, FaceDirection.PosY), Color.White);
+                DrawItemIcon(sb, slot.Id, dst);
+                if (ShouldHighlightInventoryItemForBenchRecipe(slot.Id))
+                    DrawBorder(sb, new Rectangle(rect.X + 3, rect.Y + 3, rect.Width - 6, rect.Height - 6), new Color(92, 245, 118));
             }
 
             if (slot.Count > 1)
-            {
-                var text = slot.Count.ToString();
-                var size = _font.MeasureString(text);
-                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
-                _font.DrawString(sb, text, pos, Color.White);
-            }
+                DrawSlotItemCount(sb, rect, slot.Count);
         }
+    }
+
+    private bool ShouldHighlightInventoryItemForBenchRecipe(BlockId id)
+    {
+        if (id == BlockId.Air || !TryGetSelectedHandCraftRecipe(out var recipe))
+            return false;
+
+        var handCraftingOpen = _inventoryOpen
+            && _gameMode != GameMode.Artificer
+            && _survivalInventoryView == SurvivalInventoryView.Crafting
+            && !_kilnGuiOpen;
+        if (!_artificerBenchGuiOpen && !handCraftingOpen)
+            return false;
+
+        for (var i = 0; i < recipe.Ingredients.Count; i++)
+        {
+            if (recipe.Ingredients[i].Matches(id))
+                return true;
+        }
+
+        return false;
     }
 
     private void DrawLiveInventorySlots(SpriteBatch sb, LanInventoryView? liveView)
@@ -9722,24 +16374,15 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             var blockId = i < gridIds.Length ? (BlockId)gridIds[i] : BlockId.Air;
             var count = i < gridCounts.Length ? gridCounts[i] : 0;
             
-            if (count > 0 && blockId != BlockId.Air && _atlas != null)
+            if (count > 0 && blockId != BlockId.Air)
             {
                 var pad = 6;
                 var dst = new Rectangle(rect.X + pad, rect.Y + pad, rect.Width - pad * 2, rect.Height - pad * 2);
-                var icon = GetBlockIcon(blockId, dst.Width);
-                if (icon != null)
-                    sb.Draw(icon, dst, Color.White);
-                else
-                    sb.Draw(_atlas.Texture, dst, _atlas.GetFaceSourceRect((byte)blockId, FaceDirection.PosY), Color.White);
+                DrawItemIcon(sb, blockId, dst);
             }
 
             if (count > 1)
-            {
-                var text = count.ToString();
-                var size = _font.MeasureString(text);
-                var pos = new Vector2(rect.Right - size.X - 4, rect.Bottom - size.Y - 2);
-                _font.DrawString(sb, text, pos, Color.White);
-            }
+                DrawSlotItemCount(sb, rect, count);
         }
 
         if (liveView == null)
@@ -9777,6 +16420,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _font.DrawString(sb, text, pos, Color.White);
     }
 
+    private void DrawSlotItemCount(SpriteBatch sb, Rectangle slotRect, int count)
+    {
+        if (count <= 1)
+            return;
+
+        var text = count.ToString();
+        var size = _font.MeasureString(text);
+        var pos = new Vector2(slotRect.Right - size.X - 4, slotRect.Bottom - size.Y - 2);
+        _font.DrawString(sb, text, pos, Color.White);
+    }
+
     private void DrawBorder(SpriteBatch sb, Rectangle rect, Color color)
     {
         sb.Draw(_pixel, new Rectangle(rect.X, rect.Y, rect.Width, 2), color);
@@ -9789,58 +16443,79 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     {
         var pos = _player.Position;
         var vel = _player.Velocity;
-        var leftLines = new List<string>
-        {
-            $"FPS: {_fps:0}",
-            $"WORLD: {(_meta?.Name ?? "WORLD")}",
-            $"MODE: {_gameMode.ToString().ToUpperInvariant()}",
-            $"POS: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
-            $"VEL: {vel.X:0.00}, {vel.Y:0.00}, {vel.Z:0.00}",
-            $"CHUNK: {_playerChunkCoord}",
-            $"STATE: FLY {_player.IsFlying} | GROUND {_player.IsGrounded}",
-            $"VITALS: HP {_survivalVitals.Health}/{SurvivalVitals.MaxHealth} | HUNGER {_survivalVitals.Hunger}/{SurvivalVitals.MaxHunger}",
-            $"SIGIL: ATONEMENT {MathF.Round(_sigilPositiveTargetFraction * 100f):0}% | CURSE {MathF.Round(_sigilNegativeTargetFraction * 100f):0}%",
-            $"HELD: {BlockRegistry.Get(_inventory.SelectedId).Name} ({_inventory.SelectedId})"
-        };
-
-        var rightLines = new List<string>
-        {
-            $"TIME: {_timeOfDayTicks} | WEATHER: {_weatherState.ToUpperInvariant()}",
-            $"RULES: COLLISION {(_playerCollisionEnabled ? "ON" : "OFF")} | SIGIL {(_sigilPowerEnabled ? "ON" : "OFF")}",
-            $"CYCLES: TIME {(_timeCycleEnabled ? "ON" : "OFF")} | WEATHER {(_weatherCycleEnabled ? "ON" : "OFF")}",
-            $"DIFFICULTY: {GetDifficultyDisplayLabel(_difficultyLevel).ToUpperInvariant()}",
-            $"UI: PAUSE {_pauseMenuOpen} | INV {_inventoryOpen} | CHAT {_chatInputActive} | CMD {_commandInputActive}",
-            $"STREAMING: {_activeRadiusChunks}/{_targetActiveRadiusChunks} CHUNKS"
-        };
+        var targetText = "TARGET: NONE";
+        var targetFaceText = "TARGET FACE: NONE";
+        var targetBiomeText = "BIOME: UNKNOWN";
 
         if (_world != null)
         {
             var wx = (int)MathF.Floor(pos.X);
             var wz = (int)MathF.Floor(pos.Z);
             var biomeName = _world.GetBiomeNameAt(wx, wz);
-            var desertWeight = _world.GetDesertWeightAt(wx, wz);
-            leftLines.Add($"BIOME: {biomeName} ({desertWeight:0.00}) @ {wx},{wz}");
+            targetBiomeText = $"BIOME: {biomeName} @ X {wx} Z {wz}";
 
             var origin = _player.Position + _player.HeadOffset;
             if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
             {
                 var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
                 var def = BlockRegistry.Get(id);
-                leftLines.Add($"LOOKING: {def.Name} ({id}) @ {hit.X},{hit.Y},{hit.Z}");
+                targetText = $"BLOCK: {def.Name} ({id}) XYZ {hit.X}, {hit.Y}, {hit.Z}";
+                targetFaceText = $"TARGET FACE: {FormatFaceLabel(hit.Face)} ({hit.Face})";
             }
         }
 
+        var loadedChunks = _world?.ChunkCount ?? 0;
+        var loadQueue = 0;
+        var meshQueue = 0;
+        var saveQueue = 0;
         if (_streamingService != null && _world != null)
-        {
-            var (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
-            rightLines.Add($"LOADED CHUNKS: {_world.ChunkCount}");
-            rightLines.Add($"QUEUES: LOAD {loadQueue} | MESH {meshQueue} | SAVE {saveQueue}");
-            rightLines.Add($"PREWARM: {(_spawnPrewarmComplete ? "DONE" : $"{_prewarmReadyCount}/{_prewarmTargetCount}")}");
-        }
+            (loadQueue, meshQueue, saveQueue) = _streamingService.GetQueueSizes();
 
-        var metrics = AdvancedPerformanceOptimizer.GetCurrentMetrics();
-        var (ramUsed, _, vramUsed, _) = SimpleMemoryManager.GetMemoryStats();
-        rightLines.Add($"PERF: CPU {metrics.CpuUsage:F1}% | RAM {ramUsed / 1024 / 1024}MB | VRAM {vramUsed / 1024 / 1024}MB");
+        var prewarmText = _spawnPrewarmComplete
+            ? "READY"
+            : $"{_prewarmReadyCount}/{_prewarmTargetCount}";
+        var (ramUsed, ramPeak, vramUsed, vramLimit) = SimpleMemoryManager.GetMemoryStats();
+
+        var leftLines = new List<string>
+        {
+            $"WORLD: {(_meta?.Name ?? "WORLD")}",
+            $"MODE: {_gameMode.ToString().ToUpperInvariant()}",
+            $"FPS: {_fps:0}",
+            $"XYZ: {pos.X:0.00}, {pos.Y:0.00}, {pos.Z:0.00}",
+            $"CHUNK: {_playerChunkCoord.X}, {_playerChunkCoord.Y}, {_playerChunkCoord.Z}",
+            targetText,
+            targetBiomeText
+        };
+
+        var rightLines = new List<string>
+        {
+            BuildDebugNetworkStatusLine(),
+            $"CHUNKS: LOADED {loadedChunks} | RADIUS {_activeRadiusChunks}/{_targetActiveRadiusChunks}",
+            $"QUEUES: LOAD {loadQueue} | MESH {meshQueue} | SAVE {saveQueue}",
+            $"STREAMING: PREWARM {prewarmText}",
+            BuildUserSpecsLine(),
+            $"MEM: RAM {FormatMegabytes(ramUsed)} / PEAK {FormatMegabytes(ramPeak)} | VRAM {FormatMegabytes(vramUsed)} / {FormatMegabytes(vramLimit)}",
+            $"EXTRA: SHIFT+F3 {(_debugHudExtraVisible ? "ON" : "OFF")}"
+        };
+
+        if (_debugHudExtraVisible)
+        {
+            leftLines.Add($"VEL: {vel.X:0.00}, {vel.Y:0.00}, {vel.Z:0.00}");
+            leftLines.Add($"STATE: FLY {_player.IsFlying} | GROUND {_player.IsGrounded} | CROUCH {_player.IsSneaking}");
+            leftLines.Add($"VITALS: HP {_survivalVitals.Health}/{SurvivalVitals.MaxHealth} | HUNGER {_survivalVitals.Hunger}/{SurvivalVitals.MaxHunger}");
+            leftLines.Add($"SIGIL: ATONEMENT {MathF.Round(_sigilPositiveTargetFraction * 100f):0}% | CURSE {MathF.Round(_sigilNegativeTargetFraction * 100f):0}%");
+            leftLines.Add($"HELD: {BlockRegistry.Get(_inventory.SelectedId).Name} ({_inventory.SelectedId})");
+            leftLines.Add(targetFaceText);
+            leftLines.Add("FACE MAP: TOP PosY | BOTTOM NegY | SIDE1 PosX | SIDE2 NegX | SIDE3 PosZ | SIDE4 NegZ");
+
+            rightLines.Add($"TIME: {_timeOfDayTicks} | WEATHER: {_weatherState.ToUpperInvariant()}");
+            rightLines.Add($"RULES: COLLISION {(_playerCollisionEnabled ? "ON" : "OFF")} | SIGIL {(_sigilPowerEnabled ? "ON" : "OFF")}");
+            rightLines.Add($"CYCLES: TIME {(_timeCycleEnabled ? "ON" : "OFF")} | WEATHER {(_weatherCycleEnabled ? "ON" : "OFF")}");
+            rightLines.Add($"DIFFICULTY: {GetDifficultyDisplayLabel(_difficultyLevel).ToUpperInvariant()}");
+            rightLines.Add($"UI: PAUSE {_pauseMenuOpen} | INV {_inventoryOpen} | CHAT {_chatInputActive} | CMD {_commandInputActive}");
+            rightLines.Add($"LOD: {_horizonLodStatus} | R {_horizonLodRadiusChunks} | C {_horizonLodCenterChunk.X},{_horizonLodCenterChunk.Z}");
+            rightLines.Add($"PERF: CPU {AdvancedPerformanceOptimizer.GetCurrentMetrics().CpuUsage:F1}%");
+        }
 
         var padding = 20;
         var gap = 24;
@@ -9858,13 +16533,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var leftRect = new Rectangle(_viewport.X + padding, _viewport.Y + padding, panelWidth, 22 + wrappedLeftLines.Count * lineHeight);
         var rightRect = new Rectangle(_viewport.Right - padding - panelWidth, _viewport.Y + padding, panelWidth, 22 + wrappedRightLines.Count * lineHeight);
 
-        sb.Draw(_pixel, leftRect, new Color(0, 0, 0, 124));
-        sb.Draw(_pixel, rightRect, new Color(0, 0, 0, 124));
-        DrawBorder(sb, leftRect, new Color(220, 220, 220, 220));
-        DrawBorder(sb, rightRect, new Color(220, 220, 220, 220));
+        sb.Draw(_pixel, leftRect, new Color(0, 0, 0, 214));
+        sb.Draw(_pixel, rightRect, new Color(0, 0, 0, 214));
+        DrawBorder(sb, leftRect, new Color(235, 235, 235, 235));
+        DrawBorder(sb, rightRect, new Color(235, 235, 235, 235));
 
-        _font.DrawString(sb, "WORLD / PLAYER", new Vector2(leftRect.X + 10, leftRect.Y + 8), Color.White);
-        _font.DrawString(sb, "RENDER / SYSTEMS", new Vector2(rightRect.X + 10, rightRect.Y + 8), Color.White);
+        _font.DrawString(sb, "WORLD / TARGET", new Vector2(leftRect.X + 10, leftRect.Y + 8), Color.White);
+        _font.DrawString(sb, "NETWORK / SYSTEM", new Vector2(rightRect.X + 10, rightRect.Y + 8), Color.White);
 
         for (int i = 0; i < wrappedLeftLines.Count; i++)
             _font.DrawString(sb, wrappedLeftLines[i], new Vector2(leftRect.X + 10, leftRect.Y + 8 + (i + 1) * lineHeight), Color.White);
@@ -9889,6 +16564,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var boundOverlayText = $"ATLAS OVERLAY: {_debugOverlayAtlasBound}";
         var heldText = $"HELD: {_inventory.SelectedId}";
         var modelText = $"MODEL: {(_debugDrawPlayerModel ? "ON" : "OFF")}";
+        var networkText = BuildDebugNetworkStatusLine();
         if (_world != null)
         {
             var origin = _player.Position + _player.HeadOffset;
@@ -9916,6 +16592,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             boundOverlayText,
             heldText,
             modelText,
+            networkText,
             $"BLOCKSIZE: {Scale.BlockSize:0.00}"
         };
 
@@ -9962,23 +16639,71 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     }
 #endif
 
-    private void DrawFaceOverlay(SpriteBatch sb)
+    private void TrackRenderFps()
     {
-        if (!_debugFaceOverlay)
+        _frameCount++;
+        var elapsed = _fpsStopwatch.Elapsed.TotalSeconds;
+        if (elapsed < 1.0)
             return;
 
-        var hitFaceText = "HIT FACE: NONE";
-        if (_world != null)
+        _fps = (float)(_frameCount / elapsed);
+        _frameCount = 0;
+        _fpsStopwatch.Restart();
+    }
+
+    private string BuildDebugNetworkStatusLine()
+    {
+        if (_lanSession != null)
         {
-            var origin = _player.Position + _player.HeadOffset;
-            if (VoxelRaycast.Raycast(origin, _player.Forward, InteractRange, _world.GetBlock, out var hit))
-                hitFaceText = $"HIT FACE: {FormatFaceLabel(hit.Face)} ({hit.Face})";
+            var transport = _lanSession switch
+            {
+                EosP2PHostSession => "EOS HOST",
+                EosP2PClientSession => "EOS CLIENT",
+                _ when _lanSession.IsHost => "LAN HOST",
+                _ => "LAN CLIENT"
+            };
+
+            var role = _lanSession.IsHost ? "HOST" : "CLIENT";
+            var state = _lanSession.IsConnected ? "CONNECTED" : "DISCONNECTED";
+            return $"NETWORK: {transport} {role} {state} PLAYER SLOT:{_lanSession.LocalPlayerId}";
         }
 
-        var x = _viewport.X + 20;
-        var y = _viewport.Y + 20 + (_font.LineHeight + 4) * 3;
-        _font.DrawString(sb, "FACE MAP: TOP=PosY | BOTTOM=NegY | SIDE1=PosX | SIDE2=NegX | SIDE3=PosZ | SIDE4=NegZ", new Vector2(x, y), Color.White);
-        _font.DrawString(sb, hitFaceText, new Vector2(x, y + _font.LineHeight + 2), Color.White);
+        if (_integratedServer?.IsRunning == true)
+            return $"NETWORK: INTEGRATED SERVER LOCAL READY WORLD:{_integratedServer.WorldName}";
+
+        return "NETWORK: LOCAL NO SESSION";
+    }
+
+    private static string BuildUserSpecsLine()
+    {
+        var gpu = "UNKNOWN";
+        try
+        {
+            gpu = (GraphicsAdapter.DefaultAdapter.Description ?? string.Empty).Trim();
+        }
+        catch
+        {
+            gpu = "UNKNOWN";
+        }
+
+        return $"SPECS: CPU {Environment.ProcessorCount}T | GPU {LimitOverlayText(gpu, 42)}";
+    }
+
+    private static string FormatMegabytes(long bytes)
+    {
+        if (bytes <= 0)
+            return "0MB";
+
+        return $"{bytes / 1024 / 1024}MB";
+    }
+
+    private static string LimitOverlayText(string value, int maxLength)
+    {
+        value = string.IsNullOrWhiteSpace(value) ? "UNKNOWN" : value.Trim();
+        if (value.Length <= maxLength)
+            return value;
+
+        return value[..Math.Max(0, maxLength - 3)] + "...";
     }
 
     private void DrawReticle(SpriteBatch sb)
@@ -10028,12 +16753,72 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
         }
 
+        DrawBlockBreakProgressIndicator(sb, center, size);
         DrawHandoffPrompt(sb, center, size);
+    }
+
+    private void DrawBlockBreakProgressIndicator(SpriteBatch sb, Vector2 center, int reticleSize)
+    {
+        if (!_hasActiveBreakProgress || _pauseMenuOpen || _inventoryOpen)
+            return;
+
+        var progress = Math.Clamp(_activeBreakProgressFraction, 0f, 1f);
+        if (progress <= 0f)
+            return;
+
+        var radius = Math.Max(reticleSize + 12f, 22f);
+        var thickness = 3;
+        var back = new Color(0, 0, 0, 135);
+        var fore = Color.Lerp(new Color(255, 205, 72, 230), new Color(116, 245, 190, 245), progress);
+
+        DrawReticleCircle(sb, center, radius, thickness, back);
+        DrawReticleArc(sb, center, radius, thickness + 1, fore, progress);
+
+        var barWidth = 76;
+        var barHeight = 6;
+        var bar = new Rectangle(
+            (int)MathF.Round(center.X - barWidth / 2f),
+            (int)MathF.Round(center.Y + radius + 12f),
+            barWidth,
+            barHeight);
+        sb.Draw(_pixel, new Rectangle(bar.X - 2, bar.Y - 2, bar.Width + 4, bar.Height + 4), new Color(0, 0, 0, 150));
+        sb.Draw(_pixel, bar, new Color(18, 18, 18, 210));
+        var fill = new Rectangle(bar.X, bar.Y, Math.Max(1, (int)MathF.Round(bar.Width * progress)), bar.Height);
+        sb.Draw(_pixel, fill, fore);
+        DrawBorder(sb, new Rectangle(bar.X - 1, bar.Y - 1, bar.Width + 2, bar.Height + 2), new Color(220, 220, 220, 150));
+
+        if (!string.IsNullOrWhiteSpace(_activeBreakBlockName))
+        {
+            var label = $"{_activeBreakBlockName} {(int)MathF.Round(progress * 100f)}%";
+            var labelSize = _font.MeasureString(label);
+            var labelPos = new Vector2(center.X - labelSize.X / 2f, bar.Bottom + 5f);
+            _font.DrawString(sb, label, labelPos + new Vector2(1, 1), Color.Black * 0.7f);
+            _font.DrawString(sb, label, labelPos, new Color(235, 235, 235, 225));
+        }
     }
 
     private void DrawHandoffPrompt(SpriteBatch sb, Vector2 center, int reticleSize)
     {
-        if (!_handoffPromptVisible || _pauseMenuOpen || _inventoryOpen || (_gameMode != GameMode.Veilwalker && _gameMode != GameMode.Artificer))
+        if (_pauseMenuOpen || _inventoryOpen || (_gameMode != GameMode.Veilwalker && _gameMode != GameMode.Artificer))
+            return;
+
+        if (_localOutgoingHandoffOffers.Count > 0)
+        {
+            var pending = _localOutgoingHandoffOffers.Values
+                .OrderBy(offer => offer.ExpiresIn)
+                .First();
+            var targetName = ResolvePlayerName(pending.TargetPlayerId);
+            var pendingLabel = $"OFFERING {pending.Amount}x {GetItemDisplayName(pending.ItemId)} TO {targetName.ToUpperInvariant()}";
+            var timeLabel = $"{Math.Max(0, (int)MathF.Ceiling(pending.ExpiresIn))}s";
+            var pendingText = $"{pendingLabel} ({timeLabel})";
+            var pendingSize = _font.MeasureString(pendingText);
+            var pendingPos = new Vector2(center.X - pendingSize.X / 2f, center.Y + reticleSize + 10f);
+            _font.DrawString(sb, pendingText, pendingPos + new Vector2(2, 2), Color.Black * 0.65f);
+            _font.DrawString(sb, pendingText, pendingPos, new Color(255, 230, 150, 235));
+            return;
+        }
+
+        if (!_handoffPromptVisible)
             return;
 
         var giveKey = FormatBindingLabel("GiveItem", Keys.F);
@@ -10081,6 +16866,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             var p0 = ReticleCirclePoints[i];
             var p1 = ReticleCirclePoints[(i + 1) % ReticleCirclePoints.Length];
+            var start = center + p0 * radius;
+            var end = center + p1 * radius;
+            DrawLine(sb, start, end, color, t);
+        }
+    }
+
+    private void DrawReticleArc(SpriteBatch sb, Vector2 center, float radius, int thickness, Color color, float progress)
+    {
+        if (radius <= 0f || progress <= 0f)
+            return;
+
+        var t = Math.Max(1, thickness);
+        var segmentCount = Math.Clamp((int)MathF.Ceiling(ReticleCirclePoints.Length * Math.Clamp(progress, 0f, 1f)), 1, ReticleCirclePoints.Length);
+        var offset = ReticleCirclePoints.Length / 4 * 3;
+        for (int i = 0; i < segmentCount; i++)
+        {
+            var p0 = ReticleCirclePoints[(offset + i) % ReticleCirclePoints.Length];
+            var p1 = ReticleCirclePoints[(offset + i + 1) % ReticleCirclePoints.Length];
             var start = center + p0 * radius;
             var end = center + p1 * radius;
             DrawLine(sb, start, end, color, t);
@@ -10247,6 +17050,42 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             VertexColorEnabled = false,
             World = Matrix.Identity
         };
+
+        // Initialize voxel shader per-frame parameters with defaults
+        SkyLightFactor = 1f;
+        BlockLightIntensity = 1f;
+        AOStrength = 1f;
+        BlockLightTint = new Vector3(1.0f, 0.65f, 0.35f);
+    }
+
+    private void UpdateVoxelLightParameters()
+    {
+        // Compute per-frame voxel lighting parameters from WorldTime.
+        // These are updated every frame so time-of-day changes affect environmental
+        // brightness WITHOUT rebuilding chunk meshes.
+        var timeOfDay = _worldTime.TimeOfDaySeconds;
+        var phase = _worldTime.Phase;
+
+        // Compute sky brightness based on time-of-day phase.
+        // Day = full brightness (1.0), Night = dim cool ambient (0.1),
+        // Dawn/Dusk = interpolated values.
+        float skyFactor = 1f;
+        if (phase == TimePhase.Night)
+            skyFactor = 0.1f;
+        else if (phase == TimePhase.Dawn || phase == TimePhase.Dusk)
+            skyFactor = 0.5f; // midpoint interpolation
+
+        // Block light intensity is always 1.0 (torches contribute light regardless of time)
+        float blockIntensity = 1f;
+
+        // AO strength is preserved from the baked vertex colors; keep at 1.0
+        // to avoid double-darkening. The shader uses aoRaw * AOStrength to control
+        // how much the baked AO affects the final color.
+        float aoStrength = 1f;
+
+        SkyLightFactor = skyFactor;
+        BlockLightIntensity = blockIntensity;
+        AOStrength = aoStrength;
     }
 
     private void EnsureCutoutEffect(GraphicsDevice device)
@@ -10258,6 +17097,196 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         {
             VertexColorEnabled = false
         };
+    }
+
+    private void EnsureVoxelEffect(GraphicsDevice device)
+    {
+        if (_voxelEffect != null)
+            return;
+
+        _voxelEffectLoadAttempted = true;
+        var candidates = new[]
+        {
+            "effects/voxel.mgfxo",
+            "effects/voxel.fx"
+        };
+
+        for (var i = 0; i < candidates.Length; i++)
+        {
+            if (!AssetResolver.TryResolve(candidates[i], out _))
+                continue;
+            if (!_assets.TryLoadAssetBytes(candidates[i], out var bytes) || bytes.Length == 0)
+                continue;
+
+            try
+            {
+                _voxelEffect = new Effect(device, bytes);
+                _log.Info($"Loaded voxel effect: {candidates[i]}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Failed to load voxel effect {candidates[i]}: {ex.Message}");
+                _voxelEffect?.Dispose();
+                _voxelEffect = null;
+            }
+        }
+    }
+
+    private void EnsureCelestialAssets(GraphicsDevice device)
+    {
+        if (_sunTexture != null && _moonTexture != null)
+            return;
+
+        try
+        {
+            _sunTexture = _assets.LoadTexture("textures/environment/sun.png");
+            _moonTexture = _assets.LoadTexture("textures/environment/moon.png");
+
+            if (_sunTexture == null)
+                _log.Warn("Failed to load sun texture");
+            if (_moonTexture == null)
+                _log.Warn("Failed to load moon texture");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load celestial textures: {ex.Message}");
+        }
+
+        // Initialize celestial geometry (a simple quad for billboarding)
+        if (_celestialVertexBuffer == null)
+        {
+            var vertices = new VertexPositionTexture[]
+            {
+                new VertexPositionTexture(new Vector3(-0.5f, -0.5f, 0f), new Vector2(0f, 1f)),
+                new VertexPositionTexture(new Vector3(0.5f, -0.5f, 0f), new Vector2(1f, 1f)),
+                new VertexPositionTexture(new Vector3(-0.5f, 0.5f, 0f), new Vector2(0f, 0f)),
+                new VertexPositionTexture(new Vector3(0.5f, 0.5f, 0f), new Vector2(1f, 0f))
+            };
+
+            _celestialVertexBuffer = new VertexBuffer(device, VertexPositionTexture.VertexDeclaration, vertices.Length, BufferUsage.WriteOnly);
+            _celestialVertexBuffer.SetData(vertices);
+
+            var indices = new ushort[] { 0, 1, 2, 1, 3, 2 };
+            _celestialIndexBuffer = new IndexBuffer(device, IndexElementSize.SixteenBits, indices.Length, BufferUsage.WriteOnly);
+            _celestialIndexBuffer.SetData(indices);
+        }
+
+        if (_celestialEffect == null)
+        {
+            _celestialEffect = new BasicEffect(device)
+            {
+                TextureEnabled = true,
+                LightingEnabled = false,
+                VertexColorEnabled = false,
+                FogEnabled = false
+            };
+        }
+    }
+
+    private void DrawCelestialBodies(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_celestialEffect == null || _celestialVertexBuffer == null || _celestialIndexBuffer == null)
+            return;
+
+        var timeOfDay = _worldTime.TimeOfDaySeconds;
+        var phase = _worldTime.Phase;
+
+        // Calculate sun position
+        var sunVisible = phase == TimePhase.Dawn || phase == TimePhase.Day || phase == TimePhase.Dusk;
+        var sunPosition = CalculateCelestialPosition(timeOfDay, isSun: true);
+
+        // Calculate moon position (complementary to sun)
+        var moonVisible = phase == TimePhase.Night || phase == TimePhase.Dawn || phase == TimePhase.Dusk;
+        var moonPosition = CalculateCelestialPosition(timeOfDay, isSun: false);
+
+        var celestialDistance = 400f * Scale.BlockSize; // Distance from camera
+        var celestialSize = 25f * Scale.BlockSize; // Size of celestial bodies
+
+        // Render sun
+        if (sunVisible && _sunTexture != null && sunPosition.Y > -0.2f)
+        {
+            var sunWorldPosition = _cameraPosition + sunPosition * celestialDistance;
+            DrawCelestialBody(device, view, proj, sunWorldPosition, celestialSize, _sunTexture);
+        }
+
+        // Render moon
+        if (moonVisible && _moonTexture != null && moonPosition.Y > -0.2f)
+        {
+            var moonWorldPosition = _cameraPosition + moonPosition * celestialDistance;
+            DrawCelestialBody(device, view, proj, moonWorldPosition, celestialSize, _moonTexture);
+        }
+    }
+
+    private Vector3 CalculateCelestialPosition(double timeOfDaySeconds, bool isSun)
+    {
+        // Convert time to orbital angle
+        // 00:00 = midnight (sun below horizon), 12:00 = noon (sun at zenith)
+        var dayProgress = timeOfDaySeconds / WorldTime.GameSecondsPerDay;
+        var angle = (float)(dayProgress * Math.PI * 2 - Math.PI / 2); // Start at -90 degrees
+
+        if (isSun)
+        {
+            // Sun orbits from east to west
+            var x = MathF.Cos(angle);
+            var y = MathF.Sin(angle);
+            var z = MathF.Sin(angle) * 0.3f; // Slight Z tilt
+            return new Vector3(x, y, z);
+        }
+        else
+        {
+            // Moon is opposite to sun (180 degrees offset)
+            var moonAngle = angle + MathF.PI;
+            var x = MathF.Cos(moonAngle);
+            var y = MathF.Sin(moonAngle);
+            var z = MathF.Sin(moonAngle) * 0.3f;
+            return new Vector3(x, y, z);
+        }
+    }
+
+    private void DrawCelestialBody(GraphicsDevice device, Matrix view, Matrix proj, Vector3 position, float size, Texture2D texture)
+    {
+        if (_celestialEffect == null || _celestialVertexBuffer == null || _celestialIndexBuffer == null)
+            return;
+
+        var prevRasterizer = device.RasterizerState;
+        var prevDepthStencil = device.DepthStencilState;
+        var prevBlendState = device.BlendState;
+        var prevSampler = device.SamplerStates[0];
+
+        device.RasterizerState = RasterizerState.CullNone;
+        device.DepthStencilState = DepthStencilState.DepthRead;
+        device.BlendState = BlendState.NonPremultiplied;
+        device.SamplerStates[0] = SamplerState.LinearClamp;
+
+        // Create billboard transformation to always face camera
+        var inverseView = Matrix.Invert(view);
+        var right = Vector3.Normalize(new Vector3(inverseView.M11, inverseView.M12, inverseView.M13));
+        var up = Vector3.Normalize(new Vector3(inverseView.M21, inverseView.M22, inverseView.M23));
+        
+        // Create billboard matrix: scale, then orient to camera, then translate to position
+        var billboardMatrix = Matrix.CreateScale(size) * 
+                             Matrix.CreateWorld(Vector3.Zero, -Vector3.Forward, up) * 
+                             Matrix.CreateTranslation(position);
+
+        _celestialEffect.World = billboardMatrix;
+        _celestialEffect.View = view;
+        _celestialEffect.Projection = proj;
+        _celestialEffect.Texture = texture;
+
+        device.SetVertexBuffer(_celestialVertexBuffer);
+        device.Indices = _celestialIndexBuffer;
+
+        foreach (var pass in _celestialEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            device.DrawIndexedPrimitives(PrimitiveType.TriangleList, 0, 0, 2);
+        }
+
+        device.RasterizerState = prevRasterizer;
+        device.DepthStencilState = prevDepthStencil;
+        device.BlendState = prevBlendState;
+        device.SamplerStates[0] = prevSampler;
     }
 
     private void EnsureWaterEffect(GraphicsDevice device)
@@ -10301,6 +17330,11 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
     }
 
     private static void SetEffectVector3(Effect effect, string name, Vector3 value)
+    {
+        effect.Parameters[name]?.SetValue(value);
+    }
+
+    private static void SetEffectVector2(Effect effect, string name, Vector2 value)
     {
         effect.Parameters[name]?.SetValue(value);
     }
@@ -10349,10 +17383,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _playerModel.HeadYawOffset = 0f;
         _playerModel.IsFlying = _player.IsFlying;
         _playerModel.IsSneaking = _player.IsSneaking;
-        _playerModel.IsSprinting = _player.IsSprinting;
         _playerModel.IsGrounded = _player.IsGrounded;
+        _playerModel.IsInWater = _player.IsInWater;
+        _playerModel.IsSprinting = _player.IsSprinting && !_playerModel.IsInWater;
+        _playerModel.IsSwimming = IsLocalPlayerFullyUnderwater();
         _playerModel.VerticalVelocity = _player.Velocity.Y;
-        _playerModel.HeldBlockId = _inventory.SelectedId;
+        _playerModel.HeldItemId = _inventory.SelectedId;
+        _playerModel.HeldBlockId = GetHandBlockRenderId(_inventory.SelectedId);
         _playerModel.SetAtlas(_atlas);
         _playerModel.Render(view, proj, _worldTimeSeconds);
 
@@ -10493,6 +17530,108 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _worldOverlaySpriteBatch.End();
     }
 
+    private void UpdateTorchFlameAnchors(float dt)
+    {
+        if (_world == null)
+        {
+            _torchFlameChunkCache.Clear();
+            _torchFlameAnchors.Clear();
+            _torchFlameRefreshTimer = 0f;
+            return;
+        }
+
+        _torchFlameRefreshTimer -= dt;
+        if (_torchFlameRefreshTimer > 0f)
+            return;
+
+        var previousAnchorCount = _torchFlameAnchors.Count;
+        _torchFlameRefreshTimer = TorchFlameRefreshIntervalSeconds;
+        _world.CopyChunksTo(_torchFlameChunkScratch);
+        _torchFlameRemovalScratch.Clear();
+        foreach (var key in _torchFlameChunkCache.Keys)
+            _torchFlameRemovalScratch.Add(key);
+
+        var scansThisRefresh = 0;
+        var totalTorchesFound = 0;
+        for (var i = 0; i < _torchFlameChunkScratch.Count; i++)
+        {
+            var chunk = _torchFlameChunkScratch[i];
+            var coord = chunk.Coord;
+            _torchFlameRemovalScratch.Remove(coord);
+
+            if (_torchFlameChunkCache.TryGetValue(coord, out var cached) && cached.Version == chunk.Version)
+                continue;
+
+            if (scansThisRefresh >= MaxTorchFlameChunkScansPerRefresh)
+                continue;
+
+            _torchFlameLocalScratch.Clear();
+            chunk.CollectLocalBlockPositions(BlockIds.Torch, _torchFlameLocalScratch);
+            chunk.CollectLocalBlockPositions(BlockIds.FiberWrappedTorch, _torchFlameLocalScratch);
+            scansThisRefresh++;
+            totalTorchesFound += _torchFlameLocalScratch.Count;
+
+            var positions = new List<Vector3>(_torchFlameLocalScratch.Count);
+            var originX = coord.X * VoxelChunkData.ChunkSizeX;
+            var originY = coord.Y * VoxelChunkData.ChunkSizeY;
+            var originZ = coord.Z * VoxelChunkData.ChunkSizeZ;
+            for (var p = 0; p < _torchFlameLocalScratch.Count; p++)
+            {
+                var local = _torchFlameLocalScratch[p];
+                positions.Add(new Vector3(
+                    originX + local.X + 0.5f,
+                    originY + local.Y + 0.86f,
+                    originZ + local.Z + 0.5f));
+            }
+
+            _torchFlameChunkCache[coord] = new TorchFlameChunkCache(chunk.Version, positions);
+        }
+
+        for (var i = 0; i < _torchFlameRemovalScratch.Count; i++)
+            _torchFlameChunkCache.Remove(_torchFlameRemovalScratch[i]);
+
+        _torchFlameAnchors.Clear();
+        foreach (var cached in _torchFlameChunkCache.Values)
+            _torchFlameAnchors.AddRange(cached.Anchors);
+
+        // Log torch detection changes
+        if (_torchFlameAnchors.Count != previousAnchorCount || totalTorchesFound > 0)
+        {
+            System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] TorchFlame Anchors Update: Previous={previousAnchorCount}, Current={_torchFlameAnchors.Count}, TorchesFoundThisRefresh={totalTorchesFound}, ChunksScanned={scansThisRefresh}, CachedChunks={_torchFlameChunkCache.Count}");
+        }
+    }
+
+    private void DrawTorchFlames(SpriteBatch sb, GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        var addedKilnAnchor = false;
+        if (_activeKilnSmelting && _hasActiveKilnKey)
+        {
+            _torchFlameAnchors.Add(new Vector3(_activeKilnKey.X + 0.5f, _activeKilnKey.Y + 1.08f, _activeKilnKey.Z + 0.5f));
+            addedKilnAnchor = true;
+        }
+
+        if (_torchFlameAnchors.Count == 0)
+            return;
+
+        // Log torch rendering periodically
+        _torchRenderFrameCounter++;
+        if (_torchRenderFrameCounter % 120 == 0)
+        {
+            System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] DrawTorchFlames: AnchorCount={_torchFlameAnchors.Count}, KilnAdded={addedKilnAnchor}, CameraPosition=({_cameraPosition.X:F1},{_cameraPosition.Y:F1},{_cameraPosition.Z:F1}), TimeSeconds={_worldTimeSeconds:F2}");
+        }
+
+        _torchFlameParticles.Draw(
+            device,
+            _torchFlameAnchors,
+            _cameraPosition,
+            view,
+            proj,
+            _worldTimeSeconds);
+
+        if (addedKilnAnchor)
+            _torchFlameAnchors.RemoveAt(_torchFlameAnchors.Count - 1);
+    }
+
     private static Color GetHurtOutlineColor(float timer)
     {
         var pulse = Math.Clamp(timer / HurtOutlineDurationSeconds, 0f, 1f);
@@ -10522,7 +17661,9 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _soulMarkerModel.IsSneaking = false;
         _soulMarkerModel.IsSprinting = false;
         _soulMarkerModel.IsGrounded = true;
+        _soulMarkerModel.IsSwimming = false;
         _soulMarkerModel.VerticalVelocity = 0f;
+        _soulMarkerModel.HeldItemId = BlockId.Air;
         _soulMarkerModel.HeldBlockId = BlockId.Air;
         _soulMarkerModel.SetAtlas(_atlas);
         _soulMarkerModel.ResetAnimationState();
@@ -10663,7 +17804,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         Vector3 handPosition;
         Vector3 forward;
         Vector3 up = Vector3.Up;
-        BlockId heldId = _inventory.SelectedId;
+        var legacyHeldId = _inventory.SelectedId;
+        BlockId heldId = GetHandBlockRenderId(legacyHeldId);
         var moveAmount = _player.MoveIntent.Length();
         var isFlying = _player.IsFlying;
         var isGrounded = _player.IsGrounded;
@@ -10677,7 +17819,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 handPosition = observedModel.Position + _player.HeadOffset;
                 forward = PlayerController.GetForwardVector(observedModel.Yaw, observedModel.Pitch);
             }
-            heldId = observedModel.HeldBlockId;
+            legacyHeldId = observedModel.HeldItemId;
+            heldId = GetHandBlockRenderId(legacyHeldId);
             var observedVelocity = _remoteVelocityByPlayerId.TryGetValue(_veilseerSpectateTargetPlayerId, out var remoteVelocity)
                 ? remoteVelocity
                 : Vector3.Zero;
@@ -10709,6 +17852,66 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         var damageKickProgress = _damageHandKickTimer > 0f
             ? Math.Clamp(_damageHandKickTimer / DamageHandKickDurationSeconds, 0f, 1f) * _damageHandKickStrength
             : 0f;
+        var heldItem = ItemRegistry.Get((byte)legacyHeldId);
+        if (heldItem.Id != ItemId.None && (heldItem.HandModel == ItemHandModelKind.FlatSprite || heldItem.HandModel == ItemHandModelKind.Tool))
+        {
+            var sprite = GetItemSprite(legacyHeldId);
+            if (sprite != null)
+            {
+                if (heldItem.HandModel == ItemHandModelKind.Tool)
+                {
+                    var isJavelin = ItemRegistry.IsJavelin(heldItem.Id);
+                    var toolTypeName = ItemRegistry.IsMattock(heldItem.Id) ? "mattock" :
+                                       ItemRegistry.IsHatchet(heldItem.Id) ? "hatchet" :
+                                       ItemRegistry.IsSpade(heldItem.Id) ? "spade" :
+                                       ItemRegistry.IsBlade(heldItem.Id) ? "blade" :
+                                       ItemRegistry.IsPlow(heldItem.Id) ? "plow" :
+                                       isJavelin ? "javelin" : string.Empty;
+
+                    var toolModel = !string.IsNullOrEmpty(toolTypeName) ? BlockModel.GetToolModel(toolTypeName, _log) : null;
+                    var handleTexture = GetItemSprite(BlockId.Stick);
+                    var chargeProgress = (_isChargingJavelin && isJavelin) ? (_javelinChargeHoldTimer / JavelinMaxChargeSeconds) : 0f;
+
+                    _handRenderer.DrawHeldTool(
+                        view,
+                        proj,
+                        handPosition,
+                        forward,
+                        up,
+                        toolModel,
+                        sprite,
+                        handleTexture,
+                        _worldTimeSeconds,
+                        moveAmount,
+                        isFlying,
+                        actionSwingProgress,
+                        damageKickProgress,
+                        javelinChargeProgress: chargeProgress,
+                        isJavelinThrust: isJavelin);
+                }
+                else
+                {
+                    _handRenderer.DrawItemSprite(
+                        view,
+                        proj,
+                        handPosition,
+                        forward,
+                        up,
+                        sprite,
+                        _worldTimeSeconds,
+                        moveAmount,
+                        isFlying,
+                        actionSwingProgress,
+                        damageKickProgress,
+                        isTool: false);
+                }
+
+                device.DepthStencilState = DepthStencilState.Default;
+                device.RasterizerState = prevRaster;
+                return;
+            }
+        }
+
         _handRenderer.Draw(
             view,
             proj,
@@ -10771,8 +17974,53 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         device.RasterizerState = RasterizerState.CullNone;
         device.SamplerStates[0] = SamplerState.PointClamp;
 
-        DrawWorldItemsPass(device, transparent: false);
-        DrawWorldItemsPass(device, transparent: true);
+        DrawWorldItemsPass(device, view, transparent: false);
+        DrawWorldItemsPass(device, view, transparent: true);
+    }
+
+    private void DrawPebbleProjectiles(GraphicsDevice device, Matrix view, Matrix proj)
+    {
+        if (_pebbleProjectiles.Count == 0)
+            return;
+
+        var sprite = GetItemSprite(BlockId.Pebbles);
+        if (sprite == null)
+            return;
+
+        EnsureItemEffect(device);
+        if (_itemEffect == null)
+            return;
+
+        Matrix.Invert(ref view, out var cameraWorld);
+        var cameraRight = cameraWorld.Right;
+        var cameraUp = cameraWorld.Up;
+
+        _itemEffect.View = view;
+        _itemEffect.Projection = proj;
+        _itemEffect.Texture = sprite;
+        _itemEffect.World = Matrix.Identity;
+
+        device.RasterizerState = RasterizerState.CullNone;
+        device.SamplerStates[0] = SamplerState.PointClamp;
+        device.DepthStencilState = DepthStencilState.DepthRead;
+        device.BlendState = BlendState.NonPremultiplied;
+
+        for (var i = 0; i < _pebbleProjectiles.Count; i++)
+        {
+            var projectile = _pebbleProjectiles[i];
+            var verts = BuildWorldItemSpriteVerts(
+                projectile.Position,
+                cameraRight,
+                cameraUp,
+                sprite.Width,
+                sprite.Height);
+
+            foreach (var pass in _itemEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, 2);
+            }
+        }
     }
 
     private void DrawWaterChunks(GraphicsDevice device, BoundingFrustum frustum, Matrix view, Matrix proj)
@@ -10782,17 +18030,20 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
 
         EnsureWaterEffect(device);
 
+        var prevSampler = device.SamplerStates[0];
         device.BlendState = BlendState.AlphaBlend;
         device.DepthStencilState = DepthStencilState.DepthRead;
+        device.SamplerStates[0] = SamplerState.LinearClamp;
 
         var pulse = (MathF.Sin(_worldTimeSeconds * 1.6f) + 1f) * 0.5f;
         var tintA = new Vector3(0.56f, 0.78f, 1f);
         var tintB = new Vector3(0.44f, 0.67f, 0.95f);
         var tint = Vector3.Lerp(tintA, tintB, pulse);
-        var alpha = 0.66f + pulse * 0.10f;
+        var alpha = 0.62f + pulse * 0.04f;
 
         if (_waterEffect == null)
         {
+            UpdateFlowingWaterAnimationFrame();
             _effect.DiffuseColor = tint;
             _effect.Alpha = alpha;
         }
@@ -10801,12 +18052,21 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             SetEffectVector3(_waterEffect, "TintColor", tint);
             SetEffectFloat(_waterEffect, "WaterAlpha", alpha);
             SetEffectFloat(_waterEffect, "Time", _worldTimeSeconds);
-            SetEffectFloat(_waterEffect, "WaveStrength", 0.015f);
-            SetEffectFloat(_waterEffect, "UvScrollSpeed", 0.015f);
+            SetEffectFloat(_waterEffect, "WaveStrength", 0.012f);
+            SetEffectFloat(_waterEffect, "UvScrollSpeed", 0.018f);
+            SetEffectFloat(_waterEffect, "WaterTileScale", 1f / 48f);
             SetEffectMatrix(_waterEffect, "View", view);
             SetEffectMatrix(_waterEffect, "Projection", proj);
+            SetEffectMatrix(_waterEffect, "World", Matrix.Identity);
             if (_atlas != null)
+            {
                 SetEffectTexture(_waterEffect, "Texture0", _atlas.Texture);
+                _atlas.GetFaceUvRect((byte)BlockId.Water, FaceDirection.PosY, out var uv00, out var uv10, out var uv11, out var uv01);
+                var min = Vector2.Min(Vector2.Min(uv00, uv10), Vector2.Min(uv11, uv01));
+                var max = Vector2.Max(Vector2.Max(uv00, uv10), Vector2.Max(uv11, uv01));
+                SetEffectVector2(_waterEffect, "WaterUvMin", min);
+                SetEffectVector2(_waterEffect, "WaterUvMax", max);
+            }
         }
 
         foreach (var coord in _chunkOrder)
@@ -10822,12 +18082,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             if (verts.Length % 3 != 0)
                 continue;
 
-            var wave = MathF.Sin(_worldTimeSeconds * 1.9f + coord.X * 0.45f + coord.Z * 0.37f) * 0.015f;
-            var world = Matrix.CreateTranslation(0f, wave, 0f);
-
             if (_waterEffect != null)
             {
-                SetEffectMatrix(_waterEffect, "World", world);
                 foreach (var pass in _waterEffect.CurrentTechnique.Passes)
                 {
                     pass.Apply();
@@ -10836,13 +18092,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             }
             else
             {
-                _effect.World = world;
+                _effect.World = Matrix.Identity;
                 foreach (var pass in _effect.CurrentTechnique.Passes)
                 {
                     pass.Apply();
                     device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, verts.Length / 3);
                 }
             }
+
         }
 
         if (_waterEffect == null)
@@ -10851,19 +18108,112 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _effect.DiffuseColor = Vector3.One;
             _effect.Alpha = 1f;
         }
+
+        device.SamplerStates[0] = prevSampler;
     }
 
-    private void DrawWorldItemsPass(GraphicsDevice device, bool transparent)
+    private void UpdateFlowingWaterAnimationFrame()
+    {
+        if (_atlas == null)
+            return;
+
+        var frame = (int)MathF.Floor(_worldTimeSeconds * FlowingWaterAnimationFramesPerSecond) & 7;
+        if (frame == _flowingWaterAnimationFrame)
+            return;
+
+        _flowingWaterAnimationFrame = frame;
+        for (var face = 0; face < 6; face++)
+        {
+            var rect = _atlas.GetFaceSourceRect((byte)BlockId.FlowingWater1, (FaceDirection)face);
+            if (rect.Width <= 0 || rect.Height <= 0)
+                continue;
+
+            var count = rect.Width * rect.Height;
+            if (_flowingWaterAnimationPixels == null || _flowingWaterAnimationPixels.Length != count)
+                _flowingWaterAnimationPixels = new Color[count];
+
+            FillFlowingWaterAnimationPixels(_flowingWaterAnimationPixels, rect.Width, rect.Height, frame, (FaceDirection)face);
+            _atlas.Texture.SetData(0, rect, _flowingWaterAnimationPixels, 0, count);
+        }
+    }
+
+    private static void FillFlowingWaterAnimationPixels(Color[] pixels, int width, int height, int frame, FaceDirection face)
+    {
+        var sideFace = face != FaceDirection.PosY && face != FaceDirection.NegY;
+        var frameShift = frame;
+
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                var nx = x / Math.Max(1f, width - 1f);
+                var ny = y / Math.Max(1f, height - 1f);
+                var flowCoord = sideFace ? y + frameShift : x + y + frameShift;
+                var narrow = PositiveModulo(flowCoord, 8);
+                var wide = PositiveModulo(flowCoord + x / 2, 13);
+                var ribbon = narrow <= 1 ? 1f : 0f;
+                var softRibbon = wide <= 2 ? 0.55f : 0f;
+                var foam = ((x * 11 + y * 7 + frame * 2) & 31) == 0 ? 0.25f : 0f;
+                var depthShade = sideFace ? MathHelper.Lerp(0.95f, 0.62f, ny) : MathHelper.Lerp(1.04f, 0.90f, ny);
+                var shimmer = Math.Clamp(0.58f + ribbon * 0.28f + softRibbon * 0.16f + foam, 0f, 1f);
+
+                var r = (byte)Math.Clamp((int)MathF.Round((54f + 38f * shimmer) * depthShade), 0, 255);
+                var g = (byte)Math.Clamp((int)MathF.Round((139f + 58f * shimmer) * depthShade), 0, 255);
+                var b = (byte)Math.Clamp((int)MathF.Round((216f + 35f * shimmer) * depthShade), 0, 255);
+                pixels[x + y * width] = new Color(r, g, b, (byte)214);
+            }
+        }
+
+        static int PositiveModulo(int value, int divisor)
+        {
+            var result = value % divisor;
+            return result < 0 ? result + divisor : result;
+        }
+    }
+
+    private void DrawWorldItemsPass(GraphicsDevice device, Matrix view, bool transparent)
     {
         if (_itemEffect == null)
             return;
 
         device.DepthStencilState = transparent ? DepthStencilState.DepthRead : DepthStencilState.Default;
         device.BlendState = transparent ? BlendState.NonPremultiplied : BlendState.Opaque;
+        Matrix.Invert(ref view, out var cameraWorld);
+        var cameraRight = cameraWorld.Right;
+        var cameraUp = cameraWorld.Up;
 
         foreach (var pair in _worldItems)
         {
             var item = pair.Value;
+            var itemDef = ItemRegistry.Get((byte)item.BlockId);
+            if (itemDef.Id != ItemId.None && itemDef.InventoryModel == ItemInventoryModelKind.FlatSprite)
+            {
+                if (!transparent)
+                    continue;
+
+                var sprite = GetItemSprite(item.BlockId);
+                if (sprite == null)
+                    continue;
+
+                var spriteBobPhase = MathF.Sin((_worldTimeSeconds - item.SpawnTime) * ItemBobSpeed + item.ItemId * 0.31f);
+                var spriteBob = item.IsGrounded ? (spriteBobPhase * 0.5f + 0.5f) * ItemBobHeight : spriteBobPhase * ItemBobHeight;
+                var verts = BuildWorldItemSpriteVerts(
+                    item.Position + new Vector3(0f, spriteBob, 0f),
+                    cameraRight,
+                    cameraUp,
+                    sprite.Width,
+                    sprite.Height);
+                _itemEffect.Texture = sprite;
+                _itemEffect.World = Matrix.Identity;
+                foreach (var pass in _itemEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    device.DrawUserPrimitives(PrimitiveType.TriangleList, verts, 0, 2);
+                }
+
+                continue;
+            }
+
             if (BlockRegistry.IsTransparent((byte)item.BlockId) != transparent)
                 continue;
             var mesh = GetItemMesh(item.BlockId);
@@ -10878,6 +18228,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 * Matrix.CreateRotationZ(ItemTiltRadians * 0.6f)
                 * Matrix.CreateRotationY(spin)
                 * Matrix.CreateTranslation(item.Position + new Vector3(0f, bob, 0f));
+            if (_atlas != null)
+                _itemEffect.Texture = _atlas.Texture;
             _itemEffect.World = world;
 
             foreach (var pass in _itemEffect.CurrentTechnique.Passes)
@@ -10944,14 +18296,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             dir = _player.Forward;
         }
         
-        if (!VoxelRaycast.Raycast(origin, dir, InteractRange, _world.GetBlock, out var hit))
+        if (!TryRaycastInteractBlock(origin, dir, out var hit))
         {
             _highlightActive = false;
             return;
         }
 
         var id = _world.GetBlock(hit.X, hit.Y, hit.Z);
-        if (id == BlockIds.Air)
+        if (id == BlockIds.Air || BlockIds.IsWater(id))
         {
             _highlightActive = false;
             return;
@@ -10968,14 +18320,60 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _highlightZ = hit.Z;
         _highlightActive = true;
 
-        var min = new Vector3(hit.X, hit.Y, hit.Z) * Scale.BlockSize;
-        var max = min + new Vector3(Scale.BlockSize);
+        GetBlockSelectionBounds(hit.X, hit.Y, hit.Z, id, out var min, out var max);
         var eps = HighlightEpsilon;
         min -= new Vector3(eps);
         max += new Vector3(eps);
 
         BuildHighlightVerts(min, max, _blockOutlineColor);
         _highlightColor = _blockOutlineColor;
+    }
+
+    private bool TryRaycastInteractBlock(Vector3 origin, Vector3 dir, out VoxelRaycastHit hit)
+    {
+        hit = default;
+        if (_world == null)
+            return false;
+
+        return VoxelRaycast.Raycast(
+            origin,
+            dir,
+            InteractRange,
+            _world.GetBlock,
+            (x, y, z, id) =>
+            {
+                if (!HasCustomSelectionBounds(id))
+                    return true;
+
+                GetBlockSelectionBounds(x, y, z, id, out var min, out var max);
+                return TryRayIntersectsAabbDistance(origin, dir, min, max, out var distance)
+                    && distance <= InteractRange;
+            },
+            out hit);
+    }
+
+    private static bool HasCustomSelectionBounds(byte id) =>
+        id == BlockIds.Torch
+        || id == BlockIds.FiberWrappedTorch;
+
+    private static void GetBlockSelectionBounds(int x, int y, int z, byte id, out Vector3 min, out Vector3 max)
+    {
+        if (id == BlockIds.Torch || id == BlockIds.FiberWrappedTorch)
+        {
+            const float pad = 0.01875f;
+            min = new Vector3(
+                x + 6.2f / 16f - pad,
+                y,
+                z + 6.3f / 16f - pad);
+            max = new Vector3(
+                x + 9.8f / 16f + pad,
+                y + 7.6f / 16f + pad,
+                z + 9.8f / 16f + pad);
+            return;
+        }
+
+        min = new Vector3(x, y, z) * Scale.BlockSize;
+        max = min + new Vector3(Scale.BlockSize);
     }
 
     private void BuildHighlightVerts(Vector3 min, Vector3 max, Color color)
@@ -11138,11 +18536,14 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _pauseSettings.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow++, buttonW, buttonH);
         _pauseSaveExit.Bounds = new Rectangle(centerX, startY + (buttonH + gap) * mainRow, buttonW, buttonH);
 
+        var inviteInsetX = padding + 26;
+        var inviteInsetTop = padding + 22;
+        var inviteInsetBottom = padding + 18;
         _pauseInviteRect = new Rectangle(
-            _pauseRect.X + padding,
-            _pauseRect.Y + padding,
-            _pauseRect.Width - padding * 2,
-            _pauseRect.Height - padding * 2);
+            _pauseRect.X + inviteInsetX,
+            _pauseRect.Y + inviteInsetTop,
+            _pauseRect.Width - inviteInsetX * 2,
+            _pauseRect.Height - inviteInsetTop - inviteInsetBottom);
         _pauseInviteListRect = new Rectangle(_pauseInviteRect.X, _pauseInviteRect.Y + titleH + 14, _pauseInviteRect.Width, _pauseInviteRect.Height - titleH - 92);
         _pauseInviteStatusRect = new Rectangle(_pauseInviteRect.X, _pauseInviteRect.Bottom - 58, _pauseInviteRect.Width, 22);
         var inviteButtonY = _pauseInviteRect.Bottom - 30;
@@ -11220,12 +18621,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         }
         else
         {
-            var rowH = Math.Max(68, (_font.LineHeight * 3) + 16);
+            var rowH = GetPauseInviteRowHeight();
             var y = _pauseInviteListRect.Y + 8;
             for (var i = 0; i < _pauseInviteFriendEntries.Count; i++)
             {
                 var entry = _pauseInviteFriendEntries[i];
-                var rowRect = new Rectangle(_pauseInviteListRect.X, y, _pauseInviteListRect.Width, rowH);
+                var rowRect = GetPauseInviteRowRect(y, rowH);
                 if (entry.IsSelected)
                     sb.Draw(_pixel, rowRect, new Color(42, 92, 72, 220));
                 else if (i == _pauseInviteSelectedIndex)
@@ -11354,7 +18755,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _pauseInvitePopupOpen = true;
         _pauseInviteSelectedIndex = -1;
         _pauseInviteScrollTimer = 0f;
-        _nextPauseInviteRefreshUtc = DateTime.MinValue;
         _pauseInviteStatusText = string.Empty;
         _pauseInviteStatusTimer = 0f;
         _socialState.ForceRefresh();
@@ -11572,8 +18972,36 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         finally
         {
             _pauseInviteRefreshBusy = false;
-            _nextPauseInviteRefreshUtc = DateTime.UtcNow.AddSeconds(7);
         }
+    }
+
+    private static VertexPositionTexture[] BuildWorldItemSpriteVerts(Vector3 center, Vector3 cameraRight, Vector3 cameraUp, int textureWidth, int textureHeight)
+    {
+        if (cameraRight.LengthSquared() < 0.001f)
+            cameraRight = Vector3.Right;
+        else
+            cameraRight.Normalize();
+
+        if (cameraUp.LengthSquared() < 0.001f)
+            cameraUp = Vector3.Up;
+        else
+            cameraUp.Normalize();
+
+        var halfHeight = 0.22f * Scale.BlockSize;
+        var halfWidth = halfHeight * Math.Clamp(textureWidth / (float)Math.Max(1, textureHeight), 0.55f, 1.45f);
+        var p0 = center - cameraRight * halfWidth + cameraUp * halfHeight;
+        var p1 = center + cameraRight * halfWidth + cameraUp * halfHeight;
+        var p2 = center + cameraRight * halfWidth - cameraUp * halfHeight;
+        var p3 = center - cameraRight * halfWidth - cameraUp * halfHeight;
+        return new[]
+        {
+            new VertexPositionTexture(p0, new Vector2(0f, 0f)),
+            new VertexPositionTexture(p1, new Vector2(1f, 0f)),
+            new VertexPositionTexture(p2, new Vector2(1f, 1f)),
+            new VertexPositionTexture(p0, new Vector2(0f, 0f)),
+            new VertexPositionTexture(p2, new Vector2(1f, 1f)),
+            new VertexPositionTexture(p3, new Vector2(0f, 1f))
+        };
     }
 
     private async void SendInviteToSelectedPauseFriend()
@@ -11856,6 +19284,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         ResetHostedSessionStateAfterClose();
         SetCommandStatus("Hosting closed. This world is now local only.", 5f, echoToChat: false);
         AddChatLine("HOST CLOSED: Multiplayer connection ended. Your world continues in local play.", isSystem: true);
+        StartIntegratedServerIfLocal();
         UpdatePauseMenuLayout();
 
         if (session != null)
@@ -12044,6 +19473,17 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _pauseHostOptionsOpen = false;
     }
 
+    public void OpenPauseMenuForFocusLoss()
+    {
+        if (_pauseMenuOpen || !_hasLoadedWorld || _worldSyncInProgress || _survivalRespawnPending)
+            return;
+
+        _pauseInvitePopupOpen = false;
+        _pauseHostOptionsOpen = false;
+        _gamemodeWheelVisible = false;
+        _pauseMenuOpen = true;
+    }
+
     private void UpdatePauseButtons(InputState input)
     {
         if (_pauseInvitePopupOpen)
@@ -12077,9 +19517,6 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _pauseInviteStatusText = string.Empty;
         _pauseInviteScrollTimer += 1f / 60f;
 
-        if (!_pauseInviteRefreshBusy && DateTime.UtcNow >= _nextPauseInviteRefreshUtc)
-            RefreshInviteFriendsFromPause();
-
         _pauseInviteRefresh.Enabled = !_pauseInviteRefreshBusy;
         _pauseInviteSend.Enabled = !_pauseInviteSendBusy && _pauseInviteFriendEntries.Any(entry => entry.IsSelected && !entry.InviteSent);
         _pauseInviteClose.Enabled = true;
@@ -12090,15 +19527,40 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (!input.IsNewLeftClick() || !_pauseInviteListRect.Contains(input.MousePosition))
             return;
 
-        var rowH = _font.LineHeight + 14;
-        var index = (input.MousePosition.Y - (_pauseInviteListRect.Y + 8)) / (rowH + 4);
-        if (index >= 0 && index < _pauseInviteFriendEntries.Count)
+        if (TryGetPauseInviteRowIndexAt(input.MousePosition, out var index))
         {
             _pauseInviteSelectedIndex = index;
             if (!_pauseInviteFriendEntries[index].InviteSent)
                 _pauseInviteFriendEntries[index].IsSelected = !_pauseInviteFriendEntries[index].IsSelected;
         }
     }
+
+    private bool TryGetPauseInviteRowIndexAt(Point p, out int index)
+    {
+        index = -1;
+        var rowH = GetPauseInviteRowHeight();
+        var y = _pauseInviteListRect.Y + 8;
+        for (var i = 0; i < _pauseInviteFriendEntries.Count; i++)
+        {
+            var rowRect = GetPauseInviteRowRect(y, rowH);
+            if (rowRect.Contains(p))
+            {
+                index = i;
+                return true;
+            }
+
+            y += rowH + 4;
+            if (y > _pauseInviteListRect.Bottom - rowH)
+                break;
+        }
+
+        return false;
+    }
+
+    private int GetPauseInviteRowHeight() => Math.Max(68, (_font.LineHeight * 3) + 16);
+
+    private Rectangle GetPauseInviteRowRect(int y, int rowH) =>
+        new(_pauseInviteListRect.X, y, _pauseInviteListRect.Width, rowH);
 
 
 
@@ -12126,6 +19588,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        StopIntegratedServer("promote_to_lan_host");
         _lanSession = result.Session;
         SeedLocalPlayerName();
         ResumeGameplayAfterHosting();
@@ -12178,6 +19641,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return;
         }
 
+        StopIntegratedServer("promote_to_eos_host");
         _lanSession = result.Session;
         SeedLocalPlayerName();
         ResumeGameplayAfterHosting();
@@ -12198,6 +19662,29 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _gamemodeWheelVisible = false;
         _chatOverlayScrollLines = 0;
         _chatOverlayActionUnlockUntil = 0f;
+    }
+
+    private void StartIntegratedServerIfLocal()
+    {
+        if (_world == null || _lanSession != null || _integratedServer?.IsRunning == true)
+            return;
+
+        _integratedServer = new IntegratedWorldServer(
+            _log,
+            _world,
+            _worldPath,
+            _profile.GetDisplayUsername());
+        _integratedServer.Start();
+    }
+
+    private void StopIntegratedServer(string reason)
+    {
+        if (_integratedServer == null)
+            return;
+
+        _integratedServer.Stop(reason);
+        _integratedServer.Dispose();
+        _integratedServer = null;
     }
 
     private void AnnounceOnlineHostShare(EosClient? eos, bool tryCopyToClipboard)
@@ -12448,6 +19935,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 }
             });
         }
+        StopIntegratedServer("screen_close");
         _blockIconCache?.Dispose();
         _blockIconCache = null;
         _samplerLow?.Dispose();
@@ -12462,16 +19950,22 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         _cutoutEffect = null;
         _effect?.Dispose();
         _effect = null;
+        _horizonLodEffect?.Dispose();
+        _horizonLodEffect = null;
+        DisposeHorizonLodVertexBuffer();
         _lineEffect?.Dispose();
         _lineEffect = null;
         _itemEffect?.Dispose();
         _itemEffect = null;
         _waterEffect?.Dispose();
         _waterEffect = null;
+        _torchFlameParticles.Dispose();
         _handRenderer?.Dispose();
         _handRenderer = null;
         _playerModel?.Dispose();
         _playerModel = null;
+        _inventoryPreviewPlayerModel?.Dispose();
+        _inventoryPreviewPlayerModel = null;
         _soulMarkerModel?.Dispose();
         _soulMarkerModel = null;
 
@@ -12777,7 +20271,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 status |= PlayerStatusFlying;
             if (_player.IsSneaking)
                 status |= PlayerStatusSneaking;
-            if (_player.IsSprinting)
+            if (_player.IsSprinting && !_player.IsInWater)
                 status |= PlayerStatusSprinting;
             if (_localActionSwingTimer > 0f)
                 status |= PlayerStatusActionSwing;
@@ -12787,6 +20281,8 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
                 status |= PlayerStatusVeilseer;
             if (_inventoryOpen)
                 status |= PlayerStatusInventoryOpen;
+            if (IsLocalPlayerFullyUnderwater())
+                status |= PlayerStatusSwimming;
             _lanSession.SendPlayerState(
                 _player.Position,
                 _player.Yaw,
@@ -12842,7 +20338,12 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             model.IsSneaking = (state.Status & PlayerStatusSneaking) != 0;
             model.IsSprinting = (state.Status & PlayerStatusSprinting) != 0;
             model.IsGrounded = (state.Status & PlayerStatusGrounded) != 0;
-            model.HeldBlockId = (BlockId)state.HeldBlockId;
+            model.IsSwimming = (state.Status & PlayerStatusSwimming) != 0;
+            model.IsInWater = model.IsSwimming || IsPositionInWater(model.Position);
+            if (model.IsInWater)
+                model.IsSprinting = false;
+            model.HeldItemId = (BlockId)state.HeldBlockId;
+            model.HeldBlockId = GetHandBlockRenderId(model.HeldItemId);
             model.VerticalVelocity = state.VelocityY;
             
             // Update remote state caches
@@ -13416,7 +20917,10 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         model.Pitch = state.Pitch;
         model.IsFlying = state.IsFlying;
         model.IsGrounded = !state.IsFlying;
-        model.HeldBlockId = ResolveHeldBlockFromState(state);
+        model.IsSwimming = IsPositionFullyUnderwater(model.Position);
+        model.IsInWater = model.IsSwimming || IsPositionInWater(model.Position);
+        model.HeldItemId = ResolveHeldItemFromState(state);
+        model.HeldBlockId = GetHandBlockRenderId(model.HeldItemId);
         model.VerticalVelocity = 0f;
         _remoteGameModeByPlayerId[snapshot.PlayerId] = state.CurrentGameMode;
         _remoteHealthByPlayerId[snapshot.PlayerId] = Math.Clamp(state.Health, 0, SurvivalVitals.MaxHealth);
@@ -13443,7 +20947,7 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             _remoteRespawnPendingByPlayerId.Remove(playerId);
     }
 
-    private static BlockId ResolveHeldBlockFromState(PlayerWorldState state)
+    private static BlockId ResolveHeldItemFromState(PlayerWorldState state)
     {
         if (state.Hotbar == null || state.Hotbar.Length == 0)
             return BlockId.Air;
@@ -13451,6 +20955,24 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
             return BlockId.Air;
         var id = state.Hotbar[state.SelectedIndex].Id;
         return id == BlockId.Air ? BlockId.Air : id;
+    }
+
+    private static BlockId GetHandBlockRenderId(BlockId legacyItemId)
+    {
+        if (legacyItemId == BlockId.Air)
+            return BlockId.Air;
+
+        var item = ItemRegistry.Get((byte)legacyItemId);
+        if (item.Id != ItemId.None)
+        {
+            if ((item.HandModel == ItemHandModelKind.Block || item.HandModel == ItemHandModelKind.CustomModel)
+                && item.PlacesBlock.HasValue)
+                return item.PlacesBlock.Value;
+
+            return BlockId.Air;
+        }
+
+        return legacyItemId;
     }
 
     private void TryFlushRemotePersistenceSnapshot(int playerId, LanPlayerPersistenceSnapshot snapshot, bool force = false)
@@ -13991,20 +21513,13 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         if (_meta == null)
             return state;
 
-        // Use dedicated spawn point instead of world center
+        // Always resolve the actual terrain surface instead of trusting a stored spawn Y.
+        // Older worlds wrote SpawnY=64, which can put new players inside caves or hills.
         var spawnPoint = GetWorldSpawnPoint();
-        
-        // Find safe spawn height by scanning terrain at spawn point
-        var safeHeight = FindSafeSpawnHeight(spawnPoint.X, spawnPoint.Y);
-        var height = _meta.HasCustomSpawn
-            ? Math.Clamp(_meta.SpawnY, 2, Math.Max(3, _meta.Size.Height - 2))
-            : Math.Max(safeHeight + 2f, 6f); // Spawn 2 blocks above ground
-        
-        // Position player at spawn point looking toward world center
-        var pos = new Vector3(spawnPoint.X, height, spawnPoint.Y);
+        var pos = ResolveGrassSurfaceSpawnPosition(spawnPoint);
         var centerX = HasFiniteWorldBounds() ? _meta.Size.Width / 2f : spawnPoint.X + 256f;
         var centerZ = HasFiniteWorldBounds() ? _meta.Size.Depth / 2f : spawnPoint.Y + 256f;
-        var target = new Vector3(centerX, height, centerZ);
+        var target = new Vector3(centerX, pos.Y, centerZ);
         var dir = Vector3.Normalize(target - pos);
 
         state.PosX = pos.X;
@@ -14049,6 +21564,107 @@ public sealed class GameWorldScreen : IScreen, IMouseCaptureScreen
         
         return new Vector2(spawnX, spawnZ);
     }
+
+    private Vector3 ResolveGrassSurfaceSpawnPosition(Vector2 requestedSpawn)
+    {
+        if (_world == null)
+            return new Vector3(requestedSpawn.X, 70f, requestedSpawn.Y);
+
+        var centerX = (int)MathF.Floor(requestedSpawn.X);
+        var centerZ = (int)MathF.Floor(requestedSpawn.Y);
+        const int searchRadius = 64;
+
+        if (TryFindGrassSurfaceSpawn(centerX, centerZ, searchRadius, out var blockX, out var blockY, out var blockZ))
+            return new Vector3(blockX + 0.5f, blockY, blockZ + 0.5f);
+
+        var fallbackY = Math.Max(FindSafeSpawnHeight(centerX, centerZ), 6f);
+        _log?.Warn($"Grass spawn surface not found near {centerX},{centerZ}; using safe fallback Y={fallbackY:0.##}.");
+        return new Vector3(centerX + 0.5f, fallbackY, centerZ + 0.5f);
+    }
+
+    private bool TryFindGrassSurfaceSpawn(int centerX, int centerZ, int searchRadius, out int blockX, out int spawnY, out int blockZ)
+    {
+        blockX = centerX;
+        spawnY = 70;
+        blockZ = centerZ;
+
+        if (_world == null)
+            return false;
+
+        for (var radius = 0; radius <= searchRadius; radius++)
+        {
+            for (var dx = -radius; dx <= radius; dx++)
+            {
+                for (var dz = -radius; dz <= radius; dz++)
+                {
+                    if (radius > 0 && Math.Abs(dx) != radius && Math.Abs(dz) != radius)
+                        continue;
+
+                    var wx = centerX + dx;
+                    var wz = centerZ + dz;
+                    if (!IsWorldColumnInBounds(wx, wz))
+                        continue;
+
+                    if (TryFindGrassSurfaceY(wx, wz, out var y))
+                    {
+                        blockX = wx;
+                        spawnY = y;
+                        blockZ = wz;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindGrassSurfaceY(int wx, int wz, out int spawnY)
+    {
+        spawnY = 70;
+
+        if (_world == null)
+            return false;
+
+        try
+        {
+            var spawnCoord = VoxelWorld.WorldToChunk(wx, 0, wz, out _, out _, out _);
+            _world.GetOrCreateChunkData(spawnCoord, _log);
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn($"TryFindGrassSurfaceY: failed to ensure spawn chunk generated: {ex.Message}");
+            return false;
+        }
+
+        var top = Math.Max(0, _world.WorldHeight - 3);
+        for (var y = top; y >= 1; y--)
+        {
+            if (_world.GetBlockIdAtWorld(wx, y, wz) != BlockIds.Grass)
+                continue;
+
+            var above1 = _world.GetBlockIdAtWorld(wx, y + 1, wz);
+            var above2 = _world.GetBlockIdAtWorld(wx, y + 2, wz);
+            if (IsSpawnAir(above1) && IsSpawnAir(above2))
+            {
+                spawnY = y + 1;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsWorldColumnInBounds(int x, int z)
+    {
+        if (_meta == null || !HasFiniteWorldBounds())
+            return true;
+
+        return x >= 0 && z >= 0 && x < _meta.Size.Width && z < _meta.Size.Depth;
+    }
+
+    private static bool IsSpawnAir(int id) =>
+        id == BlockIds.Air || id == BlockIds.Nullblock;
 
     
 private float FindSafeSpawnHeight(float x, float z)
@@ -14912,6 +22528,9 @@ private float FindSafeSpawnHeight(float x, float z)
         if (ENABLE_SPAWN_PREWARM && !_spawnPrewarmComplete)
             return true;
 
+        if (!_horizonLodPreloadComplete && IsHorizonLodEnabled())
+            return true;
+
         return false;
     }
 
@@ -15061,9 +22680,13 @@ private float FindSafeSpawnHeight(float x, float z)
         if (_atlas == null)
             return ChunkMesh.Empty;
 
-        var opaque = new List<VertexPositionTexture>();
-        var cutout = new List<VertexPositionTexture>();
-        var transparent = new List<VertexPositionTexture>();
+        // Lit lists (opaque/cutout/transparent) use VertexPositionColorTexture with Color.White.
+        // Stage 4 will supply real lightmap data via VoxelLightPropagator; until then,
+        // white vertex color multiplied by the texture through BasicEffect gives unchanged appearance.
+        var opaque      = new List<VertexPositionColorTexture>();
+        var cutout      = new List<VertexPositionColorTexture>();
+        var transparent = new List<VertexPositionColorTexture>();
+        // Water stays unlit (VertexPositionTexture) — lit via AmbientLight shader uniform.
         var water = new List<VertexPositionTexture>();
 
         var bs = Scale.BlockSize;
@@ -15085,38 +22708,56 @@ private float FindSafeSpawnHeight(float x, float z)
                     if (def.HasCustomModel)
                         continue;
 
-                    var target = def.RenderLayer switch
-                    {
-                        BlockRenderLayer.Water => water,
-                        BlockRenderLayer.Cutout => cutout,
-                        BlockRenderLayer.Blended => transparent,
-                        _ => opaque
-                    };
-
                     var worldX = originX + x;
                     var worldY = originY + y;
                     var worldZ = originZ + z;
 
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x + 1, y, z, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosX);
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x - 1, y, z, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegX);
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y + 1, z, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosY);
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y - 1, z, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegY);
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z + 1, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosZ);
-                    if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z - 1, chunk))
-                        AddFallbackFace(target, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegZ);
+                    if (def.RenderLayer == BlockRenderLayer.Water)
+                    {
+                        // Water uses the unlit VertexPositionTexture path.
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x + 1, y, z, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosX);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x - 1, y, z, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegX);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y + 1, z, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosY);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y - 1, z, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegY);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z + 1, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosZ);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z - 1, chunk))
+                            AddFallbackFaceWater(water, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegZ);
+                    }
+                    else
+                    {
+                        // Lit path — opaque/cutout/transparent use VertexPositionColorTexture(Color.White).
+                        var litTarget = def.RenderLayer switch
+                        {
+                            BlockRenderLayer.Cutout  => cutout,
+                            BlockRenderLayer.Blended => transparent,
+                            _                        => opaque
+                        };
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x + 1, y, z, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosX);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x - 1, y, z, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegX);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y + 1, z, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosY);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y - 1, z, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegY);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z + 1, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.PosZ);
+                        if (ShouldRenderFallbackFace(blockId, x, y, z, x, y, z - 1, chunk))
+                            AddFallbackFace(litTarget, worldX, worldY, worldZ, bs, blockId, FaceDirection.NegZ);
+                    }
                 }
             }
         }
 
         return new ChunkMesh(coord, opaque.ToArray(), cutout.ToArray(), transparent.ToArray(), water.ToArray(),
-            new BoundingBox(new Vector3(originX * bs, originY * bs, originZ * bs), 
-                           new Vector3((originX + VoxelChunkData.ChunkSizeX) * bs, 
-                                       (originY + VoxelChunkData.ChunkSizeY) * bs, 
+            new BoundingBox(new Vector3(originX * bs, originY * bs, originZ * bs),
+                           new Vector3((originX + VoxelChunkData.ChunkSizeX) * bs,
+                                       (originY + VoxelChunkData.ChunkSizeY) * bs,
                                        (originZ + VoxelChunkData.ChunkSizeZ) * bs)));
     }
 
@@ -15162,7 +22803,44 @@ private float FindSafeSpawnHeight(float x, float z)
         _ => 0
     };
 
-    private void AddFallbackFace(List<VertexPositionTexture> vertices, int x, int y, int z, float bs, byte blockId, FaceDirection face)
+    /// <summary>
+    /// Adds one fallback face (VertexPositionColorTexture with Color.White) to the lit list.
+    /// This is the crash-recovery path; Color.White gives full-brightness display which is
+    /// acceptable for emergency rendering. Stage 4 lightmap data does not flow through this path.
+    /// </summary>
+    private void AddFallbackFace(List<VertexPositionColorTexture> vertices, int x, int y, int z, float bs, byte blockId, FaceDirection face)
+    {
+        if (_atlas == null)
+            return;
+
+        var min = new Vector3(x * bs, y * bs, z * bs);
+        var max = min + new Vector3(bs, bs, bs);
+
+        switch (face)
+        {
+            case FaceDirection.PosX:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegX:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.PosY:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(min.X, max.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(max.X, max.Y, min.Z), new Vector3(min.X, max.Y, min.Z));
+                break;
+            case FaceDirection.NegY:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, min.Z), new Vector3(max.X, min.Y, min.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(min.X, min.Y, max.Z));
+                break;
+            case FaceDirection.PosZ:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(min.X, min.Y, max.Z), new Vector3(max.X, min.Y, max.Z), new Vector3(max.X, max.Y, max.Z), new Vector3(min.X, max.Y, max.Z));
+                break;
+            case FaceDirection.NegZ:
+                AddFaceLit(vertices, _atlas, blockId, face, new Vector3(max.X, min.Y, min.Z), new Vector3(min.X, min.Y, min.Z), new Vector3(min.X, max.Y, min.Z), new Vector3(max.X, max.Y, min.Z));
+                break;
+        }
+    }
+
+    /// <summary>Unlit water variant of the fallback face emitter (VertexPositionTexture).</summary>
+    private void AddFallbackFaceWater(List<VertexPositionTexture> vertices, int x, int y, int z, float bs, byte blockId, FaceDirection face)
     {
         if (_atlas == null)
             return;
@@ -15398,6 +23076,7 @@ private float FindSafeSpawnHeight(float x, float z)
         }
 
         _inventory.SetSandboxCatalogFavorites(state.ArtificerFavoriteBlockIds ?? Array.Empty<int>());
+        RestorePinnedHandCraftRecipes(state.PinnedHandCraftRecipeIds);
         _inventory.ClearSandboxCatalogSearchQuery();
         _inventory.SetSandboxCatalogFavoritesOnly(false);
         _inventoryCatalogScrollOffsetPx = 0f;
@@ -15449,6 +23128,7 @@ private float FindSafeSpawnHeight(float x, float z)
             Hotbar = _inventory.GetHotbarData(),
             InventoryGrid = _inventory.GetGridData(),
             ArtificerFavoriteBlockIds = _inventory.GetSandboxCatalogFavoriteBlockIds(),
+            PinnedHandCraftRecipeIds = GetPinnedHandCraftRecipeIdsForSave(),
             Health = _survivalVitals.Health,
             Hunger = _survivalVitals.Hunger,
             SigilAtonement = _sigilPositiveTargetFraction,
@@ -16175,7 +23855,7 @@ private float FindSafeSpawnHeight(float x, float z)
             var id = _inventory.SelectedId;
             if (id != BlockId.Air)
             {
-                SetDisplayName(BlockRegistry.Get(id).Name);
+                SetDisplayNameForItem(id);
             }
         }
         
@@ -16185,10 +23865,25 @@ private float FindSafeSpawnHeight(float x, float z)
         }
     }
 
-    private void SetDisplayName(string name)
+    private void SetDisplayName(string name, CatalogRarity rarity = CatalogRarity.Common)
     {
         _displayName = name;
+        _displayNameRarity = rarity;
         _selectedNameTimer = 3.0f; // Show for 3 seconds
+    }
+
+    private void SetDisplayNameForItem(BlockId id)
+    {
+        var item = ItemRegistry.Get((byte)id);
+        if (item.Id != ItemId.None)
+        {
+            var placedBlock = item.PlacesBlock.HasValue ? BlockRegistry.Get(item.PlacesBlock.Value) : null;
+            SetDisplayName(item.Name, ResolveCatalogRarity(id, item, placedBlock));
+            return;
+        }
+
+        var def = BlockRegistry.Get(id);
+        SetDisplayName(def.Name, ResolveCatalogRarity(id, def));
     }
 
     private void UpdateChatLines(float dt)
@@ -16511,6 +24206,24 @@ private float FindSafeSpawnHeight(float x, float z)
             return;
         }
 
+        if (token.StartsWith(InventoryHandoffAcceptActionPrefix, StringComparison.Ordinal))
+        {
+            var offerId = token.Substring(InventoryHandoffAcceptActionPrefix.Length).Trim();
+            _localIncomingHandoffOffers.Remove(offerId);
+            SendInventoryHandoffResponse(offerId, accept: true);
+            SetCommandStatus("Item handoff accepted.", 2.5f, echoToChat: false);
+            return;
+        }
+
+        if (token.StartsWith(InventoryHandoffDeclineActionPrefix, StringComparison.Ordinal))
+        {
+            var offerId = token.Substring(InventoryHandoffDeclineActionPrefix.Length).Trim();
+            _localIncomingHandoffOffers.Remove(offerId);
+            SendInventoryHandoffResponse(offerId, accept: false);
+            SetCommandStatus("Item handoff declined.", 2.5f, echoToChat: false);
+            return;
+        }
+
         if (token.StartsWith("worldinvite-join:", StringComparison.Ordinal)
             || token.StartsWith("worldinvite-open:", StringComparison.Ordinal))
         {
@@ -16649,7 +24362,7 @@ private float FindSafeSpawnHeight(float x, float z)
         _commandInputActive = false;
         _chatInputText = "";
         _commandInputText = "";
-        _inventoryOpen = true;
+        OpenInventoryUi();
         return true;
     }
 
@@ -17069,6 +24782,7 @@ private float FindSafeSpawnHeight(float x, float z)
                         "weathercycle",
                         "sigil",
                         "giveitem",
+                        "unlockcrafting",
                         "inventory",
                         "sharedsoulaccess",
                         "pvp",
@@ -17160,6 +24874,10 @@ private float FindSafeSpawnHeight(float x, float z)
                     values.Add("confirm");
                 break;
 
+            case "trash":
+            case "trashcan":
+                break;
+
             case "give":
                 if (tokenIndex == 1)
                 {
@@ -17230,6 +24948,43 @@ private float FindSafeSpawnHeight(float x, float z)
                     AppendPlayerNameTokens(values);
                 break;
 
+            case "clear":
+            case "clearinventory":
+            case "invclear":
+            case "ci":
+                if (tokenIndex == 1)
+                {
+                    AppendPlayerNameTokens(values);
+                    AppendClearCategoryTokens(values);
+                    AppendAllGiveItemTokens(values, includeNumericIds: true);
+                }
+                else if (tokenIndex == 2 && tokenIndex - 1 < tokens.Length)
+                {
+                    if (TryResolvePlayerTarget(tokens[1], out _, out _))
+                    {
+                        AppendClearCategoryTokens(values);
+                        AppendAllGiveItemTokens(values, includeNumericIds: true);
+                    }
+                    else
+                    {
+                        values.AddRange(new[] { "1", "16", "32", "64" });
+                    }
+                }
+                else if (tokenIndex == 3 && tokenIndex - 2 < tokens.Length)
+                {
+                    values.AddRange(new[] { "1", "16", "32", "64" });
+                }
+                break;
+
+            case "inv":
+            case "inventory":
+                if (tokenIndex == 1)
+                {
+                    values.Add("clear");
+                    AppendPlayerNameTokens(values);
+                }
+                break;
+
             case "sethome":
                 if (tokenIndex == 1)
                     AppendHomeNameTokens(values);
@@ -17259,14 +25014,6 @@ private float FindSafeSpawnHeight(float x, float z)
             case "msg":
                 if (tokenIndex == 1)
                     AppendPlayerNameTokens(values);
-                break;
-
-            case "inv":
-                if (tokenIndex == 1)
-                {
-                    values.Add("clear");
-                    AppendPlayerNameTokens(values);
-                }
                 break;
 
             case "pos":
@@ -17386,6 +25133,14 @@ private float FindSafeSpawnHeight(float x, float z)
             if (!string.IsNullOrWhiteSpace(name))
                 output.Add(name);
         }
+    }
+
+    private static void AppendClearCategoryTokens(List<string> output)
+    {
+        output.AddRange(new[]
+        {
+            "tools", "food", "ores", "blocks", "wood", "planks", "logs", "pickaxe", "axe", "shovel"
+        });
     }
 
     private void AppendPendingJoinRequesterTokens(List<string> output)
@@ -17796,8 +25551,10 @@ private float FindSafeSpawnHeight(float x, float z)
         var normalizedActionLabel2 = (actionLabel2 ?? string.Empty).Trim();
         var isConfirmCancelPair = hasCustomAction
             && hasCustomAction2
-            && string.Equals(normalizedActionLabel, "CONFIRM", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(normalizedActionLabel2, "CANCEL", StringComparison.OrdinalIgnoreCase);
+            && ((string.Equals(normalizedActionLabel, "CONFIRM", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(normalizedActionLabel2, "CANCEL", StringComparison.OrdinalIgnoreCase))
+                || (string.Equals(normalizedActionLabel, "ACCEPT", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(normalizedActionLabel2, "DECLINE", StringComparison.OrdinalIgnoreCase)));
 
         var shouldDedup = hasTeleportAction || hasCopyAction || hasCustomAction || hasCustomAction2;
         if (shouldDedup && _chatLines.Count > 0 
@@ -18034,7 +25791,9 @@ private float FindSafeSpawnHeight(float x, float z)
         RegisterCommand("difficulty", new[] { "diff" }, "/difficulty <peaceful|easy|normal|hard>", "/difficulty normal", "Set difficulty.", CommandPermission.Operator, ExecuteDifficultyCommand);
         RegisterCommand("seed", Array.Empty<string>(), "/seed", "/seed", "Show current world seed.", CommandPermission.Operator, ExecuteSeedCommand);
         RegisterCommand("rules", new[] { "rule" }, "/rules [<rule> [value]]", "/rules inventory keep", "Inspect or set world rules.", CommandPermission.Operator, ExecuteRulesCommand);
-        RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <ticks>]", "/time set 6000", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
+        RegisterCommand("time", Array.Empty<string>(), "/time [query|day|night|set <day|night|ticks>]", "/time set 6000", "Set or inspect time.", CommandPermission.Operator, ExecuteTimeCommand);
+        RegisterCommand("day", Array.Empty<string>(), "/day", "/day", "Set time to daytime.", CommandPermission.Operator, ExecuteDayCommand);
+        RegisterCommand("night", Array.Empty<string>(), "/night", "/night", "Set time to nighttime.", CommandPermission.Operator, ExecuteNightCommand);
         RegisterCommand("weather", Array.Empty<string>(), "/weather [query|clear|rain|storm]", "/weather rain", "Set or inspect weather.", CommandPermission.Operator, ExecuteWeatherCommand);
         RegisterCommand("setspawn", Array.Empty<string>(), "/setspawn [x y z]", "/setspawn 128 70 128", "Set world spawn.", CommandPermission.Operator, ExecuteSetSpawnCommand);
         RegisterCommand("op", Array.Empty<string>(), "/op <player>", "/op Redacted", "Grant operator permissions to a player.", CommandPermission.HostOnly, ExecuteOpCommand);
@@ -18047,15 +25806,18 @@ private float FindSafeSpawnHeight(float x, float z)
         RegisterCommand("me", Array.Empty<string>(), "/me <action>", "/me waves", "Broadcast an action message.", CommandPermission.Everyone, ExecuteMeCommand);
         RegisterCommand("msg", Array.Empty<string>(), "/msg <player> <message>", "/msg Redacted meet at spawn", "Send a private message.", CommandPermission.Everyone, ExecuteMsgCommand);
         RegisterCommand("chatclear", new[] { "clearchat", "cc" }, "/chatclear", "/chatclear", "Clear chat history (with confirmation).", CommandPermission.Everyone, ExecuteChatClearCommand);
+        RegisterCommand("autogive", new[] { "autoitem", "autoitems" }, "/autogive [on|off]", "/autogive on", "Toggle automatically accepting incoming item handoffs for this player.", CommandPermission.Everyone, ExecuteAutoGiveCommand);
         RegisterCommand("give", Array.Empty<string>(), "/give [player] <item|id> [amount]", "/give stone 64", "Give an item/block by token or numeric id.", CommandPermission.Operator, ExecuteGiveCommand);
         RegisterCommand("kill", Array.Empty<string>(), "/kill [player...]", "/kill Redacted", "Kill yourself or one or more target players.", CommandPermission.Operator, ExecuteKillCommand);
         RegisterCommand("inv", new[] { "inventory" }, "/inv [clear|player]", "/inv Redacted", "View live inventory or clear inventory view.", CommandPermission.Everyone, ExecuteInvCommand);
+        RegisterCommand("trash", new[] { "trashcan" }, "/trash", "/trash", "Open a trash container for disposing selected items.", CommandPermission.Everyone, ExecuteTrashCommand);
         RegisterCommand("pos", Array.Empty<string>(), "/pos [player]", "/pos", "Show player's exact coordinates with one-click copy.", CommandPermission.Everyone, ExecutePosCommand);
         RegisterCommand("broadcast", new[] { "bc" }, "/broadcast <message>", "/broadcast Server restart soon", "Send a broadcast message to everyone.", CommandPermission.Everyone, ExecuteBroadcastCommand);
         RegisterCommand("sigil", Array.Empty<string>(), "/sigil <empty|positive <0-100>|negative <0-100>|set <atonement> <curse>>", "/sigil set 35 10", "Debug the split sigil HUD Atonement/Curse amounts.", CommandPermission.Operator, ExecuteSigilCommand);
         RegisterCommand("set", Array.Empty<string>(), "/set <health|hunger|attunement> <player> <value>", "/set health Redacted 12", "Set a player's health, hunger, or attunement.", CommandPermission.Operator, ExecuteSetStatCommand);
         RegisterCommand("reloadhud", new[] { "reloadui" }, "/reloadhud", "/reloadhud", "Reload HUD textures from disk without restarting.", CommandPermission.Operator, ExecuteReloadHudCommand);
         RegisterCommand("commandclear", Array.Empty<string>(), "/commandclear", "/commandclear", "Clear command entries from shared input history.", CommandPermission.Everyone, ExecuteCommandClearCommand);
+        RegisterCommand("clear", new[] { "clearinventory", "invclear", "ci" }, "/clear [player] [item]", "/clear", "Clear items from your inventory or a target player's inventory.", CommandPermission.Operator, ExecuteClearInventoryCommand);
     }
 
     private void RegisterCommand(
@@ -19585,6 +27347,7 @@ private float FindSafeSpawnHeight(float x, float z)
         TryGetWorldRuleValue("weathercycle", out var weatherCycle);
         TryGetWorldRuleValue("sigil", out var sigil);
         TryGetWorldRuleValue("giveitem", out var giveItems);
+        TryGetWorldRuleValue("unlockcrafting", out var unlockCrafting);
         TryGetWorldRuleValue("inventory", out var inventory);
         TryGetWorldRuleValue("sharedsoulaccess", out var sharedSoulAccess);
         TryGetWorldRuleValue("enablemultiplehomes", out var multipleHomes);
@@ -19597,6 +27360,7 @@ private float FindSafeSpawnHeight(float x, float z)
             $"weathercycle = {weatherCycle}",
             $"sigil = {sigil}",
             $"giveitem = {giveItems}",
+            $"unlockcrafting = {unlockCrafting}",
             $"inventory = {inventory}",
             $"sharedsoulaccess = {sharedSoulAccess}",
             $"enablemultiplehomes = {multipleHomes}",
@@ -19616,6 +27380,10 @@ private float FindSafeSpawnHeight(float x, float z)
             "sigil" => "sigil",
             "giveitem" => "giveitem",
             "giveitems" => "giveitem",
+            "unlockcrafting" => "unlockcrafting",
+            "unlockcraft" => "unlockcrafting",
+            "craftingunlock" => "unlockcrafting",
+            "craftingunlocks" => "unlockcrafting",
             "inventory" => "inventory",
             "saveinventory" => "inventory",
             "keepinventory" => "inventory",
@@ -19635,7 +27403,7 @@ private float FindSafeSpawnHeight(float x, float z)
 
     private static bool IsBooleanWorldRule(string ruleKey)
     {
-        return ruleKey is "playercollision" or "pvp" or "timecycle" or "weathercycle" or "sigil" or "giveitem" or "saveinventory" or "sharedsoulaccess" or "enablemultiplehomes";
+        return ruleKey is "playercollision" or "pvp" or "timecycle" or "weathercycle" or "sigil" or "giveitem" or "unlockcrafting" or "saveinventory" or "sharedsoulaccess" or "enablemultiplehomes";
     }
 
     private static bool TryParseRuleBoolToken(string token, out bool enabled)
@@ -19753,6 +27521,12 @@ private float FindSafeSpawnHeight(float x, float z)
                 _handoffTargetId = -1;
                 _handoffTargetName = string.Empty;
                 break;
+            case "unlockcrafting":
+                _meta.Gameplay ??= new GameplaySettings();
+                _meta.Gameplay.UnlockCrafting = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
+                appliedValue = _meta.Gameplay.UnlockCrafting ? "on" : "off";
+                status = _meta.Gameplay.UnlockCrafting ? "Artificer Bench recipes are freely visible." : "Artificer Bench recipes require gathered ingredients to unlock.";
+                break;
             case "sharedsoulaccess":
                 _sharedSoulAccessEnabled = string.Equals(normalizedValue, "on", StringComparison.OrdinalIgnoreCase);
                 appliedValue = _sharedSoulAccessEnabled ? "on" : "off";
@@ -19841,6 +27615,9 @@ private float FindSafeSpawnHeight(float x, float z)
             case "giveitem":
                 value = _giveItemsEnabled ? "on" : "off";
                 return true;
+            case "unlockcrafting":
+                value = (_meta.Gameplay?.UnlockCrafting ?? true) ? "on" : "off";
+                return true;
             case "inventory":
                 value = GetInventoryRuleValue();
                 return true;
@@ -19876,6 +27653,7 @@ private float FindSafeSpawnHeight(float x, float z)
         _meta.TimeCycleEnabled = _timeCycleEnabled;
         _meta.WeatherCycleEnabled = _weatherCycleEnabled;
         _meta.TimeOfDayTicks = WorldMeta.CanonicalTimeTicks(_timeOfDayTicks);
+        _meta.TotalElapsedGameSeconds = _worldTime.TotalElapsedGameSeconds;
         _meta.WeatherState = WorldMeta.CanonicalWeatherState(_weatherState);
         _timeOfDayTicks = _meta.TimeOfDayTicks;
         _weatherState = _meta.WeatherState;
@@ -19927,13 +27705,29 @@ private float FindSafeSpawnHeight(float x, float z)
 
         if (_timeCycleEnabled)
         {
-            _timeCycleAccumulator += dt * 20f;
-            var tickDelta = (int)_timeCycleAccumulator;
-            if (tickDelta != 0)
+            _worldTime.Tick(dt);
+            // Keep legacy ticks in sync for display/backward compatibility
+            _timeOfDayTicks = WorldTime.GameSecondsToLegacyTicks(_worldTime.TotalElapsedGameSeconds);
+            UpdateTimeBasedLighting(dt);
+            
+            // Log time progression periodically
+            _timeUpdateCounter++;
+            if (_timeUpdateCounter % 300 == 0) // Log every 300 updates (~5 seconds at 60fps)
             {
-                _timeOfDayTicks = WorldMeta.CanonicalTimeTicks(_timeOfDayTicks + tickDelta);
-                _timeCycleAccumulator -= tickDelta;
+                System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] Time Update: TotalSeconds={_worldTime.TotalElapsedGameSeconds:F2}, TimeOfDay={_worldTime.TimeOfDaySeconds:F2}, Phase={_worldTime.Phase}, LegacyTicks={_timeOfDayTicks}, dt={dt:F4}");
+                
+                // Check for time/lighting representation disagreement
+                var computedTicks = WorldTime.GameSecondsToLegacyTicks(_worldTime.TotalElapsedGameSeconds);
+                if (computedTicks != _timeOfDayTicks)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] WARNING: Time representation disagreement - ComputedTicks={computedTicks}, StoredTicks={_timeOfDayTicks}");
+                }
             }
+        }
+        else
+        {
+            // Even when time cycle is disabled, keep lighting in sync with manual time changes
+            UpdateTimeBasedLighting(dt);
         }
 
         if (_weatherCycleEnabled)
@@ -19954,6 +27748,69 @@ private float FindSafeSpawnHeight(float x, float z)
         }
     }
 
+    private void UpdateTimeBasedLighting(float dt)
+    {
+        var phase = _worldTime.Phase;
+        var timeOfDay = _worldTime.TimeOfDaySeconds;
+        
+        Color targetSkyColor;
+        Color targetAmbientColor;
+        
+        // Calculate target colors based on phase and time within phase
+        switch (phase)
+        {
+            case TimePhase.Dawn:
+                {
+                    // Dawn: 05:00-06:00, interpolate from night to day
+                    var dawnProgress = (float)((timeOfDay - WorldTime.DawnStart) / (WorldTime.DayStart - WorldTime.DawnStart));
+                    targetSkyColor = Color.Lerp(NightSkyColor, DaySkyColor, dawnProgress);
+                    targetAmbientColor = Color.Lerp(NightAmbientColor, DayAmbientColor, dawnProgress);
+                    break;
+                }
+            case TimePhase.Day:
+                targetSkyColor = DaySkyColor;
+                targetAmbientColor = DayAmbientColor;
+                break;
+            case TimePhase.Dusk:
+                {
+                    // Dusk: 18:00-19:00, interpolate from day to night
+                    var duskProgress = (float)((timeOfDay - WorldTime.DuskStart) / (WorldTime.NightStart - WorldTime.DuskStart));
+                    targetSkyColor = Color.Lerp(DaySkyColor, NightSkyColor, duskProgress);
+                    targetAmbientColor = Color.Lerp(DayAmbientColor, NightAmbientColor, duskProgress);
+                    break;
+                }
+            case TimePhase.Night:
+            default:
+                targetSkyColor = NightSkyColor;
+                targetAmbientColor = NightAmbientColor;
+                break;
+        }
+        
+        // For instant updates (dt=0), set directly. For normal ticking, interpolate smoothly.
+        if (dt <= 0f)
+        {
+            _currentSkyColor = targetSkyColor;
+            _currentAmbientColor = targetAmbientColor;
+            System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] UpdateTimeBasedLighting INSTANT: Phase={phase}, TimeOfDay={timeOfDay:F2}s, TargetAmbient=({targetAmbientColor.R},{targetAmbientColor.G},{targetAmbientColor.B}), CurrentAmbient=({_currentAmbientColor.R},{_currentAmbientColor.G},{_currentAmbientColor.B}), dt={dt:F4}");
+        }
+        else
+        {
+            var lerpSpeed = 0.5f * dt; // Adjust for desired transition speed
+            var previousAmbient = _currentAmbientColor;
+            _currentSkyColor = Color.Lerp(_currentSkyColor, targetSkyColor, lerpSpeed);
+            _currentAmbientColor = Color.Lerp(_currentAmbientColor, targetAmbientColor, lerpSpeed);
+            
+            // Log significant ambient color changes
+            var ambientDelta = Math.Abs(_currentAmbientColor.R - previousAmbient.R) + 
+                               Math.Abs(_currentAmbientColor.G - previousAmbient.G) + 
+                               Math.Abs(_currentAmbientColor.B - previousAmbient.B);
+            if (ambientDelta > 5f)
+            {
+                System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] UpdateTimeBasedLighting INTERPOLATE: Phase={phase}, TimeOfDay={timeOfDay:F2}s, TargetAmbient=({targetAmbientColor.R},{targetAmbientColor.G},{targetAmbientColor.B}), PreviousAmbient=({previousAmbient.R},{previousAmbient.G},{previousAmbient.B}), CurrentAmbient=({_currentAmbientColor.R},{_currentAmbientColor.G},{_currentAmbientColor.B}), lerpSpeed={lerpSpeed:F4}");
+            }
+        }
+    }
+
     private void SyncWeatherCycleIndexFromState(bool resetAccumulator)
     {
         _weatherState = WorldMeta.CanonicalWeatherState(_weatherState);
@@ -19969,7 +27826,7 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         if (commandParts.Length < 2 || string.Equals(commandParts[1], "query", StringComparison.OrdinalIgnoreCase))
         {
-            SetCommandStatus($"Time: {_timeOfDayTicks}");
+            SetCommandStatus($"Time: {_worldTime.GetFormattedTime()}");
             return;
         }
 
@@ -19977,30 +27834,79 @@ private float FindSafeSpawnHeight(float x, float z)
         switch (token)
         {
             case "day":
-                _timeOfDayTicks = 1000;
-                SyncRuntimeRulesToMeta(persist: true);
+                SetWorldTimeToHour(12); // Noon for clear daytime
                 SetCommandStatus("Time set to day.");
                 return;
             case "night":
-                _timeOfDayTicks = 13000;
-                SyncRuntimeRulesToMeta(persist: true);
+                SetWorldTimeToHour(21); // 9 PM for clear nighttime
                 SetCommandStatus("Time set to night.");
                 return;
             case "set":
-                if (commandParts.Length < 3 || !int.TryParse(commandParts[2], out var ticks))
+                if (commandParts.Length < 3)
                 {
                     SetCommandSyntax("time", "Time set syntax is invalid.");
                     return;
                 }
 
-                _timeOfDayTicks = ((ticks % 24000) + 24000) % 24000;
+                var setToken = commandParts[2].ToLowerInvariant();
+                
+                if (setToken == "day")
+                {
+                    SetWorldTimeToHour(6);
+                    SetCommandStatus("Time set to day.");
+                    return;
+                }
+                
+                if (setToken == "night")
+                {
+                    SetWorldTimeToHour(21);
+                    SetCommandStatus("Time set to night.");
+                    return;
+                }
+
+                if (!int.TryParse(setToken, out var ticks))
+                {
+                    SetCommandSyntax("time", "Time set syntax is invalid.");
+                    return;
+                }
+
+                var normalizedTicks = ((ticks % 24000) + 24000) % 24000;
+                var targetTickDay = (int)(_worldTime.TotalElapsedGameSeconds / WorldTime.GameSecondsPerDay);
+                var targetTickTimeSeconds = targetTickDay * WorldTime.GameSecondsPerDay + WorldTime.LegacyTicksToGameSeconds(normalizedTicks);
+                _worldTime.SetTime(targetTickTimeSeconds);
+                _timeOfDayTicks = WorldTime.GameSecondsToLegacyTicks(_worldTime.TotalElapsedGameSeconds);
+                UpdateTimeBasedLighting(0f);
                 SyncRuntimeRulesToMeta(persist: true);
-                SetCommandStatus($"Time set to {_timeOfDayTicks}.");
+                SetCommandStatus($"Time set to {normalizedTicks}.");
                 return;
             default:
                 SetCommandSyntax("time", $"Unknown time action: {commandParts[1]}.");
                 return;
         }
+    }
+
+    private void SetWorldTimeToHour(int hour)
+    {
+        var currentDay = (int)(_worldTime.TotalElapsedGameSeconds / WorldTime.GameSecondsPerDay);
+        var targetTimeSeconds = currentDay * WorldTime.GameSecondsPerDay + (hour * 3600.0);
+        System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] SetWorldTimeToHour: Setting to hour {hour}, PreviousTime={_worldTime.TotalElapsedGameSeconds:F2}s, TargetTime={targetTimeSeconds:F2}s");
+        _worldTime.SetTime(targetTimeSeconds);
+        _timeOfDayTicks = WorldTime.GameSecondsToLegacyTicks(_worldTime.TotalElapsedGameSeconds);
+        UpdateTimeBasedLighting(0f);
+        SyncRuntimeRulesToMeta(persist: true);
+        System.Diagnostics.Debug.WriteLine($"[LIGHTING DIAGNOSTIC] SetWorldTimeToHour: Complete, NewTime={_worldTime.TotalElapsedGameSeconds:F2}s, LegacyTicks={_timeOfDayTicks}, Phase={_worldTime.Phase}");
+    }
+
+    private void ExecuteDayCommand(string[] commandParts)
+    {
+        SetWorldTimeToHour(12); // Noon for clear daytime
+        SetCommandStatus("Time set to day.");
+    }
+
+    private void ExecuteNightCommand(string[] commandParts)
+    {
+        SetWorldTimeToHour(21); // 9 PM for clear nighttime
+        SetCommandStatus("Time set to night.");
     }
 
     private void ExecuteWeatherCommand(string[] commandParts)
@@ -21982,6 +29888,28 @@ private float FindSafeSpawnHeight(float x, float z)
         SetCommandStatus("Chat history cleared.");
     }
 
+    private void ExecuteAutoGiveCommand(string[] commandParts)
+    {
+        if (commandParts.Length == 1)
+        {
+            SetCommandStatus($"AutoGive items is {(_autoAcceptItemHandoffs ? "ON" : "OFF")}. Use /autogive on or /autogive off.", 4f);
+            return;
+        }
+
+        if (!TryParseRuleBoolToken(commandParts[1], out var enabled))
+        {
+            SetCommandStatus("Usage: /autogive <on|off>", 3f);
+            return;
+        }
+
+        _autoAcceptItemHandoffs = enabled;
+        _settings.AutoAcceptItemHandoffs = enabled;
+        _settings.Save(_log);
+        SetCommandStatus(enabled
+            ? "AutoGive items ON. Incoming handoffs will be accepted automatically for you."
+            : "AutoGive items OFF. Incoming handoffs will require your accept prompt.");
+    }
+
     private void ExecuteGiveCommand(string[] commandParts)
     {
         if (!_giveItemsEnabled)
@@ -22072,52 +30000,203 @@ private float FindSafeSpawnHeight(float x, float z)
     {
         var args = commandParts.Skip(1).ToArray();
         var localId = _lanSession?.LocalPlayerId ?? 0;
-        var targetId = localId;
-        var targetName = ResolvePlayerName(localId);
+        var localName = ResolvePlayerName(localId);
 
-        // /clear <item> OR /clear <player> <item>
-        if (args.Length >= 1)
+        // Case 1: /clear -> prompt to clear local player inventory with hotkey / in-chat prompt
+        if (args.Length == 0)
         {
-            if (args.Length >= 2 && TryResolvePlayerTarget(args[0], out var itemTargetId, out var itemTargetName))
-            {
-                var itemToken = string.Join(" ", args.Skip(1));
-                if (TryResolveInventoryItemToken(itemToken, out var targetItemId))
-                {
-                    ExecuteClearSpecificItem(itemTargetId, itemTargetName, targetItemId);
-                    return;
-                }
-            }
+            PromptClearInventory(localId, localName);
+            return;
+        }
 
-            var selfItemToken = string.Join(" ", args);
-            if (TryResolveInventoryItemToken(selfItemToken, out var selfItemId))
+        // Case 2: /clear USERNAME -> prompt to clear target player's inventory
+        if (args.Length == 1 && TryResolvePlayerTarget(args[0], out var singleTargetId, out var singleTargetName))
+        {
+            if (_lanSession != null && singleTargetId != localId && !_lanSession.IsHost)
             {
-                ExecuteClearSpecificItem(localId, targetName, selfItemId);
+                SetCommandStatus("Only the host can clear another player's inventory.");
                 return;
             }
 
-            if (!TryResolvePlayerTarget(args[0], out targetId, out targetName))
-            {
-                SetCommandSyntax("clear", $"Unknown player or item: {args[0]}.");
-                return;
-            }
+            PromptClearInventory(singleTargetId, singleTargetName);
+            return;
+        }
+
+        // Case 3: /clear [USERNAME] ITEM [AMOUNT] OR /clear ITEM [AMOUNT]
+        var targetId = localId;
+        var targetName = localName;
+        var itemArgs = args;
+
+        if (args.Length >= 2 && TryResolvePlayerTarget(args[0], out var targetPlayerId, out var targetPlayerName))
+        {
+            targetId = targetPlayerId;
+            targetName = targetPlayerName;
+            itemArgs = args.Skip(1).ToArray();
         }
 
         if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
         {
-            SetCommandStatus("Only the host can clear another player's inventory.");
+            SetCommandStatus("Only the host can clear another player's inventory items.");
             return;
         }
 
+        int? amount = null;
+        if (itemArgs.Length >= 2 && int.TryParse(itemArgs[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount))
+        {
+            amount = Math.Max(1, parsedAmount);
+            itemArgs = itemArgs.SkipLast(1).ToArray();
+        }
+
+        var itemToken = string.Join(" ", itemArgs).Trim();
+
+        var isTagOrCategory = ItemRegistry.MatchesCategoryOrTag(ItemId.WoodPickaxe, itemToken)
+            || ItemRegistry.MatchesCategoryOrTag(ItemId.DirtBlock, itemToken)
+            || ItemRegistry.MatchesCategoryOrTag(ItemId.OakLog, itemToken)
+            || itemToken.StartsWith("tag:", StringComparison.OrdinalIgnoreCase)
+            || IsKnownCategoryToken(itemToken);
+
+        if (isTagOrCategory || TryResolveInventoryItemToken(itemToken, out _))
+        {
+            ExecuteClearSpecificItemOrCategory(targetId, targetName, itemToken, amount);
+            return;
+        }
+
+        SetCommandSyntax("clear", $"Unknown player, item, or category tag: {itemToken}.");
+    }
+
+    private static bool IsKnownCategoryToken(string token)
+    {
+        var t = token.ToLowerInvariant();
+        return t is "tools" or "tool" or "food" or "foods" or "ores" or "ore" or "blocks" or "block" or "wood" or "planks" or "log" or "logs" or "pickaxe" or "axe" or "shovel";
+    }
+
+    private void PromptClearInventory(int targetId, string targetName)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        var promptName = targetId == localId ? "your inventory" : $"{targetName}'s inventory";
+
         AddChatLine(
-            $"Clear inventory for {targetName}?",
+            $"Clear {promptName}?",
             isSystem: true,
             actionLabel: "CONFIRM",
             customActionToken: $"{InventoryClearConfirmActionPrefix}{targetId}",
-            customActionStatus: $"Cleared inventory for {targetName}.",
+            customActionStatus: $"Cleared {promptName}.",
             actionLabel2: "CANCEL",
             customActionToken2: $"{InventoryClearCancelActionPrefix}{targetId}",
             customActionStatus2: "Inventory clear canceled.");
-        SetCommandStatus($"Click CONFIRM to clear {targetName}'s inventory.", 4f, echoToChat: false);
+        SetCommandStatus($"Clear prompt sent for {promptName}. Press action hotkey or click CONFIRM.", 4f, echoToChat: false);
+    }
+
+    private void ExecuteClearSpecificItemOrCategory(int targetId, string targetName, string itemOrCategoryToken, int? maxCount)
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        if (_lanSession != null && targetId != localId && !_lanSession.IsHost)
+        {
+            SetCommandStatus("Only the host can clear another player's inventory items.");
+            return;
+        }
+
+        if (_lanSession == null || targetId == localId)
+        {
+            var removed = ClearLocalInventoryMatching(itemOrCategoryToken, maxCount);
+            if (removed <= 0)
+            {
+                SetCommandStatus($"{targetName} has no matching '{itemOrCategoryToken}' items in inventory.", 4f, echoToChat: false);
+                return;
+            }
+
+            var countText = maxCount.HasValue ? $"{removed} (limit {maxCount.Value})" : $"{removed} (all)";
+            SetCommandStatus($"Removed {countText} '{itemOrCategoryToken}' items from {targetName}.", 4f, echoToChat: false);
+            return;
+        }
+
+        if (TryResolveInventoryItemToken(itemOrCategoryToken, out var targetBlockId))
+        {
+            var countVal = maxCount ?? 999999;
+            _lanSession.SendChat(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = targetId,
+                Kind = LanChatKind.System,
+                Text = $"{InventoryClearItemSyncPrefix}{targetId}|{(byte)targetBlockId}|{countVal}|{_profile.GetDisplayUsername()}",
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            SetCommandStatus($"Requested clear of {itemOrCategoryToken} for {targetName}.", 4f, echoToChat: false);
+        }
+    }
+
+    private int ClearLocalInventoryMatching(string itemOrCategoryToken, int? maxCount)
+    {
+        var remainingToRemove = maxCount ?? int.MaxValue;
+        var totalRemoved = 0;
+
+        for (var i = 0; i < _inventory.Hotbar.Length && remainingToRemove > 0; i++)
+        {
+            ref var slot = ref _inventory.Hotbar[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            var itemId = ItemRegistry.FromLegacyBlockId(slot.Id);
+            if (IsItemMatchingToken(itemId, slot.Id, itemOrCategoryToken))
+            {
+                var toRemove = Math.Min(slot.Count, remainingToRemove);
+                slot.Count -= toRemove;
+                remainingToRemove -= toRemove;
+                totalRemoved += toRemove;
+
+                if (slot.Count <= 0)
+                {
+                    slot.Id = BlockId.Air;
+                    slot.Count = 0;
+                }
+            }
+        }
+
+        for (var i = 0; i < _inventory.Grid.Length && remainingToRemove > 0; i++)
+        {
+            ref var slot = ref _inventory.Grid[i];
+            if (slot.Id == BlockId.Air || slot.Count <= 0)
+                continue;
+
+            var itemId = ItemRegistry.FromLegacyBlockId(slot.Id);
+            if (IsItemMatchingToken(itemId, slot.Id, itemOrCategoryToken))
+            {
+                var toRemove = Math.Min(slot.Count, remainingToRemove);
+                slot.Count -= toRemove;
+                remainingToRemove -= toRemove;
+                totalRemoved += toRemove;
+
+                if (slot.Count <= 0)
+                {
+                    slot.Id = BlockId.Air;
+                    slot.Count = 0;
+                }
+            }
+        }
+
+        if (totalRemoved > 0)
+            MarkPlayerStateDirty();
+
+        return totalRemoved;
+    }
+
+    private static bool IsItemMatchingToken(ItemId itemId, BlockId blockId, string token)
+    {
+        if (ItemRegistry.MatchesCategoryOrTag(itemId, token))
+            return true;
+
+        if (TryResolveInventoryItemToken(token, out var targetBlockId) && blockId == targetBlockId)
+            return true;
+
+        var def = ItemRegistry.Get(itemId);
+        if (def.Name.Equals(token, StringComparison.OrdinalIgnoreCase) || def.Key.Equals(token, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var blockDef = BlockRegistry.Get((byte)blockId);
+        if (blockDef.Name.Equals(token, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
     }
 
     private void ExecuteClearSpecificItem(int targetId, string targetName, BlockId itemId)
@@ -22222,6 +30301,64 @@ private float FindSafeSpawnHeight(float x, float z)
             ? $"Inventory cleared ({removed} item{(removed == 1 ? string.Empty : "s")})."
             : "Inventory is already empty.";
         SetCommandStatus(status, 3f, echoToChat: false);
+    }
+
+    private void DisposeArtificerHeldItemFromUi()
+    {
+        if (_gameMode != GameMode.Artificer)
+            return;
+
+        if (_inventoryHasHeld && _inventoryHeld.Id != BlockId.Air && _inventoryHeld.Count > 0)
+        {
+            var count = _inventoryHeld.Count;
+            var name = ItemRegistry.Get((byte)_inventoryHeld.Id).Name;
+            _inventoryHeld = default;
+            _inventoryHasHeld = false;
+            _heldFrom = InventorySlotGroup.None;
+            _heldIndex = -1;
+            ResetRightInventoryDragDistribution();
+            SetCommandStatus($"Disposed {count}x {name}.", 2f, echoToChat: false);
+            return;
+        }
+
+        if (TryGetInventorySlotAtPoint(_inventoryMousePos, out var group, out var index)
+            && TryGetInventorySlotValue(group, index, out var slot)
+            && slot.Id != BlockId.Air
+            && slot.Count > 0)
+        {
+            var count = slot.Count;
+            var name = ItemRegistry.Get((byte)slot.Id).Name;
+            SetInventoryDragSlotValue(group, index, default);
+            SetCommandStatus($"Disposed {count}x {name}.", 2f, echoToChat: false);
+            return;
+        }
+
+        SetCommandStatus("Hold or hover an item to dispose it.", 2f, echoToChat: false);
+    }
+
+    private void ClearTrashInventoryFromUi()
+    {
+        if (!_trashClearConfirmPending)
+        {
+            _trashClearConfirmPending = true;
+            _trashClearConfirmTimer = InventoryClearConfirmSeconds;
+            SetCommandStatus("Click the trash icon again to confirm.", 3f, echoToChat: false);
+            return;
+        }
+
+        _trashClearConfirmPending = false;
+        _trashClearConfirmTimer = 0f;
+        var removed = 0;
+        for (var i = 0; i < _trashInventory.Length; i++)
+        {
+            if (_trashInventory[i].Id != BlockId.Air && _trashInventory[i].Count > 0)
+                removed += _trashInventory[i].Count;
+            _trashInventory[i] = default;
+        }
+
+        SetCommandStatus(removed > 0
+            ? $"Trash cleared ({removed} item{(removed == 1 ? string.Empty : "s")})."
+            : "Trash is already empty.", 2.5f, echoToChat: false);
     }
 
     private void ClearSoulLootFromUi()
@@ -22823,7 +30960,7 @@ private float FindSafeSpawnHeight(float x, float z)
         }
 
         _soulLootOpen = true;
-        _inventoryOpen = true;
+        OpenInventoryUi();
         _soulLootClearConfirmPending = false;
         _soulLootPendingClearRemoval = false;
         _soulLootTitleText = GetViewedSoulDisplayTitle();
@@ -22840,6 +30977,16 @@ private float FindSafeSpawnHeight(float x, float z)
         if (added > 0)
             SavePlayerState();
         return added;
+    }
+
+    private string GetItemDisplayName(BlockId itemId)
+    {
+        var item = ItemRegistry.Get((byte)itemId);
+        if (item.Id != ItemId.None && !string.IsNullOrWhiteSpace(item.Name))
+            return item.Name;
+
+        var block = BlockRegistry.Get(itemId);
+        return string.IsNullOrWhiteSpace(block.Name) ? itemId.ToString() : block.Name;
     }
 
     private bool TryHandoffSelectedItemDirect(int targetPlayerId, int requestedAmount, out string status)
@@ -22871,9 +31018,31 @@ private float FindSafeSpawnHeight(float x, float z)
             return false;
         }
 
+        var offerId = FindLocalOutgoingHandoffOffer(targetPlayerId, itemId);
+        if (string.IsNullOrWhiteSpace(offerId))
+            offerId = BuildLocalHandoffOfferId();
+
+        if (!TryConsumeSelectedForWorldDrop(requestedAmount, out _))
+        {
+            status = "Your held item changed before the handoff could be queued.";
+            return false;
+        }
+
+        SavePlayerState();
+        PushLocalPersistenceSnapshotNow();
+        AddOrStackLocalOutgoingHandoffOffer(offerId, _lanSession.LocalPlayerId, targetPlayerId, itemId, requestedAmount);
+
         if (_lanSession.IsHost)
         {
-            return TryProcessDirectPlayerHandoff(_lanSession.LocalPlayerId, targetPlayerId, itemId, requestedAmount, out _, out status);
+            ProcessHostItemHandoffOfferRequest(
+                _lanSession.LocalPlayerId,
+                targetPlayerId,
+                offerId,
+                itemId,
+                requestedAmount,
+                _profile.GetDisplayUsername());
+            status = $"Offering {GetLocalOutgoingHandoffAmount(offerId)}x {GetItemDisplayName(itemId)} to {ResolvePlayerName(targetPlayerId)}...";
+            return true;
         }
 
         _lanSession.SendChat(new LanChatMessage
@@ -22881,11 +31050,53 @@ private float FindSafeSpawnHeight(float x, float z)
             FromPlayerId = _lanSession.LocalPlayerId,
             ToPlayerId = 0,
             Kind = LanChatKind.System,
-            Text = $"{InventoryHandoffRequestPrefix}{targetPlayerId}|{(byte)itemId}|{requestedAmount}",
+            Text = $"{InventoryHandoffRequestPrefix}{targetPlayerId}|{offerId}|{(byte)itemId}|{requestedAmount}|{Uri.EscapeDataString(_profile.GetDisplayUsername())}",
             TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
-        status = $"Handing {requestedAmount}x {itemId} to {ResolvePlayerName(targetPlayerId)}...";
+        status = $"Offering {GetLocalOutgoingHandoffAmount(offerId)}x {GetItemDisplayName(itemId)} to {ResolvePlayerName(targetPlayerId)}...";
         return true;
+    }
+
+    private string BuildLocalHandoffOfferId()
+    {
+        var localId = _lanSession?.LocalPlayerId ?? 0;
+        return $"{localId}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}-{_nextItemId++:x}";
+    }
+
+    private string FindLocalOutgoingHandoffOffer(int targetPlayerId, BlockId itemId)
+    {
+        foreach (var offer in _localOutgoingHandoffOffers.Values)
+        {
+            if (offer.TargetPlayerId == targetPlayerId && offer.ItemId == itemId)
+                return offer.OfferId;
+        }
+
+        return string.Empty;
+    }
+
+    private int GetLocalOutgoingHandoffAmount(string offerId)
+        => _localOutgoingHandoffOffers.TryGetValue(offerId, out var offer) ? offer.Amount : 0;
+
+    private void AddOrStackLocalOutgoingHandoffOffer(string offerId, int senderPlayerId, int targetPlayerId, BlockId itemId, int amount)
+    {
+        if (_localOutgoingHandoffOffers.TryGetValue(offerId, out var existing))
+        {
+            existing.Amount += Math.Max(1, amount);
+            existing.ExpiresIn = InventoryHandoffTimeoutSeconds;
+            _localOutgoingHandoffOffers[offerId] = existing;
+            return;
+        }
+
+        _localOutgoingHandoffOffers[offerId] = new PendingItemHandoffOffer
+        {
+            OfferId = offerId,
+            SenderPlayerId = senderPlayerId,
+            TargetPlayerId = targetPlayerId,
+            ItemId = itemId,
+            Amount = Math.Max(1, amount),
+            ExpiresIn = InventoryHandoffTimeoutSeconds,
+            SenderName = ResolvePlayerName(senderPlayerId)
+        };
     }
 
     private bool TryProcessDirectPlayerHandoff(int senderPlayerId, int targetPlayerId, BlockId itemId, int requestedAmount, out int moved, out string status)
@@ -23556,11 +31767,12 @@ private float FindSafeSpawnHeight(float x, float z)
         var args = commandParts.Skip(1).ToArray();
         var localId = _lanSession?.LocalPlayerId ?? 0;
 
-        // /inv clear - clear inventory view
+        // /inv clear - clear inventory items
         if (args.Length == 1 && args[0].Equals("clear", StringComparison.OrdinalIgnoreCase))
         {
-            ClearInventoryView();
-            SetCommandStatus("Inventory view cleared.", 3f, echoToChat: false);
+            if (HasActiveRemoteInventoryView())
+                ClearInventoryView();
+            ExecuteClearInventoryCommand(commandParts);
             return;
         }
 
@@ -23591,7 +31803,7 @@ private float FindSafeSpawnHeight(float x, float z)
             // View own inventory (open regular inventory UI)
             if (!_inventoryOpen)
             {
-                _inventoryOpen = true;
+                OpenInventoryUi();
                 SetCommandStatus("Opened your inventory.", 3f, echoToChat: false);
             }
             else
@@ -23620,6 +31832,12 @@ private float FindSafeSpawnHeight(float x, float z)
             RequestInventoryView(targetId, openUi: true);
             SetCommandStatus($"Now viewing {targetName}'s inventory.", 3f, echoToChat: false);
         }
+    }
+
+    private void ExecuteTrashCommand(string[] commandParts)
+    {
+        OpenTrashInventoryUi();
+        SetCommandStatus("Opened trash.", 2f, echoToChat: false);
     }
 
     private void ClearInventoryView(bool preserveSpectate = false)
@@ -23756,7 +31974,7 @@ private float FindSafeSpawnHeight(float x, float z)
         // Open inventory UI to show live view
         if (openUi && !_inventoryOpen)
         {
-            _inventoryOpen = true;
+            OpenInventoryUi();
         }
 
         if (_lanSession.IsConnected)
@@ -24434,18 +32652,142 @@ private float FindSafeSpawnHeight(float x, float z)
 
         var payload = text.Substring(InventoryHandoffRequestPrefix.Length);
         var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length < 3
+        if (parts.Length < 4
             || !int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var targetPlayerId)
-            || !byte.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemRaw)
-            || !int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+            || !byte.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemRaw)
+            || !int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
         {
             return true;
         }
 
         var senderPlayerId = message.FromPlayerId;
+        var offerId = parts[1];
         var itemId = (BlockId)itemRaw;
-        var ok = TryProcessDirectPlayerHandoff(senderPlayerId, targetPlayerId, itemId, amount, out var moved, out var status);
-        SendInventoryHandoffSync(senderPlayerId, ok, moved, status);
+        var senderName = parts.Length >= 5 ? Uri.UnescapeDataString(parts[4]) : ResolvePlayerName(senderPlayerId);
+        ProcessHostItemHandoffOfferRequest(senderPlayerId, targetPlayerId, offerId, itemId, amount, senderName);
+        return true;
+    }
+
+    private bool TryHandleInventoryHandoffOfferMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0 && message.FromPlayerId != _lanSession.LocalPlayerId)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryHandoffOfferPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryHandoffOfferPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries);
+        if (parts.Length < 5
+            || !int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var targetPlayerId)
+            || targetPlayerId != _lanSession.LocalPlayerId
+            || !int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var senderPlayerId)
+            || !byte.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemRaw)
+            || !int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+        {
+            return true;
+        }
+
+        var offerId = parts[1];
+        var itemId = (BlockId)itemRaw;
+        var senderName = parts.Length >= 6 ? Uri.UnescapeDataString(parts[5]) : ResolvePlayerName(senderPlayerId);
+        amount = Math.Max(1, amount);
+
+        if (_autoAcceptItemHandoffs)
+        {
+            SendInventoryHandoffResponse(offerId, accept: true);
+            SetCommandStatus($"Auto-accepting {amount}x {GetItemDisplayName(itemId)} from {senderName}.", 2.5f, echoToChat: false);
+            return true;
+        }
+
+        _localIncomingHandoffOffers[offerId] = new PendingItemHandoffOffer
+        {
+            OfferId = offerId,
+            SenderPlayerId = senderPlayerId,
+            TargetPlayerId = targetPlayerId,
+            ItemId = itemId,
+            Amount = amount,
+            ExpiresIn = InventoryHandoffTimeoutSeconds,
+            SenderName = senderName
+        };
+        var warmBudget = 1;
+        WarmItemIcon(itemId, 26, ref warmBudget);
+        var itemName = GetItemDisplayName(itemId);
+        AddChatLine(
+            $"{senderName} wants to give you {amount}x {itemName}.",
+            isSystem: true,
+            actionLabel: "ACCEPT",
+            customActionToken: InventoryHandoffAcceptActionPrefix + offerId,
+            customActionStatus: "Item handoff accepted.",
+            actionLabel2: "DECLINE",
+            customActionToken2: InventoryHandoffDeclineActionPrefix + offerId,
+            customActionStatus2: "Item handoff declined.",
+            hoverText: $"Accept {amount}x {itemName}",
+            hoverText2: "Decline item handoff.");
+        return true;
+    }
+
+    private bool TryHandleInventoryHandoffResponseMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryHandoffResponsePrefix, StringComparison.Ordinal))
+            return false;
+        if (!_lanSession.IsHost)
+            return true;
+
+        var payload = text.Substring(InventoryHandoffResponsePrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2 || !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var acceptFlag))
+            return true;
+
+        ProcessHostItemHandoffResponse(parts[0], message.FromPlayerId, acceptFlag != 0);
+        return true;
+    }
+
+    private bool TryHandleInventoryHandoffResultMessage(LanChatMessage message)
+    {
+        if (_lanSession == null || message.Kind != LanChatKind.System)
+            return false;
+        if (message.FromPlayerId != 0 && message.FromPlayerId != _lanSession.LocalPlayerId)
+            return false;
+
+        var text = message.Text ?? string.Empty;
+        if (!text.StartsWith(InventoryHandoffResultPrefix, StringComparison.Ordinal))
+            return false;
+
+        var payload = text.Substring(InventoryHandoffResultPrefix.Length);
+        var parts = payload.Split('|', StringSplitOptions.TrimEntries);
+        if (parts.Length < 4
+            || !int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var targetPlayerId)
+            || targetPlayerId != _lanSession.LocalPlayerId)
+        {
+            return true;
+        }
+
+        var offerId = parts[1];
+        var role = parts[2];
+        var status = Uri.UnescapeDataString(parts[3]);
+        _localOutgoingHandoffOffers.Remove(offerId);
+        _localIncomingHandoffOffers.Remove(offerId);
+        ClearPendingItemHandoffConfirmation(offerId);
+        if (string.Equals(role, "sender-return", StringComparison.OrdinalIgnoreCase)
+            && parts.Length >= 6
+            && byte.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemRaw)
+            && int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+        {
+            var restored = GiveLocalInventoryItem((BlockId)itemRaw, Math.Max(1, amount));
+            if (restored > 0)
+                PushLocalPersistenceSnapshotNow();
+        }
+        SetCommandStatus(status, 3f, echoToChat:
+            string.Equals(role, "sender", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(role, "sender-return", StringComparison.OrdinalIgnoreCase));
         return true;
     }
 
@@ -24474,6 +32816,198 @@ private float FindSafeSpawnHeight(float x, float z)
         var status = Uri.UnescapeDataString(parts[3]);
         SetCommandStatus(status, okFlag != 0 || moved > 0 ? 3f : 2.5f, echoToChat: true);
         return true;
+    }
+
+    private void ProcessHostItemHandoffOfferRequest(int senderPlayerId, int targetPlayerId, string offerId, BlockId itemId, int amount, string senderName)
+    {
+        if (_lanSession == null || !_lanSession.IsHost)
+            return;
+
+        offerId = (offerId ?? string.Empty).Trim();
+        amount = Math.Max(1, amount);
+        if (string.IsNullOrWhiteSpace(offerId) || itemId == BlockId.Air || amount <= 0 || senderPlayerId == targetPlayerId)
+        {
+            SendInventoryHandoffResult(senderPlayerId, offerId, "sender", "Item handoff failed.");
+            return;
+        }
+
+        if (!_giveItemsEnabled)
+        {
+            ReturnHostPendingHandoffToSender(new PendingItemHandoffOffer
+            {
+                OfferId = offerId,
+                SenderPlayerId = senderPlayerId,
+                TargetPlayerId = targetPlayerId,
+                ItemId = itemId,
+                Amount = amount,
+                SenderName = senderName
+            }, "Item giving is disabled in this world.");
+            return;
+        }
+
+        if (_hostPendingHandoffOffers.TryGetValue(offerId, out var existing))
+        {
+            existing.Amount += amount;
+            existing.ExpiresIn = InventoryHandoffTimeoutSeconds;
+            _hostPendingHandoffOffers[offerId] = existing;
+        }
+        else
+        {
+            _hostPendingHandoffOffers[offerId] = new PendingItemHandoffOffer
+            {
+                OfferId = offerId,
+                SenderPlayerId = senderPlayerId,
+                TargetPlayerId = targetPlayerId,
+                ItemId = itemId,
+                Amount = amount,
+                ExpiresIn = InventoryHandoffTimeoutSeconds,
+                SenderName = string.IsNullOrWhiteSpace(senderName) ? ResolvePlayerName(senderPlayerId) : senderName.Trim()
+            };
+        }
+
+        var offer = _hostPendingHandoffOffers[offerId];
+        SendInventoryHandoffOfferToTarget(offer);
+        SendInventoryHandoffResult(
+            senderPlayerId,
+            offerId,
+            "sender",
+            $"Waiting for {ResolvePlayerName(targetPlayerId)} to accept {offer.Amount}x {GetItemDisplayName(itemId)}.");
+    }
+
+    private void ProcessHostItemHandoffResponse(string offerId, int respondingPlayerId, bool accept)
+    {
+        if (_lanSession == null || !_lanSession.IsHost)
+            return;
+
+        offerId = (offerId ?? string.Empty).Trim();
+        if (!_hostPendingHandoffOffers.TryGetValue(offerId, out var offer))
+            return;
+        if (respondingPlayerId != offer.TargetPlayerId)
+            return;
+
+        _hostPendingHandoffOffers.Remove(offerId);
+        if (!accept)
+        {
+            ReturnHostPendingHandoffToSender(offer, $"{ResolvePlayerName(offer.TargetPlayerId)} declined {offer.Amount}x {GetItemDisplayName(offer.ItemId)}.");
+            SendInventoryHandoffResult(offer.TargetPlayerId, offerId, "target", "Item handoff declined.");
+            return;
+        }
+
+        var moved = offer.TargetPlayerId == _lanSession.LocalPlayerId
+            ? GiveLocalInventoryItem(offer.ItemId, offer.Amount)
+            : GiveRemoteInventoryItem(offer.TargetPlayerId, offer.ItemId, offer.Amount);
+        if (moved != offer.Amount)
+        {
+            if (moved > 0)
+                ReturnPartialAcceptedHandoff(offer, offer.Amount - moved);
+            else
+                ReturnHostPendingHandoffToSender(offer, $"{ResolvePlayerName(offer.TargetPlayerId)}'s inventory is full.");
+
+            SendInventoryHandoffResult(offer.TargetPlayerId, offerId, "target", $"Could not receive {GetItemDisplayName(offer.ItemId)}. Inventory full.");
+            return;
+        }
+
+        var itemName = GetItemDisplayName(offer.ItemId);
+        SendInventoryHandoffResult(offer.SenderPlayerId, offerId, "sender", $"{ResolvePlayerName(offer.TargetPlayerId)} accepted {offer.Amount}x {itemName}.");
+        SendInventoryHandoffResult(offer.TargetPlayerId, offerId, "target", $"Received {offer.Amount}x {itemName} from {ResolvePlayerName(offer.SenderPlayerId)}.");
+    }
+
+    private void ReturnPartialAcceptedHandoff(PendingItemHandoffOffer offer, int leftover)
+    {
+        if (leftover <= 0)
+            return;
+
+        offer.Amount = leftover;
+        ReturnHostPendingHandoffToSender(offer, $"{ResolvePlayerName(offer.TargetPlayerId)} only had room for part of the handoff. Returned {leftover}x {GetItemDisplayName(offer.ItemId)}.");
+    }
+
+    private void ReturnHostPendingHandoffToSender(PendingItemHandoffOffer offer, string status)
+    {
+        if (_lanSession == null || !_lanSession.IsHost)
+            return;
+
+        SendInventoryHandoffResult(offer.SenderPlayerId, offer.OfferId, "sender-return", status, offer.ItemId, offer.Amount);
+    }
+
+    private void SendInventoryHandoffResponse(string offerId, bool accept)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected)
+            return;
+
+        if (_lanSession.IsHost)
+        {
+            ProcessHostItemHandoffResponse(offerId, _lanSession.LocalPlayerId, accept);
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = 0,
+            Kind = LanChatKind.System,
+            Text = $"{InventoryHandoffResponsePrefix}{offerId}|{(accept ? 1 : 0)}",
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private void SendInventoryHandoffOfferToTarget(PendingItemHandoffOffer offer)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        var text = $"{InventoryHandoffOfferPrefix}{offer.TargetPlayerId}|{offer.OfferId}|{offer.SenderPlayerId}|{(byte)offer.ItemId}|{offer.Amount}|{Uri.EscapeDataString(offer.SenderName ?? string.Empty)}";
+        if (offer.TargetPlayerId == _lanSession.LocalPlayerId)
+        {
+            TryHandleInventoryHandoffOfferMessage(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = _lanSession.LocalPlayerId,
+                Kind = LanChatKind.System,
+                Text = text,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = offer.TargetPlayerId,
+            Kind = LanChatKind.System,
+            Text = text,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+    }
+
+    private void SendInventoryHandoffResult(int targetPlayerId, string offerId, string role, string status, BlockId returnItem = BlockId.Air, int returnAmount = 0)
+    {
+        if (_lanSession == null || !_lanSession.IsConnected || !_lanSession.IsHost)
+            return;
+
+        var text = $"{InventoryHandoffResultPrefix}{targetPlayerId}|{offerId}|{role}|{Uri.EscapeDataString(status ?? string.Empty)}";
+        if (string.Equals(role, "sender-return", StringComparison.OrdinalIgnoreCase) && returnItem != BlockId.Air && returnAmount > 0)
+            text += $"|{(byte)returnItem}|{returnAmount}";
+        if (targetPlayerId == _lanSession.LocalPlayerId)
+        {
+            TryHandleInventoryHandoffResultMessage(new LanChatMessage
+            {
+                FromPlayerId = _lanSession.LocalPlayerId,
+                ToPlayerId = targetPlayerId,
+                Kind = LanChatKind.System,
+                Text = text,
+                TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+            return;
+        }
+
+        _lanSession.SendChat(new LanChatMessage
+        {
+            FromPlayerId = _lanSession.LocalPlayerId,
+            ToPlayerId = targetPlayerId,
+            Kind = LanChatKind.System,
+            Text = text,
+            TimestampUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
     }
 
     private void SendInventoryHandoffSync(int targetPlayerId, bool ok, int moved, string status)
@@ -24628,6 +33162,12 @@ private float FindSafeSpawnHeight(float x, float z)
         if (TryHandleInventoryGiveMessage(message))
             return;
         if (TryHandleInventoryHandoffRequestMessage(message))
+            return;
+        if (TryHandleInventoryHandoffOfferMessage(message))
+            return;
+        if (TryHandleInventoryHandoffResponseMessage(message))
+            return;
+        if (TryHandleInventoryHandoffResultMessage(message))
             return;
         if (TryHandleInventoryHandoffSyncMessage(message))
             return;
@@ -24960,6 +33500,29 @@ private float FindSafeSpawnHeight(float x, float z)
         DrawBorder(sb, rect, new Color(255, 255, 255, 180));
         _font.DrawString(sb, _gamemodeToastText, new Vector2(rect.X + 12, rect.Y + 7), new Color(235, 235, 235));
     }
+
+    private void DrawStuckJavelinPrompt(SpriteBatch sb)
+    {
+        if (_stuckJavelinsInLocalPlayer <= 0)
+            return;
+
+        var text = _stuckJavelinsInLocalPlayer == 1
+            ? "PRESS [E] TO REMOVE JAVELIN"
+            : $"PRESS [E] TO REMOVE JAVELINS ({_stuckJavelinsInLocalPlayer})";
+
+        var pulse = (MathF.Sin(_worldTimeSeconds * 6f) + 1f) * 0.5f;
+        var textColor = Color.Lerp(new Color(255, 120, 120), new Color(255, 230, 140), pulse);
+
+        var size = _font.MeasureString(text);
+        var width = (int)Math.Ceiling(size.X) + 28;
+        var height = _font.LineHeight + 14;
+        var rect = new Rectangle(_viewport.Center.X - width / 2, _viewport.Y + 160, width, height);
+
+        sb.Draw(_pixel, rect, new Color(40, 10, 10, 210));
+        DrawBorder(sb, rect, new Color(220, 60, 60, 200));
+        _font.DrawString(sb, text, new Vector2(rect.X + 14, rect.Y + 7), textColor);
+    }
+
 
     private void DrawFlySpeedToast(SpriteBatch sb)
     {
@@ -25829,14 +34392,26 @@ private float FindSafeSpawnHeight(float x, float z)
             }
             else if (hasPendingQuickConfirmation)
             {
-                inviteText = $"{quickConfirmPrompt} Tap {keyLabel} to CANCEL, hold {keyLabel} to CONFIRM.";
+                inviteText = _pendingQuickConfirmToken.StartsWith(InventoryHandoffAcceptActionPrefix, StringComparison.Ordinal)
+                    ? $"{quickConfirmPrompt} Tap {keyLabel} to DECLINE, hold {keyLabel} to ACCEPT."
+                    : $"{quickConfirmPrompt} Tap {keyLabel} to CANCEL, hold {keyLabel} to CONFIRM.";
             }
             else
             {
                 inviteText = $"Invite from {inviteName}: tap {keyLabel} to DECLINE, hold {keyLabel} to ACCEPT.";
             }
 
-            y = DrawCommandLine(sb, x, y, inviteText, new Color(0, 0, 0, 190), new Color(230, 235, 255), fixedWidth: overlayWidth);
+            var hasHandoffIcon = TryGetPendingItemHandoffIcon(out var handoffIconId, out var handoffIconCount);
+            y = DrawCommandLine(
+                sb,
+                x,
+                y,
+                inviteText,
+                new Color(0, 0, 0, 190),
+                new Color(230, 235, 255),
+                fixedWidth: overlayWidth,
+                iconId: hasHandoffIcon ? handoffIconId : null,
+                iconCount: handoffIconCount);
 
             if (_inviteQuickHoldActive && (!string.IsNullOrWhiteSpace(pendingPeerId) || hasPendingQuickConfirmation))
             {
@@ -26035,7 +34610,9 @@ private float FindSafeSpawnHeight(float x, float z)
         int? fixedWidth = null,
         string? actionLabel2 = null,
         ChatActionHitbox? action2 = null,
-        int? textHighlightWidth = null)
+        int? textHighlightWidth = null,
+        BlockId? iconId = null,
+        int iconCount = 0)
     {
         var actionWidth = 0;
         if (!string.IsNullOrWhiteSpace(actionLabel))
@@ -26050,7 +34627,8 @@ private float FindSafeSpawnHeight(float x, float z)
         var maxWidth = Math.Max(240, _viewport.Width - 40);
         var requestedWidth = fixedWidth ?? maxWidth;
         var width = Math.Clamp(requestedWidth, 320, maxWidth);
-        var textWidth = Math.Max(120, width - 18 - totalActionWidth);
+        var iconAreaWidth = iconId.HasValue && iconId.Value != BlockId.Air ? 34 : 0;
+        var textWidth = Math.Max(120, width - 18 - totalActionWidth - iconAreaWidth);
         var wrappedLines = WrapOverlayText(text, textWidth);
         var lineSpacing = 2;
         var textHeight = wrappedLines.Count * _font.LineHeight + Math.Max(0, wrappedLines.Count - 1) * lineSpacing;
@@ -26067,10 +34645,21 @@ private float FindSafeSpawnHeight(float x, float z)
                 _font.LineHeight + 4);
             sb.Draw(_pixel, selectionRect, new Color(88, 148, 218, 150));
         }
+        if (iconAreaWidth > 0 && iconId.HasValue)
+        {
+            var iconRect = new Rectangle(rect.X + 8, rect.Y + Math.Max(4, (rect.Height - 26) / 2), 26, 26);
+            sb.Draw(_pixel, new Rectangle(iconRect.X - 2, iconRect.Y - 2, iconRect.Width + 4, iconRect.Height + 4), new Color(15, 18, 22, 205));
+            DrawBorder(sb, new Rectangle(iconRect.X - 2, iconRect.Y - 2, iconRect.Width + 4, iconRect.Height + 4), new Color(160, 190, 220, 150));
+            DrawItemIcon(sb, iconId.Value, iconRect);
+            if (iconCount > 1)
+                DrawSlotItemCount(sb, iconRect, iconCount);
+        }
+
+        var textX = rect.X + 8 + iconAreaWidth;
         var textY = rect.Y + 6;
         for (var i = 0; i < wrappedLines.Count; i++)
         {
-            _font.DrawString(sb, wrappedLines[i], new Vector2(rect.X + 8, textY), foreground);
+            _font.DrawString(sb, wrappedLines[i], new Vector2(textX, textY), foreground);
             textY += _font.LineHeight + lineSpacing;
         }
 
@@ -26472,12 +35061,19 @@ private float FindSafeSpawnHeight(float x, float z)
         var size = _font.MeasureString(text);
         var alpha = Math.Min(1.0f, _selectedNameTimer);
         Vector2 pos;
+        var yLift = _gameMode == GameMode.Artificer ? 12f : 0f;
         if (TryGetSigilHudRect(out var sigilRect))
-            pos = new Vector2((_viewport.Width - size.X) / 2f, sigilRect.Y - size.Y - 8f);
+            pos = new Vector2(_viewport.X + (_viewport.Width - size.X) / 2f, sigilRect.Y - size.Y - 8f - yLift);
         else
-            pos = new Vector2((_viewport.Width - size.X) / 2f, _hotbarRect.Y - size.Y - 10f);
-        
-        _font.DrawString(sb, text, pos + new Vector2(2, 2), Color.Black * 0.6f * alpha);
+            pos = new Vector2(_viewport.X + (_viewport.Width - size.X) / 2f, _hotbarRect.Y - size.Y - 10f - yLift);
+
+        var backdrop = new Rectangle(
+            (int)MathF.Floor(pos.X - 8f),
+            (int)MathF.Floor(pos.Y - 4f),
+            (int)MathF.Ceiling(size.X + 16f),
+            (int)MathF.Ceiling(size.Y + 8f));
+        sb.Draw(_pixel, backdrop, new Color(0, 0, 0) * (0.35f * alpha));
+        _font.DrawString(sb, text, pos + new Vector2(2, 2), Color.Black * (0.6f * alpha));
         _font.DrawString(sb, text, pos, Color.White * alpha);
     }
 
@@ -26507,6 +35103,22 @@ private float FindSafeSpawnHeight(float x, float z)
         verts.Add(new VertexPositionTexture(p0, uv00));
         verts.Add(new VertexPositionTexture(p2, uv11));
         verts.Add(new VertexPositionTexture(p3, uv01));
+    }
+
+    /// <summary>
+    /// Lit variant of AddFace used by the fallback crash-recovery mesh path.
+    /// Emits VertexPositionColorTexture with Color.White (full-brightness).
+    /// </summary>
+    private void AddFaceLit(List<VertexPositionColorTexture> verts, CubeNetAtlas atlas, byte id, FaceDirection face, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3)
+    {
+        atlas.GetFaceUvRect(id, face, out var uv00, out var uv10, out var uv11, out var uv01);
+        var c = Color.White;
+        verts.Add(new VertexPositionColorTexture(p0, c, uv00));
+        verts.Add(new VertexPositionColorTexture(p1, c, uv10));
+        verts.Add(new VertexPositionColorTexture(p2, c, uv11));
+        verts.Add(new VertexPositionColorTexture(p0, c, uv00));
+        verts.Add(new VertexPositionColorTexture(p2, c, uv11));
+        verts.Add(new VertexPositionColorTexture(p3, c, uv01));
     }
 
     private struct ChatActionHitbox
@@ -26726,6 +35338,17 @@ private float FindSafeSpawnHeight(float x, float z)
         public int LineId;
     }
 
+    private struct PendingItemHandoffOffer
+    {
+        public string OfferId;
+        public int SenderPlayerId;
+        public int TargetPlayerId;
+        public BlockId ItemId;
+        public int Amount;
+        public float ExpiresIn;
+        public string SenderName;
+    }
+
     private sealed class SkinSyncBuffer
     {
         public SkinSyncBuffer(string hash, int chunkCount)
@@ -26771,11 +35394,83 @@ private float FindSafeSpawnHeight(float x, float z)
         public int LandedBlockZ;
     }
 
+    private struct PebbleProjectile
+    {
+        public Vector3 Position;
+        public Vector3 PreviousPosition;
+        public Vector3 Velocity;
+        public float Age;
+        public float SpawnTime;
+    }
+
+    private struct JavelinProjectile
+    {
+        public BlockId ItemId;
+        public Vector3 Position;
+        public Vector3 PreviousPosition;
+        public Vector3 Velocity;
+        public float Age;
+        public float SpawnTime;
+        public float Charge;
+        public float FlightDistance;
+        public bool IsStuck;
+        public Vector3 StuckDirection;
+        public int StuckTargetPlayerId;
+        public Vector3 StuckLocalOffset;
+    }
+
+
+    private readonly struct BlockBreakKey : IEquatable<BlockBreakKey>
+    {
+        public BlockBreakKey(int x, int y, int z)
+        {
+            X = x;
+            Y = y;
+            Z = z;
+        }
+
+        public int X { get; }
+        public int Y { get; }
+        public int Z { get; }
+
+        public bool Equals(BlockBreakKey other) => X == other.X && Y == other.Y && Z == other.Z;
+        public override bool Equals(object? obj) => obj is BlockBreakKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(X, Y, Z);
+    }
+
+    private struct BlockBreakProgress
+    {
+        public BlockBreakProgress(byte blockId)
+        {
+            BlockId = blockId;
+            ProgressSeconds = 0f;
+            InactiveSeconds = 0f;
+            SwingTimer = 0f;
+        }
+
+        public byte BlockId;
+        public float ProgressSeconds;
+        public float InactiveSeconds;
+        public float SwingTimer;
+    }
+
     private struct HurtParticle
     {
         public Vector3 Position;
         public Vector3 Velocity;
         public float Age;
         public float Lifetime;
+    }
+
+    private sealed class TorchFlameChunkCache
+    {
+        public TorchFlameChunkCache(int version, List<Vector3> anchors)
+        {
+            Version = version;
+            Anchors = anchors;
+        }
+
+        public int Version { get; }
+        public List<Vector3> Anchors { get; }
     }
 }

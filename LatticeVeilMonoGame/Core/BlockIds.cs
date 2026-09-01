@@ -8,7 +8,7 @@ public static class BlockIds
     public const byte Stone = 3;
     public const byte Water = 4;
     public const byte Sand = 5;
-    public const byte Wood = 6;
+    public const byte OakLog = 6;
     public const byte Leaves = 7;
     public const byte Chest = 10;
     public const byte CoalOre = 11;
@@ -25,7 +25,7 @@ public static class BlockIds
     public const byte Nullblock = Nullrock;
     public const byte Corestone = Nullrock;
     public const byte Gravel = 16;
-    public const byte Plank = 17;
+    public const byte OakPlanks = 17;
     public const byte Gold = 18;
     public const byte GoldOre = Gold;
     public const byte Diamond = 19;
@@ -75,4 +75,57 @@ public static class BlockIds
     public const byte PyroskinTonic = 63;
     public const byte BrineveilElixir = 64;
     public const byte WaterBucket = 65;
+    public const byte PlantFiber = 66;
+    public const byte CoalChunk = 67;
+    public const byte IronBlock = 68;
+    public const byte GoldBlock = 69;
+    public const byte DiamondBlock = 70;
+    public const byte EmptyBucket = 71;
+    public const byte Stick = 72;
+    public const byte Torch = 73;
+    public const byte FiberWrappedTorch = 74;
+    public const byte BasicKiln = 75;
+    public const byte AdvancedKiln = 76;
+    public const byte FieldOven = 77;
+    public const byte IronBillet = 78;
+    public const byte GoldBillet = 79;
+    public const byte FlowingWater1 = 80;
+    public const byte FlowingWater2 = 81;
+    public const byte FlowingWater3 = 82;
+    public const byte FlowingWater4 = 83;
+    public const byte FlowingWater5 = 84;
+    public const byte FlowingWater6 = 85;
+    public const byte FlowingWater7 = 86;
+    public const byte DiamondGem = 87;
+    public const byte Pebbles = 88;
+    public const byte CopperOre = 89;
+    public const byte IronCluster = 90;
+    public const byte GoldCluster = 91;
+    public const byte CopperCluster = 92;
+    public const byte CopperBillet = 93;
+    public const byte EmeraldOre = 94;
+    public const byte RubyOre = 95;
+    public const byte SapphireOre = 96;
+    public const byte AmethystOre = 97;
+    public const byte Emerald = 98;
+    public const byte RubyStone = 99;
+    public const byte SapphireGem = 100;
+    public const byte AmethystShard = 101;
+    public const byte BasicKilnLit = 102;
+    public const byte AdvancedKilnLit = 103;
+    public const byte FieldOvenLit = 104;
+
+    public static bool IsWater(byte id) => id == Water || IsFlowingWater(id);
+
+    public static bool IsWaterSource(byte id) => id == Water;
+
+    public static bool IsFlowingWater(byte id) => id >= FlowingWater1 && id <= FlowingWater7;
+
+    public static int GetFlowingWaterLevel(byte id) => IsFlowingWater(id) ? id - FlowingWater1 + 1 : 0;
+
+    public static byte FlowingWaterForLevel(int level)
+    {
+        level = Math.Clamp(level, 1, 7);
+        return (byte)(FlowingWater1 + level - 1);
+    }
 }

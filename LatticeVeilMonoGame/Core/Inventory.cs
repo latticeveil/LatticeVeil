@@ -269,7 +269,70 @@ public sealed class Inventory
         return false;
     }
 
+    public int Count(BlockId id)
+    {
+        if (id == BlockId.Air)
+            return 0;
+
+        var total = 0;
+        for (var i = 0; i < _hotbar.Length; i++)
+        {
+            if (_hotbar[i].Id == id && _hotbar[i].Count > 0)
+                total += _hotbar[i].Count;
+        }
+
+        for (var i = 0; i < _grid.Length; i++)
+        {
+            if (_grid[i].Id == id && _grid[i].Count > 0)
+                total += _grid[i].Count;
+        }
+
+        return total;
+    }
+
+    public int CountMatching(Func<BlockId, bool> matches)
+    {
+        var total = 0;
+        for (var i = 0; i < _hotbar.Length; i++)
+        {
+            if (_hotbar[i].Count > 0 && _hotbar[i].Id != BlockId.Air && matches(_hotbar[i].Id))
+                total += _hotbar[i].Count;
+        }
+
+        for (var i = 0; i < _grid.Length; i++)
+        {
+            if (_grid[i].Count > 0 && _grid[i].Id != BlockId.Air && matches(_grid[i].Id))
+                total += _grid[i].Count;
+        }
+
+        return total;
+    }
+
     public int GetMaxStackSize(BlockId id) => GetMaxStack(id, Mode);
+
+    public bool TryConsume(BlockId id, int amount)
+    {
+        if (amount <= 0)
+            return true;
+        if (id == BlockId.Air || Count(id) < amount)
+            return false;
+
+        amount = ConsumeFromSlots(_hotbar, id, amount);
+        amount = ConsumeFromSlots(_grid, id, amount);
+        return amount <= 0;
+    }
+
+    public bool TryConsumeMatching(Func<BlockId, bool> matches, int amount)
+    {
+        if (amount <= 0)
+            return true;
+        if (CountMatching(matches) < amount)
+            return false;
+
+        amount = ConsumeMatchingFromSlots(_hotbar, matches, amount);
+        amount = ConsumeMatchingFromSlots(_grid, matches, amount);
+        return amount <= 0;
+    }
 
     public bool TryConsumeSelected(int amount)
     {
@@ -291,8 +354,52 @@ public sealed class Inventory
         return true;
     }
 
+    private static int ConsumeFromSlots(HotbarSlot[] slots, BlockId id, int amount)
+    {
+        for (var i = 0; i < slots.Length && amount > 0; i++)
+        {
+            if (slots[i].Id != id || slots[i].Count <= 0)
+                continue;
+
+            var take = Math.Min(slots[i].Count, amount);
+            slots[i].Count -= take;
+            amount -= take;
+            if (slots[i].Count <= 0)
+            {
+                slots[i].Count = 0;
+                slots[i].Id = BlockId.Air;
+            }
+        }
+
+        return amount;
+    }
+
+    private static int ConsumeMatchingFromSlots(HotbarSlot[] slots, Func<BlockId, bool> matches, int amount)
+    {
+        for (var i = 0; i < slots.Length && amount > 0; i++)
+        {
+            if (slots[i].Id == BlockId.Air || slots[i].Count <= 0 || !matches(slots[i].Id))
+                continue;
+
+            var take = Math.Min(slots[i].Count, amount);
+            slots[i].Count -= take;
+            amount -= take;
+            if (slots[i].Count <= 0)
+            {
+                slots[i].Count = 0;
+                slots[i].Id = BlockId.Air;
+            }
+        }
+
+        return amount;
+    }
+
     private static int GetMaxStack(BlockId id, GameMode mode)
     {
+        var item = ItemRegistry.Get((byte)id);
+        if (item.Id != ItemId.None)
+            return item.MaxStack;
+
         if (mode == GameMode.Artificer)
             return ToolIds.Contains(id) ? 1 : DefaultStackSize;
         return ToolIds.Contains(id) ? 1 : DefaultStackSize;
@@ -361,6 +468,7 @@ public sealed class Inventory
     {
         BlockId.CinderbranchStaff,
         BlockId.StormreedStaff,
+        BlockId.EmptyBucket,
         BlockId.WaterBucket
     };
 
@@ -450,19 +558,27 @@ public sealed class Inventory
         if (terms == null || terms.Length == 0)
             return true;
 
-        var def = BlockRegistry.Get(id);
-        var name = def.Name.ToLowerInvariant();
-        var token = id.ToString().ToLowerInvariant();
-        var texture = (def.TextureName ?? string.Empty).ToLowerInvariant();
+        var item = ItemRegistry.Get((byte)id);
+        var name = item.Name.ToLowerInvariant();
+        var key = item.Key.ToLowerInvariant();
+        var token = item.Id.ToString().ToLowerInvariant();
+        var texture = (item.TextureName ?? string.Empty).ToLowerInvariant();
+        var placeToken = item.PlacesBlock.HasValue
+            ? item.PlacesBlock.Value.ToString().ToLowerInvariant()
+            : string.Empty;
 
         for (var i = 0; i < terms.Length; i++)
         {
             var term = terms[i];
             if (name.Contains(term, StringComparison.Ordinal))
                 continue;
+            if (key.Contains(term, StringComparison.Ordinal))
+                continue;
             if (token.Contains(term, StringComparison.Ordinal))
                 continue;
             if (texture.Contains(term, StringComparison.Ordinal))
+                continue;
+            if (placeToken.Contains(term, StringComparison.Ordinal))
                 continue;
             return false;
         }
@@ -477,8 +593,8 @@ public sealed class Inventory
             return false;
 
         blockId = (BlockId)rawValue;
-        var def = BlockRegistry.Get(blockId);
-        return def.Id == blockId && def.IsVisibleInInventory;
+        var item = ItemRegistry.Get((byte)blockId);
+        return item.Id != ItemId.None && item.IsVisibleInCatalog;
     }
 
     private static BlockId[] GetSandboxCatalogEntries()
@@ -486,10 +602,10 @@ public sealed class Inventory
         if (_sandboxCatalogEntriesCache is { Length: > 0 })
             return _sandboxCatalogEntriesCache;
 
-        _sandboxCatalogEntriesCache = BlockRegistry.All
-            .Where(def => def.Id != BlockId.Air && def.IsVisibleInInventory)
-            .OrderBy(def => def.AtlasIndex)
-            .Select(def => def.Id)
+        _sandboxCatalogEntriesCache = ItemRegistry.All
+            .Where(def => def.Id != ItemId.None && def.IsVisibleInCatalog)
+            .OrderBy(def => (byte)def.Id)
+            .Select(def => ItemRegistry.ToLegacyBlockId(def.Id))
             .ToArray();
 
         return _sandboxCatalogEntriesCache;

@@ -7,7 +7,7 @@ namespace LatticeVeilMonoGame.Core;
 
 public sealed class PlayerWorldState
 {
-    private const int CurrentVersion = 14;
+    private const int CurrentVersion = 15;
 
     public int Version { get; set; } = CurrentVersion;
     public string Username { get; set; } = "";
@@ -28,6 +28,7 @@ public sealed class PlayerWorldState
     public HotbarSlot[] Hotbar { get; set; } = new HotbarSlot[Inventory.HotbarSize];
     public HotbarSlot[] InventoryGrid { get; set; } = new HotbarSlot[Inventory.GridSize];
     public int[] ArtificerFavoriteBlockIds { get; set; } = Array.Empty<int>();
+    public string[] PinnedHandCraftRecipeIds { get; set; } = Array.Empty<string>();
     public int Health { get; set; } = SurvivalVitals.MaxHealth;
     public int Hunger { get; set; } = SurvivalVitals.MaxHunger;
     public float SigilAtonement { get; set; }
@@ -201,6 +202,19 @@ public sealed class PlayerWorldState
 
                         state.ArtificerFavoriteBlockIds = favorites.ToArray();
                     }
+
+                    if (int.TryParse(data.GetValueOrDefault("pinnedHandCraftRecipeCount"), out var pinnedRecipeCount) && pinnedRecipeCount > 0)
+                    {
+                        var pinnedRecipes = new List<string>(pinnedRecipeCount);
+                        for (int i = 0; i < pinnedRecipeCount; i++)
+                        {
+                            var recipeId = data.GetValueOrDefault($"pinnedHandCraftRecipe.{i}.id");
+                            if (!string.IsNullOrWhiteSpace(recipeId))
+                                pinnedRecipes.Add(recipeId.Trim());
+                        }
+
+                        state.PinnedHandCraftRecipeIds = pinnedRecipes.ToArray();
+                    }
                     
                     return state;
                 }
@@ -315,6 +329,13 @@ public sealed class PlayerWorldState
                 data["favoriteCount"] = ArtificerFavoriteBlockIds.Length.ToString();
                 for (int i = 0; i < ArtificerFavoriteBlockIds.Length; i++)
                     data[$"favorite.{i}.id"] = ArtificerFavoriteBlockIds[i].ToString();
+            }
+
+            if (PinnedHandCraftRecipeIds != null && PinnedHandCraftRecipeIds.Length > 0)
+            {
+                data["pinnedHandCraftRecipeCount"] = PinnedHandCraftRecipeIds.Length.ToString();
+                for (int i = 0; i < PinnedHandCraftRecipeIds.Length; i++)
+                    data[$"pinnedHandCraftRecipe.{i}.id"] = PinnedHandCraftRecipeIds[i] ?? string.Empty;
             }
 
             if (SoulInventory != null && SoulInventory.Length > 0)
@@ -452,6 +473,12 @@ public sealed class PlayerWorldState
         bw.Write((byte)favoriteCount);
         for (int i = 0; i < favoriteCount; i++)
             bw.Write(favorites[i]);
+
+        var pinnedRecipes = PinnedHandCraftRecipeIds ?? Array.Empty<string>();
+        var pinnedRecipeCount = Math.Min(pinnedRecipes.Length, byte.MaxValue);
+        bw.Write((byte)pinnedRecipeCount);
+        for (int i = 0; i < pinnedRecipeCount; i++)
+            bw.Write(pinnedRecipes[i] ?? string.Empty);
     }
 
     private static string GetSavePath(string worldPath, string safeName)
@@ -593,6 +620,20 @@ public sealed class PlayerWorldState
                 }
 
                 state.ArtificerFavoriteBlockIds = favorites.ToArray();
+            }
+
+            if (version >= 15)
+            {
+                var pinnedRecipeCount = br.ReadByte();
+                var pinnedRecipes = new List<string>(pinnedRecipeCount);
+                for (int i = 0; i < pinnedRecipeCount; i++)
+                {
+                    var recipeId = br.ReadString();
+                    if (!string.IsNullOrWhiteSpace(recipeId))
+                        pinnedRecipes.Add(recipeId.Trim());
+                }
+
+                state.PinnedHandCraftRecipeIds = pinnedRecipes.ToArray();
             }
 
             // Future-proofing: if old versions had fewer fields, they should have been handled before.
