@@ -130,6 +130,19 @@ Deno.serve(async (req) => {
     const actualHash = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
     if (actualHash !== hash) return fail(400, "skin_hash_mismatch");
 
+    // Duplicate protection: the same physical image (identical SHA-256, so
+    // byte-for-byte identical) can only be stored once per account. Re-uploading
+    // the skin that already occupies THIS slot is a harmless no-op update;
+    // uploading it to a DIFFERENT slot is rejected.
+    const { data: existing } = await admin
+      .from("player_skins")
+      .select("slot, skin_hash")
+      .eq("user_id", userId);
+    if (existing) {
+      const duplicate = existing.find((row) => row.skin_hash === hash && row.slot !== slot);
+      if (duplicate) return fail(409, "skin_already_uploaded", { slot: duplicate.slot });
+    }
+
     const payload = {
       user_id: userId,
       slot,
