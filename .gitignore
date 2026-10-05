@@ -13,6 +13,9 @@ plans/
 docs/
 *.md
 !README.md
+!AGENTS.md
+!AI_KNOWLEDGE.md
+!REFERENCES.md
 
 # IDE and editor files
 /.vscode/
@@ -120,3 +123,6 @@ run_local.*
 
 # Build stamps and markers
 .build_stamp
+
+# Supabase CLI workspace moved to ..\LatticeVeil_supabase (kept out of both repos)
+supabase/
