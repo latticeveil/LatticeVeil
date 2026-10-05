@@ -16,7 +16,12 @@ internal sealed class PlayerSkinCloudClient
 {
     private const string DefaultFunctionsBaseUrl = "https://lqghurvonrvrxfwjgkuu.supabase.co/functions/v1";
     private const string DefaultSupabaseAnonKey = "sb_publishable_oy1En_XHnhp5AiOWruitmQ_sniWHETA";
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    internal const int MaxSkinsPerUser = 5;
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     private readonly HttpClient _http;
     private readonly string _functionsBaseUrl;
@@ -41,19 +46,52 @@ internal sealed class PlayerSkinCloudClient
             return await ClearRemoteSkinAsync(accessToken, ct).ConfigureAwait(false);
 
         var entry = SkinLibrary.ListSkins().FirstOrDefault(item => string.Equals(item.Hash, hash, StringComparison.OrdinalIgnoreCase));
+
+        // Slot-aware upload: reuse the slot that already holds this skin,
+        // otherwise claim the first free slot (0..4). Slot 0 is the primary
+        // account skin the website and the game read.
+        var remoteSkins = await ListRemoteSkinsAsync(accessToken, ct).ConfigureAwait(false);
+        if (remoteSkins == null)
+            return PlayerSkinCloudResult.Fail("skin_list_lookup_failed");
+
+        var usedSlots = remoteSkins.Select(s => s.Slot).Distinct().ToArray();
+        var existingSlot = remoteSkins.FirstOrDefault(s => string.Equals(s.Hash, hash, StringComparison.OrdinalIgnoreCase))?.Slot;
+        var slot = existingSlot ?? Enumerable.Range(0, MaxSkinsPerUser).Except(usedSlots).FirstOrDefault(-1);
+        if (slot < 0)
+            return PlayerSkinCloudResult.Fail("online_skin_library_full");
+
         var payload = new PlayerSkinSetRequest
         {
             Action = "set",
             Hash = hash,
             PngBase64 = Convert.ToBase64String(pngBytes),
             DisplayName = entry?.DisplayName ?? "Account Skin",
-            HasLayers = entry?.HasLayers ?? false
+            HasLayers = entry?.HasLayers ?? false,
+            Slot = slot
         };
 
         var result = await PostAsync<PlayerSkinSetResponse>("player-skin-set", accessToken, payload, ct).ConfigureAwait(false);
         if (result.Ok)
-            _log?.Info($"Cloud skin uploaded: hash={ShortHash(hash)}, bytes={pngBytes.Length}");
+            _log?.Info($"Cloud skin uploaded: hash={ShortHash(hash)}, slot={slot}, bytes={pngBytes.Length}");
         return result;
+    }
+
+    /// <summary>
+    /// Lists the skins currently stored on the account (slot-aware). Returns
+    /// null on failure. Falls back to the legacy single-skin view as slot 0.
+    /// </summary>
+    private async Task<List<PlayerSkinDto>?> ListRemoteSkinsAsync(string accessToken, CancellationToken ct)
+    {
+        var result = await GetAsync<PlayerSkinGetResponse>("player-skin-get", accessToken, ct).ConfigureAwait(false);
+        if (!result.Ok || result.Response is not PlayerSkinGetResponse response)
+            return null;
+
+        if (response.Skins is { Count: > 0 } skins)
+            return skins;
+
+        return response.Skin != null
+            ? new List<PlayerSkinDto> { response.Skin }
+            : new List<PlayerSkinDto>();
     }
 
     public async Task<PlayerSkinCloudResult> ClearRemoteSkinAsync(string accessToken, CancellationToken ct = default)
@@ -246,6 +284,9 @@ internal sealed class PlayerSkinCloudClient
 
         [JsonPropertyName("hasLayers")]
         public bool HasLayers { get; set; }
+
+        [JsonPropertyName("slot")]
+        public int? Slot { get; set; }
     }
 
     private sealed class PlayerSkinSetResponse
@@ -259,10 +300,12 @@ internal sealed class PlayerSkinCloudClient
         public bool Ok { get; set; }
         public bool HasSkin { get; set; }
         public PlayerSkinDto? Skin { get; set; }
+        public List<PlayerSkinDto>? Skins { get; set; }
     }
 
     private sealed class PlayerSkinDto
     {
+        public int Slot { get; set; }
         public string Hash { get; set; } = string.Empty;
         public string PngBase64 { get; set; } = string.Empty;
         public string DisplayName { get; set; } = "Account Skin";
